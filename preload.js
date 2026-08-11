@@ -9,7 +9,7 @@ const call = async (channel, ...args) => {
   return result.data;
 };
 
-contextBridge.exposeInMainWorld("brain", {
+contextBridge.exposeInMainWorld("delphi", {
   projects: {
     list: () => call("projects:list"),
     create: (payload) => call("projects:create", payload),
@@ -49,6 +49,14 @@ contextBridge.exposeInMainWorld("brain", {
     create: (payload) => call("repos:create", payload),
     setPrimary: (id) => call("repos:setPrimary", id),
     remove: (id) => call("repos:delete", id),
+  },
+  oracle: {
+    stats: () => call("oracle:stats"),
+    rebuild: () => call("oracle:rebuild"),
+    context: (name) => call("oracle:context", name),
+    nearest: (query, opts) => call("oracle:nearest", query, opts),
+    reindex: (force) => call("oracle:reindex", force),
+    provider: () => call("oracle:provider"),
   },
   audit: {
     list: (limit) => call("audit:list", limit),

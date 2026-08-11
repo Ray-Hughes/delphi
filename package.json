@@ -1,12 +1,13 @@
 {
-  "name": "brain",
+  "name": "delphi",
   "version": "1.0.0",
-  "description": "Project tracker and second brain",
+  "description": "A project tracker with a knowledge graph, that your AI agents keep current themselves",
   "main": "main.js",
   "scripts": {
     "start": "electron ."
   },
   "devDependencies": {
     "electron": "^43.3.0"
-  }
+  },
+  "productName": "Delphi"
 }

@@ -187,6 +187,11 @@ def check_write(tool: str, tool_input: dict):
 
 
 def main():
+    # Fail open on anything wrong with the guard's own setup. This blocked every
+    # tool call once, when the project moved and the hook still pointed at the old
+    # path: a missing guard is a configuration problem, and refusing all work is a
+    # worse answer to it than saying so and continuing. The guard exists to catch
+    # destructive commands, not to hold a session hostage to its own config.
     try:
         payload = json.load(sys.stdin)
     except Exception:

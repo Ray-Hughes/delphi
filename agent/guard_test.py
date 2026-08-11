@@ -1,7 +1,7 @@
 import json, subprocess, sys
 
 def run(tool, inp):
-    p = subprocess.run([sys.executable, "/Users/raymondhughes/va/brain/agent/guard.py"],
+    p = subprocess.run([sys.executable, "/Users/raymondhughes/va/delphi/agent/guard.py"],
                        input=json.dumps({"tool_name": tool, "tool_input": inp}),
                        capture_output=True, text=True)
     return p.returncode, (p.stderr.strip().splitlines() or [""])[0]
@@ -28,7 +28,7 @@ MUST_ALLOW = [
   "git push origin feature/APPEALS-120085",
   "git push --force-with-lease origin my-branch",
   "git clean -n", "git status", "npm install", "bundle exec rspec",
-  "sqlite3 brain.db 'DELETE FROM audit WHERE label = \"x\"'",
+  "sqlite3 delphi.db 'DELETE FROM audit WHERE label = \"x\"'",
   "kubectl delete pod mypod", "terraform destroy -target=aws_instance.x",
   "git reset --hard HEAD~1", "curl -sL https://example.com/f.json -o f.json",
   "gh pr create --title x", "helm template test charts/foo",
@@ -51,7 +51,7 @@ for c in MUST_ALLOW:
 
 rc, _ = run("Write", {"file_path": "/Users/raymondhughes/.claude/settings.json"})
 print(f"\n  settings.json write blocked: {rc == 2}")
-rc, _ = run("Write", {"file_path": "/Users/raymondhughes/va/brain/app.js"})
+rc, _ = run("Write", {"file_path": "/Users/raymondhughes/va/delphi/app.js"})
 print(f"  normal file write allowed:   {rc == 0}")
 
 print(f"\nRESULT: {len(fails)} problems")

@@ -18,11 +18,11 @@ the other. They both talk to this.
 | `update_task` | Change status, priority, detail, or move between projects |
 | `add_note` | Store a decision, gotcha or reference against a project |
 | `search` | Search tasks and notes |
-| `graph_context` | Everything connected to a ticket, service, repo, file or concept |
-| `graph_entities` | What the graph knows about, most referenced first |
+| `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
+| `oracle_entities` | What the graph knows about, most referenced first |
 | `recent_activity` | What changed lately and which agent changed it |
 
-Every write is attributed. Set `BRAIN_ACTOR` in the server's environment to name
+Every write is attributed. Set `DELPHI_ACTOR` in the server's environment to name
 the agent, and its changes appear in the History tab labelled with that name.
 
 ## Connecting Claude Code
@@ -30,8 +30,8 @@ the agent, and its changes appear in the History tab labelled with that name.
 **Claude Code** — register it with the CLI, which writes to `~/.claude.json`:
 
 ```bash
-claude mcp add brain --scope user -e BRAIN_ACTOR=claude -- \
-  /absolute/path/to/node /absolute/path/to/second-brain/agent/mcp_server.js
+claude mcp add brain --scope user -e DELPHI_ACTOR=claude -- \
+  /absolute/path/to/node /absolute/path/to/delphi/agent/mcp_server.js
 ```
 
 Confirm with `claude mcp list`; it should report `brain ... ✔ Connected`. Restart Claude Code
@@ -49,14 +49,14 @@ Copilot agent mode reads `.vscode/mcp.json` in the workspace:
   "servers": {
     "brain": {
       "command": "node",
-      "args": ["/Users/YOU/va/brain/agent/mcp_server.js"],
-      "env": { "BRAIN_ACTOR": "copilot" }
+      "args": ["/Users/YOU/va/delphi/agent/mcp_server.js"],
+      "env": { "DELPHI_ACTOR": "copilot" }
     }
   }
 }
 ```
 
-Give each agent a different `BRAIN_ACTOR`. That is the only thing making the
+Give each agent a different `DELPHI_ACTOR`. That is the only thing making the
 History tab useful when more than one is working.
 
 ## The prompt
@@ -76,7 +76,7 @@ At the start of a session, call `list_projects`, then `list_tasks` for whichever
 project the work belongs to, so you know what is already open and do not raise
 something that is already tracked.
 
-Before searching a repository for background, call `graph_context` with the thing
+Before searching a repository for background, call `oracle_context` with the thing
 you are about to investigate: a ticket, a service, a file, a concept. It returns
 the notes and tasks that mention it, the projects it spans, and the things it
 appears alongside. That last part is the reason to prefer it over plain search:
@@ -84,7 +84,7 @@ it surfaces connections nobody wrote down, such as a database concern reaching a
 version ticket through the build pipeline.
 
 Use `search` when you want text matching rather than connections, and
-`graph_entities` when you need the exact name to ask about.
+`oracle_entities` when you need the exact name to ask about.
 
 During the work:
 
@@ -130,7 +130,7 @@ Install it by pointing a `PreToolUse` hook at it in `~/.claude/settings.json`:
     "PreToolUse": [
       {
         "matcher": "Bash|Write|Edit|NotebookEdit",
-        "hooks": [{ "type": "command", "command": "python3 /Users/YOU/va/brain/agent/guard.py" }]
+        "hooks": [{ "type": "command", "command": "python3 /Users/YOU/va/delphi/agent/guard.py" }]
       }
     ]
   }

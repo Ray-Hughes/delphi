@@ -10,7 +10,7 @@ const { DatabaseSync } = require("node:sqlite");
 const path = require("path");
 const fs = require("fs");
 
-const DB_PATH = path.join(__dirname, "brain.db");
+const DB_PATH = path.join(__dirname, "delphi.db");
 
 let db;
 

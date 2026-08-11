@@ -1,4 +1,4 @@
-// Renderer. Talks to the main process through window.brain only.
+// Renderer. Talks to the main process through window.delphi only.
 
 const state = {
   projects: [],
@@ -45,16 +45,16 @@ function ago(iso) {
 // ---------------------------------------------------------------------------
 
 async function refresh() {
-  state.projects = await window.brain.projects.list();
+  state.projects = await window.delphi.projects.list();
 
   if (state.query) {
-    const { tasks, notes } = await window.brain.search(state.query);
+    const { tasks, notes } = await window.delphi.search(state.query);
     state.tasks = tasks;
     state.notes = notes;
     state.links = [];
     state.repos = [];
   } else {
-    state.allTasks = await window.brain.tasks.list({
+    state.allTasks = await window.delphi.tasks.list({
       projectId: state.projectId,
       includeDone: true,
     });
@@ -62,9 +62,9 @@ async function refresh() {
       ? state.allTasks
       : state.allTasks.filter((t) => t.status !== "done");
     if (state.projectId) {
-      state.notes = await window.brain.notes.list(state.projectId);
-      state.links = await window.brain.links.list(state.projectId);
-      state.repos = await window.brain.repos.list(state.projectId);
+      state.notes = await window.delphi.notes.list(state.projectId);
+      state.links = await window.delphi.links.list(state.projectId);
+      state.repos = await window.delphi.repos.list(state.projectId);
     } else {
       state.notes = [];
       state.links = [];
@@ -322,7 +322,7 @@ async function renderOverview(root) {
     const path = prompt("Path to the repository folder");
     if (!path || !path.trim()) return;
     const name = path.trim().replace(/\/+$/, "").split("/").pop();
-    await window.brain.repos.create({
+    await window.delphi.repos.create({
       projectId: project.id, name, path: path.trim(),
       isPrimary: state.repos.length === 0 ? 1 : 0,
     });
@@ -346,11 +346,11 @@ async function renderOverview(root) {
         el("div", { className: "mono", textContent: r.path })));
       if (!r.is_primary) {
         const mk = el("button", { className: "btn sm", textContent: "Make primary" });
-        mk.onclick = async () => { await window.brain.repos.setPrimary(r.id); refresh(); };
+        mk.onclick = async () => { await window.delphi.repos.setPrimary(r.id); refresh(); };
         row.append(mk);
       }
       const rm = el("button", { className: "btn sm", textContent: "Remove" });
-      rm.onclick = async () => { await window.brain.repos.remove(r.id); refresh(); };
+      rm.onclick = async () => { await window.delphi.repos.remove(r.id); refresh(); };
       row.append(rm);
       flush.append(row);
     });
@@ -369,7 +369,7 @@ async function renderOverview(root) {
       const row = el("div", { className: "list-row" });
       row.append(el("span", { className: "kind", textContent: l.kind }));
       const a = el("a", { href: "#", className: "grow", textContent: l.label });
-      a.onclick = (e) => { e.preventDefault(); window.brain.openExternal(l.url); };
+      a.onclick = (e) => { e.preventDefault(); window.delphi.openExternal(l.url); };
       row.append(a);
       flush.append(row);
     });
@@ -384,7 +384,7 @@ async function renderOverview(root) {
   const nameInput = el("input", { className: "field", value: project.name });
   nameInput.onblur = async () => {
     if (nameInput.value.trim() && nameInput.value !== project.name) {
-      await window.brain.projects.update(project.id, { name: nameInput.value.trim() });
+      await window.delphi.projects.update(project.id, { name: nameInput.value.trim() });
       refresh();
     }
   };
@@ -393,7 +393,7 @@ async function renderOverview(root) {
   const sumInput = el("input", { className: "field", value: project.summary || "" , placeholder: "One line: what this project is" });
   sumInput.onblur = async () => {
     if (sumInput.value !== (project.summary || "")) {
-      await window.brain.projects.update(project.id, { summary: sumInput.value.trim() });
+      await window.delphi.projects.update(project.id, { summary: sumInput.value.trim() });
       refresh();
     }
   };
@@ -404,7 +404,7 @@ async function renderOverview(root) {
     statusSel.append(el("option", { value: s, textContent: s, selected: s === project.status }));
   }
   statusSel.onchange = async () => {
-    await window.brain.projects.update(project.id, { status: statusSel.value });
+    await window.delphi.projects.update(project.id, { status: statusSel.value });
     if (statusSel.value === "archived") { state.projectId = null; state.view = "tasks"; }
     refresh();
   };
@@ -412,7 +412,7 @@ async function renderOverview(root) {
 
   const colour = el("input", { type: "color", className: "field", value: project.colour || "#8d97a9", style: "height:34px; padding:2px" });
   colour.onchange = async () => {
-    await window.brain.projects.update(project.id, { colour: colour.value });
+    await window.delphi.projects.update(project.id, { colour: colour.value });
     refresh();
   };
   kv.append(el("dt", { textContent: "Colour" }), el("dd", {}, colour));
@@ -438,7 +438,7 @@ function renderTasks(root) {
       let priority = "med";
       if (title.startsWith("!")) { priority = "high"; title = title.slice(1).trim(); }
       const ref = (title.match(/\b([A-Z][A-Z0-9]+-\d+)\b/) || [])[1] || null;
-      await window.brain.tasks.create({ projectId: state.projectId, title, priority, ref });
+      await window.delphi.tasks.create({ projectId: state.projectId, title, priority, ref });
       input.value = "";
       refresh();
     };
@@ -479,7 +479,7 @@ function taskRow(t) {
 
   const check = el("div", { className: "check", textContent: "✓", tabIndex: 0, role: "checkbox" });
   const toggle = async () => {
-    await window.brain.tasks.update(t.id, { status: t.status === "done" ? "todo" : "done" });
+    await window.delphi.tasks.update(t.id, { status: t.status === "done" ? "todo" : "done" });
     refresh();
   };
   check.onclick = toggle;
@@ -515,7 +515,7 @@ function taskRow(t) {
   const cycle = el("button", { className: "btn sm", textContent: "status" });
   cycle.onclick = async () => {
     const order = ["todo", "doing", "blocked", "done"];
-    await window.brain.tasks.update(t.id, { status: order[(order.indexOf(t.status) + 1) % order.length] });
+    await window.delphi.tasks.update(t.id, { status: order[(order.indexOf(t.status) + 1) % order.length] });
     refresh();
   };
   const move = el("select", { className: "btn sm" });
@@ -523,10 +523,10 @@ function taskRow(t) {
   state.projects.forEach((p) =>
     move.append(el("option", { value: String(p.id), textContent: p.name, selected: p.id === t.project_id })));
   move.onchange = async () => {
-    if (move.value) { await window.brain.tasks.update(t.id, { project_id: Number(move.value) }); refresh(); }
+    if (move.value) { await window.delphi.tasks.update(t.id, { project_id: Number(move.value) }); refresh(); }
   };
   const del = el("button", { className: "btn sm", textContent: "×", title: "Delete" });
-  del.onclick = async () => { await window.brain.tasks.remove(t.id); refresh(); };
+  del.onclick = async () => { await window.delphi.tasks.remove(t.id); refresh(); };
   actions.append(cycle, move, del);
   meta.append(actions);
 
@@ -542,7 +542,7 @@ function renderNotes(root) {
   const title = el("input", { className: "field", placeholder: "New memory note title, then Enter" });
   title.onkeydown = async (e) => {
     if (e.key !== "Enter" || !title.value.trim()) return;
-    await window.brain.notes.create({ projectId: state.projectId, title: title.value.trim() });
+    await window.delphi.notes.create({ projectId: state.projectId, title: title.value.trim() });
     title.value = "";
     refresh();
   };
@@ -561,13 +561,13 @@ function noteCard(n) {
   const head = el("div", { className: "note-head" });
 
   const pin = el("button", { className: "btn sm", textContent: n.pinned ? "★" : "☆", title: "Pin" });
-  pin.onclick = async () => { await window.brain.notes.update(n.id, { pinned: n.pinned ? 0 : 1 }); refresh(); };
+  pin.onclick = async () => { await window.delphi.notes.update(n.id, { pinned: n.pinned ? 0 : 1 }); refresh(); };
   head.append(pin);
 
   const titleInput = el("input", { value: n.title });
   titleInput.onblur = async () => {
     if (titleInput.value.trim() && titleInput.value !== n.title) {
-      await window.brain.notes.update(n.id, { title: titleInput.value.trim() });
+      await window.delphi.notes.update(n.id, { title: titleInput.value.trim() });
       refresh();
     }
   };
@@ -576,11 +576,11 @@ function noteCard(n) {
   const kind = el("select", { className: "btn sm" });
   ["note", "decision", "gotcha", "reference", "contact"].forEach((k) =>
     kind.append(el("option", { value: k, textContent: k, selected: k === n.kind })));
-  kind.onchange = async () => { await window.brain.notes.update(n.id, { kind: kind.value }); refresh(); };
+  kind.onchange = async () => { await window.delphi.notes.update(n.id, { kind: kind.value }); refresh(); };
   head.append(kind);
 
   const del = el("button", { className: "btn sm", textContent: "×", title: "Delete" });
-  del.onclick = async () => { await window.brain.notes.remove(n.id); refresh(); };
+  del.onclick = async () => { await window.delphi.notes.remove(n.id); refresh(); };
   head.append(del);
   wrap.append(head);
 
@@ -591,7 +591,7 @@ function noteCard(n) {
     placeholder: "What is worth remembering here",
   });
   body.onblur = async () => {
-    if (body.value !== n.body) { await window.brain.notes.update(n.id, { body: body.value }); n.body = body.value; }
+    if (body.value !== n.body) { await window.delphi.notes.update(n.id, { body: body.value }); n.body = body.value; }
   };
   wrap.append(el("div", { className: "note-body" }, body));
   return wrap;
@@ -610,7 +610,7 @@ function renderLinks(root) {
     const kind = /pull\/\d+|\/pr\//.test(url.value) ? "pr"
       : /jira|atlassian|[A-Z]+-\d+/.test(url.value) ? "jira"
       : /grafana|dashboard|kibana/.test(url.value) ? "dashboard" : "link";
-    await window.brain.links.create({ projectId: state.projectId, label: label.value.trim(), url: url.value.trim(), kind });
+    await window.delphi.links.create({ projectId: state.projectId, label: label.value.trim(), url: url.value.trim(), kind });
     label.value = url.value = "";
     refresh();
   };
@@ -625,10 +625,10 @@ function renderLinks(root) {
     const row = el("div", { className: "list-row" });
     row.append(el("span", { className: "kind", textContent: l.kind }));
     const a = el("a", { href: "#", className: "grow", textContent: l.label });
-    a.onclick = (e) => { e.preventDefault(); window.brain.openExternal(l.url); };
+    a.onclick = (e) => { e.preventDefault(); window.delphi.openExternal(l.url); };
     row.append(a, el("span", { className: "mono", textContent: l.url.slice(0, 46) }));
     const del = el("button", { className: "btn sm", textContent: "×" });
-    del.onclick = async () => { await window.brain.links.remove(l.id); refresh(); };
+    del.onclick = async () => { await window.delphi.links.remove(l.id); refresh(); };
     row.append(del);
     list.append(row);
   });
@@ -646,7 +646,7 @@ async function renderHistory(root) {
     const b = el("button", { className: "btn", textContent: text });
     b.onclick = async () => {
       try {
-        const done = await window.brain.audit.undoLast(n);
+        const done = await window.delphi.audit.undoLast(n);
         msg.className = "ok-msg";
         msg.textContent = done ? `Reversed ${plural(done, "change", "changes")}.` : "Nothing left to undo.";
       } catch (e) { msg.className = "err-msg"; msg.textContent = e.message; }
@@ -657,7 +657,7 @@ async function renderHistory(root) {
   bar.append(undo(1, "Undo last change"), undo(5, "Undo last 5"), msg);
   root.append(bar);
 
-  const entries = await window.brain.audit.list(200);
+  const entries = await window.delphi.audit.list(200);
   if (!entries.length) {
     root.append(emptyState("Nothing recorded yet", "Every change from here on is logged and reversible."));
     return;
@@ -675,7 +675,7 @@ async function renderHistory(root) {
     else {
       const b = el("button", { className: "btn sm", textContent: "undo" });
       b.onclick = async () => {
-        try { await window.brain.audit.undo(e.id); } catch (err) { alert(err.message); }
+        try { await window.delphi.audit.undo(e.id); } catch (err) { alert(err.message); }
         refresh();
       };
       row.append(b);
@@ -714,7 +714,7 @@ const partLabel = (p) =>
   ({ Control: "control", Alt: "option", Shift: "shift", Command: "command", Space: "space" }[p] || p);
 
 async function renderSettings(root) {
-  const settings = await window.brain.settings.get();
+  const settings = await window.delphi.settings.get();
 
   // --- shortcut ------------------------------------------------------------
   const shortcut = el("div", { className: "setting" });
@@ -761,7 +761,7 @@ async function renderSettings(root) {
     const accel = [...parts, key].join("+");
     paint(accel);
     try {
-      await window.brain.settings.setHotkey(accel);
+      await window.delphi.settings.setHotkey(accel);
       settings.hotkey = accel;
       status.className = "ok-msg";
       status.textContent = `Saved. ${accel} now shows and hides this panel.`;
@@ -799,7 +799,7 @@ async function renderSettings(root) {
   box.onchange = async () => {
     try {
       // The window is rebuilt to apply this, so it will flicker once.
-      await window.brain.settings.set({ panelMode: box.checked });
+      await window.delphi.settings.set({ panelMode: box.checked });
       modeMsg.className = "ok-msg";
       modeMsg.textContent = box.checked ? "Panel mode on" : "Normal window";
     } catch (e) {
@@ -825,7 +825,7 @@ async function renderSettings(root) {
     const note = el("span", { className: "hint" });
     input.onchange = async () => {
       try {
-        const updated = await window.brain.settings.set({ [key]: Number(input.value) });
+        const updated = await window.delphi.settings.set({ [key]: Number(input.value) });
         settings[key] = updated[key];
         note.className = "ok-msg";
         note.textContent = "saved";
@@ -848,10 +848,10 @@ async function renderSettings(root) {
   const openBtn = el("button", { className: "btn", textContent: "Open the folder" });
   const exportBtn = el("button", { className: "btn", textContent: "Rebuild now" });
   const vmsg = el("span", { className: "hint" });
-  openBtn.onclick = () => window.brain.vault.reveal();
+  openBtn.onclick = () => window.delphi.vault.reveal();
   exportBtn.onclick = async () => {
     try {
-      const r = await window.brain.vault.export();
+      const r = await window.delphi.vault.export();
       vmsg.className = "ok-msg";
       vmsg.textContent = `${r.notes} notes across ${r.projects} projects written`;
     } catch (e) { vmsg.className = "err-msg"; vmsg.textContent = e.message; }
@@ -873,8 +873,8 @@ async function renderSettings(root) {
   const data = el("div", { className: "setting" });
   data.append(el("h3", { textContent: "Where your data lives" }));
   const dl = el("dl", { className: "kv" });
-  dl.append(el("dt", { textContent: "Database" }), el("dd", {}, el("span", { className: "mono", textContent: "~/va/brain/brain.db" })));
-  dl.append(el("dt", { textContent: "Settings" }), el("dd", {}, el("span", { className: "mono", textContent: "~/va/brain/settings.json" })));
+  dl.append(el("dt", { textContent: "Database" }), el("dd", {}, el("span", { className: "mono", textContent: "~/va/delphi/delphi.db" })));
+  dl.append(el("dt", { textContent: "Settings" }), el("dd", {}, el("span", { className: "mono", textContent: "~/va/delphi/settings.json" })));
   dl.append(el("dt", { textContent: "History" }), el("dd", { textContent: "Every change is recorded and can be reversed." }));
   data.append(dl);
   root.append(data);
@@ -901,7 +901,7 @@ $("new-project").onclick = async () => {
   if (!name || !name.trim()) return;
   const key = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   const palette = ["#4a63d8", "#e0803a", "#2f8757", "#a86fd1", "#c9546b", "#3fa7a1"];
-  const created = await window.brain.projects.create({
+  const created = await window.delphi.projects.create({
     key: key || `p${Date.now()}`,
     name: name.trim(),
     colour: palette[state.projects.length % palette.length],
@@ -920,7 +920,7 @@ document.addEventListener("keydown", (e) => {
       refresh();
       return;
     }
-    window.brain.hide();
+    window.delphi.hide();
   }
   if ((e.metaKey || e.ctrlKey) && e.key === "f") {
     e.preventDefault();
@@ -931,13 +931,13 @@ document.addEventListener("keydown", (e) => {
 
 // Frameless panel mode has no traffic lights, so the title bar does not need to
 // leave room for them.
-window.brain.onMode(({ panelMode }) => {
+window.delphi.onMode(({ panelMode }) => {
   document.body.classList.toggle("panel", panelMode);
 });
 
-window.brain.onShown(() => { refresh(); $("search").focus(); });
-window.brain.onAlertsChanged(() => refresh());
-window.brain.onFocusTask(({ projectId }) => {
+window.delphi.onShown(() => { refresh(); $("search").focus(); });
+window.delphi.onAlertsChanged(() => refresh());
+window.delphi.onFocusTask(({ projectId }) => {
   if (projectId) { state.projectId = projectId; state.view = "tasks"; }
   refresh();
 });

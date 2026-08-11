@@ -33,7 +33,7 @@ const VOCABULARY = {
 };
 
 function open(db) {
-  db.exec(fs.readFileSync(path.join(__dirname, "graph.sql"), "utf8"));
+  db.exec(fs.readFileSync(path.join(__dirname, "oracle.sql"), "utf8"));
 }
 
 /** Case-insensitive word match that will not fire inside a longer word. */

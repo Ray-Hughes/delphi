@@ -3,7 +3,8 @@ const path = require("path");
 const fs = require("fs");
 const db = require("./db");
 const vault = require("./vault");
-const graph = require("./graph");
+const oracle = require("./oracle");
+const embeddings = require("./embeddings");
 
 const SETTINGS_PATH = path.join(__dirname, "settings.json");
 const DEFAULT_HOTKEY = "Control+T";
@@ -42,10 +43,20 @@ function scheduleVaultExport() {
     // The graph is derived, so it is rebuilt rather than patched. Doing it here
     // means it can never be staler than the notes it was built from.
     try {
-      graph.rebuild(db.handle());
+      oracle.rebuild(db.handle());
     } catch (error) {
-      console.error("graph rebuild failed", error);
+      console.error("oracle rebuild failed", error);
     }
+
+    // Embedding is asynchronous and can be slow when a model is warming up, so it
+    // is not awaited. Rows whose text is unchanged are skipped, so this settles
+    // quickly after the first pass regardless of how often it is triggered.
+    embeddings
+      .reindex(db.handle())
+      .then((r) => {
+        if (r.embedded) console.log(`oracle: embedded ${r.embedded} via ${r.provider}`);
+      })
+      .catch((error) => console.error("embedding failed", error));
   }, 1500);
 }
 
@@ -187,7 +198,7 @@ function createTray() {
   );
   icon.setTemplateImage(true);
   tray = new Tray(icon);
-  tray.setToolTip("Brain");
+  tray.setToolTip("Delphi");
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: "Show / hide", accelerator: settings.hotkey, click: toggle },
@@ -324,11 +335,17 @@ handle("links:list", (projectId) => db.listLinks(projectId));
 handle("links:create", (payload) => db.createLink(payload));
 handle("links:delete", (id) => db.deleteLink(id));
 
-handle("graph:stats", () => graph.stats(db.handle()));
-handle("graph:rebuild", () => graph.rebuild(db.handle()));
-handle("graph:context", (name) => {
-  const found = graph.findEntities(db.handle(), name, 1)[0];
-  return found ? graph.neighbourhood(db.handle(), found.id) : null;
+handle("oracle:stats", () => ({
+  ...oracle.stats(db.handle()),
+  embeddings: embeddings.status(db.handle()),
+}));
+handle("oracle:reindex", (force) => embeddings.reindex(db.handle(), { force: !!force }));
+handle("oracle:nearest", (query, opts) => embeddings.nearest(db.handle(), query, opts || {}));
+handle("oracle:provider", () => embeddings.provider());
+handle("oracle:rebuild", () => oracle.rebuild(db.handle()));
+handle("oracle:context", (name) => {
+  const found = oracle.findEntities(db.handle(), name, 1)[0];
+  return found ? oracle.neighbourhood(db.handle(), found.id) : null;
 });
 
 handle("vault:export", () => vault.exportAll(db, settings.vaultPath || vault.DEFAULT_VAULT));

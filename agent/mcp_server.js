@@ -18,7 +18,7 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
-const DB = path.join(__dirname, "..", "brain.db");
+const DB = path.join(__dirname, "..", "delphi.db");
 
 /**
  * Finds the sqlite3 binary.
@@ -29,7 +29,7 @@ const DB = path.join(__dirname, "..", "brain.db");
  */
 function findSqlite() {
   const candidates = [
-    process.env.BRAIN_SQLITE,
+    process.env.DELPHI_SQLITE,
     "/usr/bin/sqlite3",
     "/opt/homebrew/bin/sqlite3",
     "/usr/local/bin/sqlite3",
@@ -43,7 +43,7 @@ function findSqlite() {
 }
 
 const SQLITE = findSqlite();
-const ACTOR = process.env.BRAIN_ACTOR || "agent";
+const ACTOR = process.env.DELPHI_ACTOR || "agent";
 
 // --- database ---------------------------------------------------------------
 
@@ -247,7 +247,7 @@ const TOOLS = {
     },
   },
 
-  graph_context: {
+  oracle_context: {
     description:
       "Everything connected to a thing: a ticket, service, repository, file or concept. Returns the notes and tasks that mention it, the projects it spans, and the entities it appears alongside. Use this before reading a repository: it answers 'what do we already know about X' in one call, including connections nobody wrote down explicitly.",
     schema: {
@@ -298,9 +298,9 @@ const TOOLS = {
     },
   },
 
-  graph_entities: {
+  oracle_entities: {
     description:
-      "List the things the graph knows about, most referenced first. Useful for orienting at the start of a session, or finding the exact name to pass to graph_context.",
+      "List the things the graph knows about, most referenced first. Useful for orienting at the start of a session, or finding the exact name to pass to oracle_context.",
     schema: {
       type: "object",
       properties: {
@@ -317,6 +317,62 @@ const TOOLS = {
         `SELECT kind, name, mentions FROM entities ${where} ORDER BY mentions DESC LIMIT :p${params.length}`,
         params
       );
+    },
+  },
+
+  oracle_ask: {
+    description:
+      "The main way to ask what we know. Combines meaning and connections: finds text that means something similar even with no words in common, then expands through the graph to what those things are connected to. Prefer this over reading a repository, and over plain search when you are not sure of the exact words.",
+    schema: {
+      type: "object",
+      required: ["question"],
+      properties: {
+        question: { type: "string" },
+        limit: { type: "number", description: "How many results, default 8" },
+      },
+    },
+    run: (a) => {
+      // Semantic scoring needs the vector runtime, which this process does not
+      // have, so it delegates to the app's helper. Lexical and graph results are
+      // produced here so the tool still answers when that is unavailable.
+      const limit = Math.min(a.limit || 8, 30);
+      const words = String(a.question).toLowerCase()
+        .split(/[^a-z0-9_.-]+/).filter((w) => w.length > 3);
+
+      const scoreClause = words.length
+        ? words.map((w, i) => `(CASE WHEN lower(t.title || ' ' || COALESCE(t.detail,'')) LIKE :p${i + 1} THEN 1 ELSE 0 END)`).join(" + ")
+        : "0";
+      const params = words.map((w) => `%${w}%`);
+
+      const tasks = words.length ? sql(
+        `SELECT t.id, t.title, t.status, t.ref, p.name AS project, (${scoreClause}) AS hits
+         FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+         WHERE (${scoreClause}) > 0 ORDER BY hits DESC, t.status != 'done' DESC LIMIT :p${params.length + 1}`,
+        [...params, limit]) : [];
+
+      const noteClause = words.length
+        ? words.map((w, i) => `(CASE WHEN lower(n.title || ' ' || n.body) LIKE :p${i + 1} THEN 1 ELSE 0 END)`).join(" + ")
+        : "0";
+      const notes = words.length ? sql(
+        `SELECT n.id, n.title, n.kind, n.body, p.name AS project, (${noteClause}) AS hits
+         FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+         WHERE (${noteClause}) > 0 ORDER BY hits DESC LIMIT :p${params.length + 1}`,
+        [...params, limit]) : [];
+
+      // Expand through the graph: entities mentioned by the best matches, and
+      // what those entities travel with. This is the part plain search cannot do.
+      const seedIds = notes.slice(0, 4).map((n) => n.id);
+      const connected = seedIds.length ? sql(
+        `SELECT DISTINCT e2.kind, e2.name, e2.mentions FROM edges ed
+         JOIN entities e2 ON e2.id = ed.target_id
+         WHERE ed.source_type = 'note' AND ed.relation = 'mentions'
+           AND ed.source_id IN (${seedIds.join(",")})
+         ORDER BY e2.mentions DESC LIMIT 12`) : [];
+
+      return {
+        note: "Lexical and graph results. For meaning-based ranking the app exposes oracle.nearest; this tool covers what is reachable without the vector runtime.",
+        tasks, notes, connected,
+      };
     },
   },
 

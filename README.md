@@ -95,8 +95,8 @@ one store, because none of them talk to each other; they all talk to this.
 **Claude Code** — register it with the CLI, which writes to `~/.claude.json`:
 
 ```bash
-claude mcp add brain --scope user -e BRAIN_ACTOR=claude -- \
-  /absolute/path/to/node /absolute/path/to/second-brain/agent/mcp_server.js
+claude mcp add brain --scope user -e DELPHI_ACTOR=claude -- \
+  /absolute/path/to/node /absolute/path/to/delphi/agent/mcp_server.js
 ```
 
 Confirm with `claude mcp list`; it should report `brain ... ✔ Connected`. Restart Claude Code
@@ -107,7 +107,7 @@ Use an absolute path to `node`. A version manager shim such as asdf's needs the 
 
 **GitHub Copilot** — a `.vscode/mcp.json` is already in the repository and works as is.
 
-Give each agent a different `BRAIN_ACTOR`. That name appears against every change it makes, which is
+Give each agent a different `DELPHI_ACTOR`. That name appears against every change it makes, which is
 what makes the History tab readable when more than one agent is working.
 
 ### Making the agent do it unprompted
@@ -128,8 +128,8 @@ tasks and findings as it goes rather than waiting to be asked.
 | `update_task` | Change status, priority, detail or project |
 | `add_note` | Store a decision, gotcha or reference |
 | `search` | Search tasks and notes |
-| `graph_context` | Everything connected to a ticket, service, repo, file or concept |
-| `graph_entities` | What the graph knows about, most referenced first |
+| `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
+| `oracle_entities` | What the graph knows about, most referenced first |
 | `recent_activity` | What changed, and which agent changed it |
 
 ### On delegation
@@ -182,7 +182,7 @@ prompts are disabled, because that is the case it exists for.
     "PreToolUse": [
       {
         "matcher": "Bash|Write|Edit|NotebookEdit",
-        "hooks": [{ "type": "command", "command": "python3 /absolute/path/to/second-brain/agent/guard.py" }]
+        "hooks": [{ "type": "command", "command": "python3 /absolute/path/to/delphi/agent/guard.py" }]
       }
     ]
   }
@@ -215,13 +215,13 @@ terminal.
 
 ## Your data
 
-One SQLite file, `brain.db`, next to the application. Nothing is sent anywhere.
+One SQLite file, `delphi.db`, next to the application. Nothing is sent anywhere.
 
 ```bash
-cp brain.db ~/backups/brain-$(date +%F).db
+cp delphi.db ~/backups/brain-$(date +%F).db
 ```
 
-The database uses write-ahead logging, so either quit the application first or copy `brain.db-wal`
+The database uses write-ahead logging, so either quit the application first or copy `delphi.db-wal`
 alongside it.
 
 Every change is recorded with the row as it was before, which is what makes the History tab able to
