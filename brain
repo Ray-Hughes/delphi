@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Start the brain panel, or bring the running one to the front.
+#
+# It has no dock icon on purpose, so "already running" is checked by process
+# rather than by looking for a window.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+if pgrep -f "$PWD/node_modules/electron/dist/Electron.app.*MacOS/Electron \.$" >/dev/null 2>&1; then
+  echo "Already running. Press your hotkey to show it."
+  exit 0
+fi
+
+nohup npm start >/tmp/brain-run.log 2>&1 &
+sleep 2
+echo "Started. Press your hotkey to show it (default Control+T)."

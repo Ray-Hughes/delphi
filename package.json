@@ -1,0 +1,12 @@
+{
+  "name": "brain",
+  "version": "1.0.0",
+  "description": "Project tracker and second brain",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^43.3.0"
+  }
+}

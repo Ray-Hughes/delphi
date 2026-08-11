@@ -1,0 +1,5 @@
+node_modules/
+brain.db
+brain.db-wal
+brain.db-shm
+settings.json
