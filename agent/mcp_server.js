@@ -19,6 +19,30 @@ const fs = require("fs");
 const os = require("os");
 
 const DB = path.join(__dirname, "..", "brain.db");
+
+/**
+ * Finds the sqlite3 binary.
+ *
+ * An MCP client launches this without a login shell, so PATH may not carry the
+ * one the user sees in a terminal. The system copy on macOS is checked first
+ * because it is always present and always adequate here.
+ */
+function findSqlite() {
+  const candidates = [
+    process.env.BRAIN_SQLITE,
+    "/usr/bin/sqlite3",
+    "/opt/homebrew/bin/sqlite3",
+    "/usr/local/bin/sqlite3",
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {}
+  }
+  return "sqlite3"; // fall back to PATH and let it fail loudly
+}
+
+const SQLITE = findSqlite();
 const ACTOR = process.env.BRAIN_ACTOR || "agent";
 
 // --- database ---------------------------------------------------------------
@@ -56,7 +80,7 @@ function sql(query, params = []) {
   const file = path.join(os.tmpdir(), `brain-${process.pid}-${Date.now()}.sql`);
   fs.writeFileSync(file, lines.join("\n"));
   try {
-    const out = execFileSync("sqlite3", [DB], {
+    const out = execFileSync(SQLITE, [DB], {
       input: `.read ${file}\n`,
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
