@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "brain": {
+      "command": "node",
+      "args": ["${workspaceFolder}/agent/mcp_server.js"],
+      "env": { "BRAIN_ACTOR": "copilot" }
+    }
+  }
+}
