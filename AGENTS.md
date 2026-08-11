@@ -18,6 +18,8 @@ the other. They both talk to this.
 | `update_task` | Change status, priority, detail, or move between projects |
 | `add_note` | Store a decision, gotcha or reference against a project |
 | `search` | Search tasks and notes |
+| `graph_context` | Everything connected to a ticket, service, repo, file or concept |
+| `graph_entities` | What the graph knows about, most referenced first |
 | `recent_activity` | What changed lately and which agent changed it |
 
 Every write is attributed. Set `BRAIN_ACTOR` in the server's environment to name
@@ -74,9 +76,15 @@ At the start of a session, call `list_projects`, then `list_tasks` for whichever
 project the work belongs to, so you know what is already open and do not raise
 something that is already tracked.
 
-Before searching a repository for background, call `search` first. A previous
-session may have already worked the answer out, and reading a stored note is
-faster and more reliable than re-deriving it.
+Before searching a repository for background, call `graph_context` with the thing
+you are about to investigate: a ticket, a service, a file, a concept. It returns
+the notes and tasks that mention it, the projects it spans, and the things it
+appears alongside. That last part is the reason to prefer it over plain search:
+it surfaces connections nobody wrote down, such as a database concern reaching a
+version ticket through the build pipeline.
+
+Use `search` when you want text matching rather than connections, and
+`graph_entities` when you need the exact name to ask about.
 
 During the work:
 

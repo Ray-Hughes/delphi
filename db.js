@@ -470,6 +470,9 @@ function stats() {
 
 module.exports = {
   DB_PATH,
+  // The graph builder works against the connection directly, so it is exposed
+  // rather than every graph query being proxied through this module.
+  handle: open,
   listProjects, getProject, createProject, updateProject,
   listTasks, createTask, updateTask, deleteTask,
   listNotes, createNote, updateNote, deleteNote,

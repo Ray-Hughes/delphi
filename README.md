@@ -128,6 +128,8 @@ tasks and findings as it goes rather than waiting to be asked.
 | `update_task` | Change status, priority, detail or project |
 | `add_note` | Store a decision, gotcha or reference |
 | `search` | Search tasks and notes |
+| `graph_context` | Everything connected to a ticket, service, repo, file or concept |
+| `graph_entities` | What the graph knows about, most referenced first |
 | `recent_activity` | What changed, and which agent changed it |
 
 ### On delegation
@@ -135,6 +137,36 @@ tasks and findings as it goes rather than waiting to be asked.
 Agents coordinate through shared state, not messages. One writes a task, another sees it and picks it
 up, and both leave a trail. There is no mechanism here for one agent to command another, and the
 documentation does not pretend otherwise.
+
+---
+
+## The knowledge graph
+
+Notes and tasks are also indexed as a graph, so an agent can ask what connects to
+a thing rather than only what reads similarly to it.
+
+Half the graph is free. Projects, tasks, notes, repositories and links are already
+typed relationships in the schema, which is the structure a conventional GraphRAG
+pipeline pays an expensive extraction pass to discover from prose. What is added
+on top is the entity layer: the tickets, services, repositories, files and
+concepts mentioned inside the text, plus edges between entities that appear
+together.
+
+Extraction is deterministic. Patterns match only shapes that cannot be mistaken
+for prose, and everything else comes from a curated vocabulary in `graph.js`. An
+invented node is worse than a missing one: a missing node makes a query return
+less, a wrong node makes it return something false.
+
+The payoff is multi-hop. Asking about a database concern can return a version
+ticket it never mentions, because both were discussed alongside the build
+pipeline. That is the question a vector search cannot answer.
+
+Community detection and community summarisation are deliberately not built. They
+earn their cost on a large corpus whose themes nobody knows; here the themes are
+already named by the projects.
+
+The graph rebuilds itself whenever notes or tasks change. To extend it, add to
+the vocabulary rather than loosening a pattern.
 
 ---
 

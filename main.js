@@ -3,6 +3,7 @@ const path = require("path");
 const fs = require("fs");
 const db = require("./db");
 const vault = require("./vault");
+const graph = require("./graph");
 
 const SETTINGS_PATH = path.join(__dirname, "settings.json");
 const DEFAULT_HOTKEY = "Control+T";
@@ -37,6 +38,13 @@ function scheduleVaultExport() {
       vault.exportAll(db, settings.vaultPath || vault.DEFAULT_VAULT);
     } catch (error) {
       console.error("vault export failed", error);
+    }
+    // The graph is derived, so it is rebuilt rather than patched. Doing it here
+    // means it can never be staler than the notes it was built from.
+    try {
+      graph.rebuild(db.handle());
+    } catch (error) {
+      console.error("graph rebuild failed", error);
     }
   }, 1500);
 }
@@ -315,6 +323,13 @@ handle("notes:delete", (id) => { const r = db.deleteNote(id); scheduleVaultExpor
 handle("links:list", (projectId) => db.listLinks(projectId));
 handle("links:create", (payload) => db.createLink(payload));
 handle("links:delete", (id) => db.deleteLink(id));
+
+handle("graph:stats", () => graph.stats(db.handle()));
+handle("graph:rebuild", () => graph.rebuild(db.handle()));
+handle("graph:context", (name) => {
+  const found = graph.findEntities(db.handle(), name, 1)[0];
+  return found ? graph.neighbourhood(db.handle(), found.id) : null;
+});
 
 handle("vault:export", () => vault.exportAll(db, settings.vaultPath || vault.DEFAULT_VAULT));
 handle("vault:reveal", () => {

@@ -247,6 +247,79 @@ const TOOLS = {
     },
   },
 
+  graph_context: {
+    description:
+      "Everything connected to a thing: a ticket, service, repository, file or concept. Returns the notes and tasks that mention it, the projects it spans, and the entities it appears alongside. Use this before reading a repository: it answers 'what do we already know about X' in one call, including connections nobody wrote down explicitly.",
+    schema: {
+      type: "object",
+      required: ["name"],
+      properties: { name: { type: "string", description: "e.g. truststore, MPI, APPEALS-128303, Veteran API" } },
+    },
+    run: (a) => {
+      const like = `%${a.name}%`;
+      const entity = sql(
+        "SELECT * FROM entities WHERE name LIKE :p1 ORDER BY mentions DESC LIMIT 1", [like]
+      )[0];
+      if (!entity) {
+        return { found: false, suggestions: sql(
+          "SELECT kind, name, mentions FROM entities ORDER BY mentions DESC LIMIT 15") };
+      }
+      return {
+        entity,
+        projects: sql(`
+          SELECT DISTINCT p.name FROM edges e
+          JOIN notes n ON e.source_type='note' AND n.id=e.source_id
+          JOIN projects p ON p.id=n.project_id
+          WHERE e.target_type='entity' AND e.target_id=:p1
+          UNION
+          SELECT DISTINCT p.name FROM edges e
+          JOIN tasks t ON e.source_type='task' AND t.id=e.source_id
+          JOIN projects p ON p.id=t.project_id
+          WHERE e.target_type='entity' AND e.target_id=:p1`, [entity.id]),
+        notes: sql(`
+          SELECT n.id, n.title, n.kind, n.body, p.name AS project, e.evidence
+          FROM edges e JOIN notes n ON n.id=e.source_id
+          LEFT JOIN projects p ON p.id=n.project_id
+          WHERE e.source_type='note' AND e.target_type='entity'
+            AND e.target_id=:p1 AND e.relation='mentions' LIMIT 20`, [entity.id]),
+        tasks: sql(`
+          SELECT t.id, t.title, t.status, t.priority, t.ref, p.name AS project
+          FROM edges e JOIN tasks t ON t.id=e.source_id
+          LEFT JOIN projects p ON p.id=t.project_id
+          WHERE e.source_type='task' AND e.target_type='entity'
+            AND e.target_id=:p1 AND e.relation='mentions'
+          ORDER BY t.status!='done' DESC LIMIT 20`, [entity.id]),
+        related: sql(`
+          SELECT o.kind, o.name, e.weight FROM edges e
+          JOIN entities o ON o.id = CASE WHEN e.source_id=:p1 THEN e.target_id ELSE e.source_id END
+          WHERE e.relation='co_occurs' AND (e.source_id=:p1 OR e.target_id=:p1)
+          ORDER BY e.weight DESC LIMIT 12`, [entity.id]),
+      };
+    },
+  },
+
+  graph_entities: {
+    description:
+      "List the things the graph knows about, most referenced first. Useful for orienting at the start of a session, or finding the exact name to pass to graph_context.",
+    schema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["ticket", "pr", "repo", "service", "file", "person", "env", "concept"] },
+        limit: { type: "number" },
+      },
+    },
+    run: (a) => {
+      const params = [];
+      let where = "";
+      if (a.kind) { params.push(a.kind); where = "WHERE kind = :p1"; }
+      params.push(Math.min(a.limit || 40, 200));
+      return sql(
+        `SELECT kind, name, mentions FROM entities ${where} ORDER BY mentions DESC LIMIT :p${params.length}`,
+        params
+      );
+    },
+  },
+
   recent_activity: {
     description: "What changed recently, and who changed it. Useful for picking up where another agent left off.",
     schema: { type: "object", properties: { limit: { type: "number" } } },
