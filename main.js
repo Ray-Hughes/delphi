@@ -2,6 +2,7 @@ const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, 
 const path = require("path");
 const fs = require("fs");
 const db = require("./db");
+const vault = require("./vault");
 
 const SETTINGS_PATH = path.join(__dirname, "settings.json");
 const DEFAULT_HOTKEY = "Control+T";
@@ -11,12 +12,30 @@ let tray = null;
 let settings = {
   hotkey: DEFAULT_HOTKEY,
   snoozeMinutes: 10,
+  vaultEnabled: true,
+  vaultPath: null,   // null means the default folder beside the app
   // How often the scheduler looks for due reminders. A minute is frequent enough
   // for reminders measured in minutes and cheap enough to ignore.
   checkIntervalSeconds: 60,
   autoRemindBeforeDueHours: 24,
 };
 let schedulerTimer = null;
+let vaultTimer = null;
+
+// The vault is a mirror, so it is rebuilt after changes rather than kept in step
+// edit by edit. Debounced because typing in a note fires an update per blur and
+// a full rewrite per keystroke would be silly.
+function scheduleVaultExport() {
+  if (settings.vaultEnabled === false) return;
+  if (vaultTimer) clearTimeout(vaultTimer);
+  vaultTimer = setTimeout(() => {
+    try {
+      vault.exportAll(db, settings.vaultPath || vault.DEFAULT_VAULT);
+    } catch (error) {
+      console.error("vault export failed", error);
+    }
+  }, 1500);
+}
 
 function loadSettings() {
   let existing = null;
@@ -162,6 +181,7 @@ app.whenReady().then(() => {
   createTray();
   registerHotkey(settings.hotkey);
   startScheduler();
+  scheduleVaultExport();
 
   // A dock icon would make this feel like an application to manage. It is meant
   // to behave like a panel that is either there or not.
@@ -255,18 +275,25 @@ handle("projects:create", (payload) => db.createProject(payload));
 handle("projects:update", (id, fields) => db.updateProject(id, fields));
 
 handle("tasks:list", (opts) => db.listTasks(opts));
-handle("tasks:create", (payload) => db.createTask(payload));
-handle("tasks:update", (id, fields) => db.updateTask(id, fields));
-handle("tasks:delete", (id) => db.deleteTask(id));
+handle("tasks:create", (payload) => { const r = db.createTask(payload); scheduleVaultExport(); return r; });
+handle("tasks:update", (id, fields) => { const r = db.updateTask(id, fields); scheduleVaultExport(); return r; });
+handle("tasks:delete", (id) => { const r = db.deleteTask(id); scheduleVaultExport(); return r; });
 
 handle("notes:list", (projectId) => db.listNotes(projectId));
-handle("notes:create", (payload) => db.createNote(payload));
-handle("notes:update", (id, fields) => db.updateNote(id, fields));
-handle("notes:delete", (id) => db.deleteNote(id));
+handle("notes:create", (payload) => { const r = db.createNote(payload); scheduleVaultExport(); return r; });
+handle("notes:update", (id, fields) => { const r = db.updateNote(id, fields); scheduleVaultExport(); return r; });
+handle("notes:delete", (id) => { const r = db.deleteNote(id); scheduleVaultExport(); return r; });
 
 handle("links:list", (projectId) => db.listLinks(projectId));
 handle("links:create", (payload) => db.createLink(payload));
 handle("links:delete", (id) => db.deleteLink(id));
+
+handle("vault:export", () => vault.exportAll(db, settings.vaultPath || vault.DEFAULT_VAULT));
+handle("vault:reveal", () => {
+  const target = settings.vaultPath || vault.DEFAULT_VAULT;
+  shell.openPath(target);
+  return target;
+});
 
 handle("alerts:list", (opts) => db.listAlerts(opts));
 handle("alerts:create", (payload) => db.createAlert(payload));

@@ -3,3 +3,4 @@ brain.db
 brain.db-wal
 brain.db-shm
 settings.json
+vault/

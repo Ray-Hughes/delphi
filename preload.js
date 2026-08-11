@@ -32,6 +32,10 @@ contextBridge.exposeInMainWorld("brain", {
     create: (payload) => call("links:create", payload),
     remove: (id) => call("links:delete", id),
   },
+  vault: {
+    export: () => call("vault:export"),
+    reveal: () => call("vault:reveal"),
+  },
   alerts: {
     list: (opts) => call("alerts:list", opts),
     create: (payload) => call("alerts:create", payload),

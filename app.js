@@ -623,6 +623,43 @@ async function renderSettings(root) {
   rem.append(numberField("Check for due reminders every", "checkIntervalSeconds", "seconds"));
   root.append(rem);
 
+  // --- markdown vault ---
+  const v = el("div", { className: "setting-block" });
+  v.append(el("h3", { textContent: "Markdown vault" }));
+  v.append(el("p", {
+    textContent:
+      "Your memory notes are mirrored to plain markdown files so they are not trapped in a " +
+      "database only this app reads. Point Obsidian at the folder and you get its editor, " +
+      "backlinks, graph and mobile apps over the same notes. It rewrites itself a moment after " +
+      "any change, so there is nothing to remember to do.",
+  }));
+  const vrow = el("div", { className: "row" });
+  const openBtn = el("button", { className: "btn sm", textContent: "Open the folder" });
+  const exportBtn = el("button", { className: "btn sm", textContent: "Rebuild now" });
+  const vmsg = el("span", { className: "hint" });
+  openBtn.onclick = () => window.brain.vault.reveal();
+  exportBtn.onclick = async () => {
+    try {
+      const r = await window.brain.vault.export();
+      vmsg.className = "ok-msg";
+      vmsg.textContent = `${r.notes} notes across ${r.projects} projects written`;
+    } catch (e) {
+      vmsg.className = "err-msg";
+      vmsg.textContent = e.message;
+    }
+  };
+  vrow.append(openBtn, exportBtn, vmsg);
+  v.append(vrow);
+  v.append(el("p", {
+    className: "hint",
+    style: "margin-top:10px",
+    textContent:
+      "The database stays the source of truth and the mirror is one way. Two way sync between a " +
+      "database and a folder is where these things break, so edits made in Obsidian are not read " +
+      "back.",
+  }));
+  root.append(v);
+
   // --- mouse buttons ---
   const mouse = el("div", { className: "setting-block" });
   mouse.append(el("h3", { textContent: "Using a mouse button" }));
