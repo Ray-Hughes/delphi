@@ -10,6 +10,7 @@ const state = {
   notes: [],
   links: [],
   repos: [],
+  allTasks: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -53,10 +54,13 @@ async function refresh() {
     state.links = [];
     state.repos = [];
   } else {
-    state.tasks = await window.brain.tasks.list({
+    state.allTasks = await window.brain.tasks.list({
       projectId: state.projectId,
-      includeDone: state.showDone,
+      includeDone: true,
     });
+    state.tasks = state.showDone
+      ? state.allTasks
+      : state.allTasks.filter((t) => t.status !== "done");
     if (state.projectId) {
       state.notes = await window.brain.notes.list(state.projectId);
       state.links = await window.brain.links.list(state.projectId);
@@ -156,6 +160,7 @@ function render() {
     : ["tasks", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
+  renderMetrics();
   renderTabs();
 
   const content = $("content");
@@ -181,9 +186,31 @@ function render() {
     showViewError(content, error);
   }
 
-  window.brain.stats().then((s) => {
-    $("stats").textContent = `${s.open_tasks} open · ${s.overdue} overdue · ${s.notes} notes`;
-  });
+}
+
+// Counts for whatever is selected. Shown in the header on every view so the
+// state of the work is always visible, not only on the dashboard.
+function renderMetrics() {
+  const box = $("metrics");
+  box.textContent = "";
+  if (state.query) return;
+
+  const open = state.allTasks.filter((t) => t.status !== "done");
+  const figures = [
+    ["Open", open.length, null],
+    ["Doing", open.filter((t) => t.status === "doing").length, "good"],
+    ["Blocked", open.filter((t) => t.status === "blocked").length, "warn"],
+    ["Overdue", open.filter(isOverdue).length, "crit"],
+  ];
+  if (state.projectId) figures.push(["Memory", state.notes.length, null]);
+
+  for (const [label, value, tone] of figures) {
+    // A zero is greyed rather than coloured: nothing blocked is not a warning.
+    const cls = "metric" + (value === 0 ? " zero" : tone ? ` ${tone}` : "");
+    box.append(el("div", { className: cls },
+      el("div", { className: "v", textContent: String(value) }),
+      el("div", { className: "k", textContent: label })));
+  }
 }
 
 const card = (title, ...actions) => {
@@ -217,7 +244,7 @@ async function renderOverview(root) {
   const project = currentProject();
   if (!project) return;
 
-  const all = await window.brain.tasks.list({ projectId: project.id, includeDone: true });
+  const all = state.allTasks;
   const open = all.filter((t) => t.status !== "done");
   const done = all.length - open.length;
   const overdue = open.filter(isOverdue).length;

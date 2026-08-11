@@ -159,6 +159,24 @@
     text-wrap: balance;
   }
   .head .sub { color: var(--ink-dim); margin-top: 5px; max-width: 68ch; }
+
+  /* Header metrics. Compact siblings of the dashboard tiles: same information
+     design, less weight, so they read as context rather than as content. */
+  .metrics { display: flex; gap: var(--s5); flex: 0 0 auto; padding-top: 4px; }
+  .metric { text-align: right; min-width: 54px; }
+  .metric .v {
+    font-size: 20px; font-weight: 650; letter-spacing: -0.02em; line-height: 1.15;
+    font-variant-numeric: tabular-nums;
+  }
+  .metric .k {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--ink-faint); font-weight: 600; margin-top: 2px;
+  }
+  .metric.warn .v { color: var(--warn); }
+  .metric.crit .v { color: var(--crit); }
+  .metric.good .v { color: var(--accent); }
+  .metric.zero .v { color: var(--ink-faint); font-weight: 500; }
+  @media (max-width: 900px) { .metrics { display: none; } }
   .tabs { display: flex; gap: var(--s1); margin-top: var(--s5); }
   .tab {
     padding: 8px var(--s3); color: var(--ink-dim); cursor: default;
@@ -316,7 +334,6 @@
   <header class="titlebar">
     <div class="search"><input id="search" type="search" placeholder="Search tasks and memory" aria-label="Search" /></div>
     <div class="spacer"></div>
-    <div class="hint" id="stats"></div>
   </header>
 
   <div class="body">
@@ -337,6 +354,7 @@
             <h1 id="title">Loading</h1>
             <div class="sub" id="subtitle"></div>
           </div>
+          <div class="metrics" id="metrics"></div>
         </div>
         <div class="tabs" id="tabs"></div>
       </div>
