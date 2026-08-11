@@ -1,8 +1,10 @@
 <div align="center">
 
-# Second Brain
+# Delphi
 
-**A project tracker that lives behind a hotkey, and that your AI agents keep up to date themselves.**
+**A project tracker with a knowledge graph, that your AI agents keep current themselves.**
+
+The app is Delphi. The thing you ask is the Oracle.
 
 Projects hold tasks, memory notes and links. Press a key, it appears. Press it again, it is gone.
 Claude Code and GitHub Copilot can both read and write it through MCP, so what one of them
@@ -19,7 +21,7 @@ learns is still there for the next session.
 Two problems, one tool.
 
 **Flat task lists stop working.** Past thirty items, nothing tells you which entries belong to the
-same piece of work. Second Brain makes the project the unit: each one holds its own tasks, its own
+same piece of work. Delphi makes the project the unit: each one holds its own tasks, its own
 notes, and links to the pull requests and tickets that go with it.
 
 **Agents forget.** Every session an AI agent works out the same things again: why an approach was
@@ -39,9 +41,25 @@ Requires macOS and Node 18 or newer. Everything else is bundled.
 ```bash
 git clone https://github.com/Ray-Hughes/second-brain.git
 cd second-brain
-npm install
-./brain
+make install
+make start
 ```
+
+`make start` brings up both pieces: the local embedding model and the app.
+`make stop` takes both down, and `make status` says what is running.
+
+| Command | What it does |
+| --- | --- |
+| `make start` / `make stop` | Everything, up or down |
+| `make restart` | Both, cleanly |
+| `make status` | What is running, and what is indexed |
+| `make app` / `make app-restart` | Just the app |
+| `make model` | Just the local embedding model |
+| `make reindex` | Re-embed everything, after changing model |
+| `make rebuild` | Rebuild the knowledge graph |
+| `make backup` | Copy the database somewhere safe |
+| `make doctor` | Check the pieces are wired up |
+| `make mcp` | Register the Oracle with Claude Code |
 
 Then press **Alt+Space** to show and hide the panel. There is no dock icon; it lives in the menu bar
 and opens centred on whichever display your pointer is on.
@@ -89,7 +107,7 @@ Pin the ones you reread.
 
 ## Connecting an AI agent
 
-Second Brain ships an MCP server. Any agent that speaks MCP can use it, and several agents can share
+Delphi ships an MCP server. Any agent that speaks MCP can use it, and several agents can share
 one store, because none of them talk to each other; they all talk to this.
 
 **Claude Code** — register it with the CLI, which writes to `~/.claude.json`:

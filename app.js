@@ -11,6 +11,9 @@ const state = {
   links: [],
   repos: [],
   allTasks: [],
+  oracleHits: [],
+  oracleEntities: [],
+  provider: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -53,6 +56,19 @@ async function refresh() {
     state.notes = notes;
     state.links = [];
     state.repos = [];
+
+    // Meaning-based ranking and the graph, in parallel with the literal match, so
+    // the Oracle tab is ready rather than loading when it is opened.
+    try {
+      state.provider = await window.delphi.oracle.provider();
+      state.oracleHits = await window.delphi.oracle.nearest(state.query, { limit: 10 });
+      const ctx = await window.delphi.oracle.context(state.query.split(/\s+/)[0]);
+      state.oracleEntities = ctx ? ctx.related : [];
+    } catch {
+      // The Oracle is an enhancement; losing it must not lose plain search.
+      state.oracleHits = [];
+      state.oracleEntities = [];
+    }
   } else {
     state.allTasks = await window.delphi.tasks.list({
       projectId: state.projectId,
@@ -118,7 +134,7 @@ function renderTabs() {
   box.textContent = "";
 
   const tabs = state.query
-    ? [["tasks", "Results", state.tasks.length + state.notes.length]]
+    ? [["oracle", "Oracle", state.oracleHits.length], ["tasks", "Matches", state.tasks.length + state.notes.length]]
     : state.projectId
     ? [["overview", "Overview"], ["tasks", "Tasks", state.tasks.length],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length]]
@@ -154,7 +170,7 @@ function render() {
   // A view that does not exist for the current selection falls back rather than
   // rendering blank.
   const valid = state.query
-    ? ["tasks"]
+    ? ["oracle", "tasks"]
     : state.projectId
     ? ["overview", "tasks", "notes", "links"]
     : ["tasks", "history", "settings"];
@@ -428,6 +444,75 @@ async function renderOverview(root) {
 // ---------------------------------------------------------------------------
 // Tasks
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The Oracle
+// ---------------------------------------------------------------------------
+
+function renderOracle(root) {
+  const bar = el("div", { className: "oracle-bar" });
+  const provider = state.provider;
+  bar.append(el("div", { className: "hint grow",
+    textContent: "Ranked by meaning rather than words, then expanded through what each result connects to." }));
+  if (provider) {
+    bar.append(el("span", {
+      className: "provider-tag" + (provider.neural ? " neural" : ""),
+      title: provider.neural
+        ? "A local model is producing the vectors"
+        : "No model is running, so this is falling back to word matching",
+      textContent: provider.neural ? `${provider.dims}d local model` : "word matching",
+    }));
+  }
+  root.append(bar);
+
+  if (!state.oracleHits.length) {
+    root.append(emptyState("The Oracle has nothing for that",
+      "Try a fuller question. It matches meaning, so a sentence works better than a keyword."));
+    return;
+  }
+
+  const list = el("section", { className: "card" });
+  for (const h of state.oracleHits) {
+    const row = el("div", { className: "hit" });
+
+    // Scores cluster in a narrow band, so the bar is scaled across the range in
+    // view rather than 0 to 1, which would make every result look identical.
+    const scores = state.oracleHits.map((x) => x.score);
+    const lo = Math.min(...scores), hi = Math.max(...scores);
+    const pct = hi === lo ? 100 : Math.round(((h.score - lo) / (hi - lo)) * 88 + 12);
+    row.append(el("div", { className: "score" },
+      el("div", { className: "n", textContent: h.score.toFixed(2) }),
+      el("div", { className: "bar" }, el("i", { style: `width:${pct}%` }))));
+
+    const body = el("div", { className: "hit-body" });
+    body.append(el("div", { className: "hit-title", textContent: h.title || h.name }));
+    const meta = el("div", { className: "t-meta" });
+    meta.append(el("span", { className: "chip", textContent: h.type }));
+    if (h.project) meta.append(el("span", { className: "chip", textContent: h.project }));
+    if (h.kind && h.type === "note") meta.append(el("span", { className: `kind ${h.kind}`, textContent: h.kind }));
+    if (h.status) meta.append(el("span", { className: "chip", textContent: h.status }));
+    if (h.ref) meta.append(el("span", { className: "chip ref", textContent: h.ref }));
+    body.append(meta);
+    if (h.body) body.append(el("div", { className: "hit-snip", textContent: h.body.slice(0, 200).replace(/\s+/g, " ") }));
+    row.append(body);
+    list.append(row);
+  }
+  root.append(list);
+
+  if (state.oracleEntities.length) {
+    root.append(el("div", { className: "side-label", textContent: "Connected to" }));
+    const cloud = el("div", { className: "entity-cloud" });
+    for (const e of state.oracleEntities) {
+      const chip = el("div", { className: "ent" },
+        el("b", { textContent: e.name }),
+        el("span", { className: "c", textContent: String(Math.round(e.weight)) }));
+      chip.title = `${e.kind}, appears alongside this in ${Math.round(e.weight)} places`;
+      chip.onclick = () => { $("search").value = e.name; state.query = e.name; refresh(); };
+      cloud.append(chip);
+    }
+    root.append(cloud);
+  }
+}
 
 function renderTasks(root) {
   if (!state.query) {
@@ -890,7 +975,7 @@ $("search").addEventListener("input", (e) => {
   const v = e.target.value;
   searchTimer = setTimeout(() => {
     state.query = v.trim();
-    if (state.query) state.view = "tasks";
+    if (state.query) state.view = "oracle";
     else state.view = state.projectId ? "overview" : "tasks";
     refresh();
   }, 140);
