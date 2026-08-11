@@ -25,19 +25,18 @@ the agent, and its changes appear in the History tab labelled with that name.
 
 ## Connecting Claude Code
 
-Add to `~/.claude/settings.json` (or a project `.mcp.json`):
+**Claude Code** — register it with the CLI, which writes to `~/.claude.json`:
 
-```json
-{
-  "mcpServers": {
-    "brain": {
-      "command": "node",
-      "args": ["/Users/YOU/va/brain/agent/mcp_server.js"],
-      "env": { "BRAIN_ACTOR": "claude" }
-    }
-  }
-}
+```bash
+claude mcp add brain --scope user -e BRAIN_ACTOR=claude -- \
+  /absolute/path/to/node /absolute/path/to/second-brain/agent/mcp_server.js
 ```
+
+Confirm with `claude mcp list`; it should report `brain ... ✔ Connected`. Restart Claude Code
+afterwards, because servers are loaded at startup.
+
+Use an absolute path to `node`. A version manager shim such as asdf's needs the manager itself on
+`PATH`, and an MCP client does not launch with your shell's `PATH`.
 
 ## Connecting GitHub Copilot
 

@@ -92,19 +92,18 @@ Pin the ones you reread.
 Second Brain ships an MCP server. Any agent that speaks MCP can use it, and several agents can share
 one store, because none of them talk to each other; they all talk to this.
 
-**Claude Code** — add to `~/.claude/settings.json`:
+**Claude Code** — register it with the CLI, which writes to `~/.claude.json`:
 
-```json
-{
-  "mcpServers": {
-    "brain": {
-      "command": "node",
-      "args": ["/absolute/path/to/second-brain/agent/mcp_server.js"],
-      "env": { "BRAIN_ACTOR": "claude" }
-    }
-  }
-}
+```bash
+claude mcp add brain --scope user -e BRAIN_ACTOR=claude -- \
+  /absolute/path/to/node /absolute/path/to/second-brain/agent/mcp_server.js
 ```
+
+Confirm with `claude mcp list`; it should report `brain ... ✔ Connected`. Restart Claude Code
+afterwards, because servers are loaded at startup.
+
+Use an absolute path to `node`. A version manager shim such as asdf's needs the manager itself on
+`PATH`, and an MCP client does not launch with your shell's `PATH`.
 
 **GitHub Copilot** — a `.vscode/mcp.json` is already in the repository and works as is.
 
@@ -161,11 +160,16 @@ prompts are disabled, because that is the case it exists for.
 It stops recursive deletes of root and home paths, deletes of unexpanded variables, removal of
 `.git`, `git clean` without a dry run, force pushes without `--force-with-lease`, repository deletion,
 `DROP TABLE`, `DELETE FROM` with no `WHERE`, namespace deletion, untargeted `terraform destroy`,
-piping a download into a shell, and disk-level commands. It also refuses to let a session edit the
-guard or its own hook configuration.
+piping a download into a shell, and disk-level commands. It also refuses edits to its own hook
+configuration.
 
 It matches on intent rather than exact spelling, so flags written separately or with unusual spacing
-are still caught.
+are still caught, and each command in a compound is judged on its own so a flag belonging to one is
+not read as belonging to another.
+
+Its limit is stated rather than hidden: this inspects the text of commands, so it stops accidents,
+not a determined agent. A shell redirect can still overwrite the guard itself, and closing that would
+mean blocking ordinary file writes.
 
 ```bash
 python3 agent/guard_test.py
