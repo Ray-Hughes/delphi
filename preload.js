@@ -65,6 +65,7 @@ contextBridge.exposeInMainWorld("brain", {
   hide: () => ipcRenderer.send("hide"),
   openExternal: (url) => ipcRenderer.send("open-external", url),
   onShown: (fn) => ipcRenderer.on("shown", fn),
+  onMode: (fn) => ipcRenderer.on("mode", (_e, payload) => fn(payload)),
   onAlertsChanged: (fn) => ipcRenderer.on("alerts-changed", fn),
   onFocusTask: (fn) => ipcRenderer.on("focus-task", (_e, payload) => fn(payload)),
 });

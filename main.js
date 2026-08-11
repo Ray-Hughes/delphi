@@ -12,6 +12,10 @@ let tray = null;
 let settings = {
   hotkey: DEFAULT_HOTKEY,
   snoozeMinutes: 10,
+  // Off by default: a window you can full screen and switch to like any other
+  // app is the better default. Panel mode is for people who want it to appear
+  // over their work and vanish again.
+  panelMode: false,
   vaultEnabled: true,
   vaultPath: null,   // null means the default folder beside the app
   // How often the scheduler looks for due reminders. A minute is frequent enough
@@ -62,20 +66,21 @@ function saveSettings() {
 
 function createWindow() {
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+  const panel = settings.panelMode === true;
+
   win = new BrowserWindow({
-    width: Math.min(1100, Math.round(width * 0.8)),
-    height: Math.min(760, Math.round(height * 0.85)),
-    show: false,
+    width: Math.min(1320, Math.round(width * 0.85)),
+    height: Math.min(880, Math.round(height * 0.88)),
+    minWidth: 860,
+    minHeight: 560,
+    show: !panel,                  // a normal app opens; a panel waits for the key
     frame: false,
-    transparent: false,
-    vibrancy: "under-window",
-    visualEffectState: "active",
-    titleBarStyle: "hiddenInset",
-    // Panel-like: floats above other windows so it can be consulted while
-    // working, rather than being another window to hunt for.
-    alwaysOnTop: true,
-    fullscreenable: false,
-    skipTaskbar: true,
+    titleBarStyle: "hiddenInset",  // keeps the traffic lights, drops the heavy bar
+    // In panel mode it floats over the work and cannot be full screened, because
+    // a full screen panel is just a window with extra rules.
+    alwaysOnTop: panel,
+    fullscreenable: !panel,
+    skipTaskbar: panel,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -85,10 +90,14 @@ function createWindow() {
   });
 
   win.loadFile("index.html");
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  if (panel) win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
-  // Hiding rather than closing keeps the render state, so reopening is instant
-  // and you land back where you were rather than at the top of the list.
+  win.webContents.on("did-finish-load", () => {
+    win.webContents.send("mode", { panelMode: panel });
+  });
+
+  // Closing hides rather than quits in both modes, so the shortcut and the tray
+  // can bring it back without a cold start.
   win.on("close", (event) => {
     if (!app.isQuitting) {
       event.preventDefault();
@@ -96,27 +105,47 @@ function createWindow() {
     }
   });
 
-  // Clicking away dismisses it, which is the behaviour people expect from
-  // something summoned by a hotkey.
-  win.on("blur", () => {
-    if (!win.webContents.isDevToolsOpened()) hide();
-  });
+  // Only a panel dismisses itself on losing focus. Doing that to a normal window
+  // would make it impossible to work alongside anything else.
+  if (panel) {
+    win.on("blur", () => {
+      if (!win.webContents.isDevToolsOpened()) hide();
+    });
+  }
 }
 
 function show() {
-  if (!win) createWindow();
-  // Re-centre on the display the pointer is on, so on a multi-monitor desk it
-  // appears where you are looking rather than where it was last time.
-  const cursor = screen.getCursorScreenPoint();
-  const display = screen.getDisplayNearestPoint(cursor);
-  const [w, h] = win.getSize();
-  win.setPosition(
-    Math.round(display.workArea.x + (display.workArea.width - w) / 2),
-    Math.round(display.workArea.y + (display.workArea.height - h) / 2)
-  );
+  if (!win || win.isDestroyed()) createWindow();
+
+  // A panel re-centres on whichever display the pointer is on, so it appears
+  // where you are looking. A normal window stays where you put it, because
+  // moving someone's window for them is rude.
+  if (settings.panelMode === true) {
+    const cursor = screen.getCursorScreenPoint();
+    const display = screen.getDisplayNearestPoint(cursor);
+    const [w, h] = win.getSize();
+    win.setPosition(
+      Math.round(display.workArea.x + (display.workArea.width - w) / 2),
+      Math.round(display.workArea.y + (display.workArea.height - h) / 2)
+    );
+  }
   win.show();
   win.focus();
   win.webContents.send("shown");
+}
+
+// Several window options cannot be changed after creation, so switching mode
+// rebuilds the window rather than pretending to toggle them.
+function rebuildWindow() {
+  const old = win;
+  win = null;
+  if (old && !old.isDestroyed()) {
+    old.removeAllListeners("close");
+    old.destroy();
+  }
+  createWindow();
+  if (settings.panelMode !== true) show();
+  if (app.dock) settings.panelMode === true ? app.dock.hide() : app.dock.show();
 }
 
 function hide() {
@@ -183,9 +212,8 @@ app.whenReady().then(() => {
   startScheduler();
   scheduleVaultExport();
 
-  // A dock icon would make this feel like an application to manage. It is meant
-  // to behave like a panel that is either there or not.
-  if (app.dock) app.dock.hide();
+  // A panel has no dock presence; a normal application does.
+  if (app.dock && settings.panelMode === true) app.dock.hide();
 });
 
 // ---------------------------------------------------------------------------
@@ -316,6 +344,15 @@ handle("stats", () => db.stats());
 
 handle("settings:get", () => settings);
 handle("settings:set", (fields) => {
+  if (fields.panelMode !== undefined) {
+    const next = fields.panelMode === true;
+    if (next !== (settings.panelMode === true)) {
+      settings.panelMode = next;
+      saveSettings();
+      rebuildWindow();
+      return settings;
+    }
+  }
   const numeric = ["snoozeMinutes", "checkIntervalSeconds", "autoRemindBeforeDueHours"];
   for (const key of numeric) {
     if (fields[key] !== undefined) {

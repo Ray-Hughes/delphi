@@ -2,13 +2,14 @@
 
 const state = {
   projects: [],
-  projectId: null,   // null means the All view
-  tab: "tasks",
+  projectId: null,     // null means the All view
+  view: "tasks",       // overview | tasks | notes | links | history | settings
   showDone: false,
   query: "",
   tasks: [],
   notes: [],
   links: [],
+  repos: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -23,6 +24,20 @@ const el = (tag, props = {}, ...kids) => {
 
 const today = () => new Date().toISOString().slice(0, 10);
 const isOverdue = (t) => t.due && t.status !== "done" && t.due < today();
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+/** "3 days ago" reads faster than a timestamp when scanning activity. */
+function ago(iso) {
+  if (!iso) return "";
+  const then = new Date(iso.replace(" ", "T"));
+  const mins = Math.round((Date.now() - then.getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return days < 30 ? `${days}d ago` : then.toISOString().slice(0, 10);
+}
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -30,24 +45,35 @@ const isOverdue = (t) => t.due && t.status !== "done" && t.due < today();
 
 async function refresh() {
   state.projects = await window.brain.projects.list();
+
   if (state.query) {
     const { tasks, notes } = await window.brain.search(state.query);
     state.tasks = tasks;
     state.notes = notes;
     state.links = [];
+    state.repos = [];
   } else {
     state.tasks = await window.brain.tasks.list({
       projectId: state.projectId,
       includeDone: state.showDone,
     });
-    state.notes = state.projectId ? await window.brain.notes.list(state.projectId) : [];
-    state.links = state.projectId ? await window.brain.links.list(state.projectId) : [];
+    if (state.projectId) {
+      state.notes = await window.brain.notes.list(state.projectId);
+      state.links = await window.brain.links.list(state.projectId);
+      state.repos = await window.brain.repos.list(state.projectId);
+    } else {
+      state.notes = [];
+      state.links = [];
+      state.repos = [];
+    }
   }
   render();
 }
 
+const currentProject = () => state.projects.find((p) => p.id === state.projectId) || null;
+
 // ---------------------------------------------------------------------------
-// Render
+// Chrome
 // ---------------------------------------------------------------------------
 
 function renderSidebar() {
@@ -55,27 +81,54 @@ function renderSidebar() {
   box.textContent = "";
 
   const allOpen = state.projects.reduce((n, p) => n + p.open_count, 0);
-  box.append(projectRow({ id: null, name: "All", colour: "#7c8698", open_count: allOpen }));
+  box.append(projectRow({ id: null, name: "All work", colour: "#8d97a9", open_count: allOpen }));
 
   for (const p of state.projects) box.append(projectRow(p));
 }
 
 function projectRow(p) {
-  const row = el("div", { className: "proj" + (state.projectId === p.id ? " active" : "") });
-  row.append(el("span", { className: "dot", style: `background:${p.colour || "#7c8698"}` }));
+  const row = el("div", {
+    className: "proj" + (state.projectId === p.id ? " active" : ""),
+    tabIndex: 0,
+    role: "button",
+  });
+  row.append(el("span", { className: "dot", style: `background:${p.colour || "#8d97a9"}` }));
   row.append(el("span", { className: "proj-name", textContent: p.name, title: p.summary || p.name }));
   if (p.open_count) row.append(el("span", { className: "count", textContent: String(p.open_count) }));
-  row.onclick = () => {
+
+  const go = () => {
     state.projectId = p.id;
+    // Landing on a project shows its dashboard; All has no dashboard to show.
+    state.view = p.id ? "overview" : "tasks";
     state.query = "";
     $("search").value = "";
     refresh();
   };
+  row.onclick = go;
+  row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
   return row;
 }
 
-function currentProject() {
-  return state.projects.find((p) => p.id === state.projectId) || null;
+function renderTabs() {
+  const box = $("tabs");
+  box.textContent = "";
+
+  const tabs = state.query
+    ? [["tasks", "Results", state.tasks.length + state.notes.length]]
+    : state.projectId
+    ? [["overview", "Overview"], ["tasks", "Tasks", state.tasks.length],
+       ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length]]
+    : [["tasks", "Tasks", state.tasks.length], ["history", "History"], ["settings", "Settings"]];
+
+  for (const [key, label, count] of tabs) {
+    const tab = el("div", { className: "tab" + (state.view === key ? " active" : ""), tabIndex: 0, role: "tab" });
+    tab.append(label);
+    if (count) tab.append(el("span", { className: "n", textContent: String(count) }));
+    const go = () => { state.view = key; render(); };
+    tab.onclick = go;
+    tab.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    box.append(tab);
+  }
 }
 
 function render() {
@@ -83,87 +136,327 @@ function render() {
 
   const p = currentProject();
   if (state.query) {
-    $("title").textContent = `Search: ${state.query}`;
-    $("subtitle").textContent = `${state.tasks.length} tasks, ${state.notes.length} memory notes`;
+    $("title").textContent = "Search";
+    $("subtitle").textContent =
+      `${plural(state.tasks.length, "task", "tasks")} and ${plural(state.notes.length, "note", "notes")} matching “${state.query}”`;
   } else if (p) {
     $("title").textContent = p.name;
     $("subtitle").textContent = p.summary || "";
   } else {
-    $("title").textContent = "All projects";
+    $("title").textContent = "All work";
     $("subtitle").textContent = "Everything open, across every project";
   }
 
-  $("n-tasks").textContent = state.tasks.length ? String(state.tasks.length) : "";
-  $("n-notes").textContent = state.notes.length ? String(state.notes.length) : "";
-  $("n-links").textContent = state.links.length ? String(state.links.length) : "";
+  // A view that does not exist for the current selection falls back rather than
+  // rendering blank.
+  const valid = state.query
+    ? ["tasks"]
+    : state.projectId
+    ? ["overview", "tasks", "notes", "links"]
+    : ["tasks", "history", "settings"];
+  if (!valid.includes(state.view)) state.view = valid[0];
 
-  // Links are per project, so hide that tab in the All view. History and
-  // Settings are global and always available.
-  const noProject = !state.projectId || !!state.query;
-  document.querySelectorAll(".tab").forEach((t) => {
-    t.style.display = t.dataset.tab === "links" && noProject ? "none" : "";
-    t.classList.toggle("active", t.dataset.tab === state.tab);
-  });
+  renderTabs();
 
   const content = $("content");
   content.textContent = "";
-  if (state.tab === "tasks") renderTasks(content);
-  else if (state.tab === "notes") renderNotes(content);
-  else if (state.tab === "links") renderLinks(content);
-  else if (state.tab === "audit") renderAudit(content);
-  else renderSettings(content);
+  const view = ({
+    overview: renderOverview,
+    tasks: renderTasks,
+    notes: renderNotes,
+    links: renderLinks,
+    history: renderHistory,
+    settings: renderSettings,
+  })[state.view];
+
+  // Several views are async. Without this, a throw inside one leaves an empty
+  // pane and an unhandled rejection nobody sees, which looks like the feature was
+  // never built rather than like a bug.
+  try {
+    const result = view(content);
+    if (result && typeof result.then === "function") {
+      result.catch((error) => showViewError(content, error));
+    }
+  } catch (error) {
+    showViewError(content, error);
+  }
 
   window.brain.stats().then((s) => {
-    $("stats").textContent =
-      `${s.open_tasks} open, ${s.overdue} overdue, ${s.notes} notes`;
+    $("stats").textContent = `${s.open_tasks} open · ${s.overdue} overdue · ${s.notes} notes`;
   });
 }
 
+const card = (title, ...actions) => {
+  const c = el("section", { className: "card" });
+  const head = el("div", { className: "card-head" }, el("h2", { textContent: title }));
+  actions.filter(Boolean).forEach((a) => head.append(a));
+  c.append(head);
+  const body = el("div", { className: "card-body" });
+  c.append(body);
+  return { card: c, body };
+};
+
+function showViewError(root, error) {
+  console.error("view failed", error);
+  root.textContent = "";
+  root.append(
+    el("div", { className: "empty" },
+      el("strong", { textContent: "This view failed to load" }),
+      String(error && error.message ? error.message : error))
+  );
+}
+
+const emptyState = (headline, detail) =>
+  el("div", { className: "empty" }, el("strong", { textContent: headline }), detail || "");
+
+// ---------------------------------------------------------------------------
+// Overview: the project dashboard
+// ---------------------------------------------------------------------------
+
+async function renderOverview(root) {
+  const project = currentProject();
+  if (!project) return;
+
+  const all = await window.brain.tasks.list({ projectId: project.id, includeDone: true });
+  const open = all.filter((t) => t.status !== "done");
+  const done = all.length - open.length;
+  const overdue = open.filter(isOverdue).length;
+  const blocked = open.filter((t) => t.status === "blocked").length;
+  const doing = open.filter((t) => t.status === "doing").length;
+
+  // Summary first: what needs attention before what merely exists.
+  const stats = el("div", { className: "stats" });
+  const stat = (value, label, tone) =>
+    el("div", { className: "stat" + (tone ? ` ${tone}` : "") },
+      el("div", { className: "v", textContent: String(value) }),
+      el("div", { className: "k", textContent: label }));
+  stats.append(
+    stat(open.length, "Open"),
+    stat(doing, "In progress", doing ? "good" : null),
+    stat(blocked, "Blocked", blocked ? "warn" : null),
+    stat(overdue, "Overdue", overdue ? "crit" : null),
+    stat(state.notes.length, "Memory"),
+    stat(done, "Done")
+  );
+  root.append(stats);
+
+  const cols = el("div", { className: "cols" });
+  const left = el("div");
+  const right = el("div");
+
+  // --- what to do next -----------------------------------------------------
+  const priority = [...open].sort((a, b) => {
+    const rank = (t) => (isOverdue(t) ? 0 : t.status === "doing" ? 1 : t.status === "blocked" ? 2 : 3);
+    return rank(a) - rank(b) || (a.priority === "high" ? -1 : 1);
+  }).slice(0, 6);
+
+  const nextCard = card("Needs attention");
+  if (!priority.length) {
+    nextCard.body.append(emptyState("Nothing open here", "Add a task from the Tasks tab."));
+  } else {
+    nextCard.card.querySelector(".card-body").className = "card-body flush";
+    priority.forEach((t) => nextCard.card.append(taskRow(t)));
+    nextCard.body.remove();
+    const more = open.length - priority.length;
+    if (more > 0) {
+      const link = el("div", { className: "list-row" },
+        el("a", { href: "#", className: "grow", textContent: `Show all ${open.length} open tasks` }));
+      link.onclick = (e) => { e.preventDefault(); state.view = "tasks"; render(); };
+      nextCard.card.append(link);
+    }
+  }
+  left.append(nextCard.card);
+
+  // --- pinned and recent memory -------------------------------------------
+  const memCard = card("Memory");
+  if (!state.notes.length) {
+    memCard.body.append(emptyState("Nothing stored yet",
+      "Decisions, gotchas and things worth remembering live here."));
+  } else {
+    memCard.body.remove();
+    const flush = el("div", { className: "card-body flush" });
+    state.notes.slice(0, 5).forEach((n) => {
+      const row = el("div", { className: "list-row" });
+      row.append(el("span", { className: `kind ${n.kind}`, textContent: n.kind }));
+      const link = el("a", { href: "#", className: "grow", textContent: n.title });
+      link.onclick = (e) => { e.preventDefault(); state.view = "notes"; render(); };
+      row.append(link);
+      if (n.pinned) row.append(el("span", { className: "hint", textContent: "pinned" }));
+      flush.append(row);
+    });
+    memCard.card.append(flush);
+  }
+  left.append(memCard.card);
+
+  // --- repositories --------------------------------------------------------
+  const addRepo = el("button", { className: "btn sm", textContent: "Add" });
+  const repoCard = card("Repositories", addRepo);
+  addRepo.onclick = async () => {
+    const path = prompt("Path to the repository folder");
+    if (!path || !path.trim()) return;
+    const name = path.trim().replace(/\/+$/, "").split("/").pop();
+    await window.brain.repos.create({
+      projectId: project.id, name, path: path.trim(),
+      isPrimary: state.repos.length === 0 ? 1 : 0,
+    });
+    refresh();
+  };
+
+  if (!state.repos.length) {
+    repoCard.body.append(emptyState("No repositories linked",
+      "Link the main repository and any helpers, so the project knows where its code lives."));
+  } else {
+    repoCard.body.remove();
+    const flush = el("div", { className: "card-body flush" });
+    state.repos.forEach((r) => {
+      const row = el("div", { className: "list-row" });
+      row.append(el("span", {
+        className: "kind" + (r.is_primary ? " decision" : ""),
+        textContent: r.is_primary ? "primary" : "helper",
+      }));
+      row.append(el("div", { className: "grow" },
+        el("div", { textContent: r.name }),
+        el("div", { className: "mono", textContent: r.path })));
+      if (!r.is_primary) {
+        const mk = el("button", { className: "btn sm", textContent: "Make primary" });
+        mk.onclick = async () => { await window.brain.repos.setPrimary(r.id); refresh(); };
+        row.append(mk);
+      }
+      const rm = el("button", { className: "btn sm", textContent: "Remove" });
+      rm.onclick = async () => { await window.brain.repos.remove(r.id); refresh(); };
+      row.append(rm);
+      flush.append(row);
+    });
+    repoCard.card.append(flush);
+  }
+  right.append(repoCard.card);
+
+  // --- links ---------------------------------------------------------------
+  const linkCard = card("Links");
+  if (!state.links.length) {
+    linkCard.body.append(emptyState("No links yet", "Pull requests, tickets, dashboards."));
+  } else {
+    linkCard.body.remove();
+    const flush = el("div", { className: "card-body flush" });
+    state.links.slice(0, 6).forEach((l) => {
+      const row = el("div", { className: "list-row" });
+      row.append(el("span", { className: "kind", textContent: l.kind }));
+      const a = el("a", { href: "#", className: "grow", textContent: l.label });
+      a.onclick = (e) => { e.preventDefault(); window.brain.openExternal(l.url); };
+      row.append(a);
+      flush.append(row);
+    });
+    linkCard.card.append(flush);
+  }
+  right.append(linkCard.card);
+
+  // --- project settings ----------------------------------------------------
+  const setCard = card("Project settings");
+  const kv = el("dl", { className: "kv" });
+
+  const nameInput = el("input", { className: "field", value: project.name });
+  nameInput.onblur = async () => {
+    if (nameInput.value.trim() && nameInput.value !== project.name) {
+      await window.brain.projects.update(project.id, { name: nameInput.value.trim() });
+      refresh();
+    }
+  };
+  kv.append(el("dt", { textContent: "Name" }), el("dd", {}, nameInput));
+
+  const sumInput = el("input", { className: "field", value: project.summary || "" , placeholder: "One line: what this project is" });
+  sumInput.onblur = async () => {
+    if (sumInput.value !== (project.summary || "")) {
+      await window.brain.projects.update(project.id, { summary: sumInput.value.trim() });
+      refresh();
+    }
+  };
+  kv.append(el("dt", { textContent: "Summary" }), el("dd", {}, sumInput));
+
+  const statusSel = el("select", { className: "field" });
+  for (const s of ["active", "paused", "blocked", "done", "archived"]) {
+    statusSel.append(el("option", { value: s, textContent: s, selected: s === project.status }));
+  }
+  statusSel.onchange = async () => {
+    await window.brain.projects.update(project.id, { status: statusSel.value });
+    if (statusSel.value === "archived") { state.projectId = null; state.view = "tasks"; }
+    refresh();
+  };
+  kv.append(el("dt", { textContent: "Status" }), el("dd", {}, statusSel));
+
+  const colour = el("input", { type: "color", className: "field", value: project.colour || "#8d97a9", style: "height:34px; padding:2px" });
+  colour.onchange = async () => {
+    await window.brain.projects.update(project.id, { colour: colour.value });
+    refresh();
+  };
+  kv.append(el("dt", { textContent: "Colour" }), el("dd", {}, colour));
+  kv.append(el("dt", { textContent: "Key" }), el("dd", {}, el("span", { className: "mono", textContent: project.key })));
+
+  setCard.body.append(kv);
+  right.append(setCard.card);
+
+  cols.append(left, right);
+  root.append(cols);
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
 function renderTasks(root) {
   if (!state.query) {
-    const input = el("input", { placeholder: "Add a task, then Enter", id: "quick" });
+    const input = el("input", { className: "field", placeholder: "Add a task and press Enter. Start with ! for high priority." });
     input.onkeydown = async (e) => {
       if (e.key !== "Enter" || !input.value.trim()) return;
-      // A bare "!" prefix marks it high priority, so the common case does not
-      // need a trip to a dropdown.
       let title = input.value.trim();
       let priority = "med";
-      if (title.startsWith("!")) {
-        priority = "high";
-        title = title.slice(1).trim();
-      }
-      const ref = (title.match(/\b(APPEALS-\d+)\b/i) || [])[1] || null;
+      if (title.startsWith("!")) { priority = "high"; title = title.slice(1).trim(); }
+      const ref = (title.match(/\b([A-Z][A-Z0-9]+-\d+)\b/) || [])[1] || null;
       await window.brain.tasks.create({ projectId: state.projectId, title, priority, ref });
       input.value = "";
       refresh();
     };
-    const toggle = el("button", {
-      className: "btn sm",
-      textContent: state.showDone ? "Hide done" : "Show done",
-    });
-    toggle.onclick = () => {
-      state.showDone = !state.showDone;
-      refresh();
-    };
+    const toggle = el("button", { className: "btn", textContent: state.showDone ? "Hide done" : "Show done" });
+    toggle.onclick = () => { state.showDone = !state.showDone; refresh(); };
     root.append(el("div", { className: "add-row" }, input, toggle));
   }
 
   if (!state.tasks.length) {
-    root.append(el("div", { className: "empty" }, state.query ? "Nothing matched." : "No open tasks here."));
+    root.append(emptyState(
+      state.query ? "Nothing matched" : "No open tasks",
+      state.query ? "Try a different word." : "Add one above."));
     return;
   }
 
-  for (const t of state.tasks) root.append(taskRow(t));
+  const list = el("section", { className: "card" });
+  state.tasks.forEach((t) => list.append(taskRow(t)));
+  root.append(list);
+
+  if (state.query && state.notes.length) {
+    root.append(el("div", { className: "side-label", textContent: "Matching memory" }));
+    const notes = el("section", { className: "card" });
+    state.notes.forEach((n) => {
+      const row = el("div", { className: "list-row" });
+      row.append(el("span", { className: `kind ${n.kind}`, textContent: n.kind }));
+      row.append(el("div", { className: "grow" },
+        el("div", { textContent: n.title }),
+        el("div", { className: "hint", textContent: (n.body || "").slice(0, 110) })));
+      if (n.project_name) row.append(el("span", { className: "chip", textContent: n.project_name }));
+      notes.append(row);
+    });
+    root.append(notes);
+  }
 }
 
 function taskRow(t) {
   const row = el("div", { className: "task" + (t.status === "done" ? " done" : "") });
 
-  const check = el("div", { className: "check", textContent: "✓" });
-  check.onclick = async () => {
+  const check = el("div", { className: "check", textContent: "✓", tabIndex: 0, role: "checkbox" });
+  const toggle = async () => {
     await window.brain.tasks.update(t.id, { status: t.status === "done" ? "todo" : "done" });
     refresh();
   };
+  check.onclick = toggle;
+  check.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
   row.append(check);
 
   const body = el("div", { className: "t-body" });
@@ -171,312 +464,204 @@ function taskRow(t) {
 
   const meta = el("div", { className: "t-meta" });
   if (!state.projectId && t.project_name) {
-    const c = el("span", { className: "chip", textContent: t.project_name });
-    c.style.color = t.project_colour || "";
-    meta.append(c);
+    meta.append(el("span", { className: "chip", textContent: t.project_name }));
   }
   if (t.priority === "high") meta.append(el("span", { className: "chip high", textContent: "high" }));
-  if (t.status === "doing") meta.append(el("span", { className: "chip doing", textContent: "doing" }));
+  if (t.status === "doing") meta.append(el("span", { className: "chip doing", textContent: "in progress" }));
   if (t.status === "blocked") meta.append(el("span", { className: "chip blocked", textContent: "blocked" }));
-  if (isOverdue(t)) meta.append(el("span", { className: "chip overdue", textContent: `due ${t.due}` }));
+  if (isOverdue(t)) meta.append(el("span", { className: "chip overdue", textContent: `overdue ${t.due}` }));
   else if (t.due) meta.append(el("span", { className: "chip", textContent: `due ${t.due}` }));
   if (t.ref) meta.append(el("span", { className: "chip ref", textContent: t.ref }));
-  if (t.legacy_id) meta.append(el("span", { className: "chip ref", textContent: t.legacy_id }));
+
+  if (t.detail) {
+    const detail = el("div", { className: "t-detail", textContent: t.detail });
+    detail.style.display = "none";
+    const more = el("button", { className: "btn sm", textContent: "notes" });
+    more.onclick = () => { detail.style.display = detail.style.display === "none" ? "" : "none"; };
+    meta.append(more);
+    body.append(meta, detail);
+  } else {
+    body.append(meta);
+  }
 
   const actions = el("div", { className: "t-actions" });
   const cycle = el("button", { className: "btn sm", textContent: "status" });
   cycle.onclick = async () => {
     const order = ["todo", "doing", "blocked", "done"];
-    const next = order[(order.indexOf(t.status) + 1) % order.length];
-    await window.brain.tasks.update(t.id, { status: next });
+    await window.brain.tasks.update(t.id, { status: order[(order.indexOf(t.status) + 1) % order.length] });
     refresh();
   };
   const move = el("select", { className: "btn sm" });
-  move.append(el("option", { value: "", textContent: "move to…" }));
-  for (const p of state.projects) {
-    move.append(el("option", { value: String(p.id), textContent: p.name, selected: p.id === t.project_id }));
-  }
+  move.append(el("option", { value: "", textContent: "move…" }));
+  state.projects.forEach((p) =>
+    move.append(el("option", { value: String(p.id), textContent: p.name, selected: p.id === t.project_id })));
   move.onchange = async () => {
-    if (!move.value) return;
-    await window.brain.tasks.update(t.id, { project_id: Number(move.value) });
-    refresh();
+    if (move.value) { await window.brain.tasks.update(t.id, { project_id: Number(move.value) }); refresh(); }
   };
   const del = el("button", { className: "btn sm", textContent: "×", title: "Delete" });
-  del.onclick = async () => {
-    await window.brain.tasks.remove(t.id);
-    refresh();
-  };
+  del.onclick = async () => { await window.brain.tasks.remove(t.id); refresh(); };
   actions.append(cycle, move, del);
   meta.append(actions);
-  body.append(meta);
-
-  if (t.detail) {
-    const d = el("div", { className: "t-detail", textContent: t.detail });
-    d.style.display = "none";
-    const more = el("span", { className: "chip", textContent: "notes" });
-    more.style.cursor = "default";
-    more.onclick = () => {
-      d.style.display = d.style.display === "none" ? "" : "none";
-    };
-    meta.insertBefore(more, actions);
-    body.append(d);
-  }
 
   row.append(body);
   return row;
 }
 
-function renderNotes(root) {
-  if (!state.projectId && !state.query) {
-    root.append(el("div", { className: "empty" }, "Pick a project to see its memory."));
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
 
-  if (state.projectId) {
-    const title = el("input", { placeholder: "New memory note title, then Enter" });
-    title.onkeydown = async (e) => {
-      if (e.key !== "Enter" || !title.value.trim()) return;
-      await window.brain.notes.create({ projectId: state.projectId, title: title.value.trim() });
-      title.value = "";
-      refresh();
-    };
-    root.append(el("div", { className: "add-row" }, title));
-  }
+function renderNotes(root) {
+  const title = el("input", { className: "field", placeholder: "New memory note title, then Enter" });
+  title.onkeydown = async (e) => {
+    if (e.key !== "Enter" || !title.value.trim()) return;
+    await window.brain.notes.create({ projectId: state.projectId, title: title.value.trim() });
+    title.value = "";
+    refresh();
+  };
+  root.append(el("div", { className: "add-row" }, title));
 
   if (!state.notes.length) {
-    root.append(
-      el("div", { className: "empty" },
-        "Nothing stored yet. This is where decisions, gotchas and things worth remembering live.")
-    );
+    root.append(emptyState("Nothing stored yet",
+      "This is for decisions and why the alternative was rejected, traps that cost time, and values that are hard to look up again."));
     return;
   }
-
-  for (const n of state.notes) root.append(noteCard(n));
+  state.notes.forEach((n) => root.append(noteCard(n)));
 }
 
 function noteCard(n) {
-  const card = el("div", { className: "note" });
+  const wrap = el("article", { className: "note" });
+  const head = el("div", { className: "note-head" });
 
-  const head = el("h3");
-  const pin = el("span", { textContent: n.pinned ? "★" : "☆", title: "Pin" });
-  pin.style.cursor = "default";
-  pin.style.color = n.pinned ? "var(--med)" : "var(--ink-faint)";
-  pin.onclick = async () => {
-    await window.brain.notes.update(n.id, { pinned: n.pinned ? 0 : 1 });
-    refresh();
-  };
+  const pin = el("button", { className: "btn sm", textContent: n.pinned ? "★" : "☆", title: "Pin" });
+  pin.onclick = async () => { await window.brain.notes.update(n.id, { pinned: n.pinned ? 0 : 1 }); refresh(); };
   head.append(pin);
 
   const titleInput = el("input", { value: n.title });
-  titleInput.style.border = "1px solid transparent";
-  titleInput.style.fontWeight = "600";
   titleInput.onblur = async () => {
-    if (titleInput.value !== n.title) {
-      await window.brain.notes.update(n.id, { title: titleInput.value });
+    if (titleInput.value.trim() && titleInput.value !== n.title) {
+      await window.brain.notes.update(n.id, { title: titleInput.value.trim() });
       refresh();
     }
   };
   head.append(titleInput);
 
-  const kind = el("select");
-  for (const k of ["note", "decision", "gotcha", "reference", "contact"]) {
-    kind.append(el("option", { value: k, textContent: k, selected: k === n.kind }));
-  }
-  kind.className = "btn sm";
-  kind.onchange = () => window.brain.notes.update(n.id, { kind: kind.value }).then(refresh);
+  const kind = el("select", { className: "btn sm" });
+  ["note", "decision", "gotcha", "reference", "contact"].forEach((k) =>
+    kind.append(el("option", { value: k, textContent: k, selected: k === n.kind })));
+  kind.onchange = async () => { await window.brain.notes.update(n.id, { kind: kind.value }); refresh(); };
   head.append(kind);
 
-  const del = el("button", { className: "btn sm", textContent: "×" });
-  del.onclick = async () => {
-    await window.brain.notes.remove(n.id);
-    refresh();
-  };
+  const del = el("button", { className: "btn sm", textContent: "×", title: "Delete" });
+  del.onclick = async () => { await window.brain.notes.remove(n.id); refresh(); };
   head.append(del);
-  card.append(head);
+  wrap.append(head);
 
-  const body = el("textarea", { value: n.body, rows: Math.min(14, Math.max(3, n.body.split("\n").length + 1)) });
-  body.placeholder = "What is worth remembering here…";
+  const body = el("textarea", {
+    className: "field",
+    value: n.body,
+    rows: Math.min(18, Math.max(4, (n.body || "").split("\n").length + 1)),
+    placeholder: "What is worth remembering here",
+  });
   body.onblur = async () => {
-    if (body.value !== n.body) {
-      await window.brain.notes.update(n.id, { body: body.value });
-      n.body = body.value;
-    }
+    if (body.value !== n.body) { await window.brain.notes.update(n.id, { body: body.value }); n.body = body.value; }
   };
-  card.append(body);
-  return card;
+  wrap.append(el("div", { className: "note-body" }, body));
+  return wrap;
 }
 
+// ---------------------------------------------------------------------------
+// Links
+// ---------------------------------------------------------------------------
+
 function renderLinks(root) {
-  if (!state.projectId) {
-    root.append(el("div", { className: "empty" }, "Pick a project to see its links."));
-    return;
-  }
-  const label = el("input", { placeholder: "Label" });
-  const url = el("input", { placeholder: "https://…" });
-  const add = el("button", { className: "btn sm", textContent: "Add" });
+  const label = el("input", { className: "field", placeholder: "Label" });
+  const url = el("input", { className: "field", placeholder: "https://" });
+  const add = el("button", { className: "btn primary", textContent: "Add" });
   add.onclick = async () => {
     if (!label.value.trim() || !url.value.trim()) return;
-    const kind = /pull\/\d+/.test(url.value) ? "pr" : /jira|APPEALS-/i.test(url.value) ? "jira" : "link";
-    await window.brain.links.create({
-      projectId: state.projectId, label: label.value.trim(), url: url.value.trim(), kind,
-    });
+    const kind = /pull\/\d+|\/pr\//.test(url.value) ? "pr"
+      : /jira|atlassian|[A-Z]+-\d+/.test(url.value) ? "jira"
+      : /grafana|dashboard|kibana/.test(url.value) ? "dashboard" : "link";
+    await window.brain.links.create({ projectId: state.projectId, label: label.value.trim(), url: url.value.trim(), kind });
     label.value = url.value = "";
     refresh();
   };
   root.append(el("div", { className: "add-row" }, label, url, add));
 
   if (!state.links.length) {
-    root.append(el("div", { className: "empty" }, "No links yet. Pull requests, tickets, dashboards."));
+    root.append(emptyState("No links yet", "Pull requests, tickets and dashboards for this project."));
     return;
   }
-
-  for (const l of state.links) {
-    const row = el("div", { className: "link-row" });
-    row.append(el("span", { className: "chip", textContent: l.kind }));
-    const a = el("a", { href: "#", textContent: l.label, className: "grow" });
-    a.onclick = (e) => {
-      e.preventDefault();
-      window.brain.openExternal(l.url);
-    };
-    row.append(a);
+  const list = el("section", { className: "card" });
+  state.links.forEach((l) => {
+    const row = el("div", { className: "list-row" });
+    row.append(el("span", { className: "kind", textContent: l.kind }));
+    const a = el("a", { href: "#", className: "grow", textContent: l.label });
+    a.onclick = (e) => { e.preventDefault(); window.brain.openExternal(l.url); };
+    row.append(a, el("span", { className: "mono", textContent: l.url.slice(0, 46) }));
     const del = el("button", { className: "btn sm", textContent: "×" });
-    del.onclick = async () => {
-      await window.brain.links.remove(l.id);
-      refresh();
-    };
+    del.onclick = async () => { await window.brain.links.remove(l.id); refresh(); };
     row.append(del);
-    root.append(row);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Wiring
-// ---------------------------------------------------------------------------
-
-document.querySelectorAll(".tab").forEach((tab) => {
-  tab.onclick = () => {
-    state.tab = tab.dataset.tab;
-    render();
-  };
-});
-
-let searchTimer;
-$("search").addEventListener("input", (e) => {
-  clearTimeout(searchTimer);
-  const v = e.target.value;
-  // Debounced so typing does not fire a query per keystroke.
-  searchTimer = setTimeout(() => {
-    state.query = v.trim();
-    if (state.query) state.tab = "tasks";
-    refresh();
-  }, 140);
-});
-
-$("new-project").onclick = async () => {
-  const name = prompt("Project name");
-  if (!name || !name.trim()) return;
-  const key = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  const palette = ["#4f8ef7", "#e0803a", "#57a773", "#a86fd1", "#c9546b", "#3fa7a1"];
-  await window.brain.projects.create({
-    key: key || `p${Date.now()}`,
-    name: name.trim(),
-    colour: palette[state.projects.length % palette.length],
+    list.append(row);
   });
-  refresh();
-};
-
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    if ($("search").value) {
-      $("search").value = "";
-      state.query = "";
-      refresh();
-      return;
-    }
-    window.brain.hide();
-  }
-  // Cmd+F focuses search, matching the shortcut people already have in their hands.
-  if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-    e.preventDefault();
-    $("search").focus();
-    $("search").select();
-  }
-});
-
-// Re-read on every show, so the panel never displays stale data after work
-// happened elsewhere, for instance a task added from a script.
-window.brain.onShown(() => {
-  refresh();
-  $("search").focus();
-});
-
-refresh();
-
+  root.append(list);
+}
 
 // ---------------------------------------------------------------------------
 // History
 // ---------------------------------------------------------------------------
 
-async function renderAudit(root) {
+async function renderHistory(root) {
   const bar = el("div", { className: "add-row" });
-  const undo1 = el("button", { className: "btn sm", textContent: "Undo last change" });
-  const undo5 = el("button", { className: "btn sm", textContent: "Undo last 5" });
   const msg = el("span", { className: "hint" });
-  const runUndo = async (n) => {
-    try {
-      const done = await window.brain.audit.undoLast(n);
-      msg.className = "ok-msg";
-      msg.textContent = done ? `Reversed ${done} change${done === 1 ? "" : "s"}.` : "Nothing left to undo.";
-    } catch (e) {
-      msg.className = "err-msg";
-      msg.textContent = e.message;
-    }
-    refresh();
+  const undo = (n, text) => {
+    const b = el("button", { className: "btn", textContent: text });
+    b.onclick = async () => {
+      try {
+        const done = await window.brain.audit.undoLast(n);
+        msg.className = "ok-msg";
+        msg.textContent = done ? `Reversed ${plural(done, "change", "changes")}.` : "Nothing left to undo.";
+      } catch (e) { msg.className = "err-msg"; msg.textContent = e.message; }
+      refresh();
+    };
+    return b;
   };
-  undo1.onclick = () => runUndo(1);
-  undo5.onclick = () => runUndo(5);
-  bar.append(undo1, undo5, msg);
+  bar.append(undo(1, "Undo last change"), undo(5, "Undo last 5"), msg);
   root.append(bar);
 
   const entries = await window.brain.audit.list(200);
   if (!entries.length) {
-    root.append(el("div", { className: "empty" },
-      "No changes recorded yet. Everything you do from here on is logged and reversible."));
+    root.append(emptyState("Nothing recorded yet", "Every change from here on is logged and reversible."));
     return;
   }
 
-  for (const e of entries) {
+  const list = el("section", { className: "card" });
+  entries.forEach((e) => {
     const row = el("div", { className: "audit-row" + (e.undone ? " undone" : "") });
-    row.append(el("span", { className: "audit-when", textContent: e.at }));
-
-    const what = el("div", { className: "audit-what" });
-    what.append(el("span", { textContent: `${e.entity} ${e.summary}` }));
-    if (e.label) what.append(el("div", { className: "lbl", textContent: e.label.slice(0, 110) }));
+    row.append(el("span", { className: "audit-when", textContent: ago(e.at) }));
+    const what = el("div", { className: "audit-what" },
+      el("div", { textContent: `${e.entity} ${e.summary}` }));
+    if (e.label) what.append(el("div", { className: "lbl", textContent: e.label.slice(0, 120) }));
     row.append(what);
-
-    if (e.undone) {
-      row.append(el("span", { className: "chip", textContent: "undone" }));
-    } else {
+    if (e.undone) row.append(el("span", { className: "chip", textContent: "undone" }));
+    else {
       const b = el("button", { className: "btn sm", textContent: "undo" });
       b.onclick = async () => {
-        try {
-          await window.brain.audit.undo(e.id);
-        } catch (err) {
-          alert(err.message);
-        }
+        try { await window.brain.audit.undo(e.id); } catch (err) { alert(err.message); }
         refresh();
       };
       row.append(b);
     }
-    root.append(row);
-  }
+    list.append(row);
+  });
+  root.append(list);
 }
 
 // ---------------------------------------------------------------------------
-// Settings, including the hotkey recorder
+// Settings
 // ---------------------------------------------------------------------------
 
-// Electron accelerators use these names rather than the browser's key values.
 function toAccelerator(event) {
   const parts = [];
   if (event.ctrlKey) parts.push("Control");
@@ -487,41 +672,36 @@ function toAccelerator(event) {
   let key = event.key;
   const code = event.code || "";
   if (["Control", "Alt", "Shift", "Meta"].includes(key)) return { parts, key: null };
-
   if (key === " " || code === "Space") key = "Space";
   else if (code.startsWith("Digit")) key = code.slice(5);
   else if (code.startsWith("Key")) key = code.slice(3);
-  else if (/^F\d{1,2}$/.test(key)) key = key;
   else if (key === "ArrowUp") key = "Up";
   else if (key === "ArrowDown") key = "Down";
   else if (key === "ArrowLeft") key = "Left";
   else if (key === "ArrowRight") key = "Right";
   else if (key.length === 1) key = key.toUpperCase();
-
   return { parts, key };
 }
+
+const partLabel = (p) =>
+  ({ Control: "control", Alt: "option", Shift: "shift", Command: "command", Space: "space" }[p] || p);
 
 async function renderSettings(root) {
   const settings = await window.brain.settings.get();
 
-  // --- hotkey ---
-  const block = el("div", { className: "setting-block" });
-  block.append(el("h3", { textContent: "Show and hide shortcut" }));
-  block.append(el("p", {
-    textContent:
-      "Click the box, then press the combination you want. It is registered straight away, " +
-      "and if another application already owns it you are told rather than left wondering.",
+  // --- shortcut ------------------------------------------------------------
+  const shortcut = el("div", { className: "setting" });
+  shortcut.append(el("h3", { textContent: "Show and hide shortcut" }));
+  shortcut.append(el("p", {
+    textContent: "Click the box, then press the combination you want. It registers straight away, and if another application already owns it you are told rather than left wondering.",
   }));
 
-  const rec = el("div", { className: "recorder" });
+  const rec = el("div", { className: "recorder", tabIndex: 0, role: "button" });
   const keys = el("div", { className: "keys" });
   const status = el("div", { className: "hint", textContent: "Click to record" });
-
   const paint = (accel) => {
     keys.textContent = "";
-    for (const part of accel.split("+")) {
-      keys.append(el("span", { className: "key", textContent: partLabel(part) }));
-    }
+    accel.split("+").forEach((p) => keys.append(el("span", { className: "key", textContent: partLabel(p) })));
   };
   paint(settings.hotkey);
   rec.append(keys, status);
@@ -530,34 +710,27 @@ async function renderSettings(root) {
   const stop = () => {
     armed = false;
     rec.classList.remove("armed");
+    status.className = "hint";
     status.textContent = "Click to record";
     document.removeEventListener("keydown", onKey, true);
   };
-
   const onKey = async (event) => {
     if (!armed) return;
     event.preventDefault();
     event.stopPropagation();
-
-    if (event.key === "Escape") {
-      paint(settings.hotkey);
-      stop();
-      return;
-    }
+    if (event.key === "Escape") { paint(settings.hotkey); stop(); return; }
 
     const { parts, key } = toAccelerator(event);
     if (!key) {
-      // Modifiers alone: show them building up so it feels responsive.
       keys.textContent = "";
-      for (const p of parts) keys.append(el("span", { className: "key", textContent: partLabel(p) }));
+      parts.forEach((p) => keys.append(el("span", { className: "key", textContent: partLabel(p) })));
       return;
     }
     if (!parts.length) {
       status.className = "err-msg";
-      status.textContent = "Needs at least one modifier, otherwise it would fire while typing.";
+      status.textContent = "Needs at least one modifier, otherwise it would fire while you type.";
       return;
     }
-
     const accel = [...parts, key].join("+");
     paint(accel);
     try {
@@ -574,8 +747,7 @@ async function renderSettings(root) {
     rec.classList.remove("armed");
     document.removeEventListener("keydown", onKey, true);
   };
-
-  rec.onclick = () => {
+  const arm = () => {
     if (armed) return stop();
     armed = true;
     rec.classList.add("armed");
@@ -583,26 +755,46 @@ async function renderSettings(root) {
     status.textContent = "Listening. Press a combination, or Escape to cancel.";
     document.addEventListener("keydown", onKey, true);
   };
+  rec.onclick = arm;
+  shortcut.append(rec);
+  root.append(shortcut);
 
-  block.append(rec);
-  root.append(block);
-
-  // --- reminder behaviour ---
-  const rem = el("div", { className: "setting-block" });
-  rem.append(el("h3", { textContent: "Reminders" }));
-  rem.append(el("p", {
-    textContent:
-      "How long Snooze puts a reminder off for, and how often the app checks for " +
-      "reminders that have come due.",
+  // --- window behaviour ----------------------------------------------------
+  const mode = el("div", { className: "setting" });
+  mode.append(el("h3", { textContent: "Window behaviour" }));
+  mode.append(el("p", {
+    textContent: "By default this is an ordinary application: it appears in the dock, can be full screened, and stays where you put it. Panel mode instead makes it float above your work and disappear as soon as you click away, which suits quick glances and gets in the way of longer sessions.",
   }));
+  const modeRow = el("div", { className: "row" });
+  const box = el("input", { type: "checkbox", checked: settings.panelMode === true, id: "panel-mode" });
+  const lbl = el("label", { htmlFor: "panel-mode", textContent: "Panel mode: float above other windows and hide when it loses focus" });
+  const modeMsg = el("span", { className: "hint" });
+  box.onchange = async () => {
+    try {
+      // The window is rebuilt to apply this, so it will flicker once.
+      await window.brain.settings.set({ panelMode: box.checked });
+      modeMsg.className = "ok-msg";
+      modeMsg.textContent = box.checked ? "Panel mode on" : "Normal window";
+    } catch (e) {
+      modeMsg.className = "err-msg";
+      modeMsg.textContent = e.message;
+      box.checked = !box.checked;
+    }
+  };
+  modeRow.append(box, lbl, modeMsg);
+  mode.append(modeRow);
+  mode.append(el("p", { className: "hint", style: "margin:12px 0 0",
+    textContent: "The shortcut works either way: in normal mode it brings the window forward rather than dismissing it." }));
+  root.append(mode);
 
+  // --- reminders -----------------------------------------------------------
+  const rem = el("div", { className: "setting" });
+  rem.append(el("h3", { textContent: "Reminders" }));
+  rem.append(el("p", { textContent: "How long Snooze puts a reminder off for, and how often the app looks for reminders that have come due." }));
   const numberField = (label, key, suffix) => {
-    const row = el("div", { className: "row", style: "margin-bottom:8px" });
-    row.append(el("span", { textContent: label, style: "flex:0 0 190px" }));
-    const input = el("input", {
-      type: "number", min: "1", value: String(settings[key] ?? ""),
-      style: "width:90px; padding:5px 8px; border-radius:7px; border:1px solid var(--line); background:var(--panel); outline:none",
-    });
+    const row = el("div", { className: "row", style: "margin-bottom:10px" });
+    row.append(el("span", { textContent: label, style: "flex:0 0 210px" }));
+    const input = el("input", { type: "number", min: "1", value: String(settings[key] ?? ""), className: "field", style: "width:92px" });
     const note = el("span", { className: "hint" });
     input.onchange = async () => {
       try {
@@ -610,32 +802,24 @@ async function renderSettings(root) {
         settings[key] = updated[key];
         note.className = "ok-msg";
         note.textContent = "saved";
-      } catch (e) {
-        note.className = "err-msg";
-        note.textContent = e.message;
-      }
+      } catch (e) { note.className = "err-msg"; note.textContent = e.message; }
     };
     row.append(input, el("span", { className: "hint", textContent: suffix }), note);
     return row;
   };
-
   rem.append(numberField("Snooze for", "snoozeMinutes", "minutes"));
   rem.append(numberField("Check for due reminders every", "checkIntervalSeconds", "seconds"));
   root.append(rem);
 
-  // --- markdown vault ---
-  const v = el("div", { className: "setting-block" });
+  // --- vault ---------------------------------------------------------------
+  const v = el("div", { className: "setting" });
   v.append(el("h3", { textContent: "Markdown vault" }));
   v.append(el("p", {
-    textContent:
-      "Your memory notes are mirrored to plain markdown files so they are not trapped in a " +
-      "database only this app reads. Point Obsidian at the folder and you get its editor, " +
-      "backlinks, graph and mobile apps over the same notes. It rewrites itself a moment after " +
-      "any change, so there is nothing to remember to do.",
+    textContent: "Your memory notes are mirrored to plain markdown files so they are not trapped in a database only this app reads. Point Obsidian at the folder and you get its editor, backlinks, graph and mobile apps over the same notes. It rewrites itself a moment after any change.",
   }));
   const vrow = el("div", { className: "row" });
-  const openBtn = el("button", { className: "btn sm", textContent: "Open the folder" });
-  const exportBtn = el("button", { className: "btn sm", textContent: "Rebuild now" });
+  const openBtn = el("button", { className: "btn", textContent: "Open the folder" });
+  const exportBtn = el("button", { className: "btn", textContent: "Rebuild now" });
   const vmsg = el("span", { className: "hint" });
   openBtn.onclick = () => window.brain.vault.reveal();
   exportBtn.onclick = async () => {
@@ -643,46 +827,92 @@ async function renderSettings(root) {
       const r = await window.brain.vault.export();
       vmsg.className = "ok-msg";
       vmsg.textContent = `${r.notes} notes across ${r.projects} projects written`;
-    } catch (e) {
-      vmsg.className = "err-msg";
-      vmsg.textContent = e.message;
-    }
+    } catch (e) { vmsg.className = "err-msg"; vmsg.textContent = e.message; }
   };
   vrow.append(openBtn, exportBtn, vmsg);
   v.append(vrow);
-  v.append(el("p", {
-    className: "hint",
-    style: "margin-top:10px",
-    textContent:
-      "The database stays the source of truth and the mirror is one way. Two way sync between a " +
-      "database and a folder is where these things break, so edits made in Obsidian are not read " +
-      "back.",
-  }));
+  v.append(el("p", { className: "hint", style: "margin-top:12px; margin-bottom:0",
+    textContent: "The database stays the source of truth and the mirror is one way. Two way sync between a database and a folder is where these break, so edits made in Obsidian are not read back." }));
   root.append(v);
 
-  // --- mouse buttons ---
-  const mouse = el("div", { className: "setting-block" });
+  // --- mouse buttons -------------------------------------------------------
+  const mouse = el("div", { className: "setting" });
   mouse.append(el("h3", { textContent: "Using a mouse button" }));
-  mouse.append(el("p", {
-    textContent:
-      "A global shortcut can only be a keyboard combination, so a mouse button cannot be bound here " +
-      "directly. Do it the other way round: in your mouse software, map the side button to send the " +
-      "combination above. The panel cannot tell the difference, so the button then works exactly like " +
-      "pressing the keys. Logitech Options, SteerMouse and Razer Synapse all do this.",
-  }));
+  mouse.append(el("p", { style: "margin-bottom:0",
+    textContent: "A global shortcut can only be a keyboard combination, so a mouse button cannot be bound here directly. Do it the other way round: in your mouse software, map the side button to send the combination above. The panel cannot tell the difference. Logitech Options, SteerMouse and Razer Synapse all do this." }));
   root.append(mouse);
 
-  // --- where things live ---
-  const info = el("div", { className: "setting-block" });
-  info.append(el("h3", { textContent: "Where your data lives" }));
-  const list = el("p");
-  list.append(el("span", { textContent: "Database: ~/va/brain/brain.db" }), el("br"),
-              el("span", { textContent: "Settings: ~/va/brain/settings.json" }), el("br"),
-              el("span", { textContent: "Every change is recorded on the History tab and can be reversed." }));
-  info.append(list);
-  root.append(info);
+  // --- data ----------------------------------------------------------------
+  const data = el("div", { className: "setting" });
+  data.append(el("h3", { textContent: "Where your data lives" }));
+  const dl = el("dl", { className: "kv" });
+  dl.append(el("dt", { textContent: "Database" }), el("dd", {}, el("span", { className: "mono", textContent: "~/va/brain/brain.db" })));
+  dl.append(el("dt", { textContent: "Settings" }), el("dd", {}, el("span", { className: "mono", textContent: "~/va/brain/settings.json" })));
+  dl.append(el("dt", { textContent: "History" }), el("dd", { textContent: "Every change is recorded and can be reversed." }));
+  data.append(dl);
+  root.append(data);
 }
 
-function partLabel(part) {
-  return { Control: "control", Alt: "option", Shift: "shift", Command: "command", Space: "space" }[part] || part;
-}
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+let searchTimer;
+$("search").addEventListener("input", (e) => {
+  clearTimeout(searchTimer);
+  const v = e.target.value;
+  searchTimer = setTimeout(() => {
+    state.query = v.trim();
+    if (state.query) state.view = "tasks";
+    else state.view = state.projectId ? "overview" : "tasks";
+    refresh();
+  }, 140);
+});
+
+$("new-project").onclick = async () => {
+  const name = prompt("Project name");
+  if (!name || !name.trim()) return;
+  const key = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const palette = ["#4a63d8", "#e0803a", "#2f8757", "#a86fd1", "#c9546b", "#3fa7a1"];
+  const created = await window.brain.projects.create({
+    key: key || `p${Date.now()}`,
+    name: name.trim(),
+    colour: palette[state.projects.length % palette.length],
+  });
+  state.projectId = created.id;
+  state.view = "overview";
+  refresh();
+};
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if ($("search").value) {
+      $("search").value = "";
+      state.query = "";
+      state.view = state.projectId ? "overview" : "tasks";
+      refresh();
+      return;
+    }
+    window.brain.hide();
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+    e.preventDefault();
+    $("search").focus();
+    $("search").select();
+  }
+});
+
+// Frameless panel mode has no traffic lights, so the title bar does not need to
+// leave room for them.
+window.brain.onMode(({ panelMode }) => {
+  document.body.classList.toggle("panel", panelMode);
+});
+
+window.brain.onShown(() => { refresh(); $("search").focus(); });
+window.brain.onAlertsChanged(() => refresh());
+window.brain.onFocusTask(({ projectId }) => {
+  if (projectId) { state.projectId = projectId; state.view = "tasks"; }
+  refresh();
+});
+
+refresh();
