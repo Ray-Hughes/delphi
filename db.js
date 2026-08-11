@@ -335,6 +335,128 @@ function search(query) {
   return { tasks, notes };
 }
 
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+
+// Everything due, so the scheduler can fire in one pass. Snoozed alerts come
+// back through the same query because a snooze just moves fire_at forward.
+function dueAlerts() {
+  return all(`
+    SELECT a.*, t.title AS task_title, t.status AS task_status, t.project_id,
+           p.name AS project_name
+    FROM alerts a
+    JOIN tasks t ON t.id = a.task_id
+    LEFT JOIN projects p ON p.id = t.project_id
+    WHERE a.status IN ('pending', 'snoozed')
+      AND a.fire_at <= datetime('now')
+      AND t.status != 'done'
+    ORDER BY a.fire_at
+  `);
+}
+
+function listAlerts({ includeFinished = true } = {}) {
+  const where = includeFinished ? "" : "WHERE a.status IN ('pending','snoozed','fired')";
+  return all(`
+    SELECT a.*, t.title AS task_title, t.status AS task_status, t.project_id,
+           p.name AS project_name, p.colour AS project_colour
+    FROM alerts a
+    JOIN tasks t ON t.id = a.task_id
+    LEFT JOIN projects p ON p.id = t.project_id
+    ${where}
+    ORDER BY CASE a.status WHEN 'fired' THEN 0 WHEN 'snoozed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END,
+             a.fire_at DESC
+    LIMIT 200
+  `);
+}
+
+function createAlert({ taskId, fireAt, message = null, repeatEveryMinutes = null }) {
+  const r = run(
+    `INSERT INTO alerts (task_id, fire_at, message, repeat_every_minutes)
+     VALUES (:taskId, :fireAt, :message, :repeatEveryMinutes)`,
+    { taskId, fireAt, message, repeatEveryMinutes }
+  );
+  const created = one("SELECT * FROM alerts WHERE id = :id", { id: Number(r.lastInsertRowid) });
+  record({ action: "create", entity: "task", entityId: taskId,
+           summary: `reminder set for ${fireAt}`, label: message || null, after: created });
+  return created;
+}
+
+function updateAlert(id, fields) {
+  const allowed = ["fire_at", "message", "status", "repeat_every_minutes"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return one("SELECT * FROM alerts WHERE id = :id", { id });
+  const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
+  run(`UPDATE alerts SET ${assignments} WHERE id = :id`, {
+    ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id,
+  });
+  return one("SELECT * FROM alerts WHERE id = :id", { id });
+}
+
+function deleteAlert(id) {
+  run("DELETE FROM alerts WHERE id = :id", { id });
+}
+
+// Marks an alert as shown. A repeating alert schedules its next appearance here
+// rather than when it is acted on, so a reminder that is ignored still returns.
+function markFired(id) {
+  const alert = one("SELECT * FROM alerts WHERE id = :id", { id });
+  if (!alert) return null;
+  if (alert.repeat_every_minutes) {
+    run(`UPDATE alerts SET status = 'fired', fired_at = datetime('now'),
+         fire_at = datetime('now', '+' || :mins || ' minutes') WHERE id = :id`,
+        { id, mins: alert.repeat_every_minutes });
+  } else {
+    run("UPDATE alerts SET status = 'fired', fired_at = datetime('now') WHERE id = :id", { id });
+  }
+  return one("SELECT * FROM alerts WHERE id = :id", { id });
+}
+
+function snoozeAlert(id, minutes) {
+  run(`UPDATE alerts SET status = 'snoozed', snooze_count = snooze_count + 1,
+       fire_at = datetime('now', '+' || :minutes || ' minutes') WHERE id = :id`,
+      { id, minutes });
+  return one("SELECT * FROM alerts WHERE id = :id", { id });
+}
+
+// Acting on an alert closes it. Deliberately does not touch the task: clicking a
+// reminder means "I am looking at this now", not "this is finished".
+function actOnAlert(id) {
+  run("UPDATE alerts SET status = 'done', acted_at = datetime('now') WHERE id = :id", { id });
+  return one("SELECT * FROM alerts WHERE id = :id", { id });
+}
+
+// ---------------------------------------------------------------------------
+// Repositories
+// ---------------------------------------------------------------------------
+
+function listRepos(projectId) {
+  return all("SELECT * FROM repos WHERE project_id = :projectId ORDER BY is_primary DESC, name",
+             { projectId });
+}
+
+function createRepo({ projectId, name, path, isPrimary = 0 }) {
+  // Only one primary per project, so setting a new one clears the old.
+  if (isPrimary) run("UPDATE repos SET is_primary = 0 WHERE project_id = :projectId", { projectId });
+  const r = run(
+    `INSERT INTO repos (project_id, name, path, is_primary) VALUES (:projectId, :name, :path, :isPrimary)`,
+    { projectId, name, path, isPrimary: isPrimary ? 1 : 0 }
+  );
+  return one("SELECT * FROM repos WHERE id = :id", { id: Number(r.lastInsertRowid) });
+}
+
+function setPrimaryRepo(id) {
+  const repo = one("SELECT * FROM repos WHERE id = :id", { id });
+  if (!repo) return null;
+  run("UPDATE repos SET is_primary = 0 WHERE project_id = :projectId", { projectId: repo.project_id });
+  run("UPDATE repos SET is_primary = 1 WHERE id = :id", { id });
+  return one("SELECT * FROM repos WHERE id = :id", { id });
+}
+
+function deleteRepo(id) {
+  run("DELETE FROM repos WHERE id = :id", { id });
+}
+
 function stats() {
   return one(`
     SELECT
@@ -354,4 +476,7 @@ module.exports = {
   listLinks, createLink, deleteLink,
   search, stats,
   listAudit, undo, undoLast,
+  dueAlerts, listAlerts, createAlert, updateAlert, deleteAlert,
+  markFired, snoozeAlert, actOnAlert,
+  listRepos, createRepo, setPrimaryRepo, deleteRepo,
 };

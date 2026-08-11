@@ -1,99 +1,229 @@
-# Brain
+<div align="center">
 
-A project tracker that lives behind a hotkey. Projects hold tasks, memory notes
-and links, so work has a home rather than sitting in one long list.
+# Second Brain
 
-## Running it
+**A project tracker that lives behind a hotkey, and that your AI agents keep up to date themselves.**
 
+Projects hold tasks, memory notes and links. Press a key, it appears. Press it again, it is gone.
+Claude Code and GitHub Copilot can both read and write it through MCP, so what one of them
+learns is still there for the next session.
+
+[Why](#why) · [Install](#install) · [Use](#use) · [Agents](#connecting-an-ai-agent) · [Safety](#safety-guard) · [Data](#your-data)
+
+</div>
+
+---
+
+## Why
+
+Two problems, one tool.
+
+**Flat task lists stop working.** Past thirty items, nothing tells you which entries belong to the
+same piece of work. Second Brain makes the project the unit: each one holds its own tasks, its own
+notes, and links to the pull requests and tickets that go with it.
+
+**Agents forget.** Every session an AI agent works out the same things again: why an approach was
+rejected, which value was wrong last time, what the gotcha was. Those findings live in a chat log
+nobody reads again. Here they go into the project as notes, and any agent can search them before it
+starts digging through a repository.
+
+Notes are deliberately not tasks. A note is something you want to remember; a task is something you
+want to finish. Collapsing the two is how trackers turn into junk drawers.
+
+---
+
+## Install
+
+Requires macOS and Node 18 or newer. Everything else is bundled.
+
+```bash
+git clone https://github.com/Ray-Hughes/second-brain.git
+cd second-brain
+npm install
+./brain
 ```
-~/va/brain/brain
-```
 
-Then press **Control+T** to show or hide it. There is no dock icon; it lives in
-the menu bar and appears centred on whichever display your pointer is on.
+Then press **Alt+Space** to show and hide the panel. There is no dock icon; it lives in the menu bar
+and opens centred on whichever display your pointer is on.
 
-Clicking away hides it, and so does Escape.
+To change the shortcut, open the panel, go to **Settings**, click the recorder and press the
+combination you want. It registers immediately and tells you if another application already owns it.
 
-To start it automatically at login: System Settings, General, Login Items, add
-`~/va/brain/brain`.
+**Start it at login:** System Settings → General → Login Items → add `second-brain/brain`.
 
-## Changing the hotkey
+### Bringing in existing tasks
 
-Control+T is also the macOS "transpose characters" binding inside text fields, so
-if that bothers you, change it. Edit `settings.json` in this folder:
+If you already track work in JSON, adapt `import.py` and run it. It matches on your existing
+identifiers, so it can be run repeatedly without creating duplicates.
+
+---
+
+## Use
+
+| Action | How |
+| --- | --- |
+| Show or hide | Your hotkey, or click the menu bar icon |
+| Add a task | Type on the Tasks tab and press Enter |
+| High priority | Start the task with `!` |
+| Link a ticket | Include a reference like `ABC-1234`; it is picked up automatically |
+| Search everything | Type in the top box, or press <kbd>Cmd</kbd>+<kbd>F</kbd> |
+| Change status | Hover a task and click **status** to cycle todo → doing → blocked → done |
+| Move between projects | Hover a task and use the **move to** menu |
+| Store a finding | The **Memory** tab, per project |
+| Undo a mistake | The **History** tab. Every change is reversible |
+| Dismiss | <kbd>Esc</kbd>, or click away |
+
+### Memory notes
+
+Each note has a kind, which is the difference between a useful store and a pile of text:
+
+- **decision** — what was chosen and, more importantly, why the alternative was not
+- **gotcha** — something that cost time once and should not cost it twice
+- **reference** — a value, path or piece of protocol that is hard to look up again
+- **contact** — who owns a thing
+- **note** — everything else
+
+Pin the ones you reread.
+
+---
+
+## Connecting an AI agent
+
+Second Brain ships an MCP server. Any agent that speaks MCP can use it, and several agents can share
+one store, because none of them talk to each other; they all talk to this.
+
+**Claude Code** — add to `~/.claude/settings.json`:
 
 ```json
-{ "hotkey": "Alt+Space" }
+{
+  "mcpServers": {
+    "brain": {
+      "command": "node",
+      "args": ["/absolute/path/to/second-brain/agent/mcp_server.js"],
+      "env": { "BRAIN_ACTOR": "claude" }
+    }
+  }
+}
 ```
 
-Restart the app afterwards. Anything Electron accepts as an accelerator works,
-for example `Command+Shift+Space`, `Alt+Space`, `Control+Shift+T`. If the
-combination is already owned by another application the app logs that it could
-not register and keeps the previous one rather than failing silently.
+**GitHub Copilot** — a `.vscode/mcp.json` is already in the repository and works as is.
 
-## What is where
+Give each agent a different `BRAIN_ACTOR`. That name appears against every change it makes, which is
+what makes the History tab readable when more than one agent is working.
 
-| File | What it does |
+### Making the agent do it unprompted
+
+Connecting the server is not enough on its own. Paste the prompt in
+[AGENTS.md](AGENTS.md) into your agent's standing instructions — `CLAUDE.md`,
+`.github/copilot-instructions.md`, or wherever yours reads from. It tells the agent to check the
+tracker at the start of a session, search stored notes before searching a repository, and record
+tasks and findings as it goes rather than waiting to be asked.
+
+### Available tools
+
+| Tool | Purpose |
 | --- | --- |
-| `schema.sql` | Tables. Applied on every open, so it is safe to re-run |
+| `list_projects` | Projects with open task counts |
+| `list_tasks` | Tasks, filtered by project or status |
+| `add_task` | Create a task |
+| `update_task` | Change status, priority, detail or project |
+| `add_note` | Store a decision, gotcha or reference |
+| `search` | Search tasks and notes |
+| `recent_activity` | What changed, and which agent changed it |
+
+### On delegation
+
+Agents coordinate through shared state, not messages. One writes a task, another sees it and picks it
+up, and both leave a trail. There is no mechanism here for one agent to command another, and the
+documentation does not pretend otherwise.
+
+---
+
+## Safety guard
+
+If you run an agent with permission prompts turned off, nothing stands between a bad command and your
+disk. `agent/guard.py` is a `PreToolUse` hook that denies destructive commands. It keeps working when
+prompts are disabled, because that is the case it exists for.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit",
+        "hooks": [{ "type": "command", "command": "python3 /absolute/path/to/second-brain/agent/guard.py" }]
+      }
+    ]
+  }
+}
+```
+
+It stops recursive deletes of root and home paths, deletes of unexpanded variables, removal of
+`.git`, `git clean` without a dry run, force pushes without `--force-with-lease`, repository deletion,
+`DROP TABLE`, `DELETE FROM` with no `WHERE`, namespace deletion, untargeted `terraform destroy`,
+piping a download into a shell, and disk-level commands. It also refuses to let a session edit the
+guard or its own hook configuration.
+
+It matches on intent rather than exact spelling, so flags written separately or with unusual spacing
+are still caught.
+
+```bash
+python3 agent/guard_test.py
+```
+
+That prints every command it blocks and every command it deliberately allows. Read it before trusting
+it. There is no override flag: if something it blocks genuinely needs doing, run it yourself in a
+terminal.
+
+---
+
+## Your data
+
+One SQLite file, `brain.db`, next to the application. Nothing is sent anywhere.
+
+```bash
+cp brain.db ~/backups/brain-$(date +%F).db
+```
+
+The database uses write-ahead logging, so either quit the application first or copy `brain.db-wal`
+alongside it.
+
+Every change is recorded with the row as it was before, which is what makes the History tab able to
+reverse any change rather than only the most recent one.
+
+---
+
+## How it is built
+
+| File | Role |
+| --- | --- |
+| `schema.sql` | Tables, applied on every open so it is safe to re-run |
 | `db.js` | All database access, main process only |
-| `main.js` | Window, tray, global hotkey, IPC handlers |
-| `preload.js` | The only bridge the interface gets to the database |
+| `main.js` | Window, tray, global shortcut, IPC |
+| `preload.js` | The only bridge the interface has to the data |
 | `app.js` | The interface |
-| `import.py` | Seeds from the old `~/va/worklog/tasks.json` |
-| `seed_memory.js` | Seeds the memory notes from recent work |
-| `brain.db` | Your data. Everything lives here |
+| `agent/mcp_server.js` | MCP server for AI agents |
+| `agent/guard.py` | Destructive command guard |
 
-## The data model
+Storage is SQLite through `node:sqlite`, which ships inside Electron. There is no native module to
+compile and nothing to rebuild when Electron updates, which is the usual reason small tools like this
+quietly stop working.
 
-**Projects** are the unit. A flat task list stops being useful past about thirty
-items because nothing tells you which of them belong to the same problem.
+---
 
-**Tasks** belong to a project and behave the way you expect: status cycles
-todo, doing, blocked, done, and completion time is derived from status rather
-than stored separately so the two cannot disagree.
+## Status
 
-**Notes** are the memory spots, kept deliberately separate from tasks. A note is
-something you want to remember, not something you want to finish. Forcing them
-into one table is how task lists turn into junk drawers. Each note has a kind:
-note, decision, gotcha, reference or contact.
+Working today: projects, tasks, memory notes, links, search, history with undo, the MCP server and
+the safety guard.
 
-**Links** are pull requests, tickets and dashboards per project.
+Being built: desktop reminders with snooze, project dashboards with linked repositories, local vector
+search over project material, an agent activity view, and a skills browser.
 
-## Using it
+## Contributing
 
-- Type in the box at the top to search tasks and notes across every project.
-  Notes go through a full text index; Cmd+F focuses the box.
-- On the Tasks tab, type and press Enter to add. Start with `!` for high
-  priority. Any `APPEALS-1234` in the text is picked up as the reference.
-- Hover a task for status, move-to-project and delete.
-- The Memory tab is per project. Titles and bodies save when you click away.
-- Pin a note with the star to keep it at the top.
+Issues and pull requests are welcome. If you add a rule to the guard, add a case to `guard_test.py`
+on both sides: one command it must block, and one nearby command it must not.
 
-## Re-importing from the old tracker
+## Licence
 
-`python3 import.py` is rerunnable. Tasks match on their old T-number, so it
-updates rather than duplicating, and anything you created in the app is left
-alone.
-
-Note that the old `~/va/worklog/task` CLI still writes to `tasks.json`, so the
-two will drift apart once you use both. Either keep using the CLI and re-import,
-or stop using it. Porting the CLI onto this database is the obvious next step and
-has not been done.
-
-## Backups
-
-Everything is one SQLite file. To back it up:
-
-```
-cp ~/va/brain/brain.db ~/Dropbox/brain-$(date +%F).db
-```
-
-The database uses write-ahead logging, so copy `brain.db-wal` alongside it if the
-app is running, or quit the app first for a clean single-file copy.
-
-## Not built yet
-
-Free-form capture outside a project, tags across projects, reminders, and syncing
-Jira status automatically. The schema has room for all of it; none of it is
-written.
+MIT

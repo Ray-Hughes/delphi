@@ -103,3 +103,35 @@ CREATE TABLE IF NOT EXISTS audit (
   undone_at   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
+
+-- Reminders.
+--
+-- An alert is a separate row rather than a flag on the task, because one task can
+-- warrant several nudges and because a fired alert has a life of its own: it can
+-- be snoozed, acted on, or dismissed without touching the task it points at.
+CREATE TABLE IF NOT EXISTS alerts (
+  id          INTEGER PRIMARY KEY,
+  task_id     INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  fire_at     TEXT NOT NULL,           -- when it should next appear
+  message     TEXT,                    -- overrides the task title if set
+  status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'fired', 'snoozed', 'done', 'dismissed')),
+  repeat_every_minutes INTEGER,        -- null for one-shot
+  snooze_count INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  fired_at    TEXT,
+  acted_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_due ON alerts(status, fire_at);
+
+-- Repositories attached to a project. One is marked primary; the rest are the
+-- helper repositories that get searched alongside it.
+CREATE TABLE IF NOT EXISTS repos (
+  id         INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  is_primary INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_repos_project ON repos(project_id);

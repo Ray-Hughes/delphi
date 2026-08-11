@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage } = require("electron");
+const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage, Notification } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const db = require("./db");
@@ -8,7 +8,15 @@ const DEFAULT_HOTKEY = "Control+T";
 
 let win = null;
 let tray = null;
-let settings = { hotkey: DEFAULT_HOTKEY };
+let settings = {
+  hotkey: DEFAULT_HOTKEY,
+  snoozeMinutes: 10,
+  // How often the scheduler looks for due reminders. A minute is frequent enough
+  // for reminders measured in minutes and cheap enough to ignore.
+  checkIntervalSeconds: 60,
+  autoRemindBeforeDueHours: 24,
+};
+let schedulerTimer = null;
 
 function loadSettings() {
   let existing = null;
@@ -153,11 +161,74 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
   registerHotkey(settings.hotkey);
+  startScheduler();
 
   // A dock icon would make this feel like an application to manage. It is meant
   // to behave like a panel that is either there or not.
   if (app.dock) app.dock.hide();
 });
+
+// ---------------------------------------------------------------------------
+// Reminders
+// ---------------------------------------------------------------------------
+
+function showAlert(alert) {
+  const title = alert.project_name ? `${alert.project_name}` : "Reminder";
+  const body = alert.message || alert.task_title;
+
+  const notification = new Notification({
+    title,
+    body,
+    // Buttons rather than a text reply, so snoozing is one click.
+    actions: [{ type: "button", text: "Snooze" }],
+    closeButtonText: "Dismiss",
+    silent: false,
+  });
+
+  // Clicking the body takes you to the task and closes the reminder. Acting on it
+  // does not complete the task: opening something is not finishing it.
+  notification.on("click", () => {
+    db.actOnAlert(alert.id);
+    show();
+    if (win) win.webContents.send("focus-task", { taskId: alert.task_id, projectId: alert.project_id });
+  });
+
+  notification.on("action", () => {
+    db.snoozeAlert(alert.id, settings.snoozeMinutes);
+    if (win) win.webContents.send("alerts-changed");
+  });
+
+  notification.on("close", () => {
+    // Closing without acting leaves a one-shot alert finished, so it does not
+    // reappear on the next sweep and nag.
+    const current = db.listAlerts().find((a) => a.id === alert.id);
+    if (current && current.status === "fired" && !current.repeat_every_minutes) {
+      db.updateAlert(alert.id, { status: "dismissed" });
+      if (win) win.webContents.send("alerts-changed");
+    }
+  });
+
+  notification.show();
+  db.markFired(alert.id);
+  if (win) win.webContents.send("alerts-changed");
+}
+
+function sweep() {
+  try {
+    for (const alert of db.dueAlerts()) showAlert(alert);
+  } catch (error) {
+    // A failing sweep must not take the app down; it runs every minute forever.
+    console.error("reminder sweep failed", error);
+  }
+}
+
+function startScheduler() {
+  if (schedulerTimer) clearInterval(schedulerTimer);
+  schedulerTimer = setInterval(sweep, Math.max(15, settings.checkIntervalSeconds) * 1000);
+  // Sweep shortly after launch so anything that came due while the app was closed
+  // appears rather than waiting for the first interval.
+  setTimeout(sweep, 3000);
+}
 
 app.on("window-all-closed", (e) => e.preventDefault());
 app.on("will-quit", () => globalShortcut.unregisterAll());
@@ -197,6 +268,18 @@ handle("links:list", (projectId) => db.listLinks(projectId));
 handle("links:create", (payload) => db.createLink(payload));
 handle("links:delete", (id) => db.deleteLink(id));
 
+handle("alerts:list", (opts) => db.listAlerts(opts));
+handle("alerts:create", (payload) => db.createAlert(payload));
+handle("alerts:update", (id, fields) => db.updateAlert(id, fields));
+handle("alerts:delete", (id) => db.deleteAlert(id));
+handle("alerts:snooze", (id) => db.snoozeAlert(id, settings.snoozeMinutes));
+handle("alerts:act", (id) => db.actOnAlert(id));
+
+handle("repos:list", (projectId) => db.listRepos(projectId));
+handle("repos:create", (payload) => db.createRepo(payload));
+handle("repos:setPrimary", (id) => db.setPrimaryRepo(id));
+handle("repos:delete", (id) => db.deleteRepo(id));
+
 handle("audit:list", (limit) => db.listAudit(limit));
 handle("audit:undo", (id) => db.undo(id));
 handle("audit:undoLast", (n) => db.undoLast(n));
@@ -205,6 +288,20 @@ handle("search", (q) => db.search(q));
 handle("stats", () => db.stats());
 
 handle("settings:get", () => settings);
+handle("settings:set", (fields) => {
+  const numeric = ["snoozeMinutes", "checkIntervalSeconds", "autoRemindBeforeDueHours"];
+  for (const key of numeric) {
+    if (fields[key] !== undefined) {
+      const value = Number(fields[key]);
+      if (!Number.isFinite(value) || value <= 0) throw new Error(`${key} must be a positive number`);
+      settings[key] = value;
+    }
+  }
+  saveSettings();
+  if (fields.checkIntervalSeconds !== undefined) startScheduler();
+  return settings;
+});
+
 handle("settings:setHotkey", (accelerator) => {
   const previous = settings.hotkey;
   if (!registerHotkey(accelerator)) {

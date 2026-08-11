@@ -587,6 +587,42 @@ async function renderSettings(root) {
   block.append(rec);
   root.append(block);
 
+  // --- reminder behaviour ---
+  const rem = el("div", { className: "setting-block" });
+  rem.append(el("h3", { textContent: "Reminders" }));
+  rem.append(el("p", {
+    textContent:
+      "How long Snooze puts a reminder off for, and how often the app checks for " +
+      "reminders that have come due.",
+  }));
+
+  const numberField = (label, key, suffix) => {
+    const row = el("div", { className: "row", style: "margin-bottom:8px" });
+    row.append(el("span", { textContent: label, style: "flex:0 0 190px" }));
+    const input = el("input", {
+      type: "number", min: "1", value: String(settings[key] ?? ""),
+      style: "width:90px; padding:5px 8px; border-radius:7px; border:1px solid var(--line); background:var(--panel); outline:none",
+    });
+    const note = el("span", { className: "hint" });
+    input.onchange = async () => {
+      try {
+        const updated = await window.brain.settings.set({ [key]: Number(input.value) });
+        settings[key] = updated[key];
+        note.className = "ok-msg";
+        note.textContent = "saved";
+      } catch (e) {
+        note.className = "err-msg";
+        note.textContent = e.message;
+      }
+    };
+    row.append(input, el("span", { className: "hint", textContent: suffix }), note);
+    return row;
+  };
+
+  rem.append(numberField("Snooze for", "snoozeMinutes", "minutes"));
+  rem.append(numberField("Check for due reminders every", "checkIntervalSeconds", "seconds"));
+  root.append(rem);
+
   // --- mouse buttons ---
   const mouse = el("div", { className: "setting-block" });
   mouse.append(el("h3", { textContent: "Using a mouse button" }));

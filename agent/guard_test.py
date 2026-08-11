@@ -19,6 +19,11 @@ MUST_BLOCK = [
 ]
 
 MUST_ALLOW = [
+  # Compound commands. A flag belonging to one command must not be read as
+  # belonging to another; this is what the segment split exists for.
+  "pkill -9 -f electron; sleep 2; git push -q origin main",
+  "npm run build && git push origin main",
+  "ps aux | grep -f patterns.txt",
   "rm -rf node_modules", "rm -rf build/", "rm -rf /tmp/scratch",
   "git push origin feature/APPEALS-120085",
   "git push --force-with-lease origin my-branch",

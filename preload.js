@@ -32,6 +32,20 @@ contextBridge.exposeInMainWorld("brain", {
     create: (payload) => call("links:create", payload),
     remove: (id) => call("links:delete", id),
   },
+  alerts: {
+    list: (opts) => call("alerts:list", opts),
+    create: (payload) => call("alerts:create", payload),
+    update: (id, fields) => call("alerts:update", id, fields),
+    remove: (id) => call("alerts:delete", id),
+    snooze: (id) => call("alerts:snooze", id),
+    act: (id) => call("alerts:act", id),
+  },
+  repos: {
+    list: (projectId) => call("repos:list", projectId),
+    create: (payload) => call("repos:create", payload),
+    setPrimary: (id) => call("repos:setPrimary", id),
+    remove: (id) => call("repos:delete", id),
+  },
   audit: {
     list: (limit) => call("audit:list", limit),
     undo: (id) => call("audit:undo", id),
@@ -41,9 +55,12 @@ contextBridge.exposeInMainWorld("brain", {
   stats: () => call("stats"),
   settings: {
     get: () => call("settings:get"),
+    set: (fields) => call("settings:set", fields),
     setHotkey: (accelerator) => call("settings:setHotkey", accelerator),
   },
   hide: () => ipcRenderer.send("hide"),
   openExternal: (url) => ipcRenderer.send("open-external", url),
   onShown: (fn) => ipcRenderer.on("shown", fn),
+  onAlertsChanged: (fn) => ipcRenderer.on("alerts-changed", fn),
+  onFocusTask: (fn) => ipcRenderer.on("focus-task", (_e, payload) => fn(payload)),
 });
