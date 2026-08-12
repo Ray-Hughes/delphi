@@ -27,6 +27,7 @@ let settings = {
 };
 let schedulerTimer = null;
 let vaultTimer = null;
+let lastSeenDbChange = 0;
 
 // The vault is a mirror, so it is rebuilt after changes rather than kept in step
 // edit by edit. Debounced because typing in a note fires an update per blur and
@@ -289,9 +290,38 @@ function sweep() {
   }
 }
 
+// The vault export and the graph rebuild are triggered by this app's own write
+// handlers, so anything written directly to the database is invisible to both. An
+// agent writing through the MCP server is exactly that case: the note is stored,
+// but it never reaches the markdown mirror and the Oracle cannot find it, which
+// defeats the point of letting agents record what they learn.
+//
+// Watching the file covers every external writer rather than only the one we know
+// about, and costs a stat call a minute.
+function checkForExternalWrites() {
+  try {
+    const stat = fs.statSync(db.DB_PATH);
+    const changed = stat.mtimeMs;
+    if (lastSeenDbChange === 0) {
+      lastSeenDbChange = changed;
+      return;
+    }
+    if (changed > lastSeenDbChange) {
+      lastSeenDbChange = changed;
+      scheduleVaultExport();
+      if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
+    }
+  } catch (error) {
+    console.error("could not check the database for external writes", error);
+  }
+}
+
 function startScheduler() {
   if (schedulerTimer) clearInterval(schedulerTimer);
-  schedulerTimer = setInterval(sweep, Math.max(15, settings.checkIntervalSeconds) * 1000);
+  schedulerTimer = setInterval(() => {
+    sweep();
+    checkForExternalWrites();
+  }, Math.max(15, settings.checkIntervalSeconds) * 1000);
   // Sweep shortly after launch so anything that came due while the app was closed
   // appears rather than waiting for the first interval.
   setTimeout(sweep, 3000);
