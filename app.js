@@ -508,15 +508,24 @@ async function renderWhatsNew(root) {
       body.append(meta);
       row.append(body);
 
-      // Clicking goes to the project it belongs to, on the tab that holds it.
+      // The whole row is the target rather than a button at the end: the row is
+      // what someone is already looking at, and a button makes them travel to the
+      // edge to act on it. Keyboard users get the same target, which a hover-only
+      // affordance would not give them.
       if (item.project_id) {
-        const open = el("button", { className: "btn sm", textContent: "open" });
-        open.onclick = () => {
+        row.classList.add("clickable");
+        row.tabIndex = 0;
+        row.setAttribute("role", "link");
+        row.title = `Open in ${item.project_name}`;
+        const go = () => {
           state.projectId = item.project_id;
           state.view = item.item_type === "note" ? "notes" : "tasks";
           refresh();
         };
-        row.append(open);
+        row.onclick = go;
+        row.onkeydown = (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
+        };
       }
       list.append(row);
     }

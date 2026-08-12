@@ -360,6 +360,21 @@
   .list-row:last-child { border-bottom: 0; }
   .list-row:hover { background: var(--raised); }
 
+  /* A row that acts like a link should look like one before it is hovered, not
+     only during. The left edge carries the cue at rest so the whole list reads as
+     navigable, and firms up on hover rather than appearing from nothing. */
+  .list-row.clickable {
+    cursor: default;
+    box-shadow: inset 2px 0 0 var(--line);
+    transition: box-shadow 100ms ease, background 100ms ease;
+  }
+  .list-row.clickable:hover,
+  .list-row.clickable:focus-visible {
+    background: var(--raised);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .list-row.clickable:active { background: var(--panel-hi); }
+
   /* Settings ------------------------------------------------------------- */
   .setting { padding: var(--s5) 0; border-bottom: 1px solid var(--line-soft); max-width: 70ch; }
   .setting:first-child { padding-top: 0; }
