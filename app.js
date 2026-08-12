@@ -3,7 +3,7 @@
 const state = {
   projects: [],
   projectId: null,     // null means the All view
-  view: "tasks",       // overview | tasks | notes | links | history | settings
+  view: "new",         // new | overview | tasks | notes | links | history | settings
   showDone: false,
   query: "",
   tasks: [],
@@ -119,7 +119,7 @@ function projectRow(p) {
   const go = () => {
     state.projectId = p.id;
     // Landing on a project shows its dashboard; All has no dashboard to show.
-    state.view = p.id ? "overview" : "tasks";
+    state.view = p.id ? "overview" : "new";
     state.query = "";
     $("search").value = "";
     refresh();
@@ -138,7 +138,8 @@ function renderTabs() {
     : state.projectId
     ? [["overview", "Overview"], ["tasks", "Tasks", state.tasks.length],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length]]
-    : [["tasks", "Tasks", state.tasks.length], ["history", "History"], ["settings", "Settings"]];
+    : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
+       ["history", "History"], ["settings", "Settings"]];
 
   for (const [key, label, count] of tabs) {
     const tab = el("div", { className: "tab" + (state.view === key ? " active" : ""), tabIndex: 0, role: "tab" });
@@ -173,7 +174,7 @@ function render() {
     ? ["oracle", "tasks"]
     : state.projectId
     ? ["overview", "tasks", "notes", "links"]
-    : ["tasks", "history", "settings"];
+    : ["new", "tasks", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
   renderMetrics();
@@ -444,6 +445,86 @@ async function renderOverview(root) {
 // ---------------------------------------------------------------------------
 // Tasks
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// What's new
+// ---------------------------------------------------------------------------
+
+async function renderWhatsNew(root) {
+  const items = await window.delphi.recent(10);
+
+  if (!items.length) {
+    root.append(emptyState("Nothing yet", "Tasks and notes will appear here as they are added."));
+    return;
+  }
+
+  // Grouped by day rather than listed flat: "what changed today" is the question
+  // being asked, and a bare list of timestamps makes that harder to see, not easier.
+  const groups = new Map();
+  for (const item of items) {
+    const day = dayLabel(item.updated_at);
+    if (!groups.has(day)) groups.set(day, []);
+    groups.get(day).push(item);
+  }
+
+  for (const [day, group] of groups) {
+    root.append(el("div", { className: "side-label", textContent: day }));
+    const list = el("section", { className: "card" });
+
+    for (const item of group) {
+      const row = el("div", { className: "list-row" });
+
+      row.append(el("span", {
+        className: item.item_type === "note" ? `kind ${item.kind || "note"}` : "kind",
+        textContent: item.item_type === "note" ? (item.kind || "note") : "task",
+      }));
+
+      const body = el("div", { className: "grow" });
+      body.append(el("div", { textContent: item.title }));
+
+      const meta = el("div", { className: "t-meta" });
+      if (item.project_name) {
+        const chip = el("span", { className: "chip", textContent: item.project_name });
+        if (item.project_colour) chip.style.color = item.project_colour;
+        meta.append(chip);
+      }
+      if (item.status && item.status !== "todo") {
+        meta.append(el("span", { className: `chip ${item.status === "blocked" ? "blocked" : "doing"}`, textContent: item.status }));
+      }
+      if (item.priority === "high") meta.append(el("span", { className: "chip high", textContent: "high" }));
+      if (item.ref) meta.append(el("span", { className: "chip ref", textContent: item.ref }));
+      // Created and edited read differently, so say which this is.
+      meta.append(el("span", { className: "hint",
+        textContent: `${item.created_at === item.updated_at ? "added" : "edited"} ${ago(item.updated_at)}` }));
+      body.append(meta);
+      row.append(body);
+
+      // Clicking goes to the project it belongs to, on the tab that holds it.
+      if (item.project_id) {
+        const open = el("button", { className: "btn sm", textContent: "open" });
+        open.onclick = () => {
+          state.projectId = item.project_id;
+          state.view = item.item_type === "note" ? "notes" : "tasks";
+          refresh();
+        };
+        row.append(open);
+      }
+      list.append(row);
+    }
+    root.append(list);
+  }
+}
+
+/** Today and Yesterday read faster than a date when scanning recent activity. */
+function dayLabel(iso) {
+  if (!iso) return "Earlier";
+  const day = String(iso).slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  if (day === today) return "Today";
+  if (day === yesterday) return "Yesterday";
+  return day;
+}
 
 // ---------------------------------------------------------------------------
 // The Oracle
@@ -976,7 +1057,7 @@ $("search").addEventListener("input", (e) => {
   searchTimer = setTimeout(() => {
     state.query = v.trim();
     if (state.query) state.view = "oracle";
-    else state.view = state.projectId ? "overview" : "tasks";
+    else state.view = state.projectId ? "overview" : "new";
     refresh();
   }, 140);
 });
@@ -1001,7 +1082,7 @@ document.addEventListener("keydown", (e) => {
     if ($("search").value) {
       $("search").value = "";
       state.query = "";
-      state.view = state.projectId ? "overview" : "tasks";
+      state.view = state.projectId ? "overview" : "new";
       refresh();
       return;
     }

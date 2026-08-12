@@ -457,6 +457,30 @@ function deleteRepo(id) {
   run("DELETE FROM repos WHERE id = :id", { id });
 }
 
+// The most recently touched things, whatever kind they are.
+//
+// Tasks and notes are unioned so the list reads as "what has happened lately"
+// rather than making someone check two places. Ordered by when a row was last
+// touched rather than created, because editing a note is news too, and an item
+// created and then revised should appear once, at its latest position.
+function recentItems(limit = 10) {
+  return all(`
+    SELECT * FROM (
+      SELECT 'task' AS item_type, t.id, t.title, t.status, t.priority, t.ref,
+             NULL AS kind, t.created_at, t.updated_at,
+             p.name AS project_name, p.colour AS project_colour, p.id AS project_id
+      FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+      UNION ALL
+      SELECT 'note' AS item_type, n.id, n.title, NULL, NULL, NULL,
+             n.kind, n.created_at, n.updated_at,
+             p.name, p.colour, p.id
+      FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+    )
+    ORDER BY updated_at DESC, id DESC
+    LIMIT :limit
+  `, { limit });
+}
+
 function stats() {
   return one(`
     SELECT
@@ -479,6 +503,7 @@ module.exports = {
   listLinks, createLink, deleteLink,
   search, stats,
   listAudit, undo, undoLast,
+  recentItems,
   dueAlerts, listAlerts, createAlert, updateAlert, deleteAlert,
   markFired, snoozeAlert, actOnAlert,
   listRepos, createRepo, setPrimaryRepo, deleteRepo,

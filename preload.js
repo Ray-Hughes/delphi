@@ -63,6 +63,7 @@ contextBridge.exposeInMainWorld("delphi", {
     undo: (id) => call("audit:undo", id),
     undoLast: (n) => call("audit:undoLast", n),
   },
+  recent: (limit) => call("recent", limit),
   search: (q) => call("search", q),
   stats: () => call("stats"),
   settings: {

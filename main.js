@@ -397,6 +397,7 @@ handle("repos:create", (payload) => db.createRepo(payload));
 handle("repos:setPrimary", (id) => db.setPrimaryRepo(id));
 handle("repos:delete", (id) => db.deleteRepo(id));
 
+handle("recent", (limit) => db.recentItems(limit));
 handle("audit:list", (limit) => db.listAudit(limit));
 handle("audit:undo", (id) => db.undo(id));
 handle("audit:undoLast", (n) => db.undoLast(n));
