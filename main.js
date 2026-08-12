@@ -336,9 +336,13 @@ app.on("will-quit", () => globalShortcut.unregisterAll());
 // ---------------------------------------------------------------------------
 
 const handle = (channel, fn) =>
-  ipcMain.handle(channel, (_event, ...args) => {
+  // Async, and the result awaited, because several handlers are. Returning
+  // { data: <pending promise> } cannot be sent across the boundary, so those
+  // handlers silently produced nothing: the Oracle reported that it had no
+  // results rather than that it had never run.
+  ipcMain.handle(channel, async (_event, ...args) => {
     try {
-      return { ok: true, data: fn(...args) };
+      return { ok: true, data: await fn(...args) };
     } catch (error) {
       // Returning the message rather than throwing keeps the renderer able to
       // show what went wrong instead of a rejected promise with no detail.

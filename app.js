@@ -17,6 +17,7 @@ const state = {
   history: [],
   oracleHits: [],
   oracleEntities: [],
+  oracleError: null,
   provider: null,
 };
 
@@ -64,14 +65,18 @@ async function refresh() {
     // Meaning-based ranking and the graph, in parallel with the literal match, so
     // the Oracle tab is ready rather than loading when it is opened.
     try {
+      state.oracleError = null;
       state.provider = await window.delphi.oracle.provider();
       state.oracleHits = await window.delphi.oracle.nearest(state.query, { limit: 10 });
       const ctx = await window.delphi.oracle.context(state.query.split(/\s+/)[0]);
       state.oracleEntities = ctx ? ctx.related : [];
-    } catch {
-      // The Oracle is an enhancement; losing it must not lose plain search.
+    } catch (error) {
+      // The Oracle is an enhancement, so plain search must survive losing it.
+      // The reason is kept rather than discarded: "nothing matched" and "the
+      // Oracle never ran" look identical on screen otherwise.
       state.oracleHits = [];
       state.oracleEntities = [];
+      state.oracleError = String(error.message || error);
     }
   } else {
     state.allTasks = await window.delphi.tasks.list({
@@ -602,6 +607,11 @@ function renderOracle(root) {
     }));
   }
   root.append(bar);
+
+  if (state.oracleError) {
+    root.append(emptyState("The Oracle could not answer", state.oracleError));
+    return;
+  }
 
   if (!state.oracleHits.length) {
     root.append(emptyState("The Oracle has nothing for that",

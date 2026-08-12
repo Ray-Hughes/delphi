@@ -91,13 +91,23 @@
     background: var(--surface);
   }
   .search { -webkit-app-region: no-drag; flex: 1; max-width: 520px; position: relative; }
+  /* The field sat a shade darker than the bar it lives in, with a hairline
+     border, so on a dark ground it read as empty space rather than as somewhere
+     to type. It now carries a visible edge at rest and a ring on focus. */
   .search input {
-    width: 100%; padding: 7px 12px 7px 32px;
-    border-radius: var(--r-sm); border: 1px solid var(--line);
+    width: 100%; padding: 8px 12px 8px 32px;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--ink-faint);
     background: var(--bg); color: var(--ink); outline: none;
-    transition: border-color 120ms ease, background 120ms ease;
+    transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
   }
-  .search input:focus { border-color: var(--accent); background: var(--surface); }
+  .search input::placeholder { color: var(--ink-faint); }
+  .search input:hover { border-color: var(--ink-dim); }
+  .search input:focus {
+    border-color: var(--accent);
+    background: var(--surface);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
   .search::before {
     content: "⌕"; position: absolute; left: 11px; top: 50%; transform: translateY(-52%);
     color: var(--ink-faint); font-size: 15px; pointer-events: none;
