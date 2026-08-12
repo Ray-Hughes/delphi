@@ -183,6 +183,8 @@ function render() {
   const content = $("content");
   content.textContent = "";
   const view = ({
+    new: renderWhatsNew,
+    oracle: renderOracle,
     overview: renderOverview,
     tasks: renderTasks,
     notes: renderNotes,
@@ -194,6 +196,13 @@ function render() {
   // Several views are async. Without this, a throw inside one leaves an empty
   // pane and an unhandled rejection nobody sees, which looks like the feature was
   // never built rather than like a bug.
+  if (typeof view !== "function") {
+    // A view listed in the tabs but missing from the table above. Say which,
+    // rather than reporting that some anonymous value is not a function.
+    showViewError(content, new Error(`No renderer is registered for the "${state.view}" view`));
+    return;
+  }
+
   try {
     const result = view(content);
     if (result && typeof result.then === "function") {
