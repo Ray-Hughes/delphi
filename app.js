@@ -802,6 +802,15 @@ function noteCard(n) {
   kind.onchange = async () => { await window.delphi.notes.update(n.id, { kind: kind.value }); refresh(); };
   head.append(kind);
 
+  const expand = el("button", { className: "icon-btn", title: "Full view (Command + Enter while editing)" });
+  expand.setAttribute("aria-label", "Open full view");
+  expand.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
+  expand.onclick = () => openNoteSheet(n);
+  head.append(expand);
+
   const del = el("button", { className: "btn sm", textContent: "×", title: "Delete" });
   del.onclick = async () => { await window.delphi.notes.remove(n.id); refresh(); };
   head.append(del);
@@ -816,8 +825,89 @@ function noteCard(n) {
   body.onblur = async () => {
     if (body.value !== n.body) { await window.delphi.notes.update(n.id, { body: body.value }); n.body = body.value; }
   };
+  // The moment you want more room is while typing in too little of it.
+  body.onkeydown = (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      n.body = body.value;
+      openNoteSheet(n);
+    }
+  };
   wrap.append(el("div", { className: "note-body" }, body));
   return wrap;
+}
+
+// ---------------------------------------------------------------------------
+// Full view
+// ---------------------------------------------------------------------------
+
+let openSheet = null;
+
+/**
+ * Opens one note at full size.
+ *
+ * Saves on close rather than on every keystroke: this is a place to write at
+ * length, and a write per character would fight the vault rebuild that follows
+ * each change.
+ */
+function openNoteSheet(note) {
+  if (openSheet) closeNoteSheet();
+
+  const overlay = el("div", { className: "overlay" });
+  const sheet = el("div", { className: "sheet", role: "dialog" });
+  sheet.setAttribute("aria-modal", "true");
+
+  const head = el("div", { className: "sheet-head" });
+  const title = el("input", { value: note.title });
+  head.append(el("span", { className: `kind ${note.kind || "note"}`, textContent: note.kind || "note" }), title);
+
+  const status = el("span", { className: "hint" });
+  const close = el("button", { className: "icon-btn", title: "Close (Escape)" });
+  close.setAttribute("aria-label", "Close full view");
+  close.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" ' +
+    'stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+  head.append(status, close);
+
+  const area = el("textarea", { value: note.body || "", spellcheck: false });
+  area.placeholder = "What is worth remembering here";
+
+  const foot = el("div", { className: "sheet-foot" });
+  const counts = () => {
+    const text = area.value;
+    const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+    foot.textContent = `${text.split("\n").length} lines, ${words} words   ·   Escape closes and saves`;
+  };
+  counts();
+  area.oninput = counts;
+
+  sheet.append(head, el("div", { className: "sheet-body" }, area), foot);
+  overlay.append(sheet);
+  // Clicking the backdrop closes, but a click inside must not bubble out to it.
+  overlay.onclick = (e) => { if (e.target === overlay) closeNoteSheet(); };
+  close.onclick = () => closeNoteSheet();
+  document.body.append(overlay);
+
+  openSheet = { overlay, note, title, area, status };
+  area.focus();
+  area.setSelectionRange(area.value.length, area.value.length);
+}
+
+async function closeNoteSheet() {
+  if (!openSheet) return;
+  const { overlay, note, title, area } = openSheet;
+  openSheet = null;
+
+  const updates = {};
+  if (title.value.trim() && title.value !== note.title) updates.title = title.value.trim();
+  if (area.value !== (note.body || "")) updates.body = area.value;
+
+  overlay.remove();
+
+  if (Object.keys(updates).length) {
+    await window.delphi.notes.update(note.id, updates);
+    refresh();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,6 +1233,14 @@ window.addEventListener("mouseup", (e) => {
 });
 
 document.addEventListener("keydown", (e) => {
+  // While the sheet is open it owns the keyboard apart from Escape. Navigating
+  // behind it would leave it orphaned over a page it does not belong to, and
+  // lose whatever was being written.
+  if (openSheet && e.key !== "Escape") {
+    if ((e.metaKey || e.ctrlKey) && ["[", "ArrowLeft", "f"].includes(e.key)) e.preventDefault();
+    return;
+  }
+
   // The shortcuts macOS already uses for Back, so there is nothing new to learn.
   if ((e.metaKey || e.ctrlKey) && (e.key === "[" || e.key === "ArrowLeft")) {
     e.preventDefault();
@@ -1151,6 +1249,9 @@ document.addEventListener("keydown", (e) => {
   }
 
   if (e.key === "Escape") {
+    // The sheet is the innermost thing open, so it closes first. Without this,
+    // Escape would hide the whole window and lose unsaved edits.
+    if (openSheet) { closeNoteSheet(); return; }
     if ($("search").value) {
       $("search").value = "";
       state.query = "";

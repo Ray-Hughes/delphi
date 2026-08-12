@@ -362,6 +362,60 @@
   .kind.gotcha   { color: var(--warn); background: transparent; border: 1px solid var(--warn); }
   .kind.reference{ color: var(--good); background: transparent; border: 1px solid var(--good); }
 
+  /* Expanded note ---------------------------------------------------------
+     A note that is mostly commands is unreadable in a box six lines tall. This
+     is the same note, given the room the content actually needs. */
+  .overlay {
+    position: fixed; inset: 0; z-index: 50;
+    background: color-mix(in srgb, var(--bg) 78%, black);
+    display: grid; place-items: center; padding: var(--s6);
+    animation: fade 120ms ease;
+  }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  .sheet {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r-lg); box-shadow: var(--shadow);
+    width: min(1100px, 100%); height: min(860px, 100%);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .sheet-head {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: var(--s4) var(--s5); border-bottom: 1px solid var(--line-soft);
+  }
+  .sheet-head input {
+    flex: 1; font-size: 17px; font-weight: 600;
+    border: 1px solid transparent; background: transparent;
+    padding: 6px 8px; border-radius: var(--r-sm); outline: none; min-width: 0;
+  }
+  .sheet-head input:hover { border-color: var(--line); }
+  .sheet-head input:focus { border-color: var(--accent); background: var(--bg); }
+  .sheet-body { flex: 1; padding: var(--s5); min-height: 0; display: flex; }
+  .sheet-body textarea {
+    flex: 1; resize: none; outline: none;
+    border: 1px solid var(--line); border-radius: var(--r);
+    background: var(--bg); padding: var(--s4) var(--s5);
+    font-size: 14px; line-height: 1.7;
+    /* Notes here carry commands and paths as often as prose, and proportional
+       type makes indentation and alignment unreadable. */
+    font-family: var(--mono);
+    tab-size: 2;
+  }
+  .sheet-body textarea:focus { border-color: var(--accent); }
+  .sheet-foot {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: var(--s3) var(--s5); border-top: 1px solid var(--line-soft);
+    color: var(--ink-faint); font-size: 11.5px;
+  }
+  .icon-btn {
+    flex: 0 0 auto; width: 28px; height: 28px; padding: 0;
+    display: grid; place-items: center;
+    border-radius: 7px; border: 1px solid var(--line);
+    background: var(--surface); color: var(--ink-dim); cursor: default;
+    transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+  }
+  .icon-btn:hover { background: var(--raised); color: var(--ink); border-color: var(--ink-faint); }
+  .icon-btn svg { width: 14px; height: 14px; }
+
   /* Lists ---------------------------------------------------------------- */
   .row { display: flex; gap: var(--s2); align-items: center; }
   .grow { flex: 1; min-width: 0; }
