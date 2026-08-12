@@ -11,6 +11,10 @@ const state = {
   links: [],
   repos: [],
   allTasks: [],
+  // Where we have been, so Back can return. Holds the whole position rather than
+  // just the project, because returning to the right project on the wrong tab is
+  // not returning.
+  history: [],
   oracleHits: [],
   oracleEntities: [],
   provider: null,
@@ -96,6 +100,41 @@ const currentProject = () => state.projects.find((p) => p.id === state.projectId
 // Chrome
 // ---------------------------------------------------------------------------
 
+/** Current position, as the thing Back restores. */
+const position = () => ({ projectId: state.projectId, view: state.view, query: state.query });
+
+const samePosition = (a, b) =>
+  a.projectId === b.projectId && a.view === b.view && a.query === b.query;
+
+/**
+ * Moves to a new position, remembering the old one.
+ *
+ * Repeats are not pushed, so holding Back does not walk through a run of
+ * identical entries, and the depth is capped because this is a panel, not a
+ * browser: nobody needs to unwind fifty steps.
+ */
+function navigate(next) {
+  const from = position();
+  Object.assign(state, next);
+  const to = position();
+  if (samePosition(from, to)) return;
+
+  state.history.push(from);
+  if (state.history.length > 50) state.history.shift();
+  refresh();
+}
+
+function goBack() {
+  const previous = state.history.pop();
+  if (!previous) return false;
+  state.projectId = previous.projectId;
+  state.view = previous.view;
+  state.query = previous.query;
+  $("search").value = previous.query || "";
+  refresh();
+  return true;
+}
+
 function renderSidebar() {
   const box = $("projects");
   box.textContent = "";
@@ -117,12 +156,9 @@ function projectRow(p) {
   if (p.open_count) row.append(el("span", { className: "count", textContent: String(p.open_count) }));
 
   const go = () => {
-    state.projectId = p.id;
-    // Landing on a project shows its dashboard; All has no dashboard to show.
-    state.view = p.id ? "overview" : "new";
-    state.query = "";
     $("search").value = "";
-    refresh();
+    // Landing on a project shows its dashboard; All has no dashboard to show.
+    navigate({ projectId: p.id, view: p.id ? "overview" : "new", query: "" });
   };
   row.onclick = go;
   row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
@@ -145,7 +181,7 @@ function renderTabs() {
     const tab = el("div", { className: "tab" + (state.view === key ? " active" : ""), tabIndex: 0, role: "tab" });
     tab.append(label);
     if (count) tab.append(el("span", { className: "n", textContent: String(count) }));
-    const go = () => { state.view = key; render(); };
+    const go = () => navigate({ view: key });
     tab.onclick = go;
     tab.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
     box.append(tab);
@@ -176,6 +212,10 @@ function render() {
     ? ["overview", "tasks", "notes", "links"]
     : ["new", "tasks", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
+
+  // Hidden rather than disabled when there is nowhere to go: a button that is
+  // always present but usually dead trains people to stop looking at it.
+  $("back").hidden = state.history.length === 0;
 
   renderMetrics();
   renderTabs();
@@ -314,7 +354,7 @@ async function renderOverview(root) {
     if (more > 0) {
       const link = el("div", { className: "list-row" },
         el("a", { href: "#", className: "grow", textContent: `Show all ${open.length} open tasks` }));
-      link.onclick = (e) => { e.preventDefault(); state.view = "tasks"; render(); };
+      link.onclick = (e) => { e.preventDefault(); navigate({ view: "tasks" }); };
       nextCard.card.append(link);
     }
   }
@@ -332,7 +372,7 @@ async function renderOverview(root) {
       const row = el("div", { className: "list-row" });
       row.append(el("span", { className: `kind ${n.kind}`, textContent: n.kind }));
       const link = el("a", { href: "#", className: "grow", textContent: n.title });
-      link.onclick = (e) => { e.preventDefault(); state.view = "notes"; render(); };
+      link.onclick = (e) => { e.preventDefault(); navigate({ view: "notes" }); };
       row.append(link);
       if (n.pinned) row.append(el("span", { className: "hint", textContent: "pinned" }));
       flush.append(row);
@@ -517,11 +557,10 @@ async function renderWhatsNew(root) {
         row.tabIndex = 0;
         row.setAttribute("role", "link");
         row.title = `Open in ${item.project_name}`;
-        const go = () => {
-          state.projectId = item.project_id;
-          state.view = item.item_type === "note" ? "notes" : "tasks";
-          refresh();
-        };
+        const go = () => navigate({
+          projectId: item.project_id,
+          view: item.item_type === "note" ? "notes" : "tasks",
+        });
         row.onclick = go;
         row.onkeydown = (e) => {
           if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
@@ -606,7 +645,7 @@ function renderOracle(root) {
         el("b", { textContent: e.name }),
         el("span", { className: "c", textContent: String(Math.round(e.weight)) }));
       chip.title = `${e.kind}, appears alongside this in ${Math.round(e.weight)} places`;
-      chip.onclick = () => { $("search").value = e.name; state.query = e.name; refresh(); };
+      chip.onclick = () => { $("search").value = e.name; navigate({ query: e.name, view: "oracle" }); };
       cloud.append(chip);
     }
     root.append(cloud);
@@ -1095,7 +1134,22 @@ $("new-project").onclick = async () => {
   refresh();
 };
 
+$("back").onclick = () => goBack();
+
+// The side buttons on a mouse, which people expect to mean back and forward.
+// Bound on mouseup because Chromium fires auxclick inconsistently for these.
+window.addEventListener("mouseup", (e) => {
+  if (e.button === 3) { e.preventDefault(); goBack(); }
+});
+
 document.addEventListener("keydown", (e) => {
+  // The shortcuts macOS already uses for Back, so there is nothing new to learn.
+  if ((e.metaKey || e.ctrlKey) && (e.key === "[" || e.key === "ArrowLeft")) {
+    e.preventDefault();
+    goBack();
+    return;
+  }
+
   if (e.key === "Escape") {
     if ($("search").value) {
       $("search").value = "";
