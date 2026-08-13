@@ -39,8 +39,12 @@
     --shadow: 0 1px 2px rgba(16, 20, 28, 0.05), 0 4px 16px rgba(16, 20, 28, 0.06);
   }
 
+  /* The dark set is declared once and applied from two places: when the system
+     asks for dark and the user has not overridden it, and when the user has
+     chosen dark outright. Following the system stays the default, so an
+     untouched install behaves exactly as it did before the setting existed. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg:        #0f1217;
       --surface:   #171b23;
       --raised:    #1f242f;
@@ -59,6 +63,26 @@
 
       --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     }
+  }
+
+  :root[data-theme="dark"] {
+    --bg:        #0f1217;
+    --surface:   #171b23;
+    --raised:    #1f242f;
+    --line:      #2a3040;
+    --line-soft: #222836;
+
+    --ink:       #e6e9ef;
+    --ink-dim:   #98a1b2;
+    --ink-faint: #6a7385;
+
+    --accent:      #7c9bff;
+    --accent-soft: #1e2740;
+    --good:      #4fb477;
+    --warn:      #e0a458;
+    --crit:      #e2685f;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   }
 
   * { box-sizing: border-box; }
@@ -290,6 +314,95 @@
   .stat.warn .v { color: var(--warn); }
   .stat.crit .v { color: var(--crit); }
   .stat.good .v { color: var(--good); }
+
+  /* A tile that filters the task list has to look like it does something before
+     it is hovered, or nobody discovers it. The arrow carries that at rest and
+     the whole tile lifts on hover. A tile leading nowhere -- a count of zero --
+     keeps the flat treatment rather than promising a view with nothing in it. */
+  .stat.act {
+    cursor: default; position: relative;
+    text-align: left; width: 100%; font: inherit; color: inherit;
+    transition: border-color 100ms ease, background 100ms ease, transform 100ms ease;
+  }
+  .stat.act::after {
+    content: "→"; position: absolute; top: var(--s3); right: var(--s3);
+    color: var(--ink-faint); font-size: 12px; opacity: 0.55;
+    transition: opacity 100ms ease, transform 100ms ease, color 100ms ease;
+  }
+  .stat.act:hover, .stat.act:focus-visible {
+    background: var(--raised); border-color: var(--ink-faint); transform: translateY(-1px);
+  }
+  .stat.act:hover::after, .stat.act:focus-visible::after {
+    opacity: 1; color: var(--accent); transform: translateX(2px);
+  }
+  .stat.act:active { transform: translateY(0); }
+
+  /* Segmented control ------------------------------------------------------
+     Used where a setting has three or fewer states and seeing the alternatives
+     matters as much as seeing the current one. */
+  .seg { display: inline-flex; padding: 3px; gap: 2px; background: var(--raised); border-radius: var(--r-sm); border: 1px solid var(--line-soft); }
+  .seg button {
+    background: transparent; border: 1px solid transparent; color: var(--ink-dim);
+    padding: 5px 12px; border-radius: 5px; cursor: default;
+    transition: background 100ms ease, color 100ms ease;
+  }
+  .seg button:hover { color: var(--ink); }
+  .seg button[aria-pressed="true"] {
+    background: var(--surface); color: var(--ink); font-weight: 600;
+    border-color: var(--line); box-shadow: 0 1px 2px rgba(16, 20, 28, 0.06);
+  }
+
+  /* Active filter, shown so a filtered list never looks like an empty one. */
+  .filter-note { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s3); color: var(--ink-dim); }
+
+  /* Rendered markdown ------------------------------------------------------
+     Memory notes are written as markdown by agents and read by people. These
+     are deliberately tight: the note is the content, so headings do not need
+     display sizes. */
+  .md { line-height: 1.65; overflow-wrap: anywhere; }
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md h1, .md h2, .md h3 { margin: var(--s5) 0 var(--s2); font-weight: 650; letter-spacing: -0.01em; line-height: 1.3; }
+  .md h1 { font-size: 17px; }
+  .md h2 { font-size: 15px; }
+  .md h3 { font-size: 13.5px; color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 11.5px; }
+  .md p { margin: 0 0 var(--s3); }
+  .md ul, .md ol { margin: 0 0 var(--s3); padding-left: var(--s5); }
+  .md li { margin-bottom: 5px; }
+  .md code {
+    font-family: var(--mono); font-size: 12px;
+    background: var(--raised); padding: 1.5px 5px; border-radius: 4px;
+  }
+  .md pre {
+    background: var(--raised); border: 1px solid var(--line-soft); border-radius: var(--r);
+    padding: var(--s3) var(--s4); overflow-x: auto; margin: 0 0 var(--s3);
+  }
+  .md pre code { background: none; padding: 0; font-size: 12px; line-height: 1.6; }
+  .md blockquote {
+    margin: 0 0 var(--s3); padding: 2px 0 2px var(--s4);
+    border-left: 2px solid var(--line); color: var(--ink-dim);
+  }
+  .md hr { border: 0; border-top: 1px solid var(--line-soft); margin: var(--s5) 0; }
+  /* Notes lean on tables heavily, and a wide one must scroll inside the note
+     rather than stretching the pane it lives in. */
+  .md .table-wrap { overflow-x: auto; margin: 0 0 var(--s3); }
+  .md table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  .md th, .md td { border: 1px solid var(--line-soft); padding: 6px 10px; text-align: left; vertical-align: top; }
+  .md th { background: var(--raised); font-weight: 600; white-space: nowrap; }
+  .md strong { font-weight: 650; }
+
+  /* The rendered pane inside the full-size sheet gets the same frame the
+     textarea has, so toggling does not move the content. */
+  .sheet-body .md {
+    flex: 1; overflow-y: auto;
+    border: 1px solid var(--line); border-radius: var(--r);
+    background: var(--bg); padding: var(--s4) var(--s5);
+  }
+  .note-body .md {
+    border: 1px solid var(--line); border-radius: var(--r-sm);
+    background: var(--bg); padding: var(--s3) var(--s4);
+    max-height: 460px; overflow-y: auto;
+  }
 
   .cols { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: var(--s5); align-items: start; }
   @media (max-width: 940px) { .cols { grid-template-columns: 1fr; } }

@@ -24,6 +24,12 @@ let settings = {
   // for reminders measured in minutes and cheap enough to ignore.
   checkIntervalSeconds: 60,
   autoRemindBeforeDueHours: 24,
+  // Follow the system unless told otherwise, which is how the window behaved
+  // before the setting existed.
+  theme: "system",
+  // Memory notes are markdown written by agents and read by people, so reading
+  // is the default and the source is a switch away.
+  noteView: "formatted",
 };
 let schedulerTimer = null;
 let vaultTimer = null;
@@ -420,6 +426,20 @@ handle("settings:set", (fields) => {
       return settings;
     }
   }
+  // Presentation preferences. Validated against their allowed values rather
+  // than stored as given, so a bad write cannot leave the renderer applying an
+  // attribute no stylesheet answers to.
+  const choices = {
+    theme: ["system", "light", "dark"],
+    noteView: ["formatted", "raw"],
+  };
+  for (const [key, allowed] of Object.entries(choices)) {
+    if (fields[key] !== undefined) {
+      if (!allowed.includes(fields[key])) throw new Error(`${key} must be one of ${allowed.join(", ")}`);
+      settings[key] = fields[key];
+    }
+  }
+
   const numeric = ["snoozeMinutes", "checkIntervalSeconds", "autoRemindBeforeDueHours"];
   for (const key of numeric) {
     if (fields[key] !== undefined) {

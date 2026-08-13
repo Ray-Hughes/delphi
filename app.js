@@ -5,6 +5,12 @@ const state = {
   projectId: null,     // null means the All view
   view: "new",         // new | overview | tasks | notes | links | history | settings
   showDone: false,
+  // Set by the dashboard tiles, so a tile is a way into the list rather than a
+  // number you then have to go and find yourself. Cleared whenever the list is
+  // reached by any other route.
+  taskFilter: null,    // null | doing | blocked | overdue | done
+  theme: "system",     // system | light | dark
+  noteView: "formatted", // formatted | raw
   query: "",
   tasks: [],
   notes: [],
@@ -34,6 +40,163 @@ const el = (tag, props = {}, ...kids) => {
 const today = () => new Date().toISOString().slice(0, 10);
 const isOverdue = (t) => t.due && t.status !== "done" && t.due < today();
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+// ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+/**
+ * Applies a theme choice.
+ *
+ * "system" removes the attribute rather than resolving the preference here, so
+ * the media query stays in charge and the window follows the system if it
+ * changes while open. The other two pin it.
+ */
+function applyTheme(theme) {
+  const choice = ["light", "dark"].includes(theme) ? theme : "system";
+  state.theme = choice;
+  if (choice === "system") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", choice);
+}
+
+// ---------------------------------------------------------------------------
+// Markdown
+// ---------------------------------------------------------------------------
+
+/**
+ * Renders the markdown subset the notes actually contain.
+ *
+ * Agents write these notes, and they write headings, tables, fenced code,
+ * lists and links. Nothing here is a general markdown implementation; it is
+ * the smallest thing that renders our own notes faithfully.
+ *
+ * Everything is built as DOM nodes rather than assembled into innerHTML. The
+ * content is our own, but a renderer that pastes strings into the document is
+ * one imported note away from being an injection point, and the page runs with
+ * a strict CSP precisely so that cannot happen.
+ */
+function inlineMarkdown(text) {
+  const out = [];
+  // Emphasis may not be flanked by spaces, so arithmetic and shell globs in a
+  // note ("2 * 3 * 4") are left alone rather than silently italicised.
+  const pattern = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*(?!\s)[^*\n]*?(?<!\s)\*)|(\[[^\]]+\]\([^)\s]+\))/g;
+  let last = 0;
+  let match;
+  while ((match = pattern.exec(text))) {
+    if (match.index > last) out.push(document.createTextNode(text.slice(last, match.index)));
+    const token = match[0];
+    if (token.startsWith("`")) {
+      out.push(el("code", { textContent: token.slice(1, -1) }));
+    } else if (token.startsWith("**")) {
+      out.push(el("strong", { textContent: token.slice(2, -2) }));
+    } else if (token.startsWith("*")) {
+      out.push(el("em", { textContent: token.slice(1, -1) }));
+    } else {
+      const split = token.indexOf("](");
+      const href = token.slice(split + 2, -1);
+      const link = el("a", { textContent: token.slice(1, split), href: "#", title: href });
+      // Only http(s) leaves the app, and it leaves through the main process
+      // rather than navigating this window.
+      link.onclick = (e) => {
+        e.preventDefault();
+        if (/^https?:\/\//i.test(href)) window.delphi.openExternal(href);
+      };
+      out.push(link);
+    }
+    last = pattern.lastIndex;
+  }
+  if (last < text.length) out.push(document.createTextNode(text.slice(last)));
+  return out;
+}
+
+const isTableSeparator = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes("-");
+const splitRow = (line) => line.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((c) => c.trim());
+
+function renderMarkdown(source) {
+  const root = el("div", { className: "md" });
+  const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (!line.trim()) { i += 1; continue; }
+
+    // Fenced code. An unterminated fence runs to the end rather than throwing
+    // away the rest of the note.
+    const fence = line.match(/^\s*```(\w*)\s*$/);
+    if (fence) {
+      const body = [];
+      i += 1;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { body.push(lines[i]); i += 1; }
+      i += 1;
+      root.append(el("pre", {}, el("code", { textContent: body.join("\n") })));
+      continue;
+    }
+
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { root.append(el("hr")); i += 1; continue; }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      const level = Math.min(heading[1].length, 3);
+      root.append(el(`h${level}`, {}, inlineMarkdown(heading[2].trim())));
+      i += 1;
+      continue;
+    }
+
+    // Table: a pipe row followed by a dash rule.
+    if (line.includes("|") && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      const table = el("table");
+      const head = el("tr");
+      splitRow(line).forEach((cell) => head.append(el("th", {}, inlineMarkdown(cell))));
+      table.append(el("thead", {}, head));
+      const tbody = el("tbody");
+      i += 2;
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+        const tr = el("tr");
+        splitRow(lines[i]).forEach((cell) => tr.append(el("td", {}, inlineMarkdown(cell))));
+        tbody.append(tr);
+        i += 1;
+      }
+      table.append(tbody);
+      root.append(el("div", { className: "table-wrap" }, table));
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const body = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { body.push(lines[i].replace(/^\s*>\s?/, "")); i += 1; }
+      root.append(el("blockquote", {}, ...inlineMarkdown(body.join(" "))));
+      continue;
+    }
+
+    const bullet = /^\s*[-*+]\s+/;
+    const numbered = /^\s*\d+[.)]\s+/;
+    if (bullet.test(line) || numbered.test(line)) {
+      const ordered = numbered.test(line);
+      const marker = ordered ? numbered : bullet;
+      const list = el(ordered ? "ol" : "ul");
+      while (i < lines.length && marker.test(lines[i])) {
+        list.append(el("li", {}, inlineMarkdown(lines[i].replace(marker, ""))));
+        i += 1;
+      }
+      root.append(list);
+      continue;
+    }
+
+    // Paragraph: runs until a blank line or the start of another block.
+    const para = [];
+    while (
+      i < lines.length && lines[i].trim() &&
+      !/^\s*(#{1,6}\s|>|```)/.test(lines[i]) &&
+      !bullet.test(lines[i]) && !numbered.test(lines[i]) &&
+      !/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])
+    ) { para.push(lines[i].trim()); i += 1; }
+    if (para.length) root.append(el("p", {}, ...inlineMarkdown(para.join(" "))));
+  }
+
+  return root;
+}
 
 /** "3 days ago" reads faster than a timestamp when scanning activity. */
 function ago(iso) {
@@ -120,12 +283,35 @@ const samePosition = (a, b) =>
  */
 function navigate(next) {
   const from = position();
+  // A filter belongs to the trip that set it. Any other move into the task list,
+  // or out of it, drops the filter rather than leaving a list quietly narrowed.
+  if (next.view !== undefined) state.taskFilter = null;
   Object.assign(state, next);
   const to = position();
   if (samePosition(from, to)) return;
 
   state.history.push(from);
   if (state.history.length > 50) state.history.shift();
+  refresh();
+}
+
+/**
+ * Opens the task list narrowed to one slice of it.
+ *
+ * Done is the exception that needs showDone turned on, since the list hides
+ * finished work by default and a Done tile that led to an empty list would
+ * look broken.
+ */
+function showTasks(filter) {
+  const already = state.view === "tasks";
+  if (filter === "done") state.showDone = true;
+  if (already) {
+    state.taskFilter = filter;
+    refresh();
+    return;
+  }
+  navigate({ view: "tasks" });
+  state.taskFilter = filter;
   refresh();
 }
 
@@ -324,17 +510,36 @@ async function renderOverview(root) {
 
   // Summary first: what needs attention before what merely exists.
   const stats = el("div", { className: "stats" });
-  const stat = (value, label, tone) =>
-    el("div", { className: "stat" + (tone ? ` ${tone}` : "") },
+
+  /**
+   * One tile. Given a destination it becomes a button; given none, or a count
+   * of zero, it stays the flat card it was. Promising a view and then showing
+   * an empty one is worse than not offering the link.
+   */
+  const stat = (value, label, tone, go) => {
+    const live = typeof go === "function" && value > 0;
+    const node = el(live ? "button" : "div", {
+      className: "stat" + (tone ? ` ${tone}` : "") + (live ? " act" : ""),
+    });
+    node.append(
       el("div", { className: "v", textContent: String(value) }),
-      el("div", { className: "k", textContent: label }));
+      el("div", { className: "k", textContent: label })
+    );
+    if (live) {
+      node.type = "button";
+      node.title = `Show ${label.toLowerCase()}`;
+      node.onclick = go;
+    }
+    return node;
+  };
+
   stats.append(
-    stat(open.length, "Open"),
-    stat(doing, "In progress", doing ? "good" : null),
-    stat(blocked, "Blocked", blocked ? "warn" : null),
-    stat(overdue, "Overdue", overdue ? "crit" : null),
-    stat(state.notes.length, "Memory"),
-    stat(done, "Done")
+    stat(open.length, "Open", null, () => showTasks(null)),
+    stat(doing, "In progress", doing ? "good" : null, () => showTasks("doing")),
+    stat(blocked, "Blocked", blocked ? "warn" : null, () => showTasks("blocked")),
+    stat(overdue, "Overdue", overdue ? "crit" : null, () => showTasks("overdue")),
+    stat(state.notes.length, "Memory", null, () => navigate({ view: "notes" })),
+    stat(done, "Done", null, () => showTasks("done"))
   );
   root.append(stats);
 
@@ -680,15 +885,34 @@ function renderTasks(root) {
     root.append(el("div", { className: "add-row" }, input, toggle));
   }
 
-  if (!state.tasks.length) {
+  // Applied here rather than in refresh so the tab count keeps reporting the
+  // whole list, and clearing the filter is a render away rather than a reload.
+  const filters = {
+    doing: [(t) => t.status === "doing", "in progress"],
+    blocked: [(t) => t.status === "blocked", "blocked"],
+    overdue: [isOverdue, "overdue"],
+    done: [(t) => t.status === "done", "done"],
+  };
+  const active = filters[state.taskFilter];
+  const shown = active ? state.tasks.filter(active[0]) : state.tasks;
+
+  if (active) {
+    const clear = el("button", { className: "btn sm", textContent: "Clear filter" });
+    clear.onclick = () => { state.taskFilter = null; refresh(); };
+    root.append(el("div", { className: "filter-note" },
+      el("span", { textContent: `Showing ${plural(shown.length, "task", "tasks")} ${active[1]}` }),
+      clear));
+  }
+
+  if (!shown.length) {
     root.append(emptyState(
-      state.query ? "Nothing matched" : "No open tasks",
-      state.query ? "Try a different word." : "Add one above."));
+      state.query ? "Nothing matched" : active ? `Nothing ${active[1]}` : "No open tasks",
+      state.query ? "Try a different word." : active ? "Clear the filter to see the rest." : "Add one above."));
     return;
   }
 
   const list = el("section", { className: "card" });
-  state.tasks.forEach((t) => list.append(taskRow(t)));
+  shown.forEach((t) => list.append(taskRow(t)));
   root.append(list);
 
   if (state.query && state.notes.length) {
@@ -779,7 +1003,9 @@ function renderNotes(root) {
     title.value = "";
     refresh();
   };
-  root.append(el("div", { className: "add-row" }, title));
+  // The toggle sits beside the composer so it governs the whole list, which is
+  // how it is used: you are either reading the notes or editing them.
+  root.append(el("div", { className: "add-row" }, title, noteViewToggle()));
 
   if (!state.notes.length) {
     root.append(emptyState("Nothing stored yet",
@@ -787,6 +1013,30 @@ function renderNotes(root) {
     return;
   }
   state.notes.forEach((n) => root.append(noteCard(n)));
+}
+
+/**
+ * Switches memory between rendered markdown and the source.
+ *
+ * Notes are written as markdown by agents and read as prose by people, so both
+ * are first-class: formatted to read, raw to edit. The choice is remembered
+ * because it tracks what you are doing that session, not which note you are on.
+ */
+function noteViewToggle() {
+  const seg = el("div", { className: "seg", role: "group" });
+  seg.setAttribute("aria-label", "Memory display");
+  for (const [value, label] of [["formatted", "Formatted"], ["raw", "Raw markdown"]]) {
+    const button = el("button", { type: "button", textContent: label });
+    button.setAttribute("aria-pressed", String(state.noteView === value));
+    button.onclick = async () => {
+      if (state.noteView === value) return;
+      state.noteView = value;
+      try { await window.delphi.settings.set({ noteView: value }); } catch {}
+      refresh();
+    };
+    seg.append(button);
+  }
+  return seg;
 }
 
 function noteCard(n) {
@@ -825,6 +1075,19 @@ function noteCard(n) {
   del.onclick = async () => { await window.delphi.notes.remove(n.id); refresh(); };
   head.append(del);
   wrap.append(head);
+
+  if (state.noteView === "formatted") {
+    // Read mode. Double click drops into the source at the note you are looking
+    // at, so switching to edit does not mean changing a global setting first.
+    const rendered = renderMarkdown(n.body);
+    rendered.title = "Double click to edit the markdown";
+    rendered.ondblclick = () => { state.noteView = "raw"; refresh(); };
+    wrap.append(el("div", { className: "note-body" },
+      (n.body || "").trim()
+        ? rendered
+        : el("div", { className: "hint", textContent: "Empty. Switch to raw markdown to write something." })));
+    return wrap;
+  }
 
   const body = el("textarea", {
     className: "field",
@@ -877,10 +1140,35 @@ function openNoteSheet(note) {
   close.innerHTML =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" ' +
     'stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>';
-  head.append(status, close);
-
   const area = el("textarea", { value: note.body || "", spellcheck: false });
   area.placeholder = "What is worth remembering here";
+
+  const pane = el("div", { className: "sheet-body" });
+
+  // Rendering reads from the textarea rather than from the note, so switching
+  // to formatted shows what you have just typed and not what was last saved.
+  const paint = () => {
+    pane.textContent = "";
+    pane.append(state.noteView === "formatted" ? renderMarkdown(area.value) : area);
+    if (state.noteView === "raw") area.focus();
+  };
+
+  const seg = el("div", { className: "seg", role: "group" });
+  seg.setAttribute("aria-label", "Display");
+  for (const [value, label] of [["formatted", "Formatted"], ["raw", "Raw"]]) {
+    const button = el("button", { type: "button", textContent: label });
+    button.setAttribute("aria-pressed", String(state.noteView === value));
+    button.onclick = async () => {
+      if (state.noteView === value) return;
+      state.noteView = value;
+      for (const b of seg.children) b.setAttribute("aria-pressed", String(b.textContent.toLowerCase().startsWith(value)));
+      try { await window.delphi.settings.set({ noteView: value }); } catch {}
+      paint();
+    };
+    seg.append(button);
+  }
+
+  head.append(seg, status, close);
 
   const foot = el("div", { className: "sheet-foot" });
   const counts = () => {
@@ -891,7 +1179,8 @@ function openNoteSheet(note) {
   counts();
   area.oninput = counts;
 
-  sheet.append(head, el("div", { className: "sheet-body" }, area), foot);
+  paint();
+  sheet.append(head, pane, foot);
   overlay.append(sheet);
   // Clicking the backdrop closes, but a click inside must not bubble out to it.
   overlay.onclick = (e) => { if (e.target === overlay) closeNoteSheet(); };
@@ -899,8 +1188,12 @@ function openNoteSheet(note) {
   document.body.append(overlay);
 
   openSheet = { overlay, note, title, area, status };
-  area.focus();
-  area.setSelectionRange(area.value.length, area.value.length);
+  // Only the source pane can take a caret. In formatted mode the textarea is
+  // detached, and focusing a node that is not in the document does nothing.
+  if (state.noteView === "raw") {
+    area.focus();
+    area.setSelectionRange(area.value.length, area.value.length);
+  }
 }
 
 async function closeNoteSheet() {
@@ -1038,6 +1331,31 @@ const partLabel = (p) =>
 
 async function renderSettings(root) {
   const settings = await window.delphi.settings.get();
+
+  // --- appearance ----------------------------------------------------------
+  const appearance = el("div", { className: "setting" });
+  appearance.append(el("h3", { textContent: "Appearance" }));
+  appearance.append(el("p", {
+    textContent: "System follows whatever the Mac is set to and changes with it. Light and dark pin the window regardless.",
+  }));
+
+  const themes = el("div", { className: "seg", role: "group" });
+  themes.setAttribute("aria-label", "Theme");
+  for (const [value, label] of [["system", "System"], ["light", "Light"], ["dark", "Dark"]]) {
+    const button = el("button", { type: "button", textContent: label });
+    button.setAttribute("aria-pressed", String(state.theme === value));
+    button.onclick = async () => {
+      // Applied before the write so the window changes on the click rather than
+      // after a round trip, and left applied if the write fails: the setting
+      // not persisting is a smaller problem than the button looking dead.
+      applyTheme(value);
+      for (const b of themes.children) b.setAttribute("aria-pressed", String(b.textContent.toLowerCase() === value));
+      try { await window.delphi.settings.set({ theme: value }); } catch {}
+    };
+    themes.append(button);
+  }
+  appearance.append(themes);
+  root.append(appearance);
 
   // --- shortcut ------------------------------------------------------------
   const shortcut = el("div", { className: "setting" });
@@ -1291,4 +1609,22 @@ window.delphi.onFocusTask(({ projectId }) => {
   refresh();
 });
 
-refresh();
+/**
+ * Reads the stored preferences before the first paint.
+ *
+ * The theme is applied here rather than inside render so the window never shows
+ * one theme and then swaps to the other. A failure is survivable: the defaults
+ * are the behaviour the app had before these settings existed.
+ */
+async function boot() {
+  try {
+    const settings = await window.delphi.settings.get();
+    applyTheme(settings.theme);
+    if (["formatted", "raw"].includes(settings.noteView)) state.noteView = settings.noteView;
+  } catch {
+    applyTheme("system");
+  }
+  refresh();
+}
+
+boot();
