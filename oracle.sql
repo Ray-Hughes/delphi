@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS entities (
   id          INTEGER PRIMARY KEY,
   kind        TEXT NOT NULL
                 CHECK (kind IN ('ticket', 'pr', 'repo', 'service', 'file', 'person', 'env', 'concept')),
-  name        TEXT NOT NULL,          -- canonical form, e.g. APPEALS-128303
+  name        TEXT NOT NULL,          -- canonical form, e.g. PROJ-1234
   display     TEXT,                   -- what to show if different from the name
   summary     TEXT,                   -- filled in as things are learned about it
   mentions    INTEGER NOT NULL DEFAULT 0,
@@ -34,7 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(kind);
 -- An edge from a stored row to an entity, or between two entities.
 --
 -- source_type is the table the edge starts at, so a single table covers "this
--- note mentions APPEALS-128303" and "this ticket blocks that ticket" without a
+-- note mentions PROJ-1234" and "this ticket blocks that ticket" without a
 -- join table per pair.
 CREATE TABLE IF NOT EXISTS edges (
   id          INTEGER PRIMARY KEY,

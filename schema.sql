@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   owner        TEXT,
   due          TEXT,
   source       TEXT,
-  ref          TEXT,                       -- APPEALS-123, PR number, whatever
+  ref          TEXT,                       -- PROJ-123, PR number, whatever
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT

@@ -25,7 +25,7 @@ MUST_ALLOW = [
   "npm run build && git push origin main",
   "ps aux | grep -f patterns.txt",
   "rm -rf node_modules", "rm -rf build/", "rm -rf /tmp/scratch",
-  "git push origin feature/APPEALS-120085",
+  "git push origin feature/PROJ-1234",
   "git push --force-with-lease origin my-branch",
   "git clean -n", "git status", "npm install", "bundle exec rspec",
   "sqlite3 delphi.db 'DELETE FROM audit WHERE label = \"x\"'",
