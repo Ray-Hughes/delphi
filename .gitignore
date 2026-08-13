@@ -11,5 +11,11 @@ brain.db
 brain.db-wal
 brain.db-shm
 
+# Personal seeding scripts. These carry real note content from the work they were
+# written to load, and that content is already in the database, so they are kept
+# on disk but never committed. Anyone else starts from an empty tracker.
+seed_memory.js
+import.py
+
 settings.json
 vault/

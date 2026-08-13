@@ -148,11 +148,6 @@ Add the Desktop launcher as a login item: **System Settings**, then **General**,
 then **Login Items**, then **+**, and choose **Delphi** on your Desktop. It then
 starts each time you log in, hidden, waiting for your hotkey.
 
-### Bringing in existing tasks
-
-If you already track work in JSON, adapt `import.py` and run it. It matches on your existing
-identifiers, so it can be run repeatedly without creating duplicates.
-
 ---
 
 ## Use

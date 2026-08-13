@@ -289,7 +289,7 @@ const TOOLS = {
     schema: {
       type: "object",
       required: ["name"],
-      properties: { name: { type: "string", description: "e.g. truststore, MPI, APPEALS-128303, Veteran API" } },
+      properties: { name: { type: "string", description: "e.g. deploy pipeline, auth service, PROJ-1234, billing API" } },
     },
     run: (a) => {
       const like = `%${a.name}%`;
