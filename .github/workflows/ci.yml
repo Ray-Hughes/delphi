@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  guard:
+    name: Safety guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The guard is the one component where a regression is dangerous rather
+      # than inconvenient, so it is tested on both sides: every command it must
+      # block, and every nearby command it must not.
+      - name: Run the guard test suite
+        run: python3 agent/guard_test.py
+
+  syntax:
+    name: Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Catches the class of error that otherwise only appears when a user
+      # double-clicks the Desktop icon and nothing happens.
+      - name: Shell scripts
+        run: |
+          for f in install/*.sh oracle-launcher; do
+            [ -f "$f" ] && bash -n "$f" && echo "ok  $f"
+          done
+
+      - name: JavaScript
+        run: |
+          for f in main.js preload.js db.js app.js oracle.js embeddings.js vault.js agent/mcp_server.js; do
+            [ -f "$f" ] && node --check "$f" && echo "ok  $f"
+          done
+
+      - name: JSON
+        run: |
+          for f in package.json .vscode/mcp.json; do
+            [ -f "$f" ] && python3 -m json.tool "$f" > /dev/null && echo "ok  $f"
+          done
+
+      # The database holds work content rather than code. It reached a public
+      # repository once because .gitignore still named the file by its old
+      # name, so this is checked rather than trusted.
+      - name: No database committed
+        run: |
+          if git ls-files | grep -E '\.db(-wal|-shm)?$'; then
+            echo "A database file is tracked. Remove it with: git rm --cached <file>"
+            exit 1
+          fi
+          echo "ok  no database tracked"

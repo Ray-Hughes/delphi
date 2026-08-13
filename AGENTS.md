@@ -4,8 +4,7 @@ Delphi is a small MCP server over a SQLite file. Any agent that speaks MCP can r
 and write it, so two agents working on the same codebase share one memory instead of
 each keeping its own. Neither agent talks to the other. They both talk to this.
 
-For how to work on delphi itself, see `CLAUDE.md`. For what we have already learned
-and decided, see `MEMORY.md`.
+For how to work on delphi itself, see `CLAUDE.md`.
 
 ## Tools
 

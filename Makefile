@@ -27,7 +27,7 @@ bold  := \033[1m
 off   := \033[0m
 
 .PHONY: help start stop restart status app app-stop app-restart model model-stop \
-        reindex rebuild logs applogs modellogs doctor install backup
+        reindex rebuild logs applogs modellogs doctor install backup setup desktop mcp
 
 help: ## Show this help
 	@echo ""
@@ -165,8 +165,14 @@ doctor: ## Check everything is wired up correctly
 	@printf "  %-26s" "MCP registered"; claude mcp list 2>/dev/null | grep -q delphi && echo "yes" || echo "no, run: make mcp"
 	@echo ""
 
-mcp: ## Register the Oracle with Claude Code
-	@claude mcp remove delphi 2>/dev/null || true
-	@claude mcp remove brain 2>/dev/null || true
-	@claude mcp add delphi --scope user -e DELPHI_ACTOR=claude -- "$(NODE)" "$(APP_DIR)/agent/mcp_server.js"
-	@echo "  registered. Restart Claude Code to pick it up."
+mcp: ## Connect the Oracle to Claude Code and Copilot
+	@bash "$(APP_DIR)/install/mcp.sh"
+
+desktop: ## Put a Delphi icon on the Desktop
+	@bash "$(APP_DIR)/install/desktop.sh"
+
+setup: install mcp desktop ## First run: dependencies, agents and Desktop icon
+	@echo ""
+	@echo -e "  $(green)ready$(off). Start it with: $(bold)make start$(off)"
+	@echo -e "  $(dim)Restart your editor so it picks up the MCP server.$(off)"
+	@echo ""

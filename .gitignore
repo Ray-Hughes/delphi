@@ -1,6 +1,15 @@
 node_modules/
+
+# The database is personal work content, not code. It was tracked here as
+# brain.db once, that name stopped matching the file after the rename to
+# delphi.db, and a populated database reached this public repository as a
+# result. Both names are listed so an older clone is covered too.
+delphi.db
+delphi.db-wal
+delphi.db-shm
 brain.db
 brain.db-wal
 brain.db-shm
+
 settings.json
 vault/
