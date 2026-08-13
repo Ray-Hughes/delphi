@@ -116,11 +116,39 @@ function normalise(v) {
 
 // --- embedding --------------------------------------------------------------
 
+// The model's limit is tokens, not characters, and a note dense with tables or
+// code reaches it far sooner than prose does. 8000 characters overflowed
+// nomic-embed-text on a real note; 6000 sits comfortably inside it for both
+// kinds of text. Anything that still overflows is caught below rather than
+// being allowed to take the whole reindex down with it.
+const NEURAL_CHAR_LIMIT = 6000;
+
 async function embed(text) {
   const p = await provider();
   if (p.neural) {
-    const r = await post(`${OLLAMA}/api/embeddings`, { model: MODEL, prompt: String(text).slice(0, 8000) });
-    return { vector: normalise(Float32Array.from(r.embedding)), model: p.name, dims: r.embedding.length };
+    try {
+      const r = await post(`${OLLAMA}/api/embeddings`, {
+        model: MODEL,
+        prompt: String(text).slice(0, NEURAL_CHAR_LIMIT),
+      });
+      // Ollama reports a refusal as {error} on an otherwise successful response,
+      // so a missing embedding is the ordinary shape of failure here rather than
+      // a thrown one. Without this check the Float32Array conversion below is
+      // what fails, several frames from the actual cause.
+      if (!r || !r.embedding) throw new Error(r && r.error ? r.error : "no embedding returned");
+      return { vector: normalise(Float32Array.from(r.embedding)), model: p.name, dims: r.embedding.length };
+    } catch (error) {
+      // A single input the model will not accept must not stop everything after
+      // it from being indexed, which is what happened before: one oversized note
+      // aborted the entire reindex and left semantic search silently stale.
+      //
+      // The fallback is stored under the lexical model rather than the neural
+      // one, because nearest() filters on model name. That keeps the row out of
+      // neural results instead of mixing two incomparable vector spaces, and it
+      // is still reachable by text search.
+      console.error(`neural embedding failed, falling back to lexical: ${error.message}`);
+      return { vector: lexicalVector(text), model: "lexical", dims: LEXICAL_DIMS, degraded: true };
+    }
   }
   return { vector: lexicalVector(text), model: p.name, dims: LEXICAL_DIMS };
 }
@@ -164,6 +192,9 @@ async function reindex(db, { force = false } = {}) {
 
   let embedded = 0;
   let skipped = 0;
+  // Counted rather than only logged, so a store quietly losing rows from
+  // semantic search is visible to the caller instead of buried in stderr.
+  let degradedCount = 0;
 
   for (const [kind, rows] of sources) {
     for (const row of rows) {
@@ -178,7 +209,8 @@ async function reindex(db, { force = false } = {}) {
         continue;
       }
 
-      const { vector, model, dims } = await embed(text);
+      const { vector, model, dims, degraded } = await embed(text);
+      if (degraded) degradedCount++;
       db.prepare(
         `INSERT INTO embeddings (source_type, source_id, model, dims, vector, content_hash)
          VALUES (:k, :id, :model, :dims, :vector, :hash)
@@ -198,7 +230,7 @@ async function reindex(db, { force = false } = {}) {
       (source_type = 'entity' AND source_id NOT IN (SELECT id FROM entities))
   `).run();
 
-  return { provider: p.name, neural: p.neural, embedded, skipped, pruned: pruned.changes };
+  return { provider: p.name, neural: p.neural, embedded, skipped, degraded: degradedCount, pruned: pruned.changes };
 }
 
 /**
