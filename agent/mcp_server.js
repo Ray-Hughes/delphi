@@ -118,6 +118,42 @@ const TOOLS = {
            FROM projects p WHERE p.status != 'archived' ORDER BY p.sort_order`),
   },
 
+  add_project: {
+    description:
+      "Create a project. Use this when work does not belong to any existing project rather than filing it under General, so its tasks and notes have a home. Call list_projects first to check one does not already exist.",
+    schema: {
+      type: "object",
+      required: ["key", "name"],
+      properties: {
+        key: { type: "string", description: "Short slug, e.g. co-hearing-address" },
+        name: { type: "string" },
+        summary: { type: "string", description: "One line: what this project is" },
+        colour: { type: "string", description: "Accent for the sidebar dot, e.g. #4A90D9" },
+      },
+    },
+    run: (a) => {
+      // The slug is the one column with a uniqueness constraint, so it is
+      // normalised here rather than trusting the caller to pass a clean one.
+      const key = String(a.key).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      if (!key) throw new Error("key must contain at least one alphanumeric character");
+
+      const clash = sql("SELECT id, key, name FROM projects WHERE key = :p1", [key])[0];
+      if (clash) throw new Error(`Project ${clash.id} already uses key '${key}' (${clash.name})`);
+
+      // Sit above General, which is pinned at 99 as the catch-all. New projects
+      // slot in behind the last real one so the sidebar keeps its order.
+      const below = sql("SELECT COALESCE(MAX(sort_order), 0) + 10 AS next FROM projects WHERE sort_order < 99")[0];
+      sql(
+        `INSERT INTO projects (key, name, summary, colour, sort_order)
+         VALUES (:p1, :p2, :p3, :p4, :p5)`,
+        [key, a.name, a.summary ?? null, a.colour ?? null, below.next]
+      );
+      const row = sql("SELECT id, key, name, summary, status, sort_order FROM projects WHERE key = :p1", [key])[0];
+      audit("create", "project", row.id, "created", row.name);
+      return row;
+    },
+  },
+
   list_tasks: {
     description:
       "List tasks. Omit project_id for every project. Done tasks are excluded unless include_done is true.",
