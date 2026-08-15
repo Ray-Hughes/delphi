@@ -841,17 +841,40 @@ make start</code></pre>
     alt.append(link);
   }
 
-  // Version and size, if GitHub answers. The page is complete without this, so a
-  // rate limited or offline visitor loses a line of text rather than the download.
+  /**
+   * Confirms a release actually exists before offering a file from it.
+   *
+   * /releases/latest/download/ is a permanent address only once something has
+   * been published there. Before that, and for as long as a release sits in
+   * draft, every one of these buttons is a 404, which reads as a broken site
+   * rather than as a project between releases. So the buttons are pointed at the
+   * releases page instead, and say so.
+   *
+   * A rate limited or offline visitor is treated as the good case: the links are
+   * left alone, because they almost certainly work and a working download matters
+   * more than an accurate byline.
+   */
   fetch("https://api.github.com/repos/Ray-Hughes/delphi/releases/latest")
-    .then((r) => (r.ok ? r.json() : Promise.reject()))
+    .then((r) => {
+      if (r.status === 404) throw new Error("none published");
+      return r.ok ? r.json() : Promise.reject(new Error("unavailable"));
+    })
     .then((release) => {
       const asset = chosen && release.assets.find((a) => a.name === BUILDS[chosen].file);
       const size = asset ? " and " + (asset.size / 1048576).toFixed(0) + " MB" : "";
       document.getElementById("meta").textContent =
         release.tag_name + size + ". macOS 11 or newer, Windows 10 and 11. MIT licensed.";
     })
-    .catch(() => {});
+    .catch((error) => {
+      if (error.message !== "none published") return;
+      const releases = "https://github.com/Ray-Hughes/delphi/releases";
+      for (const node of document.querySelectorAll('a[href^="' + BASE + '"]')) {
+        node.href = releases;
+      }
+      document.getElementById("primary-label").textContent = "See releases";
+      document.getElementById("meta").textContent =
+        "No release has been published yet. Build it from source, or watch the repository.";
+    });
 
   // Theme -------------------------------------------------------------------
   const system = () => (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
