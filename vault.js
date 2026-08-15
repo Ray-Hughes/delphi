@@ -13,8 +13,12 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const paths = require("./paths");
 
-const DEFAULT_VAULT = path.join(__dirname, "vault");
+// A folder beside the source in a checkout, and in Documents once installed. The
+// whole point of the mirror is that a person opens it in Obsidian or an editor,
+// and nobody browses to Application Support to do that.
+const DEFAULT_VAULT = paths.defaultVault();
 
 /** Turns a note title into something safe on disk without losing readability. */
 function slug(text) {

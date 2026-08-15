@@ -9,13 +9,18 @@
 const { DatabaseSync } = require("node:sqlite");
 const path = require("path");
 const fs = require("fs");
+const paths = require("./paths");
 
-const DB_PATH = path.join(__dirname, "delphi.db");
+// Beside the source when run from a checkout, in the per-user data directory when
+// run from an installer. See paths.js: the packaged source directory is a
+// read-only archive, so a database cannot live there.
+const DB_PATH = paths.DB_PATH;
 
 let db;
 
 function open() {
   if (db) return db;
+  paths.ensureDataDir();
   db = new DatabaseSync(DB_PATH);
   db.exec("PRAGMA foreign_keys = ON");
   // Schema is idempotent, so applying it on every open keeps a hand-copied

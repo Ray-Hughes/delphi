@@ -38,9 +38,24 @@ jobs:
             [ -f "$f" ] && bash -n "$f" && echo "ok  $f"
           done
 
+      # The Windows installer script, parsed rather than run. PowerShell is on the
+      # Ubuntu runners, and a syntax error here would otherwise surface only on
+      # someone else's Windows machine.
+      - name: PowerShell scripts
+        run: |
+          for f in install/*.ps1; do
+            [ -f "$f" ] || continue
+            pwsh -NoProfile -Command "
+              \$errors = \$null
+              [System.Management.Automation.Language.Parser]::ParseFile('$f', [ref]\$null, [ref]\$errors) > \$null
+              if (\$errors) { \$errors | ForEach-Object { Write-Error \$_ }; exit 1 }
+            " && echo "ok  $f"
+          done
+
       - name: JavaScript
         run: |
-          for f in main.js preload.js db.js app.js oracle.js embeddings.js vault.js agent/mcp_server.js; do
+          for f in main.js preload.js db.js app.js paths.js oracle.js embeddings.js vault.js \
+                   agent/mcp_server.js tools/after-pack.js; do
             [ -f "$f" ] && node --check "$f" && echo "ok  $f"
           done
 
@@ -49,6 +64,22 @@ jobs:
           for f in package.json .vscode/mcp.json; do
             [ -f "$f" ] && python3 -m json.tool "$f" > /dev/null && echo "ok  $f"
           done
+
+      # A broken build configuration otherwise announces itself on release day,
+      # which is the worst moment to find out.
+      - name: Build configuration
+        run: |
+          npm ci
+          node -e "
+            const yaml = require('js-yaml');
+            const fs = require('fs');
+            const config = yaml.load(fs.readFileSync('electron-builder.yml', 'utf8'));
+            for (const file of [...config.files, config.mac.icon, config.win.icon]) {
+              const path = file.replace(/\/$/, '');
+              if (!fs.existsSync(path)) throw new Error('electron-builder.yml refers to a missing path: ' + path);
+            }
+            console.log('ok  electron-builder.yml, ' + config.files.length + ' entries all present');
+          "
 
       # The database holds work content rather than code. It reached a public
       # repository once because .gitignore still named the file by its old

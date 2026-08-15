@@ -1,4 +1,4 @@
--- Second brain: projects hold tasks, notes and links.
+-- Delphi: projects hold tasks, notes and links.
 --
 -- The unit of thought here is the project, not the task. A flat task list stops
 -- being useful past about thirty items because nothing tells you which of them

@@ -1,10 +1,8 @@
 <div align="center">
 
-<h1>
-  <br>
-  Delphi
-  <br>
-</h1>
+<img src="docs/icon.png" width="132" alt="Delphi" />
+
+<h1>Delphi</h1>
 
 ### A project tracker with a knowledge graph, that your AI agents keep current themselves
 
@@ -12,15 +10,16 @@
 
 <br>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/Ray-Hughes/second-brain/ci.yml?branch=main&style=for-the-badge&label=tests&labelColor=1B2B34&logo=githubactions&logoColor=white)](https://github.com/Ray-Hughes/second-brain/actions/workflows/ci.yml)
+[![Download](https://img.shields.io/badge/download-macOS%20%26%20Windows-0B7285?style=for-the-badge&labelColor=1B2B34)](https://ray-hughes.github.io/Delphi/)
+[![CI](https://img.shields.io/github/actions/workflow/status/Ray-Hughes/Delphi/ci.yml?branch=main&style=for-the-badge&label=tests&labelColor=1B2B34&logo=githubactions&logoColor=white)](https://github.com/Ray-Hughes/Delphi/actions/workflows/ci.yml)
 [![Licence](https://img.shields.io/badge/licence-MIT-0B7285?style=for-the-badge&labelColor=1B2B34)](#licence)
-[![macOS](https://img.shields.io/badge/macOS-13%2B-1B2B34?style=for-the-badge&logo=apple&logoColor=white)](#install)
-[![Data stays local](https://img.shields.io/badge/data-never%20leaves%20your%20mac-0B7285?style=for-the-badge&labelColor=1B2B34)](#your-data)
+[![Data stays local](https://img.shields.io/badge/data-never%20leaves%20your%20machine-1B2B34?style=for-the-badge)](#your-data)
 
 <br>
 
+<img src="https://img.shields.io/badge/macOS-11+-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS 11 or newer">
+<img src="https://img.shields.io/badge/Windows-10%20%26%2011-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows 10 and 11">
 <img src="https://img.shields.io/badge/Electron-43-47848F?style=flat-square&logo=electron&logoColor=white" alt="Electron 43">
-<img src="https://img.shields.io/badge/Node-18+-5FA04E?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node 18 or newer">
 <img src="https://img.shields.io/badge/SQLite-node:sqlite-003B57?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite via node:sqlite">
 <img src="https://img.shields.io/badge/MCP-stdio-6E56CF?style=flat-square" alt="Model Context Protocol over stdio">
 <img src="https://img.shields.io/badge/Claude_Code-supported-D97757?style=flat-square&logo=anthropic&logoColor=white" alt="Claude Code supported">
@@ -40,8 +39,8 @@ learns is still there for the next session.
 </div>
 
 > [!TIP]
-> Not comfortable in a terminal? [Paste one prompt into your AI agent](#if-you-would-rather-not-use-a-terminal)
-> and it installs everything, including a Desktop icon.
+> No terminal needed. [Download the installer](https://ray-hughes.github.io/Delphi/),
+> open it, and connect your AI agent afterwards with one command.
 
 ---
 
@@ -65,53 +64,69 @@ want to finish. Collapsing the two is how trackers turn into junk drawers.
 
 ## Install
 
-Requires macOS and Node 18 or newer. Everything else is bundled.
+**[Download for macOS or Windows](https://ray-hughes.github.io/Delphi/)**, or take
+a file directly:
 
-### If you would rather not use a terminal
+| | | |
+| --- | --- | --- |
+| **macOS**, Apple Silicon | [Delphi-mac-arm64.dmg](https://github.com/Ray-Hughes/Delphi/releases/latest/download/Delphi-mac-arm64.dmg) | Any Mac since 2020 |
+| **macOS**, Intel | [Delphi-mac-x64.dmg](https://github.com/Ray-Hughes/Delphi/releases/latest/download/Delphi-mac-x64.dmg) | |
+| **Windows** | [Delphi-Setup.exe](https://github.com/Ray-Hughes/Delphi/releases/latest/download/Delphi-Setup.exe) | 64 bit, Windows 10 or 11 |
 
-Open Claude Code or GitHub Copilot Chat and paste this in. It does the whole
-install, puts an icon on your Desktop, and connects the tracker to your AI
-agent.
+Nothing else is needed to run it. Node is required only to connect an AI agent,
+because your editor launches the MCP server with its own Node rather than with
+the app.
 
-```text
-Please install Delphi on my Mac for me. I am not comfortable in a terminal, so
-run the commands yourself and tell me what happened in plain language.
+### The first launch will stop you once
 
-1. Check that Node 18 or newer is installed by running: node --version
-   If it is missing or older, stop and tell me how to install it rather than
-   installing it yourself.
-2. Clone https://github.com/Ray-Hughes/second-brain.git into my home folder,
-   into a directory named delphi. If that directory already exists, pull the
-   latest changes instead of cloning again.
-3. Change into that directory and run: make setup
-   That installs dependencies, connects Delphi to the AI agents on this
-   machine, and creates a Delphi icon on my Desktop.
-4. Run: make doctor
-   And tell me if anything reports as MISSING.
-5. Start it with: make start
+Delphi is not signed with a paid developer certificate yet, so both systems ask
+before running it the first time. This is expected and it happens once.
 
-Then tell me, in one short list: where the Desktop icon is, which keyboard
-shortcut shows and hides the panel, and whether my AI agent was connected.
-Do not modify anything outside that delphi directory.
-```
-
-The last line matters. It keeps the agent inside the folder it just created, so
-a failed step cannot reach the rest of your machine.
-
-### If you are comfortable in a terminal
+**macOS.** Drag Delphi into Applications, then **right click it and choose
+Open**. Do not double click it the first time: double clicking offers only a
+Cancel button, while right click and Open gives you the button that lets it
+through. If macOS claims the app is damaged it is not, that message means the
+quarantine flag survived the copy:
 
 ```bash
-git clone https://github.com/Ray-Hughes/second-brain.git ~/delphi
+xattr -dr com.apple.quarantine /Applications/Delphi.app
+```
+
+**Windows.** SmartScreen shows a blue box saying it protected your PC. Click
+**More info**, then **Run anyway**. The Run anyway button only appears after
+More info, which is why the box looks like a dead end. The installer is per
+user, so it never asks for administrator rights.
+
+### Opening it
+
+Three ways in, and they all reach the same window:
+
+- **The application**, from Launchpad, the Start menu or the desktop shortcut.
+- **The keyboard.** **Ctrl+T** shows and hides it from anywhere.
+- **The menu bar icon** on macOS, or the **system tray icon** on Windows.
+
+To change the shortcut, open **Settings**, click the recorder and press the
+combination you want. It registers immediately and tells you if another
+application already owns it.
+
+By default Delphi is an ordinary window. Turn on **panel mode** in Settings, or
+in **View**, and it floats above your work and vanishes when you click away.
+
+### From source
+
+For running the development copy, which is also the only way to get the
+`make` targets and the Desktop launcher.
+
+```bash
+git clone https://github.com/Ray-Hughes/Delphi.git ~/delphi
 cd ~/delphi
 make setup     # dependencies, AI agents, Desktop icon
 make start
 ```
 
-`make setup` is the only command needed on a new machine. It runs `make
-install`, connects Claude Code and Copilot, and builds the Desktop launcher.
-
-`make start` brings up both pieces: the local embedding model and the app.
-`make stop` takes both down, and `make status` says what is running.
+A checkout keeps its database, settings and vault beside the source, so it does
+not touch anything an installed copy is using and the two can be run side by
+side.
 
 | Command | What it does |
 | --- | --- |
@@ -128,25 +143,15 @@ install`, connects Claude Code and Copilot, and builds the Desktop launcher.
 | `make mcp` | Connect the Oracle to Claude Code and Copilot |
 | `make desktop` | Put a Delphi icon on the Desktop |
 
-### Opening it
-
-Three ways in, and they all reach the same panel:
-
-- **The Desktop icon.** `make setup` creates one. Double-click it. If Delphi is
-  already running it tells you so rather than starting a second copy.
-- **The keyboard.** Press **Alt+Space** to show and hide the panel. There is no
-  dock icon; it lives in the menu bar and opens centred on whichever display
-  your pointer is on.
-- **The menu bar icon.** Click it any time.
-
-To change the shortcut, open the panel, go to **Settings**, click the recorder and press the
-combination you want. It registers immediately and tells you if another application already owns it.
+Building the installers yourself needs `npm run dist:mac` or `npm run dist:win`.
+Each has to run on its own platform: a Windows installer built on macOS needs
+Wine, and a dmg cannot be made anywhere but macOS.
 
 ### Opening it at login
 
-Add the Desktop launcher as a login item: **System Settings**, then **General**,
-then **Login Items**, then **+**, and choose **Delphi** on your Desktop. It then
-starts each time you log in, hidden, waiting for your hotkey.
+**macOS**: System Settings, then General, then Login Items, then **+**, and
+choose Delphi. **Windows**: press <kbd>Win</kbd>+<kbd>R</kbd>, run
+`shell:startup`, and put a shortcut to Delphi in the folder that opens.
 
 ---
 
@@ -191,8 +196,14 @@ one store, because none of them talk to each other; they all talk to this.
 One command connects both, and skips whichever you do not have installed:
 
 ```bash
-make mcp
+bash install/mcp.sh                                        # macOS
+powershell -ExecutionPolicy Bypass -File install\mcp.ps1   # Windows
 ```
+
+From a checkout, `make mcp` runs the first of those for you. The
+`-ExecutionPolicy Bypass` on Windows is not optional advice: Windows refuses to
+run unsigned scripts by default, and the error it gives says nothing about what
+to do about it.
 
 Restart your editor afterwards. MCP servers are loaded at startup, so a server
 registered mid-session does not appear until the editor is restarted. This is
@@ -354,10 +365,29 @@ terminal.
 
 ## Your data
 
-One SQLite file, `delphi.db`, next to the application. Nothing is sent anywhere.
+One SQLite file, `delphi.db`. Nothing is sent anywhere.
+
+Where it lives depends on how Delphi was installed, because a packaged
+application is a read-only archive and cannot keep a database inside itself:
+
+| | Database and settings | Markdown vault |
+| --- | --- | --- |
+| **Installed, macOS** | `~/Library/Application Support/Delphi` | `~/Documents/Delphi` |
+| **Installed, Windows** | `%APPDATA%\Delphi` | `Documents\Delphi` |
+| **From a checkout** | beside the source, as before | `vault/`, beside the source |
+
+**Help**, then **Show Data Folder** opens whichever applies. The first time an
+installed copy starts it looks for a checkout's database in the usual places and
+brings it across, so upgrading from a source install does not present you with an
+empty tracker. Set `DELPHI_DATA_DIR` to override the location entirely.
+
+Back up from **File**, then **Back Up Database**. That runs `VACUUM INTO` rather
+than copying the file, which matters: the database uses write-ahead logging, so
+recent rows can still be sitting in `delphi.db-wal` and a plain copy produces a
+backup quietly missing the last session.
 
 ```bash
-make backup     # or: cp delphi.db ~/backups/delphi-$(date +%F).db
+make backup     # from a checkout
 ```
 
 The database is deliberately not tracked in git. It holds your work, not code,
@@ -390,14 +420,18 @@ reverse any change rather than only the most recent one.
 | --- | --- |
 | `schema.sql` | Tables, applied on every open so it is safe to re-run |
 | `db.js` | All database access, main process only |
-| `main.js` | Window, tray, global shortcut, IPC |
+| `paths.js` | Where things live, which differs once packaged |
+| `main.js` | Window, tray, menu, global shortcut, IPC |
 | `preload.js` | The only bridge the interface has to the data |
 | `app.js` | The interface |
 | `embeddings.js` | Local vectors: Ollama when present, lexical when not |
 | `agent/mcp_server.js` | MCP server for AI agents |
 | `agent/guard.py` | Destructive command guard |
-| `install/mcp.sh` | Connects the server to Claude Code and Copilot |
-| `install/desktop.sh` | Builds the Desktop launcher |
+| `install/mcp.sh`, `install/mcp.ps1` | Connects the server to Claude Code and Copilot |
+| `install/desktop.sh` | Builds the Desktop launcher for a checkout |
+| `electron-builder.yml` | How the installers are packaged |
+| `tools/make_icons.py` | Rebuilds every icon from the artwork in `build/source` |
+| `docs/` | The download page, served by GitHub Pages |
 
 Storage is SQLite through `node:sqlite`, which ships inside Electron. There is no native module to
 compile and nothing to rebuild when Electron updates, which is the usual reason small tools like this
@@ -410,7 +444,9 @@ it with, which may not have `node:sqlite`, so it shells out to the `sqlite3` bin
 
 Working today: projects, tasks, memory notes with markdown rendering, links, search,
 project dashboards with linked repositories, local vector search over project material,
-history with undo, light and dark themes, the MCP server and the safety guard.
+history with undo, light and dark themes, the MCP server and the safety guard. Signed
+installers for macOS and Windows are the next thing, rather than a certificate being
+in place already.
 
 Being built: desktop reminders with snooze, an agent activity view, and a skills browser.
 

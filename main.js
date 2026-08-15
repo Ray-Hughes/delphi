@@ -1,13 +1,22 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage, Notification } = require("electron");
+const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage, nativeTheme, Notification, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const paths = require("./paths");
+
+// Before anything reads it. Packaged, the name comes from the bundle, but running
+// from a checkout Electron falls back to its own name and the macOS menu bar reads
+// "Electron" instead of "Delphi".
+app.setName("Delphi");
+
 const db = require("./db");
 const vault = require("./vault");
 const oracle = require("./oracle");
 const embeddings = require("./embeddings");
 
-const SETTINGS_PATH = path.join(__dirname, "settings.json");
+const isMac = process.platform === "darwin";
+const SETTINGS_PATH = paths.SETTINGS_PATH;
 const DEFAULT_HOTKEY = "Control+T";
+const REPO = "https://github.com/Ray-Hughes/Delphi";
 
 let win = null;
 let tray = null;
@@ -87,7 +96,39 @@ function loadSettings() {
 }
 
 function saveSettings() {
+  paths.ensureDataDir();
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
+}
+
+/** Whether dark tokens are the ones currently in force. */
+const darkNow = () =>
+  settings.theme === "dark" || (settings.theme !== "light" && nativeTheme.shouldUseDarkColors);
+
+/**
+ * Colours for the Windows window control overlay.
+ *
+ * These are the --surface and --ink-dim tokens from index.html. They have to be
+ * repeated here because the buttons are drawn by Windows rather than by the page,
+ * so a stylesheet cannot reach them, and a mismatch shows as a block of the wrong
+ * colour in the corner of the title bar.
+ */
+const overlay = () =>
+  darkNow()
+    ? { color: "#171b23", symbolColor: "#98a1b2", height: 46 }
+    : { color: "#ffffff", symbolColor: "#5a6376", height: 46 };
+
+/**
+ * Window chrome, which is the one place the two platforms cannot share a setting.
+ *
+ * macOS insets its traffic lights into the app's own bar and the page leaves room
+ * for them. Windows has no such thing: a frameless window there has no minimise,
+ * maximise or close at all, so the overlay puts the real system buttons on top of
+ * our bar. A panel is frameless on both, because it is dismissed by clicking away.
+ */
+function chromeFor(panel) {
+  if (isMac) return { frame: false, titleBarStyle: "hiddenInset" };
+  if (panel) return { frame: false };
+  return { titleBarStyle: "hidden", titleBarOverlay: overlay() };
 }
 
 function createWindow() {
@@ -100,8 +141,9 @@ function createWindow() {
     minWidth: 860,
     minHeight: 560,
     show: !panel,                  // a normal app opens; a panel waits for the key
-    frame: false,
-    titleBarStyle: "hiddenInset",  // keeps the traffic lights, drops the heavy bar
+    icon: path.join(__dirname, "assets", "mark-64.png"),
+    backgroundColor: darkNow() ? "#0f1217" : "#f4f6f9",
+    ...chromeFor(panel),
     // In panel mode it floats over the work and cannot be full screened, because
     // a full screen panel is just a window with extra rules.
     alwaysOnTop: panel,
@@ -119,7 +161,14 @@ function createWindow() {
   if (panel) win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   win.webContents.on("did-finish-load", () => {
-    win.webContents.send("mode", { panelMode: panel });
+    // The platform goes with it: the title bar has to leave room for traffic
+    // lights on the left on macOS and for the control overlay on the right on
+    // Windows, and the page cannot work out which from CSS alone.
+    win.webContents.send("mode", {
+      panelMode: panel,
+      platform: process.platform,
+      overlay: !isMac && !panel,
+    });
   });
 
   // Closing hides rather than quits in both modes, so the shortcut and the tray
@@ -194,17 +243,29 @@ function registerHotkey(accelerator) {
   return ok;
 }
 
+/**
+ * The tray image for the menu bar this platform actually has.
+ *
+ * macOS wants a template image: black plus alpha, which the system inverts itself
+ * for a dark menu bar. Handing it a coloured icon is why some apps show a dark
+ * blob on a dark menu bar.
+ *
+ * Windows draws the icon exactly as given, and its taskbar follows the system
+ * theme, so one colour is legible on one and nearly invisible on the other. The
+ * system setting is read directly rather than through the app's own theme
+ * preference: pinning the window to dark does not repaint the taskbar.
+ */
+function trayIcon() {
+  const file = isMac
+    ? "trayTemplate.png"
+    : nativeTheme.shouldUseDarkColors ? "tray-win-on-dark.png" : "tray-win-on-light.png";
+  const icon = nativeImage.createFromPath(path.join(__dirname, "assets", file));
+  if (isMac) icon.setTemplateImage(true);
+  return icon;
+}
+
 function createTray() {
-  // A 16pt template image renders correctly in both light and dark menu bars.
-  const icon = nativeImage.createFromDataURL(
-    "data:image/png;base64," +
-      "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAlUlEQVQ4jaWTQQ7AIAgEF///Z3po" +
-      "TCMKuvVEIjOsQERElEBEUlUFAKhqZuYFAOB9773vAWDbtq7ruq6qqmVZAGBmZuacc0RkZgAws7uu" +
-      "6wIAM1NVAJiZmXV3d0TEzAAgIu6+7wsAmJmZubu7uyMiZgYAM3P3fV8AwMzM3d3d3RERMwOAmbn7" +
-      "vi8AYGbm7u7ujoiYGQD8AItqHkzq2QLLAAAAAElFTkSuQmCC"
-  );
-  icon.setTemplateImage(true);
-  tray = new Tray(icon);
+  tray = new Tray(trayIcon());
   tray.setToolTip("Delphi");
   tray.setContextMenu(
     Menu.buildFromTemplate([
@@ -218,8 +279,10 @@ function createTray() {
       { label: "Toggle developer tools", click: () => win && win.webContents.toggleDevTools() },
       { type: "separator" },
       {
-        label: "Quit",
-        accelerator: "Command+Q",
+        // Command on a Mac, Control everywhere else. A menu item labelled with a
+        // shortcut the platform does not have is worse than one with none.
+        label: "Quit Delphi",
+        accelerator: "CmdOrCtrl+Q",
         click: () => {
           app.isQuitting = true;
           app.quit();
@@ -227,20 +290,239 @@ function createTray() {
       },
     ])
   );
-  tray.on("click", toggle);
+  // A left click toggles on macOS. On Windows a single click is expected to do
+  // nothing but select, and the double click is what opens; binding both there
+  // would fire twice and land back where it started.
+  if (isMac) tray.on("click", toggle);
+  else tray.on("double-click", toggle);
+}
+
+// ---------------------------------------------------------------------------
+// The application menu
+//
+// Without one, Electron installs a default menu whose first item is named after
+// the executable, which is why an unpackaged run says "Electron". Setting a menu
+// fixes the name, but a menu of items that do nothing is its own bug, so every
+// entry here either drives the window or is a role the platform implements.
+//
+// Anything that acts on what is on screen is sent to the renderer as a single
+// "menu" message rather than reaching into the page from here. That keeps the one
+// rule the codebase already has: the main process owns data, the renderer owns
+// what is displayed.
+// ---------------------------------------------------------------------------
+
+/** Sends a menu action to the window, opening it first if it is hidden. */
+function toRenderer(action, payload) {
+  if (!win || win.isDestroyed()) createWindow();
+  if (!win.isVisible()) show();
+  win.webContents.send("menu", { action, ...payload });
+}
+
+function buildMenu() {
+  const template = [];
+
+  if (isMac) {
+    template.push({
+      label: "Delphi",
+      submenu: [
+        { role: "about" },
+        { type: "separator" },
+        { label: "Settings", accelerator: "CmdOrCtrl+,", click: () => toRenderer("settings") },
+        { type: "separator" },
+        { role: "services" },
+        { type: "separator" },
+        { role: "hide" }, { role: "hideOthers" }, { role: "unhide" },
+        { type: "separator" },
+        { label: "Quit Delphi", accelerator: "CmdOrCtrl+Q", click: () => { app.isQuitting = true; app.quit(); } },
+      ],
+    });
+  }
+
+  template.push({
+    label: "File",
+    submenu: [
+      { label: "New Task", accelerator: "CmdOrCtrl+N", click: () => toRenderer("new-task") },
+      { label: "New Note", accelerator: "CmdOrCtrl+Shift+N", click: () => toRenderer("new-note") },
+      { label: "New Project", accelerator: "CmdOrCtrl+Shift+P", click: () => toRenderer("new-project") },
+      { type: "separator" },
+      { label: "Open Database Folder", click: () => shell.showItemInFolder(db.DB_PATH) },
+      { label: "Open Vault Folder", click: () => shell.openPath(settings.vaultPath || vault.DEFAULT_VAULT) },
+      { label: "Back Up Database", click: backupDatabase },
+      { type: "separator" },
+      ...(isMac
+        ? [{ role: "close" }]
+        : [
+            { label: "Settings", accelerator: "CmdOrCtrl+,", click: () => toRenderer("settings") },
+            { type: "separator" },
+            { label: "Quit Delphi", accelerator: "CmdOrCtrl+Q", click: () => { app.isQuitting = true; app.quit(); } },
+          ]),
+    ],
+  });
+
+  template.push({
+    label: "Edit",
+    submenu: [
+      { role: "undo" }, { role: "redo" },
+      { type: "separator" },
+      { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" },
+      { type: "separator" },
+      // Not the browser's find bar, which would search the rendered page. This is
+      // the app's own search across tasks, notes and the graph.
+      { label: "Search Everything", accelerator: "CmdOrCtrl+F", click: () => toRenderer("search") },
+      { label: "Undo Last Change", click: () => toRenderer("undo-last") },
+    ],
+  });
+
+  template.push({
+    label: "View",
+    submenu: [
+      { label: "What's New", accelerator: "CmdOrCtrl+1", click: () => toRenderer("view", { view: "new" }) },
+      { label: "Tasks", accelerator: "CmdOrCtrl+2", click: () => toRenderer("view", { view: "tasks" }) },
+      { label: "Memory", accelerator: "CmdOrCtrl+3", click: () => toRenderer("view", { view: "notes" }) },
+      { label: "History", accelerator: "CmdOrCtrl+4", click: () => toRenderer("view", { view: "history" }) },
+      { type: "separator" },
+      { label: "Back", accelerator: "CmdOrCtrl+[", click: () => toRenderer("back") },
+      { type: "separator" },
+      {
+        label: "Appearance",
+        submenu: ["system", "light", "dark"].map((choice) => ({
+          label: choice[0].toUpperCase() + choice.slice(1),
+          type: "radio",
+          checked: settings.theme === choice,
+          click: () => setTheme(choice),
+        })),
+      },
+      {
+        label: "Panel Mode",
+        type: "checkbox",
+        checked: settings.panelMode === true,
+        click: (item) => setPanelMode(item.checked),
+      },
+      { type: "separator" },
+      { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" },
+      { type: "separator" },
+      { role: "reload" }, { role: "toggleDevTools" },
+    ],
+  });
+
+  template.push({
+    label: "Oracle",
+    submenu: [
+      { label: "Rebuild Knowledge Graph", click: () => runAndReport("Knowledge graph rebuilt", () => oracle.rebuild(db.handle())) },
+      { label: "Reindex Embeddings", click: () => runAndReport("Embeddings reindexed", () => embeddings.reindex(db.handle(), { force: true })) },
+      { label: "Export Vault Now", click: () => runAndReport("Vault exported", () => vault.exportAll(db, settings.vaultPath || vault.DEFAULT_VAULT)) },
+      { type: "separator" },
+      { label: "Connect an AI Agent", click: () => shell.openExternal(`${REPO}#connecting-an-ai-agent`) },
+    ],
+  });
+
+  template.push({
+    label: "Window",
+    submenu: isMac
+      ? [{ role: "minimize" }, { role: "zoom" }, { type: "separator" }, { role: "front" }]
+      : [{ role: "minimize" }, { role: "zoom" }],
+  });
+
+  template.push({
+    role: "help",
+    submenu: [
+      { label: "Documentation", click: () => shell.openExternal(REPO) },
+      { label: "Report an Issue", click: () => shell.openExternal(`${REPO}/issues/new`) },
+      { type: "separator" },
+      { label: `Version ${app.getVersion()}`, enabled: false },
+      { label: "Show Data Folder", click: () => shell.openPath(paths.DATA_DIR) },
+    ],
+  });
+
+  return Menu.buildFromTemplate(template);
+}
+
+/** Rebuilt rather than mutated, because the radio and checkbox states are read
+ *  from settings when the template is built. */
+function refreshMenu() {
+  Menu.setApplicationMenu(buildMenu());
+}
+
+function setTheme(choice) {
+  settings.theme = choice;
+  saveSettings();
+  refreshMenu();
+  if (win && !win.isDestroyed()) {
+    win.webContents.send("menu", { action: "theme", theme: choice });
+    if (!isMac && settings.panelMode !== true && win.setTitleBarOverlay) win.setTitleBarOverlay(overlay());
+  }
+}
+
+function setPanelMode(next) {
+  if (next === (settings.panelMode === true)) return;
+  settings.panelMode = next;
+  saveSettings();
+  rebuildWindow();
+  refreshMenu();
+}
+
+async function backupDatabase() {
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    title: "Back up the Delphi database",
+    defaultPath: path.join(app.getPath("documents"), `delphi-${stamp}.db`),
+    filters: [{ name: "SQLite database", extensions: ["db"] }],
+  });
+  if (canceled || !filePath) return;
+  try {
+    // Through SQLite rather than a file copy. The database runs in write-ahead
+    // mode, so recent rows can still be sitting in delphi.db-wal and copying the
+    // file alone produces a backup that is quietly missing the last session.
+    db.handle().exec(`VACUUM INTO '${filePath.replace(/'/g, "''")}'`);
+    dialog.showMessageBox({ type: "info", message: "Backed up", detail: filePath });
+  } catch (error) {
+    dialog.showErrorBox("Backup failed", String(error.message || error));
+  }
+}
+
+/** Runs a maintenance action and says what happened, rather than appearing to do
+ *  nothing at all. */
+async function runAndReport(message, work) {
+  try {
+    const result = await work();
+    const detail = result && typeof result === "object" ? JSON.stringify(result) : undefined;
+    if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
+    dialog.showMessageBox({ type: "info", message, detail });
+  } catch (error) {
+    dialog.showErrorBox("That did not work", String(error.message || error));
+  }
 }
 
 app.whenReady().then(() => {
   loadSettings();
+  // Before the database is opened for the first time, or the migration finds a
+  // file already there and declines to do anything.
+  if (app.isPackaged) paths.migrateLegacyDatabase();
   createWindow();
   createTray();
+  refreshMenu();
   registerHotkey(settings.hotkey);
   startScheduler();
   scheduleVaultExport();
 
   // A panel has no dock presence; a normal application does.
   if (app.dock && settings.panelMode === true) app.dock.hide();
+
+  // Following the system means following it while running, not only at startup.
+  nativeTheme.on("updated", () => {
+    // The Windows taskbar changes with the system rather than with the app's own
+    // preference, so the tray icon is swapped whatever the app is pinned to.
+    if (!isMac && tray && !tray.isDestroyed()) tray.setImage(trayIcon());
+    if (settings.theme !== "system") return;
+    if (win && !win.isDestroyed() && !isMac && settings.panelMode !== true && win.setTitleBarOverlay) {
+      win.setTitleBarOverlay(overlay());
+    }
+  });
 });
+
+// Windows and Linux keep the process alive with no windows, which for a tray app
+// is correct. Clicking the dock icon on macOS should still bring the panel back.
+app.on("activate", () => show());
 
 // ---------------------------------------------------------------------------
 // Reminders
@@ -253,9 +535,11 @@ function showAlert(alert) {
   const notification = new Notification({
     title,
     body,
-    // Buttons rather than a text reply, so snoozing is one click.
-    actions: [{ type: "button", text: "Snooze" }],
-    closeButtonText: "Dismiss",
+    // Buttons rather than a text reply, so snoozing is one click. macOS only:
+    // Windows takes its buttons from a toast XML document instead, and passing
+    // these there is ignored rather than an error, so snoozing on Windows is done
+    // from the panel.
+    ...(isMac ? { actions: [{ type: "button", text: "Snooze" }], closeButtonText: "Dismiss" } : {}),
     silent: false,
   });
 
@@ -423,6 +707,7 @@ handle("settings:set", (fields) => {
       settings.panelMode = next;
       saveSettings();
       rebuildWindow();
+      refreshMenu();
       return settings;
     }
   }
@@ -450,6 +735,15 @@ handle("settings:set", (fields) => {
   }
   saveSettings();
   if (fields.checkIntervalSeconds !== undefined) startScheduler();
+  // The Appearance menu carries a radio mark, and the Windows control overlay is
+  // painted by the system rather than by the stylesheet. Both are stale the moment
+  // the theme is changed from inside the window instead of from the menu.
+  if (fields.theme !== undefined) {
+    refreshMenu();
+    if (win && !win.isDestroyed() && !isMac && settings.panelMode !== true && win.setTitleBarOverlay) {
+      win.setTitleBarOverlay(overlay());
+    }
+  }
   return settings;
 });
 

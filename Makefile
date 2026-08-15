@@ -27,7 +27,8 @@ bold  := \033[1m
 off   := \033[0m
 
 .PHONY: help start stop restart status app app-stop app-restart model model-stop \
-        reindex rebuild logs applogs modellogs doctor install backup setup desktop mcp
+        reindex rebuild logs applogs modellogs doctor install backup setup desktop mcp \
+        icons dist
 
 help: ## Show this help
 	@echo ""
@@ -150,6 +151,17 @@ modellogs: ## Follow the model log
 install: ## Install dependencies
 	@cd "$(APP_DIR)" && npm install
 	@command -v ollama >/dev/null 2>&1 || echo "  ollama not installed. For local embeddings: brew install ollama"
+
+icons: ## Rebuild every icon from the artwork in build/source
+	@python3 "$(APP_DIR)/tools/make_icons.py"
+
+dist: ## Build the installer for this platform, into release/
+	@cd "$(APP_DIR)" && npx electron-builder
+	@echo ""
+	@ls -lh "$(APP_DIR)/release"/*.dmg "$(APP_DIR)/release"/*.exe 2>/dev/null || true
+	@echo ""
+	@echo -e "  $(dim)Windows installers are built by the release workflow, not here:$(off)"
+	@echo -e "  $(dim)building one on a Mac needs Wine.$(off)"
 
 backup: ## Copy the database somewhere safe
 	@mkdir -p "$(HOME)/backups"

@@ -77,4 +77,7 @@ contextBridge.exposeInMainWorld("delphi", {
   onMode: (fn) => ipcRenderer.on("mode", (_e, payload) => fn(payload)),
   onAlertsChanged: (fn) => ipcRenderer.on("alerts-changed", fn),
   onFocusTask: (fn) => ipcRenderer.on("focus-task", (_e, payload) => fn(payload)),
+  // The application menu cannot touch the page directly, so every item that acts
+  // on what is displayed arrives here as one message.
+  onMenu: (fn) => ipcRenderer.on("menu", (_e, payload) => fn(payload)),
 });

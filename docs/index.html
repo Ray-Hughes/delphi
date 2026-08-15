@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Delphi</title>
+<meta name="description" content="A project tracker with a knowledge graph, that your AI agents keep current themselves. Free for macOS and Windows." />
+<link rel="icon" href="favicon.png" />
+
+<meta property="og:title" content="Delphi" />
+<meta property="og:description" content="A project tracker with a knowledge graph, that your AI agents keep current themselves." />
+<meta property="og:image" content="https://ray-hughes.github.io/Delphi/icon.png" />
+<meta property="og:type" content="website" />
+
+<style>
+  /* Colours are taken from the icon rather than chosen alongside it: the navy it
+     sits on, the cyan of the flame, the violet at its base. */
+  :root {
+    --ground:     #f2f5f8;
+    --panel:      #ffffff;
+    --panel-edge: #dde4ec;
+    --ink:        #0d1420;
+    --ink-soft:   #4a5768;
+    --ink-faint:  #78879a;
+    --accent:     #0e6f9c;
+    --accent-ink: #ffffff;
+    --note-bg:    #fff8e8;
+    --note-edge:  #e2b96b;
+    --note-ink:   #6a4a10;
+    --shadow:     0 1px 2px rgba(13, 20, 32, .05), 0 10px 30px rgba(13, 20, 32, .07);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:     #080d16;
+      --panel:      #111a28;
+      --panel-edge: #23303f;
+      --ink:        #e9eff7;
+      --ink-soft:   #a2b2c6;
+      --ink-faint:  #6d7f95;
+      --accent:     #4fd8e0;
+      --accent-ink: #06202b;
+      --note-bg:    #211a0c;
+      --note-edge:  #5f4a1c;
+      --note-ink:   #e6c98a;
+      --shadow:     0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px rgba(0, 0, 0, .35);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(44px, 8vw, 68px); font-weight: 700; }
+  h2 { font-size: clamp(26px, 4vw, 34px); font-weight: 650; margin-bottom: 10px; }
+  h3 { font-size: 17px; font-weight: 650; margin-bottom: 6px; letter-spacing: -0.01em; }
+  p { margin: 0 0 14px; color: var(--ink-soft); max-width: 64ch; }
+  a { color: var(--accent); }
+
+  code, kbd {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: .9em;
+  }
+  kbd {
+    background: var(--ground); border: 1px solid var(--panel-edge);
+    border-radius: 5px; padding: 1px 6px; color: var(--ink);
+  }
+
+  /* Hero ------------------------------------------------------------------ */
+  header { padding: 84px 0 64px; text-align: center; }
+  header img.logo {
+    width: 128px; height: 128px; display: block; margin: 0 auto 26px;
+    filter: drop-shadow(0 12px 28px rgba(13, 20, 32, .28));
+  }
+  .tagline {
+    font-size: clamp(18px, 2.6vw, 22px); color: var(--ink-soft);
+    max-width: 30ch; margin: 16px auto 4px;
+  }
+  .oracle-line { font-size: 15px; color: var(--ink-faint); margin: 0 auto 34px; }
+
+  /* Download -------------------------------------------------------------- */
+  .downloads { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+    background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 10px;
+    padding: 15px 30px; font-size: 17px; font-weight: 620;
+    text-decoration: none; cursor: pointer;
+    transition: transform 120ms ease, filter 120ms ease;
+  }
+  .btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
+  .btn svg { width: 19px; height: 19px; fill: currentColor; }
+  .alt { display: flex; gap: 18px; flex-wrap: wrap; justify-content: center; font-size: 14.5px; }
+  .alt a { color: var(--ink-soft); }
+  .meta { font-size: 13px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
+
+  /* Sections -------------------------------------------------------------- */
+  section { padding: 44px 0; }
+  section + section { border-top: 1px solid var(--panel-edge); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px; margin-top: 22px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--panel-edge);
+    border-radius: 12px; padding: 22px; box-shadow: var(--shadow);
+  }
+  .card p { margin: 0; font-size: 14.5px; }
+
+  /* First launch ---------------------------------------------------------- */
+  .tabs { display: flex; gap: 8px; margin: 18px 0 18px; }
+  .tab {
+    background: var(--panel); border: 1px solid var(--panel-edge); color: var(--ink-soft);
+    border-radius: 9px; padding: 9px 18px; font: inherit; font-size: 14.5px; font-weight: 560;
+    cursor: pointer;
+  }
+  .tab[aria-selected="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  .panel-body[hidden] { display: none; }
+
+  .note {
+    background: var(--note-bg); border: 1px solid var(--note-edge); border-left-width: 3px;
+    border-radius: 9px; padding: 16px 20px; margin: 18px 0;
+  }
+  .note p { color: var(--note-ink); margin: 0; font-size: 14.5px; }
+  .note strong { color: var(--note-ink); }
+
+  ol.steps { margin: 0; padding-left: 22px; color: var(--ink-soft); max-width: 64ch; }
+  ol.steps li { margin-bottom: 9px; }
+
+  pre {
+    background: var(--panel); border: 1px solid var(--panel-edge);
+    border-radius: 10px; padding: 16px 18px; overflow-x: auto;
+    font-size: 13.5px; line-height: 1.6; color: var(--ink);
+  }
+
+  footer {
+    padding: 40px 0 64px; text-align: center; color: var(--ink-faint); font-size: 14px;
+    border-top: 1px solid var(--panel-edge);
+  }
+  footer a { color: var(--ink-soft); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <img class="logo" src="icon.png" alt="" />
+    <h1>Delphi</h1>
+    <p class="tagline">A project tracker with a knowledge graph, that your AI agents keep current themselves.</p>
+    <p class="oracle-line">The app is Delphi. The thing you ask is the Oracle.</p>
+
+    <div class="downloads">
+      <a class="btn" id="primary" href="https://github.com/Ray-Hughes/Delphi/releases/latest">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16l-6-6h4V3h4v7h4l-6 6zm-8 2h16v3H4v-3z"/></svg>
+        <span id="primary-label">Download Delphi</span>
+      </a>
+      <div class="alt" id="alt"></div>
+      <p class="meta" id="meta">Free and open source. MIT licensed.</p>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>The first time you open it</h2>
+    <p>
+      Delphi is not signed with a paid developer certificate yet, so both systems will
+      stop you once and ask. This is expected, and it is a one time step: after the
+      first launch it opens like anything else.
+    </p>
+
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" id="tab-mac" aria-controls="panel-mac" aria-selected="true">macOS</button>
+      <button class="tab" role="tab" id="tab-win" aria-controls="panel-win" aria-selected="false">Windows</button>
+    </div>
+
+    <div class="panel-body" id="panel-mac" role="tabpanel" aria-labelledby="tab-mac">
+      <ol class="steps">
+        <li>Open the downloaded <code>.dmg</code> and drag <strong>Delphi</strong> into Applications.</li>
+        <li>In Applications, <strong>right click</strong> Delphi and choose <strong>Open</strong>. Do not double click it the first time: double clicking offers only a Cancel button, while right click and Open gives you the button that lets it through.</li>
+        <li>Choose <strong>Open</strong> in the dialog. macOS remembers, so every launch after this is a normal one.</li>
+      </ol>
+      <div class="note">
+        <p>
+          <strong>If macOS says the app is damaged,</strong> it is not. That message means the
+          quarantine flag survived the copy. Clear it with:
+          <br /><code>xattr -dr com.apple.quarantine /Applications/Delphi.app</code>
+        </p>
+      </div>
+    </div>
+
+    <div class="panel-body" id="panel-win" role="tabpanel" aria-labelledby="tab-win" hidden>
+      <ol class="steps">
+        <li>Run the downloaded <code>Delphi-Setup.exe</code>.</li>
+        <li>Windows SmartScreen will show a blue box saying it protected your PC. Click <strong>More info</strong>, then <strong>Run anyway</strong>. The Run anyway button only appears after More info, which is why the box looks like a dead end.</li>
+        <li>Follow the installer. It installs for your user only, so it never asks for administrator rights.</li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What it does</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>Projects, not one long list</h3>
+        <p>Past thirty items a flat task list stops telling you which entries belong to the same piece of work. Each project holds its own tasks, notes and links.</p>
+      </div>
+      <div class="card">
+        <h3>Your agents remember</h3>
+        <p>Claude Code and GitHub Copilot read and write it over MCP, so what one of them works out is still there for the next session, and for the other one.</p>
+      </div>
+      <div class="card">
+        <h3>It stays on your machine</h3>
+        <p>One SQLite file. Nothing is uploaded, there is no account, and search runs locally against a model on your own computer.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Connect an AI agent</h2>
+    <p>
+      Delphi ships an MCP server, so any agent that speaks MCP can use it, and several
+      can share one store. Open Delphi, then run the connector for your system from the
+      folder it was installed in.
+    </p>
+    <pre><code>macOS      bash install/mcp.sh
+Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
+    <p>
+      Restart your editor afterwards. MCP servers are loaded at startup, so one
+      registered mid session does not appear until the editor restarts. That is the
+      single most common reason people think the connection failed.
+    </p>
+    <p><a href="https://github.com/Ray-Hughes/Delphi#connecting-an-ai-agent">Full instructions, and how to do it by hand</a></p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Requirements</h2>
+    <p>
+      macOS 11 or newer, on Apple Silicon or Intel. Windows 10 or 11, 64 bit.
+      Nothing else: the installers carry everything the app needs.
+    </p>
+    <p>
+      Node is needed only to connect an AI agent, because the editor launches the MCP
+      server with its own Node rather than with the app. Local search is sharper with
+      <a href="https://ollama.com">Ollama</a> running, and falls back to a lexical
+      search rather than disappearing when it is not.
+    </p>
+    <p>
+      Prefer to run from source? <a href="https://github.com/Ray-Hughes/Delphi#from-source">Clone the repository</a>.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      <a href="https://github.com/Ray-Hughes/Delphi">Source on GitHub</a> &middot;
+      <a href="https://github.com/Ray-Hughes/Delphi/issues">Report an issue</a> &middot;
+      MIT licensed
+    </p>
+  </div>
+</footer>
+
+<script>
+  // Stable file names, so these addresses keep working across every release and
+  // this page never needs editing on release day.
+  const BASE = "https://github.com/Ray-Hughes/Delphi/releases/latest/download/";
+  const BUILDS = {
+    "mac-arm64": { file: "Delphi-mac-arm64.dmg", label: "Download for Mac", note: "Apple Silicon" },
+    "mac-x64":   { file: "Delphi-mac-x64.dmg",   label: "Download for Mac", note: "Intel" },
+    "win":       { file: "Delphi-Setup.exe",     label: "Download for Windows", note: "64 bit" },
+  };
+
+  /**
+   * Which build to offer first.
+   *
+   * Apple Silicon cannot be read from the user agent, which reports Intel on both.
+   * The renderer string from WebGL does distinguish them, so it is tried, and when
+   * it tells us nothing the Apple Silicon build is the one offered: it has been
+   * the only Mac sold for years, and the Intel build is one click away regardless.
+   */
+  function detect() {
+    const ua = navigator.userAgent;
+    if (/Windows/i.test(ua)) return "win";
+    if (/Mac/i.test(ua)) {
+      try {
+        const gl = document.createElement("canvas").getContext("webgl");
+        const info = gl && gl.getExtension("WEBGL_debug_renderer_info");
+        const renderer = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "";
+        if (/Intel/i.test(renderer)) return "mac-x64";
+      } catch {}
+      return "mac-arm64";
+    }
+    return null;
+  }
+
+  const primary = document.getElementById("primary");
+  const primaryLabel = document.getElementById("primary-label");
+  const alt = document.getElementById("alt");
+
+  const chosen = detect();
+  const order = chosen ? [chosen, ...Object.keys(BUILDS).filter((k) => k !== chosen)] : Object.keys(BUILDS);
+
+  if (chosen) {
+    primary.href = BASE + BUILDS[chosen].file;
+    primaryLabel.textContent = BUILDS[chosen].label;
+  }
+
+  // Everything not offered as the main button still gets a link, so nobody on an
+  // unrecognised system, or on the wrong Mac, is left without a way to download.
+  for (const key of order.slice(chosen ? 1 : 0)) {
+    const link = document.createElement("a");
+    link.href = BASE + BUILDS[key].file;
+    link.textContent = `${BUILDS[key].label.replace("Download for ", "")} (${BUILDS[key].note})`;
+    alt.append(link);
+  }
+
+  // Version and size, if GitHub answers. The page is complete without this, so a
+  // rate limited or offline visitor loses a line of text rather than the download.
+  fetch("https://api.github.com/repos/Ray-Hughes/Delphi/releases/latest")
+    .then((r) => (r.ok ? r.json() : Promise.reject()))
+    .then((release) => {
+      const asset = chosen && release.assets.find((a) => a.name === BUILDS[chosen].file);
+      const size = asset ? ` &middot; ${(asset.size / 1048576).toFixed(0)} MB` : "";
+      document.getElementById("meta").innerHTML =
+        `${release.tag_name}${size} &middot; free and open source, MIT licensed`;
+    })
+    .catch(() => {});
+
+  // Tabs
+  const tabs = [["tab-mac", "panel-mac"], ["tab-win", "panel-win"]];
+  for (const [tabId, panelId] of tabs) {
+    document.getElementById(tabId).addEventListener("click", () => {
+      for (const [t, p] of tabs) {
+        const active = t === tabId;
+        document.getElementById(t).setAttribute("aria-selected", String(active));
+        document.getElementById(p).hidden = !active;
+      }
+    });
+  }
+  // Opened on the tab for the system the visitor is using.
+  if (chosen === "win") document.getElementById("tab-win").click();
+</script>
+
+</body>
+</html>

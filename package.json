@@ -3,11 +3,25 @@
   "version": "1.0.0",
   "description": "A project tracker with a knowledge graph, that your AI agents keep current themselves",
   "main": "main.js",
+  "author": "Ray Hughes",
+  "license": "MIT",
+  "homepage": "https://github.com/Ray-Hughes/Delphi",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ray-Hughes/Delphi.git"
+  },
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "icons": "python3 tools/make_icons.py",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "release": "electron-builder --publish always"
   },
   "devDependencies": {
-    "electron": "^43.3.0"
+    "electron": "^43.3.0",
+    "electron-builder": "^26.0.12"
   },
   "productName": "Delphi"
 }

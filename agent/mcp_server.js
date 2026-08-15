@@ -7,10 +7,9 @@
  * the same store: neither is talking to the other, they are both talking to this.
  *
  * Written against the protocol directly rather than an SDK so it has no
- * dependencies. It runs under the system Node, which does not have node:sqlite,
- * so the database is reached through the sqlite3 binary. Parameters are bound
- * through a temporary file rather than interpolated, because an agent will
- * eventually pass a note containing a quote.
+ * dependencies. It runs under whatever Node the editor launched it with, which
+ * is the awkward part: that Node may or may not have node:sqlite, so there are
+ * two ways in and the better one is tried first. See openDatabase below.
  */
 
 const { execFileSync } = require("child_process");
@@ -18,32 +17,122 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
-const DB = path.join(__dirname, "..", "delphi.db");
+/**
+ * Finds the database.
+ *
+ * A checkout keeps it beside the source, an installed copy keeps it in the
+ * per-user data directory, and the same server file is used by both: from a
+ * checkout it is agent/mcp_server.js, and from an installed app it is the copy in
+ * Resources. Looking for the neighbour first is what tells the two apart, since
+ * only a checkout has one. This duplicates paths.js on purpose, because that file
+ * ends up inside app.asar and a plain Node process cannot read in there.
+ */
+function findDatabase() {
+  if (process.env.DELPHI_DB) return path.resolve(process.env.DELPHI_DB);
+
+  const beside = path.join(__dirname, "..", "delphi.db");
+  if (fs.existsSync(beside)) return beside;
+
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db");
+  }
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    return path.join(appData, "Delphi", "delphi.db");
+  }
+  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(configHome, "Delphi", "delphi.db");
+}
+
+const DB = findDatabase();
+const ACTOR = process.env.DELPHI_ACTOR || "agent";
 
 /**
- * Finds the sqlite3 binary.
+ * Finds the sqlite3 binary, for when node:sqlite is not available.
  *
  * An MCP client launches this without a login shell, so PATH may not carry the
  * one the user sees in a terminal. The system copy on macOS is checked first
- * because it is always present and always adequate here.
+ * because it is always present and always adequate here. Windows ships no sqlite3
+ * at all, which is why this is now the fallback rather than the only route.
  */
 function findSqlite() {
   const candidates = [
     process.env.DELPHI_SQLITE,
-    "/usr/bin/sqlite3",
-    "/opt/homebrew/bin/sqlite3",
-    "/usr/local/bin/sqlite3",
+    ...(process.platform === "win32"
+      ? [
+          path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Links", "sqlite3.exe"),
+          "C:\\ProgramData\\chocolatey\\bin\\sqlite3.exe",
+          "sqlite3.exe",
+        ]
+      : ["/usr/bin/sqlite3", "/opt/homebrew/bin/sqlite3", "/usr/local/bin/sqlite3"]),
   ].filter(Boolean);
   for (const candidate of candidates) {
     try {
       if (fs.existsSync(candidate)) return candidate;
     } catch {}
   }
-  return "sqlite3"; // fall back to PATH and let it fail loudly
+  return process.platform === "win32" ? "sqlite3.exe" : "sqlite3";
 }
 
-const SQLITE = findSqlite();
-const ACTOR = process.env.DELPHI_ACTOR || "agent";
+/**
+ * Opens the database the best way this Node allows.
+ *
+ * node:sqlite is preferred wherever it exists. It is in process, so there is no
+ * temporary file and no subprocess per query, and it is the only route that works
+ * on Windows out of the box: Windows ships no sqlite3 command, so a server that
+ * can only shell out is a server that cannot start there.
+ *
+ * It is not always there. It landed in Node 22.5 behind a flag and only became
+ * available unflagged later, so requiring it throws on plenty of the versions an
+ * editor might be running. That throw is the whole test.
+ */
+function openDatabase() {
+  try {
+    const { DatabaseSync } = require("node:sqlite");
+    const handle = new DatabaseSync(DB);
+    return {
+      kind: "node:sqlite",
+      query(statement) {
+        // all() rather than run() for everything. It returns rows for a SELECT
+        // and an empty list for a write, which is exactly the shape the shelling
+        // out version produced, so nothing downstream has to know which is in use.
+        return handle.prepare(statement).all();
+      },
+    };
+  } catch {
+    const binary = findSqlite();
+    return {
+      kind: binary,
+      query(statement) {
+        // Written to a file rather than bound through ".parameter set", which is
+        // a dot command and therefore line-oriented: a note body containing a
+        // newline silently breaks it halfway through. A quoted SQL literal inside
+        // a script file spans lines happily.
+        const lines = [".mode json", ".headers on", statement];
+        const file = path.join(os.tmpdir(), `delphi-${process.pid}-${Date.now()}.sql`);
+        fs.writeFileSync(file, lines.join("\n"));
+        try {
+          const out = execFileSync(binary, [DB], {
+            input: `.read ${file}\n`,
+            encoding: "utf8",
+            maxBuffer: 32 * 1024 * 1024,
+          });
+          const trimmed = out.trim();
+          if (!trimmed) return [];
+          try {
+            return JSON.parse(trimmed);
+          } catch {
+            return [];
+          }
+        } finally {
+          try { fs.unlinkSync(file); } catch {}
+        }
+      },
+    };
+  }
+}
+
+const DATABASE = openDatabase();
 
 // --- database ---------------------------------------------------------------
 
@@ -62,10 +151,8 @@ function literal(v) {
 }
 
 function sql(query, params = []) {
-  // Values are substituted into the statement rather than bound through
-  // ".parameter set", which is a dot-command and therefore line-oriented: a note
-  // body containing a newline silently breaks it halfway through. A quoted SQL
-  // literal inside a script file spans lines happily.
+  // Values are substituted into the statement rather than bound. Both routes take
+  // the statement as text, so doing it once here keeps them interchangeable.
   //
   // Placeholders are replaced highest-numbered first so :p10 is not eaten by the
   // pattern for :p1.
@@ -75,26 +162,7 @@ function sql(query, params = []) {
     statement = statement.replaceAll(`:p${index + 1}`, literal(params[index]));
   });
 
-  const lines = [".mode json", ".headers on", statement.endsWith(";") ? statement : statement + ";"];
-
-  const file = path.join(os.tmpdir(), `brain-${process.pid}-${Date.now()}.sql`);
-  fs.writeFileSync(file, lines.join("\n"));
-  try {
-    const out = execFileSync(SQLITE, [DB], {
-      input: `.read ${file}\n`,
-      encoding: "utf8",
-      maxBuffer: 32 * 1024 * 1024,
-    });
-    const trimmed = out.trim();
-    if (!trimmed) return [];
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return [];
-    }
-  } finally {
-    try { fs.unlinkSync(file); } catch {}
-  }
+  return DATABASE.query(statement.endsWith(";") ? statement : statement + ";");
 }
 
 const audit = (action, entity, entityId, summary, label) =>

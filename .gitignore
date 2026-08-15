@@ -1,5 +1,9 @@
 node_modules/
 
+# Installer output. Rebuilt from a tag by the release workflow, and a single mac
+# dmg is over a hundred megabytes, so it is never committed.
+release/
+
 # The database is personal work content, not code. It was tracked here as
 # brain.db once, that name stopped matching the file after the rename to
 # delphi.db, and a populated database reached this public repository as a

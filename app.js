@@ -288,11 +288,14 @@ function navigate(next) {
   if (next.view !== undefined) state.taskFilter = null;
   Object.assign(state, next);
   const to = position();
-  if (samePosition(from, to)) return;
+  if (samePosition(from, to)) return Promise.resolve();
 
   state.history.push(from);
   if (state.history.length > 50) state.history.shift();
-  refresh();
+  // The repaint is handed back so a caller can wait for it. The menu needs that:
+  // the composer it wants to put the cursor in is created by the render and does
+  // not exist in the document until this has finished.
+  return refresh();
 }
 
 /**
@@ -1537,9 +1540,9 @@ $("search").addEventListener("input", (e) => {
   }, 140);
 });
 
-$("new-project").onclick = async () => {
+async function createProject() {
   const name = prompt("Project name");
-  if (!name || !name.trim()) return;
+  if (!name || !name.trim()) return null;
   const key = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   const palette = ["#4a63d8", "#e0803a", "#2f8757", "#a86fd1", "#c9546b", "#3fa7a1"];
   const created = await window.delphi.projects.create({
@@ -1549,8 +1552,11 @@ $("new-project").onclick = async () => {
   });
   state.projectId = created.id;
   state.view = "overview";
-  refresh();
-};
+  await refresh();
+  return created;
+}
+
+$("new-project").onclick = createProject;
 
 $("back").onclick = () => goBack();
 
@@ -1597,9 +1603,122 @@ document.addEventListener("keydown", (e) => {
 });
 
 // Frameless panel mode has no traffic lights, so the title bar does not need to
-// leave room for them.
-window.delphi.onMode(({ panelMode }) => {
+// leave room for them. Which side needs the room at all is a platform question:
+// macOS puts its traffic lights on the left of our bar, Windows puts the system
+// control overlay on the right of it.
+window.delphi.onMode(({ panelMode, platform, overlay }) => {
   document.body.classList.toggle("panel", panelMode);
+  document.body.classList.toggle("mac", platform === "darwin");
+  document.body.classList.toggle("overlay", overlay === true);
+});
+
+// ---------------------------------------------------------------------------
+// The application menu
+//
+// The menu is built in the main process, which owns no part of the page, so every
+// item that acts on what is displayed arrives here as one message. Anything that
+// puts the cursor in a composer waits for the repaint first: those fields are
+// created by the render and are not in the document until it has run.
+// ---------------------------------------------------------------------------
+
+function focusComposer() {
+  const place = () => {
+    const field = document.querySelector(".add-row .field");
+    if (!field) return null;
+    field.focus();
+    field.select();
+    return field;
+  };
+
+  const field = place();
+  if (!field) return;
+
+  // A repaint that was still in flight replaces this field with a new one and the
+  // cursor is left nowhere. Two menu items in quick succession is the case that
+  // does it: the first is still rendering when the second arrives. Cheap to check
+  // whether that happened, so it is checked rather than assumed not to.
+  requestAnimationFrame(() => {
+    if (!document.contains(field)) place();
+  });
+}
+
+/** Navigating from the menu empties the search box with the query, so the field
+ *  cannot sit there showing a search the view no longer reflects. */
+function goTo(next) {
+  if (next.query === "") $("search").value = "";
+  return navigate(next);
+}
+
+/** Notes and dashboards belong to a project, so the menu needs one to open. */
+const someProjectId = () => state.projectId || (state.projects[0] && state.projects[0].id) || null;
+
+window.delphi.onMenu(async ({ action, view, theme }) => {
+  switch (action) {
+    case "search":
+      $("search").focus();
+      $("search").select();
+      return;
+
+    case "back":
+      goBack();
+      return;
+
+    case "theme":
+      applyTheme(theme);
+      render();
+      return;
+
+    case "settings":
+      // Settings live in the All view, so getting there means leaving whichever
+      // project is open rather than looking for a tab that is not there.
+      await goTo({ projectId: null, view: "settings", query: "" });
+      return;
+
+    case "new-project":
+      await createProject();
+      return;
+
+    case "new-task":
+      await goTo({ view: "tasks", query: "" });
+      focusComposer();
+      return;
+
+    case "new-note": {
+      const projectId = someProjectId();
+      // Memory is stored per project, so with none in the tracker yet the useful
+      // thing to do is make one rather than to fail quietly.
+      if (!projectId) {
+        if (!(await createProject())) return;
+      } else {
+        await goTo({ projectId, view: "notes", query: "" });
+      }
+      focusComposer();
+      return;
+    }
+
+    case "undo-last":
+      try {
+        await window.delphi.audit.undoLast(1);
+      } catch (error) {
+        alert(`Nothing to undo: ${error.message}`);
+      }
+      await refresh();
+      return;
+
+    case "view": {
+      // What's new and History are the All view's tabs; Memory only exists inside
+      // a project. Sending the wrong one would land on a tab that is not there.
+      if (view === "new" || view === "history") {
+        await goTo({ projectId: null, view, query: "" });
+      } else if (view === "notes") {
+        const projectId = someProjectId();
+        if (projectId) await goTo({ projectId, view: "notes", query: "" });
+      } else {
+        await goTo({ view, query: "" });
+      }
+      return;
+    }
+  }
 });
 
 window.delphi.onShown(() => { refresh(); $("search").focus(); });

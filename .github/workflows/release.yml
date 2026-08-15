@@ -1,0 +1,76 @@
+name: Release
+
+# Tag a version and this builds the installers and puts them on the release.
+#
+#   npm version 1.0.1 && git push --follow-tags
+#
+# Each platform is built on its own runner because neither can produce the other's
+# installer without help: a Windows installer built on macOS needs Wine, and a mac
+# build cannot be signed or made into a dmg anywhere but macOS.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not throw away the other's build, which may
+      # have taken ten minutes and be perfectly good.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: macOS
+            args: --mac
+          - os: windows-latest
+            name: Windows
+            args: --win
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build and publish
+        run: npx electron-builder ${{ matrix.args }} --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signing, for when there are certificates to sign with. Every one of
+          # these is empty today, and electron-builder treats an empty signing
+          # variable as "do not sign" rather than as an error, so this block is
+          # inert until the secrets exist. Adding them is then a settings change
+          # rather than a workflow rewrite.
+          #
+          # macOS needs CSC_LINK (a base64 .p12), its password, and the three
+          # notarisation values. Windows needs the same first two with its own
+          # certificate. tools/after-pack.js stands down as soon as CSC_LINK is
+          # set, so the ad-hoc signature it applies cannot overwrite a real one.
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Keep the installers even if publishing failed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-installers
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
