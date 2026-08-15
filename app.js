@@ -947,7 +947,14 @@ function taskRow(t) {
   row.append(check);
 
   const body = el("div", { className: "t-body" });
-  body.append(el("div", { className: "t-title", textContent: t.title }));
+  // The title is the way in. A task is a line until you open it, and everything
+  // worth knowing about it lives behind that click.
+  const heading = el("div", { className: "t-title", textContent: t.title, tabIndex: 0, role: "button" });
+  heading.onclick = () => openTaskSheet(t.id);
+  heading.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTaskSheet(t.id); }
+  };
+  body.append(heading);
 
   const meta = el("div", { className: "t-meta" });
   if (!state.projectId && t.project_name) {
@@ -959,6 +966,11 @@ function taskRow(t) {
   if (isOverdue(t)) meta.append(el("span", { className: "chip overdue", textContent: `overdue ${t.due}` }));
   else if (t.due) meta.append(el("span", { className: "chip", textContent: `due ${t.due}` }));
   if (t.ref) meta.append(el("span", { className: "chip ref", textContent: t.ref }));
+  if (t.subtask_count) {
+    meta.append(el("span", { className: "chip", textContent: `${t.subtask_done}/${t.subtask_count} subtasks` }));
+  }
+  if (t.comment_count) meta.append(el("span", { className: "chip", textContent: `${t.comment_count} comments` }));
+  if (t.assignee) meta.append(el("span", { className: "chip who", textContent: t.assignee }));
 
   if (t.detail) {
     const detail = el("div", { className: "t-detail", textContent: t.detail });
@@ -1190,7 +1202,7 @@ function openNoteSheet(note) {
   close.onclick = () => closeNoteSheet();
   document.body.append(overlay);
 
-  openSheet = { overlay, note, title, area, status };
+  openSheet = { overlay, note, title, area, status, close: closeNoteSheet };
   // Only the source pane can take a caret. In formatted mode the textarea is
   // detached, and focusing a node that is not in the document does nothing.
   if (state.noteView === "raw") {
@@ -1525,6 +1537,399 @@ async function renderSettings(root) {
 }
 
 // ---------------------------------------------------------------------------
+// The task sheet
+//
+// A task in a list is a line of text. Opened, it is the whole story: what state
+// it has been through and for how long, what was said about it, what it is made
+// of, and who is holding it.
+//
+// Two things here are deliberate rather than decorative. The timeline shows
+// durations rather than timestamps, because "blocked for four days" is the thing
+// anyone actually wants to know and a pair of dates makes you do the arithmetic.
+// And the handoff block turns the task into a brief an agent can act on, because
+// the alternative is a person retyping the same context into a chat window.
+// ---------------------------------------------------------------------------
+
+const STATUSES = [
+  ["todo", "To do"],
+  ["doing", "In progress"],
+  ["blocked", "Blocked"],
+  ["done", "Done"],
+];
+
+/** Names that belong to software rather than to a person. */
+const isAgent = (name) => /claude|copilot|codex|cursor|agent|gpt|bot/i.test(String(name || ""));
+
+/**
+ * A gap in words.
+ *
+ * Rounded to one unit on purpose: this is read at a glance to answer "was that
+ * recent", and "3d" answers it where "3 days 4 hours 12 minutes" does not.
+ */
+function gap(fromIso, toIso) {
+  const from = new Date(String(fromIso).replace(" ", "T") + "Z").getTime();
+  const to = toIso ? new Date(String(toIso).replace(" ", "T") + "Z").getTime() : Date.now();
+  const seconds = Math.max(0, Math.round((to - from) / 1000));
+  if (seconds < 90) return "moments";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 36) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+/**
+ * The task as something an agent can be handed.
+ *
+ * Everything it would otherwise have to ask for, plus the exact calls that change
+ * it, so the agent does not have to guess the tool names. Copied rather than sent
+ * anywhere: which agent gets this is the person's decision, not the app's.
+ */
+function handoffText(detail) {
+  const t = detail.task;
+  const lines = [
+    `Delphi task ${t.id}: ${t.title}`,
+    detail.project ? `Project: ${detail.project.name}` : null,
+    `Status: ${t.status}   Priority: ${t.priority}` +
+      (t.due ? `   Due: ${t.due}` : "") +
+      (t.assignee ? `   Assignee: ${t.assignee}` : ""),
+    t.ref ? `Reference: ${t.ref}` : null,
+    "",
+    t.detail ? t.detail.trim() : "(no detail written)",
+  ].filter((line) => line !== null);
+
+  if (detail.subtasks.length) {
+    lines.push("", "Subtasks:");
+    for (const s of detail.subtasks) lines.push(`  [${s.status === "done" ? "x" : " "}] ${s.title}`);
+  }
+
+  if (detail.comments.length) {
+    lines.push("", "Discussion so far:");
+    for (const c of detail.comments) lines.push(`  ${c.author}: ${c.body.replace(/\s+/g, " ").trim()}`);
+  }
+
+  if (detail.events.length > 1) {
+    lines.push("", "How it got here:");
+    for (let i = 0; i < detail.events.length; i++) {
+      const e = detail.events[i];
+      const next = detail.events[i + 1];
+      lines.push(`  ${e.status} for ${gap(e.at, next ? next.at : null)}${e.actor ? ` (${e.actor})` : ""}`);
+    }
+  }
+
+  lines.push(
+    "",
+    "To act on this through the Delphi MCP server:",
+    `  update_task(id: ${t.id}, status: "doing")`,
+    `  update_task(id: ${t.id}, status: "done")`,
+    "  add_note(project, title, body, kind) for anything worth keeping afterwards"
+  );
+
+  return lines.join("\n");
+}
+
+async function openTaskSheet(taskId) {
+  if (openSheet) await openSheet.close();
+
+  let detail = await window.delphi.tasks.detail(taskId);
+  if (!detail) return;
+
+  const overlay = el("div", { className: "overlay" });
+  const sheet = el("div", { className: "sheet task-sheet", role: "dialog" });
+  sheet.setAttribute("aria-modal", "true");
+  sheet.setAttribute("aria-label", "Task detail");
+
+  // Head ---------------------------------------------------------------------
+  const head = el("div", { className: "sheet-head" });
+  const title = el("input", { value: detail.task.title });
+  title.setAttribute("aria-label", "Task title");
+  const saved = el("span", { className: "hint" });
+  const close = el("button", { className: "icon-btn", title: "Close (Escape)" });
+  close.setAttribute("aria-label", "Close task");
+  close.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" ' +
+    'stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+  head.append(title, saved, close);
+
+  const cols = el("div", { className: "task-cols" });
+  const main = el("div", { className: "task-main" });
+  const rail = el("div", { className: "task-rail" });
+  cols.append(main, rail);
+
+  const foot = el("div", { className: "sheet-foot" });
+
+  // Repaints everything that reads from the record, after any write.
+  const reload = async () => {
+    detail = await window.delphi.tasks.detail(taskId);
+    if (!detail) return;
+    paintControls();
+    paintSubtasks();
+    paintComments();
+    paintTimeline();
+    paintFoot();
+  };
+
+  const flash = (text) => {
+    saved.textContent = text;
+    setTimeout(() => { if (saved.textContent === text) saved.textContent = ""; }, 1600);
+  };
+
+  const write = async (fields, note) => {
+    await window.delphi.tasks.update(taskId, fields);
+    flash(note);
+    await reload();
+    refresh();
+  };
+
+  // Controls -----------------------------------------------------------------
+  const controls = el("div", { className: "task-controls" });
+
+  const field = (label, control, extra = "") =>
+    el("label", { className: `task-field ${extra}`.trim() },
+       el("span", { className: "task-field-label", textContent: label }), control);
+
+
+  function paintControls() {
+    controls.textContent = "";
+    const t = detail.task;
+
+    const statusRow = el("div", { className: "seg status-seg", role: "group" });
+    statusRow.setAttribute("aria-label", "Status");
+    for (const [value, label] of STATUSES) {
+      const button = el("button", { type: "button", textContent: label, className: `st-${value}` });
+      button.setAttribute("aria-pressed", String(t.status === value));
+      button.onclick = () => t.status !== value && write({ status: value }, `moved to ${label.toLowerCase()}`);
+      statusRow.append(button);
+    }
+    controls.append(field("Status", statusRow, "wide-field"));
+
+    const priority = el("select");
+    for (const p of ["high", "med", "low"]) {
+      priority.append(el("option", { value: p, textContent: p, selected: t.priority === p }));
+    }
+    priority.onchange = () => write({ priority: priority.value }, "priority saved");
+    controls.append(field("Priority", priority));
+
+    const assignee = el("input", { value: t.assignee || "", placeholder: "nobody yet" });
+    assignee.setAttribute("aria-label", "Assignee");
+    assignee.onchange = () => write({ assignee: assignee.value.trim() || null }, "assignee saved");
+    const assigneeWrap = el("div", { className: "assignee-wrap" }, assignee);
+    if (isAgent(t.assignee)) assigneeWrap.append(el("span", { className: "agent-tag", textContent: "agent" }));
+    controls.append(field("Assigned to", assigneeWrap));
+
+    const due = el("input", { type: "date", value: t.due || "" });
+    due.setAttribute("aria-label", "Due date");
+    due.onchange = () => write({ due: due.value || null }, "due date saved");
+    controls.append(field("Due", due));
+  }
+
+  // Detail -------------------------------------------------------------------
+  const detailArea = el("textarea", { value: detail.task.detail || "", spellcheck: false });
+  detailArea.placeholder = "What does finishing this actually involve";
+  detailArea.setAttribute("aria-label", "Task detail");
+
+  // Subtasks -----------------------------------------------------------------
+  const subtaskBox = el("div", { className: "task-section" });
+
+  function paintSubtasks() {
+    subtaskBox.textContent = "";
+    const done = detail.subtasks.filter((s) => s.status === "done").length;
+    const total = detail.subtasks.length;
+
+    const head = el("div", { className: "task-section-head" },
+      el("h4", { textContent: "Subtasks" }),
+      total ? el("span", { className: "hint", textContent: `${done} of ${total}` }) : null);
+    subtaskBox.append(head);
+
+    if (total) {
+      const bar = el("div", { className: "progress" });
+      bar.append(el("div", { className: "progress-fill", style: `width:${Math.round((done / total) * 100)}%` }));
+      subtaskBox.append(bar);
+    }
+
+    for (const s of detail.subtasks) {
+      const row = el("div", { className: "subtask" + (s.status === "done" ? " done" : "") });
+      const check = el("div", { className: "check", textContent: "✓", tabIndex: 0, role: "checkbox" });
+      check.setAttribute("aria-checked", String(s.status === "done"));
+      check.onclick = async () => {
+        await window.delphi.tasks.update(s.id, { status: s.status === "done" ? "todo" : "done" });
+        await reload();
+        refresh();
+      };
+      check.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); check.onclick(); } };
+      row.append(check, el("span", { className: "subtask-title", textContent: s.title }));
+      const open = el("button", { className: "btn sm", textContent: "open" });
+      open.onclick = () => openTaskSheet(s.id);
+      row.append(open);
+      subtaskBox.append(row);
+    }
+
+    const add = el("input", { className: "field", placeholder: "Add a subtask and press Enter" });
+    add.onkeydown = async (e) => {
+      if (e.key !== "Enter" || !add.value.trim()) return;
+      await window.delphi.tasks.create({ title: add.value.trim(), parentId: taskId });
+      add.value = "";
+      await reload();
+      refresh();
+    };
+    subtaskBox.append(add);
+  }
+
+  // Comments -----------------------------------------------------------------
+  const commentBox = el("div", { className: "task-section" });
+
+  function paintComments() {
+    commentBox.textContent = "";
+    commentBox.append(el("div", { className: "task-section-head" },
+      el("h4", { textContent: "Discussion" }),
+      el("span", { className: "hint", textContent: detail.comments.length ? `${detail.comments.length}` : "" })));
+
+    if (!detail.comments.length) {
+      commentBox.append(el("div", { className: "hint pad",
+        textContent: "Nothing said yet. Agents write here too, and what they leave is what the next one reads." }));
+    }
+
+    for (const c of detail.comments) {
+      const agent = isAgent(c.author);
+      const row = el("div", { className: "comment" + (agent ? " from-agent" : "") });
+      const who = el("div", { className: "comment-who" },
+        el("span", { className: "avatar", textContent: String(c.author || "?").slice(0, 1).toUpperCase() }),
+        el("span", { className: "comment-author", textContent: c.author }),
+        agent ? el("span", { className: "agent-tag", textContent: "agent" }) : null,
+        el("span", { className: "hint", textContent: `${gap(c.created_at)} ago` }));
+      const remove = el("button", { className: "btn sm", textContent: "delete" });
+      remove.onclick = async () => {
+        await window.delphi.tasks.uncomment(c.id);
+        await reload();
+      };
+      who.append(remove);
+      row.append(who, renderMarkdown(c.body));
+      commentBox.append(row);
+    }
+
+    const composer = el("textarea", { className: "comment-input", placeholder: "Add to the discussion" });
+    composer.setAttribute("aria-label", "New comment");
+    const send = el("button", { className: "btn primary", textContent: "Comment" });
+    const post = async () => {
+      if (!composer.value.trim()) return;
+      await window.delphi.tasks.comment(taskId, composer.value, "you");
+      composer.value = "";
+      await reload();
+    };
+    send.onclick = post;
+    // Enter sends, Shift and Enter makes a paragraph. The opposite would make a
+    // one line comment need a trip to the mouse.
+    composer.onkeydown = (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); post(); }
+    };
+    commentBox.append(el("div", { className: "composer" }, composer, send));
+  }
+
+  // Timeline -----------------------------------------------------------------
+  const timeline = el("div", { className: "task-section" });
+
+  function paintTimeline() {
+    timeline.textContent = "";
+    timeline.append(el("div", { className: "task-section-head" }, el("h4", { textContent: "How it got here" })));
+
+    if (!detail.events.length) {
+      timeline.append(el("div", { className: "hint pad", textContent: "No status history yet." }));
+      return;
+    }
+
+    const list = el("div", { className: "timeline" });
+    detail.events.forEach((e, i) => {
+      const next = detail.events[i + 1];
+      const row = el("div", { className: "tl-row" + (next ? "" : " current") });
+      row.append(el("span", { className: `tl-dot st-${e.status}` }));
+      const body = el("div", { className: "tl-body" });
+      body.append(el("div", { className: "tl-status" },
+        el("span", { textContent: STATUSES.find((s) => s[0] === e.status)?.[1] || e.status }),
+        el("span", { className: "hint", textContent: next ? `for ${gap(e.at, next.at)}` : `for ${gap(e.at)} so far` })));
+      const by = e.actor ? el("span", { className: isAgent(e.actor) ? "agent-tag" : "hint", textContent: e.actor }) : null;
+      body.append(el("div", { className: "tl-when" }, el("span", { className: "hint", textContent: e.at }), by));
+      row.append(body);
+      list.append(row);
+    });
+    timeline.append(list);
+  }
+
+  // Handoff ------------------------------------------------------------------
+  const handoff = el("div", { className: "task-section handoff" });
+  handoff.append(el("div", { className: "task-section-head" }, el("h4", { textContent: "Hand to an agent" })));
+  handoff.append(el("div", { className: "hint pad",
+    textContent: "Copies this task, its discussion and its history as a brief, with the tool calls that change it." }));
+  const copy = el("button", { className: "btn primary wide", textContent: "Copy brief" });
+  copy.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(handoffText(detail));
+      copy.textContent = "Copied";
+      setTimeout(() => (copy.textContent = "Copy brief"), 1400);
+    } catch {
+      copy.textContent = "Could not copy";
+      setTimeout(() => (copy.textContent = "Copy brief"), 1400);
+    }
+  };
+  handoff.append(copy);
+
+  const claim = el("button", { className: "btn wide", textContent: "Mark an agent as working on it" });
+  claim.onclick = () => write({ assignee: "claude", status: "doing" }, "handed to claude");
+  handoff.append(claim);
+
+  // Foot ---------------------------------------------------------------------
+  function paintFoot() {
+    foot.textContent = "";
+    const t = detail.task;
+    const bits = [
+      `task ${t.id}`,
+      detail.project ? detail.project.name : "no project",
+      t.ref || null,
+      `created ${ago(t.created_at)}`,
+      t.completed_at ? `completed ${ago(t.completed_at)}` : null,
+    ].filter(Boolean);
+    foot.append(el("span", { textContent: bits.join("  ·  ") }));
+    if (detail.parent) {
+      const up = el("button", { className: "btn sm", textContent: `parent: ${detail.parent.title}` });
+      up.onclick = () => openTaskSheet(detail.parent.id);
+      foot.append(el("span", { className: "spacer" }), up);
+    }
+  }
+
+  // Assemble -----------------------------------------------------------------
+  main.append(controls, el("div", { className: "task-section" },
+    el("div", { className: "task-section-head" }, el("h4", { textContent: "Detail" })), detailArea),
+    subtaskBox, commentBox);
+  rail.append(timeline, handoff);
+  sheet.append(head, cols, foot);
+  overlay.append(sheet);
+  document.body.append(overlay);
+
+  paintControls();
+  paintSubtasks();
+  paintComments();
+  paintTimeline();
+  paintFoot();
+
+  const closeSheet = async () => {
+    if (!openSheet) return;
+    openSheet = null;
+    const updates = {};
+    if (title.value.trim() && title.value !== detail.task.title) updates.title = title.value.trim();
+    if (detailArea.value !== (detail.task.detail || "")) updates.detail = detailArea.value;
+    overlay.remove();
+    if (Object.keys(updates).length) {
+      await window.delphi.tasks.update(taskId, updates);
+      refresh();
+    }
+  };
+
+  close.onclick = closeSheet;
+  overlay.onclick = (e) => { if (e.target === overlay) closeSheet(); };
+  openSheet = { overlay, close: closeSheet };
+  title.focus();
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
@@ -1585,7 +1990,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     // The sheet is the innermost thing open, so it closes first. Without this,
     // Escape would hide the whole window and lose unsaved edits.
-    if (openSheet) { closeNoteSheet(); return; }
+    if (openSheet) { openSheet.close(); return; }
     if ($("search").value) {
       $("search").value = "";
       state.query = "";

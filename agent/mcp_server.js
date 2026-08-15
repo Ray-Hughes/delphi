@@ -264,15 +264,25 @@ const TOOLS = {
         priority: { type: "string", enum: ["high", "med", "low"] },
         due: { type: "string", description: "YYYY-MM-DD" },
         ref: { type: "string", description: "Ticket or pull request reference" },
+        parent_id: { type: "number", description: "Make this a subtask of that task" },
       },
     },
     run: (a) => {
+      // A subtask lives in its parent's project whatever was passed, because a
+      // subtask filed somewhere else is not a subtask.
+      let projectId = a.project_id ?? null;
+      if (a.parent_id) {
+        const parent = sql("SELECT project_id FROM tasks WHERE id = :p1", [a.parent_id])[0];
+        if (!parent) throw new Error(`No task ${a.parent_id} to hang this from`);
+        projectId = parent.project_id;
+      }
       sql(
-        `INSERT INTO tasks (project_id, title, detail, priority, due, ref, source)
-         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7)`,
-        [a.project_id ?? null, a.title, a.detail ?? null, a.priority || "med", a.due ?? null, a.ref ?? null, ACTOR]
+        `INSERT INTO tasks (project_id, title, detail, priority, due, ref, parent_id, source)
+         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8)`,
+        [projectId, a.title, a.detail ?? null, a.priority || "med", a.due ?? null, a.ref ?? null, a.parent_id ?? null, ACTOR]
       );
       const row = sql("SELECT id, title FROM tasks ORDER BY id DESC LIMIT 1")[0];
+      sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'todo', :p2)", [row.id, ACTOR]);
       audit("create", "task", row.id, "created", row.title);
       return row;
     },
@@ -292,12 +302,13 @@ const TOOLS = {
         priority: { type: "string", enum: ["high", "med", "low"] },
         due: { type: "string" },
         project_id: { type: "number" },
+        assignee: { type: "string", description: "Who is holding this. Your own actor name if you are taking it." },
       },
     },
     run: (a) => {
       const before = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
       if (!before) throw new Error(`No task ${a.id}`);
-      const fields = ["title", "detail", "status", "priority", "due", "project_id"].filter((f) => a[f] !== undefined);
+      const fields = ["title", "detail", "status", "priority", "due", "project_id", "assignee"].filter((f) => a[f] !== undefined);
       if (!fields.length) return before;
       const params = fields.map((f) => a[f]);
       const sets = fields.map((f, i) => `${f} = :p${i + 1}`).join(", ");
@@ -305,8 +316,60 @@ const TOOLS = {
       const done = a.status === "done" ? ", completed_at = datetime('now')" : a.status ? ", completed_at = NULL" : "";
       sql(`UPDATE tasks SET ${sets}, updated_at = datetime('now')${done} WHERE id = :p${params.length}`, params);
       const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
+      // The timeline should not be able to tell whether a person or an agent
+      // moved a task, only who it was. Recorded here for the same reason the app
+      // records it: so the history cannot disagree with the column.
+      if (after.status !== before.status) {
+        sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
+            [a.id, after.status, ACTOR]);
+      }
       audit("update", "task", a.id, a.status ? `status to ${a.status}` : "updated", after.title);
       return after;
+    },
+  },
+
+  get_task: {
+    description:
+      "Everything about one task: its detail, subtasks, the discussion on it, and every status it has been through. Read this before starting work on a task, because the last agent probably left you something.",
+    schema: {
+      type: "object",
+      required: ["id"],
+      properties: { id: { type: "number" } },
+    },
+    run: (a) => {
+      const task = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
+      if (!task) throw new Error(`No task ${a.id}`);
+      return {
+        task,
+        project: task.project_id
+          ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [task.project_id])[0]
+          : null,
+        subtasks: sql("SELECT id, title, status FROM tasks WHERE parent_id = :p1 ORDER BY id", [a.id]),
+        comments: sql("SELECT author, body, created_at FROM comments WHERE task_id = :p1 ORDER BY id", [a.id]),
+        history: sql("SELECT status, actor, at FROM status_events WHERE task_id = :p1 ORDER BY at, id", [a.id]),
+      };
+    },
+  },
+
+  add_comment: {
+    description:
+      "Leave a comment on a task. Use it for what you found, what you tried, and what you would do next, so the agent that picks this up after you does not start from nothing.",
+    schema: {
+      type: "object",
+      required: ["task_id", "body"],
+      properties: {
+        task_id: { type: "number" },
+        body: { type: "string", description: "Markdown. Be specific: an unread comment is better than a vague one." },
+      },
+    },
+    run: (a) => {
+      const task = sql("SELECT id, title FROM tasks WHERE id = :p1", [a.task_id])[0];
+      if (!task) throw new Error(`No task ${a.task_id}`);
+      if (!a.body || !String(a.body).trim()) throw new Error("A comment needs something in it");
+      sql("INSERT INTO comments (task_id, author, body) VALUES (:p1, :p2, :p3)",
+          [a.task_id, ACTOR, String(a.body).trim()]);
+      audit("update", "task", a.task_id, "commented", task.title);
+      return sql("SELECT * FROM comments WHERE task_id = :p1 ORDER BY id DESC LIMIT 1", [a.task_id])[0];
     },
   },
 

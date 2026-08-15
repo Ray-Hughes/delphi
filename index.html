@@ -234,7 +234,7 @@
   }
   .back[hidden] { display: none; }
   .back:hover { background: var(--raised); color: var(--ink); border-color: var(--ink-faint); }
-  .back:active { background: var(--panel-hi); }
+  .back:active { background: var(--raised); }
   .back svg { width: 16px; height: 16px; }
 
   /* Header metrics. Compact siblings of the dashboard tiles: same information
@@ -492,6 +492,137 @@
   .kind.gotcha   { color: var(--warn); background: transparent; border: 1px solid var(--warn); }
   .kind.reference{ color: var(--good); background: transparent; border: 1px solid var(--good); }
 
+  /* Task sheet ------------------------------------------------------------
+     Two columns: what the task is on the left, what has happened to it on the
+     right. The rail is narrow on purpose, because history is glanced at and the
+     work is done in the main column. */
+  .task-sheet { width: min(1180px, 100%); height: min(880px, 100%); }
+  .task-cols {
+    flex: 1; min-height: 0; display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+  }
+  .task-main {
+    min-height: 0; overflow-y: auto;
+    padding: var(--s5); display: flex; flex-direction: column; gap: var(--s5);
+  }
+  .task-rail {
+    min-height: 0; overflow-y: auto;
+    padding: var(--s5) var(--s5) var(--s5) 0;
+    display: flex; flex-direction: column; gap: var(--s5);
+  }
+  @media (max-width: 900px) {
+    .task-cols { grid-template-columns: 1fr; }
+    .task-rail { padding: 0 var(--s5) var(--s5); }
+  }
+
+  .task-section { display: flex; flex-direction: column; gap: var(--s3); }
+  .task-section-head { display: flex; align-items: baseline; gap: var(--s2); }
+  .task-section-head h4 {
+    font-size: 11px; font-weight: 650; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--ink-faint);
+  }
+  .task-section .pad { padding: var(--s2) 0; }
+  .task-section textarea {
+    resize: vertical; min-height: 110px; outline: none;
+    border: 1px solid var(--line); border-radius: var(--r);
+    background: var(--bg); padding: var(--s3) var(--s4);
+    font-size: 13.5px; line-height: 1.7; color: var(--ink);
+  }
+  .task-section textarea:focus { border-color: var(--accent); }
+
+  .task-controls {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: var(--s3) var(--s4);
+  }
+  .task-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .task-field-label {
+    font-size: 10.5px; font-weight: 650; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--ink-faint);
+  }
+  .task-field select, .task-field input {
+    border: 1px solid var(--line); border-radius: var(--r-sm);
+    background: var(--bg); color: var(--ink);
+    padding: 7px 9px; font-size: 13px; outline: none; width: 100%;
+  }
+  .task-field select:focus, .task-field input:focus { border-color: var(--accent); }
+  .assignee-wrap { display: flex; align-items: center; gap: 6px; }
+  /* The status control spans the row. Left in one grid cell it squeezed four
+     buttons into 150px and the last one fell off the edge. */
+  .task-field.wide-field { grid-column: 1 / -1; }
+  .task-controls .seg { width: 100%; }
+  .task-controls .seg button { flex: 1; }
+  /* The state a task is in should be readable from the control, not only from
+     which button looks pressed. */
+  .seg button.st-doing[aria-pressed="true"]   { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .seg button.st-blocked[aria-pressed="true"] { background: var(--crit); border-color: var(--crit); color: #fff; }
+  .seg button.st-done[aria-pressed="true"]    { background: var(--good); border-color: var(--good); color: #fff; }
+
+  .progress { height: 4px; border-radius: 99px; background: var(--raised); overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--good); transition: width 180ms ease; }
+
+  .subtask {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: 7px 0; border-bottom: 1px solid var(--line-soft);
+  }
+  .subtask:last-of-type { border-bottom: 0; }
+  .subtask-title { flex: 1; font-size: 13.5px; }
+  .subtask.done .subtask-title { color: var(--ink-faint); text-decoration: line-through; }
+
+  /* Discussion. An agent's contribution is marked rather than styled to look
+     like a different kind of content, because it is the same kind of content and
+     only the author differs. */
+  .comment {
+    border: 1px solid var(--line); border-left: 3px solid var(--line);
+    border-radius: var(--r); padding: var(--s3) var(--s4); background: var(--surface);
+  }
+  .comment.from-agent { border-left-color: var(--accent); background: var(--accent-soft); }
+  .comment-who { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
+  .comment-who .btn { margin-left: auto; opacity: 0; transition: opacity 120ms ease; }
+  .comment:hover .comment-who .btn { opacity: 1; }
+  .comment-author { font-size: 12.5px; font-weight: 620; }
+  .comment .md { font-size: 13.5px; }
+  .comment .md :first-child { margin-top: 0; }
+  .comment .md :last-child { margin-bottom: 0; }
+  .avatar {
+    width: 20px; height: 20px; border-radius: 99px; flex: 0 0 20px;
+    display: grid; place-items: center;
+    background: var(--raised); color: var(--ink-dim);
+    font-size: 10.5px; font-weight: 700;
+  }
+  .from-agent .avatar { background: var(--accent); color: #fff; }
+  .agent-tag {
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase;
+    padding: 1px 5px; border-radius: 4px;
+    background: var(--accent); color: #fff;
+  }
+  .composer { display: flex; flex-direction: column; gap: var(--s2); align-items: flex-end; }
+  .composer textarea { width: 100%; min-height: 62px; }
+
+  /* Timeline. Durations rather than timestamps, because "blocked for 4d" is the
+     question people are asking. */
+  .timeline { display: flex; flex-direction: column; }
+  .tl-row { display: flex; gap: var(--s3); padding-bottom: var(--s3); position: relative; }
+  .tl-row:not(:last-child)::before {
+    content: ""; position: absolute; left: 4px; top: 14px; bottom: 0;
+    width: 1px; background: var(--line);
+  }
+  .tl-dot {
+    width: 9px; height: 9px; border-radius: 99px; margin-top: 4px; flex: 0 0 9px;
+    background: var(--ink-faint); z-index: 1;
+  }
+  .tl-dot.st-doing { background: var(--accent); }
+  .tl-dot.st-blocked { background: var(--crit); }
+  .tl-dot.st-done { background: var(--good); }
+  .tl-body { min-width: 0; }
+  .tl-status { display: flex; gap: 7px; align-items: baseline; font-size: 13px; font-weight: 600; }
+  .tl-when { display: flex; gap: 6px; align-items: center; font-size: 11px; }
+  .tl-row.current .tl-status { color: var(--ink); }
+
+  .handoff .btn.wide { width: 100%; justify-content: center; }
+  .chip.who { border-color: var(--accent); color: var(--accent); }
+  .t-title[role="button"] { cursor: default; }
+  .t-title[role="button"]:hover { color: var(--accent); }
+
   /* Expanded note ---------------------------------------------------------
      A note that is mostly commands is unreadable in a box six lines tall. This
      is the same note, given the room the content actually needs. */
@@ -574,7 +705,7 @@
     background: var(--raised);
     box-shadow: inset 2px 0 0 var(--accent);
   }
-  .list-row.clickable:active { background: var(--panel-hi); }
+  .list-row.clickable:active { background: var(--raised); }
 
   /* Settings ------------------------------------------------------------- */
   .setting { padding: var(--s5) 0; border-bottom: 1px solid var(--line-soft); max-width: 70ch; }
