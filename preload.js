@@ -20,6 +20,9 @@ contextBridge.exposeInMainWorld("delphi", {
     create: (payload) => call("tasks:create", payload),
     update: (id, fields) => call("tasks:update", id, fields),
     remove: (id) => call("tasks:delete", id),
+    detail: (id) => call("tasks:detail", id),
+    comment: (id, body, author) => call("tasks:comment", id, body, author),
+    uncomment: (id) => call("tasks:uncomment", id),
   },
   notes: {
     list: (projectId) => call("notes:list", projectId),

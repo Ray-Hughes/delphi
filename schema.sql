@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   due          TEXT,
   source       TEXT,
   ref          TEXT,                       -- PROJ-123, PR number, whatever
+  -- A subtask is a task with a parent rather than a row in a second table, so
+  -- everything that already works on a task works on a subtask: search, the
+  -- audit trail, status events, the MCP tools, all of it.
+  parent_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  -- Free text until there is a people table. An agent name goes here too, which
+  -- is what lets the queue show who is holding a piece of work.
+  assignee     TEXT,
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT
@@ -54,6 +61,37 @@ CREATE TABLE IF NOT EXISTS notes (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Conversation about a task, kept on the task.
+--
+-- The author is free text rather than a reference to a people table, because
+-- agents and people both write here and neither should be the special case. When
+-- people management arrives it can backfill from these names rather than the
+-- other way around.
+CREATE TABLE IF NOT EXISTS comments (
+  id         INTEGER PRIMARY KEY,
+  task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  author     TEXT NOT NULL DEFAULT 'you',
+  body       TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id, id);
+
+-- Every status a task has been in, and when it entered it.
+--
+-- The task keeps its current status as a column, so nothing that reads a task
+-- has to change. This is the history behind that column, and it is what makes
+-- "how long was this blocked" a question with an answer. Written by the update
+-- path rather than by callers, so it cannot drift from the status it describes.
+CREATE TABLE IF NOT EXISTS status_events (
+  id      INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  status  TEXT NOT NULL CHECK (status IN ('todo', 'doing', 'blocked', 'done')),
+  actor   TEXT,
+  at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_status_events_task ON status_events(task_id, at);
 
 CREATE TABLE IF NOT EXISTS links (
   id         INTEGER PRIMARY KEY,
@@ -135,3 +173,5 @@ CREATE TABLE IF NOT EXISTS repos (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_repos_project ON repos(project_id);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);

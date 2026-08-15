@@ -665,6 +665,13 @@ handle("tasks:list", (opts) => db.listTasks(opts));
 handle("tasks:create", (payload) => { const r = db.createTask(payload); scheduleVaultExport(); return r; });
 handle("tasks:update", (id, fields) => { const r = db.updateTask(id, fields); scheduleVaultExport(); return r; });
 handle("tasks:delete", (id) => { const r = db.deleteTask(id); scheduleVaultExport(); return r; });
+handle("tasks:detail", (id) => db.taskDetail(id));
+handle("tasks:comment", (taskId, body, author) => {
+  const r = db.createComment({ taskId, body, author });
+  scheduleVaultExport();
+  return r;
+});
+handle("tasks:uncomment", (id) => db.deleteComment(id));
 
 handle("notes:list", (projectId) => db.listNotes(projectId));
 handle("notes:create", (payload) => { const r = db.createNote(payload); scheduleVaultExport(); return r; });

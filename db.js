@@ -26,8 +26,41 @@ function open() {
   // Schema is idempotent, so applying it on every open keeps a hand-copied
   // database in step without a migration framework.
   const schema = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
+  // Columns first, then the schema. schema.sql indexes some of these columns, and
+  // an index on a column that does not exist yet is an error that stops the whole
+  // file, so an older database would fail to open at all.
+  addLaterColumns(db);
   db.exec(schema);
   return db;
+}
+
+/**
+ * Adds columns that arrived after a database was first created.
+ *
+ * schema.sql stays idempotent because everything in it is CREATE ... IF NOT
+ * EXISTS, but SQLite has no ADD COLUMN IF NOT EXISTS, so a new column on an
+ * existing table cannot live there alone. Rather than bring in a migration
+ * framework and a version table for what has so far only ever been added
+ * columns, each one is named here and applied when it is missing.
+ *
+ * The column is also declared in schema.sql, so a fresh database gets it from
+ * there and this finds nothing to do. Anything more structural than an added
+ * column should get a real migration rather than an entry here.
+ */
+const LATER_COLUMNS = [
+  ["tasks", "parent_id", "INTEGER REFERENCES tasks(id) ON DELETE CASCADE"],
+  ["tasks", "assignee", "TEXT"],
+];
+
+function addLaterColumns(db) {
+  for (const [table, column, definition] of LATER_COLUMNS) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+    // No rows means the table does not exist yet, which is a brand new database.
+    // schema.sql is about to create it with the column already in place.
+    if (!columns.length) continue;
+    if (columns.some((c) => c.name === column)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 const all = (sql, params = {}) => open().prepare(sql).all(params);
@@ -178,13 +211,20 @@ function updateProject(id, fields) {
 
 // Tasks. Passing projectId of null means everything, which is what the All view
 // and the search box use.
-function listTasks({ projectId = null, includeDone = false } = {}) {
+function listTasks({ projectId = null, includeDone = false, includeSubtasks = false } = {}) {
   const clauses = [];
   if (projectId !== null) clauses.push("t.project_id = :projectId");
   if (!includeDone) clauses.push("t.status != 'done'");
+  // Subtasks are shown by their parent, not alongside it. Left in, a task broken
+  // into six pieces makes the list longer rather than clearer, which is the
+  // opposite of the point.
+  if (!includeSubtasks) clauses.push("t.parent_id IS NULL");
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   return all(
-    `SELECT t.*, p.name AS project_name, p.colour AS project_colour
+    `SELECT t.*, p.name AS project_name, p.colour AS project_colour,
+            (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id) AS subtask_count,
+            (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id AND s.status = 'done') AS subtask_done,
+            (SELECT COUNT(*) FROM comments c WHERE c.task_id = t.id) AS comment_count
      FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
      ${where}
      ORDER BY
@@ -196,20 +236,35 @@ function listTasks({ projectId = null, includeDone = false } = {}) {
   );
 }
 
-function createTask({ projectId = null, title, detail = null, priority = "med", ref = null, due = null }) {
+function createTask({
+  projectId = null, title, detail = null, priority = "med",
+  ref = null, due = null, parentId = null, assignee = null, actor = null,
+}) {
+  // A subtask belongs to the same project as its parent whatever the caller
+  // says, because a subtask filed somewhere else is not a subtask.
+  if (parentId) {
+    const parent = one("SELECT project_id FROM tasks WHERE id = :id", { id: parentId });
+    if (!parent) throw new Error("No such parent task");
+    projectId = parent.project_id;
+  }
+
   const r = run(
-    `INSERT INTO tasks (project_id, title, detail, priority, ref, due, source)
-     VALUES (:projectId, :title, :detail, :priority, :ref, :due, 'app')`,
-    { projectId, title, detail, priority, ref, due }
+    `INSERT INTO tasks (project_id, title, detail, priority, ref, due, parent_id, assignee, source)
+     VALUES (:projectId, :title, :detail, :priority, :ref, :due, :parentId, :assignee, 'app')`,
+    { projectId, title, detail, priority, ref, due, parentId, assignee }
   );
   const created = one("SELECT * FROM tasks WHERE id = :id", { id: Number(r.lastInsertRowid) });
+  // The opening status is an event like any other, so a timeline never starts
+  // halfway through the story.
+  run("INSERT INTO status_events (task_id, status, actor) VALUES (:id, :status, :actor)",
+      { id: created.id, status: created.status, actor });
   record({ action: "create", entity: "task", entityId: created.id,
            summary: "created", label: created.title, after: created });
   return created;
 }
 
-function updateTask(id, fields) {
-  const allowed = ["project_id", "title", "detail", "status", "priority", "owner", "due", "ref"];
+function updateTask(id, fields, { actor = null } = {}) {
+  const allowed = ["project_id", "title", "detail", "status", "priority", "owner", "due", "ref", "assignee", "parent_id"];
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return one("SELECT * FROM tasks WHERE id = :id", { id });
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
@@ -226,10 +281,70 @@ function updateTask(id, fields) {
     { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id }
   );
   const after = one("SELECT * FROM tasks WHERE id = :id", { id });
+  // Written here rather than by callers, so the history cannot drift from the
+  // column it describes. Only an actual change is recorded: setting a status to
+  // what it already was is not a transition and should not look like one.
+  if (before && after.status !== before.status) {
+    run("INSERT INTO status_events (task_id, status, actor) VALUES (:id, :status, :actor)",
+        { id, status: after.status, actor });
+  }
   record({ action: "update", entity: "task", entityId: id,
            summary: describeUpdate("task", before, after), label: after.title,
            before, after });
   return after;
+}
+
+// ---------------------------------------------------------------------------
+// The task detail
+// ---------------------------------------------------------------------------
+
+const listComments = (taskId) =>
+  all("SELECT * FROM comments WHERE task_id = :taskId ORDER BY id", { taskId });
+
+function createComment({ taskId, body, author = "you" }) {
+  if (!body || !String(body).trim()) throw new Error("A comment needs something in it");
+  const r = run(
+    "INSERT INTO comments (task_id, author, body) VALUES (:taskId, :author, :body)",
+    { taskId, author, body: String(body).trim() }
+  );
+  // Comments are not in the audit table's entity list, so the task carries the
+  // trail. That keeps the History tab readable: "commented on X" belongs against
+  // the task, not against a row nobody can navigate to.
+  const task = one("SELECT * FROM tasks WHERE id = :id", { id: taskId });
+  record({ action: "update", entity: "task", entityId: taskId,
+           summary: `commented (by ${author})`, label: task ? task.title : null });
+  return one("SELECT * FROM comments WHERE id = :id", { id: Number(r.lastInsertRowid) });
+}
+
+function deleteComment(id) {
+  const comment = one("SELECT * FROM comments WHERE id = :id", { id });
+  if (!comment) return { ok: false };
+  run("DELETE FROM comments WHERE id = :id", { id });
+  return { ok: true };
+}
+
+const statusEvents = (taskId) =>
+  all("SELECT * FROM status_events WHERE task_id = :taskId ORDER BY at, id", { taskId });
+
+const subtasks = (parentId) =>
+  all("SELECT * FROM tasks WHERE parent_id = :parentId ORDER BY id", { parentId });
+
+/** Everything the detail view shows, in one call so it cannot half load. */
+function taskDetail(id) {
+  const task = one("SELECT * FROM tasks WHERE id = :id", { id });
+  if (!task) return null;
+  return {
+    task,
+    project: task.project_id
+      ? one("SELECT id, name, colour FROM projects WHERE id = :id", { id: task.project_id })
+      : null,
+    parent: task.parent_id
+      ? one("SELECT id, title, status FROM tasks WHERE id = :id", { id: task.parent_id })
+      : null,
+    comments: listComments(id),
+    events: statusEvents(id),
+    subtasks: subtasks(id),
+  };
 }
 
 function deleteTask(id) {
@@ -504,6 +619,7 @@ module.exports = {
   handle: open,
   listProjects, getProject, createProject, updateProject,
   listTasks, createTask, updateTask, deleteTask,
+  taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
   listNotes, createNote, updateNote, deleteNote,
   listLinks, createLink, deleteLink,
   search, stats,
