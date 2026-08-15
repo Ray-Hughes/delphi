@@ -512,6 +512,109 @@
   .act-delete { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--crit); }
   .audit-row.deleted { background: color-mix(in srgb, var(--crit) 5%, transparent); }
 
+  /* Table view ------------------------------------------------------------
+     Columns line up so the eye compares down one rather than reading every row.
+     The row still opens the task; the controls sit at the end where they do not
+     compete with it. */
+  .ttable {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r); overflow: hidden;
+  }
+  .trow {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) 132px 150px 110px 92px 148px;
+    align-items: center; gap: var(--s2);
+    padding: 9px var(--s3);
+    border-bottom: 1px solid var(--line-soft);
+    cursor: default;
+  }
+  .trow:last-child { border-bottom: 0; }
+  .trow:hover { background: var(--raised); }
+  .trow.picked { background: var(--accent-soft); }
+  .trow.thead {
+    background: var(--bg); cursor: default;
+    font-size: 10.5px; font-weight: 650; letter-spacing: 0.07em;
+    text-transform: uppercase; color: var(--ink-faint);
+  }
+  .trow.thead:hover { background: var(--bg); }
+  .trow.done .trow-title { color: var(--ink-faint); text-decoration: line-through; }
+
+  .tcell { min-width: 0; display: flex; align-items: center; gap: 6px; }
+  .tcell-name { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .trow-title { font-size: 13.5px; line-height: 1.4; }
+  .trow-sub { display: flex; gap: var(--s3); font-size: 11px; color: var(--ink-faint); }
+  .cell-text { font-size: 12.5px; color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cell-empty { font-size: 12.5px; color: var(--ink-faint); }
+  .queued-mark { font-family: var(--mono); font-size: 10px; color: var(--accent); }
+  .pill.muted { color: var(--ink-faint); border-color: var(--line); }
+
+  .cell-select {
+    border: 1px solid var(--line); border-radius: 99px;
+    background: var(--surface); color: var(--ink-dim);
+    padding: 2px 6px; font-size: 11.5px; outline: none; max-width: 100%;
+  }
+  .cell-select:hover { border-color: var(--ink-faint); }
+  .cell-select.st-doing { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .cell-select.st-blocked { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 40%, transparent); }
+  .cell-select.st-done { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, transparent); }
+
+  /* Present rather than hidden until hover. A control nobody can see is a
+     control nobody uses, and the row already opens the task on its own. */
+  .tcell-actions { justify-content: flex-end; opacity: 0.55; transition: opacity 120ms ease; }
+  .trow:hover .tcell-actions, .trow:focus-within .tcell-actions { opacity: 1; }
+  .row-btn {
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink-dim);
+    border-radius: var(--r-sm); padding: 3px 9px; font-size: 11.5px; cursor: default;
+  }
+  .row-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .row-btn.icon { padding: 3px 7px; }
+
+  .row-check {
+    width: 16px; height: 16px; border-radius: 4px; flex: 0 0 16px;
+    border: 1.5px solid var(--line); background: var(--surface);
+    display: grid; place-items: center; cursor: default;
+  }
+  .row-check:hover { border-color: var(--accent); }
+  .row-check.on { background: var(--accent); border-color: var(--accent); }
+  .row-check.on::after { content: "✓"; color: #fff; font-size: 10px; font-weight: 700; }
+  .row-check.head { border-style: dashed; }
+
+  .tgroup {
+    display: flex; align-items: center; gap: 7px;
+    padding: 8px var(--s3); background: var(--bg);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .tgroup .tcol-dot { width: 7px; height: 7px; border-radius: 99px; background: var(--ink-faint); }
+  .tgroup.st-doing .tcol-dot { background: var(--accent); }
+  .tgroup.st-blocked .tcol-dot { background: var(--crit); }
+  .tgroup.st-done .tcol-dot { background: var(--good); }
+  .tgroup-name { font-size: 11px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; }
+
+  /* The bar that appears when rows are selected. Floating, so it is near the
+     pointer that made the selection and does not shove the table down. */
+  .bulk-bar {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    z-index: 70; display: flex; align-items: center; gap: var(--s2);
+    background: var(--ink); color: var(--bg);
+    border-radius: 99px; padding: 7px 9px 7px var(--s4);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
+    animation: bulkIn 140ms ease;
+  }
+  @keyframes bulkIn { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+  .bulk-count { font-size: 12.5px; font-weight: 600; margin-right: var(--s2); white-space: nowrap; }
+  .bulk-btn {
+    border: 0; border-radius: 99px; padding: 5px 12px;
+    background: color-mix(in srgb, var(--bg) 18%, transparent);
+    color: var(--bg); font-size: 12px; font-weight: 600; cursor: default;
+  }
+  .bulk-btn:hover { background: color-mix(in srgb, var(--bg) 32%, transparent); }
+  .bulk-btn.danger:hover { background: var(--crit); color: #fff; }
+  .bulk-close {
+    border: 0; background: none; color: var(--bg); opacity: 0.7;
+    font-size: 13px; cursor: default; padding: 4px 6px;
+  }
+  .bulk-close:hover { opacity: 1; }
+
   /* Columns and board ------------------------------------------------------
      One column per status. The difference between the two modes is only whether
      the cards can be dragged: a column is a status either way. */

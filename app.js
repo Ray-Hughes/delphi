@@ -913,6 +913,7 @@ function viewSwitcher() {
   const mode = taskViewMode();
   for (const [value, label, title] of [
     ["list", "List", "One column, top to bottom"],
+    ["table", "Table", "Columns you can compare down, and select across"],
     ["columns", "Columns", "One column per status, side by side"],
     ["board", "Board", "Drag between statuses"],
   ]) {
@@ -1047,6 +1048,206 @@ function taskComposer() {
   return input;
 }
 
+/* ---------------------------------------------------------------------------
+   The table view, and selecting more than one thing
+
+   A table is the layout for scanning many tasks against the same few fields:
+   columns line up, so the eye compares down a column instead of reading every
+   row. The row still opens the task, and the controls sit at the end where they
+   do not compete with it.
+
+   Selection exists because some jobs are about several tasks at once. Ticking
+   rows one at a time and then repeating the same menu on each is the thing a
+   floating bar removes.
+--------------------------------------------------------------------------- */
+
+const selected = new Set();
+
+function clearSelection() {
+  selected.clear();
+  const bar = document.getElementById("bulk-bar");
+  if (bar) bar.remove();
+  for (const box of document.querySelectorAll(".row-check.on")) box.classList.remove("on");
+  for (const row of document.querySelectorAll(".trow.picked")) row.classList.remove("picked");
+}
+
+/**
+ * The bar that appears once something is selected.
+ *
+ * Floating rather than a toolbar at the top, so it is near the pointer that just
+ * made the selection and does not push the table around when it appears.
+ */
+function paintBulkBar() {
+  const existing = document.getElementById("bulk-bar");
+  if (!selected.size) { if (existing) existing.remove(); return; }
+
+  const bar = existing || el("div", { className: "bulk-bar", id: "bulk-bar" });
+  bar.textContent = "";
+  bar.append(el("span", { className: "bulk-count",
+    textContent: `${selected.size} ${selected.size === 1 ? "task" : "tasks"} selected` }));
+
+  const ids = () => [...selected];
+  const act = async (fn, label) => {
+    // Sequential rather than parallel: these are writes to one SQLite file, and
+    // twenty at once would spend their time waiting on each other's locks.
+    for (const id of ids()) await fn(id);
+    clearSelection();
+    refresh();
+  };
+
+  const button = (label, title, run, danger = false) => {
+    const b = el("button", { className: "bulk-btn" + (danger ? " danger" : ""), textContent: label, title });
+    b.onclick = run;
+    return b;
+  };
+
+  bar.append(
+    button("Done", "Mark every selected task done",
+      () => act((id) => window.delphi.tasks.update(id, { status: "done" }))),
+    button("Start", "Move every selected task to in progress",
+      () => act((id) => window.delphi.tasks.update(id, { status: "doing" }))),
+    button("Queue", "Send every selected task to the agent queue",
+      () => act((id) => window.delphi.tasks.queue(id, "ready"))),
+    button("Delete", "Delete every selected task",
+      async () => {
+        const n = selected.size;
+        await act((id) => window.delphi.tasks.remove(id));
+        setTimeout(() => alert(`${n} ${n === 1 ? "task" : "tasks"} deleted. Restore from this project's Activity tab.`), 30);
+      }, true)
+  );
+
+  const close = el("button", { className: "bulk-close", textContent: "✕", title: "Clear selection" });
+  close.onclick = clearSelection;
+  bar.append(close);
+
+  if (!existing) document.body.append(bar);
+}
+
+function toggleSelected(id, rowEl, boxEl) {
+  if (selected.has(id)) selected.delete(id); else selected.add(id);
+  boxEl.classList.toggle("on", selected.has(id));
+  rowEl.classList.toggle("picked", selected.has(id));
+  paintBulkBar();
+}
+
+/** A tick box that selects rather than completes. */
+function selectBox(t, row) {
+  const box = el("span", { className: "row-check" + (selected.has(t.id) ? " on" : ""), role: "checkbox", tabIndex: 0 });
+  box.setAttribute("aria-checked", String(selected.has(t.id)));
+  const hit = (e) => { e.stopPropagation(); toggleSelected(t.id, row, box); };
+  box.onclick = hit;
+  box.onkeydown = (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); hit(e); } };
+  return box;
+}
+
+const TABLE_COLUMNS = ["", "Task", "Status", "Assignee", "Due", "Priority", ""];
+
+/** One task as a table row. */
+function taskTableRow(t) {
+  const row = el("div", { className: "trow" + (t.status === "done" ? " done" : "") + (selected.has(t.id) ? " picked" : "") });
+
+  row.append(selectBox(t, row));
+
+  const name = el("div", { className: "tcell tcell-name" });
+  name.append(el("span", { className: "trow-title", textContent: t.title }));
+  const under = el("span", { className: "trow-sub" });
+  if (!state.projectId && t.project_name) under.append(el("span", { textContent: t.project_name }));
+  if (t.ref) under.append(el("span", { className: "t-ref", textContent: t.ref }));
+  if (t.subtask_count) under.append(el("span", { textContent: `${t.subtask_done}/${t.subtask_count}` }));
+  if (t.comment_count) under.append(el("span", { textContent: `${t.comment_count} ✦` }));
+  if (t.queue) under.append(el("span", { className: "queued-mark", textContent: t.claimed_by ? `◆ ${t.claimed_by}` : "◆ queued" }));
+  if (under.childNodes.length) name.append(under);
+  row.append(name);
+
+  // Status is a control here rather than a label: in a table the whole point is
+  // changing one field across many rows without opening any of them.
+  const statusCell = el("div", { className: "tcell" });
+  const status = el("select", { className: `cell-select st-${t.status}` });
+  for (const [value, label] of BOARD_COLUMNS) {
+    status.append(el("option", { value, textContent: label, selected: t.status === value }));
+  }
+  status.onclick = (e) => e.stopPropagation();
+  status.onchange = async (e) => {
+    e.stopPropagation();
+    await window.delphi.tasks.update(t.id, { status: status.value });
+    refresh();
+  };
+  statusCell.append(status);
+  row.append(statusCell);
+
+  const who = el("div", { className: "tcell" });
+  if (t.assignee) {
+    who.append(el("span", { className: "avatar sm" + (isAgent(t.assignee) ? " agent" : ""), textContent: t.assignee.slice(0, 1).toUpperCase() }));
+    who.append(el("span", { className: "cell-text", textContent: t.assignee }));
+  } else {
+    who.append(el("span", { className: "cell-empty", textContent: "unassigned" }));
+  }
+  row.append(who);
+
+  const due = el("div", { className: "tcell" });
+  if (isOverdue(t)) due.append(el("span", { className: "pill overdue", textContent: t.due }));
+  else if (t.due) due.append(el("span", { className: "cell-text", textContent: t.due }));
+  else due.append(el("span", { className: "cell-empty", textContent: "no date" }));
+  row.append(due);
+
+  const priority = el("div", { className: "tcell" });
+  priority.append(el("span", { className: "pill " + (t.priority === "high" ? "high" : "muted"), textContent: t.priority }));
+  row.append(priority);
+
+  const actions = el("div", { className: "tcell tcell-actions" });
+  const open = el("button", { className: "row-btn", textContent: "Open", title: "Open the task" });
+  open.onclick = (e) => { e.stopPropagation(); openTaskSheet(t.id); };
+  const look = el("button", { className: "row-btn", textContent: "Look", title: "Quick look" });
+  look.onclick = (e) => { e.stopPropagation(); quickLook(t.id); };
+  const more = el("button", { className: "row-btn icon", textContent: "⋯", title: "Actions" });
+  more.onclick = (e) => {
+    e.stopPropagation();
+    const box = more.getBoundingClientRect();
+    taskMenu(t, box.left - 150, box.bottom + 4);
+  };
+  actions.append(open, look, more);
+  row.append(actions);
+
+  row.onclick = () => openTaskSheet(t.id);
+  row.oncontextmenu = (e) => { e.preventDefault(); taskMenu(t, e.clientX, e.clientY); };
+  return row;
+}
+
+/** The table, grouped by status the way the references group it. */
+function renderTaskTable(root, tasks) {
+  const table = el("section", { className: "ttable" });
+
+  const header = el("div", { className: "trow thead" });
+  header.append(el("span", { className: "row-check head", title: "Select all" }));
+  for (const label of TABLE_COLUMNS.slice(1)) header.append(el("div", { className: "tcell", textContent: label }));
+  // Select all is the one place the header box does something.
+  const all = header.querySelector(".row-check");
+  all.onclick = () => {
+    const everyone = tasks.every((t) => selected.has(t.id));
+    if (everyone) clearSelection();
+    else { for (const t of tasks) selected.add(t.id); refreshSelectionMarks(); paintBulkBar(); }
+  };
+  table.append(header);
+
+  for (const group of groupByStatus(tasks)) {
+    if (!group.tasks.length) continue;
+    const head = el("div", { className: `tgroup st-${group.status}` });
+    head.append(el("span", { className: "tcol-dot" }));
+    head.append(el("span", { className: "tgroup-name", textContent: group.label }));
+    head.append(el("span", { className: "tcol-n", textContent: String(group.tasks.length) }));
+    table.append(head);
+    for (const t of group.tasks) table.append(taskTableRow(t));
+  }
+
+  root.append(table);
+}
+
+/** Marks every row as selected after a select all, without a full re-render. */
+function refreshSelectionMarks() {
+  for (const box of document.querySelectorAll(".trow:not(.thead) .row-check")) box.classList.add("on");
+  for (const row of document.querySelectorAll(".trow:not(.thead)")) row.classList.add("picked");
+}
+
 function renderTasks(root) {
   const mode = state.projectId && !state.query ? taskViewMode() : "list";
 
@@ -1087,6 +1288,8 @@ function renderTasks(root) {
   // The columns and the board keep their shape when empty, because an empty
   // column is information and a board that vanishes when the last task moves is
   // disorienting.
+  clearSelection();
+
   if (!shown.length && mode === "list") {
     root.append(emptyState(
       state.query ? "Nothing matched" : active ? `Nothing ${active[1]}` : "No open tasks",
@@ -1098,6 +1301,8 @@ function renderTasks(root) {
     const list = el("section", { className: "card" });
     shown.forEach((t) => list.append(taskRow(t)));
     root.append(list);
+  } else if (mode === "table") {
+    renderTaskTable(root, shown);
   } else {
     // Done is hidden by default everywhere else, so a Done column that is always
     // empty would be a lie. It appears only when done work is being shown.

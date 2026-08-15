@@ -222,6 +222,11 @@ function undoLast(count = 1) {
 
 // Projects, each carrying its own open/total counts so the sidebar can show
 // progress without a second round trip per project.
+// The layouts a project's tasks can be shown in. Here rather than as a CHECK
+// constraint, because a constraint cannot be added to a database that already
+// exists and the two would drift.
+const TASK_VIEWS = ["list", "table", "columns", "board"];
+
 function listProjects() {
   return all(`
     SELECT p.*,
@@ -250,6 +255,9 @@ function createProject({ key, name, summary = null, colour = "#7c8698" }) {
 
 function updateProject(id, fields) {
   const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view"];
+  if (fields.task_view !== undefined && !TASK_VIEWS.includes(fields.task_view)) {
+    throw new Error(`task_view must be one of ${TASK_VIEWS.join(", ")}`);
+  }
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getProject(id);
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
