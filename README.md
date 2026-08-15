@@ -82,15 +82,22 @@ the app.
 Delphi is not signed with a paid developer certificate yet, so both systems ask
 before running it the first time. This is expected and it happens once.
 
-**macOS.** Drag Delphi into Applications, then **right click it and choose
-Open**. Do not double click it the first time: double clicking offers only a
-Cancel button, while right click and Open gives you the button that lets it
-through. If macOS claims the app is damaged it is not, that message means the
-quarantine flag survived the copy:
+**macOS.** Drag Delphi into Applications and open it. macOS says it could not
+verify the app is free of malware. Click **Done**, not Move to Trash: that button
+is the highlighted one and it deletes the app. Then open **System Settings**,
+**Privacy and Security**, scroll to Security where it now says Delphi was
+blocked, and click **Open Anyway**. It opens normally from then on.
+
+One line does the same thing, by clearing the quarantine flag rather than
+approving it:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Delphi.app
 ```
+
+Older advice for unsigned apps is to right click and choose Open. Apple removed
+that route in macOS 15, so on a current Mac it does nothing that double clicking
+does not.
 
 **Windows.** SmartScreen shows a blue box saying it protected your PC. Click
 **More info**, then **Run anyway**. The Run anyway button only appears after

@@ -472,20 +472,34 @@
         <ol>
           <li>Open the <code>.dmg</code> and drag <strong>Delphi</strong> into Applications.</li>
           <li>
-            In Applications, <strong>right click</strong> Delphi and choose
-            <strong>Open</strong>. Do not double click it the first time: double
-            clicking offers only a Cancel button, while right click and Open gives
-            you the button that lets it through.
+            Open it. macOS says it "could not verify Delphi is free of malware".
+            Click <strong>Done</strong>.
           </li>
-          <li>Choose <strong>Open</strong> in the dialog. macOS remembers, so every launch after this is a normal one.</li>
+          <li>
+            Open <strong>System Settings</strong>, then <strong>Privacy and
+            Security</strong>. Scroll down to Security, where it now says Delphi
+            was blocked. Click <strong>Open Anyway</strong> and confirm with your
+            password or Touch ID.
+          </li>
+          <li>macOS remembers, so every launch after this is an ordinary one.</li>
         </ol>
         <div class="note">
           <p>
-            <strong>If macOS says the app is damaged,</strong> it is not. That message
-            means the quarantine flag survived the copy. Clear it with
-            <code>xattr -dr com.apple.quarantine /Applications/Delphi.app</code>
+            <strong>Do not click "Move to Trash".</strong> It is the highlighted
+            button in that dialog and it deletes the app. The one you want is
+            <strong>Done</strong>.
           </p>
         </div>
+        <p>
+          If you would rather do it in one line, this clears the quarantine flag
+          and the app then opens normally:
+        </p>
+        <pre><code>xattr -dr com.apple.quarantine /Applications/Delphi.app</code></pre>
+        <p>
+          Older advice for unsigned apps is to right click and choose Open. Apple
+          removed that route in macOS 15, so on a current Mac it does nothing that
+          double clicking does not.
+        </p>
       </div>
 
       <div class="pane" id="pane-win" role="tabpanel" aria-labelledby="tab-win" hidden>

@@ -122,9 +122,14 @@ jobs:
           | Windows 10 and 11 | `Delphi-Setup.exe` |
 
           **The first launch will stop you once.** These builds are not signed with a
-          paid certificate yet. On macOS, right click Delphi in Applications and choose
-          Open rather than double clicking it: double clicking offers only a Cancel
-          button. On Windows, click More info and then Run anyway.
+          paid certificate yet.
+
+          On macOS, open it and click **Done** on the warning, not Move to Trash. Then
+          go to System Settings, Privacy and Security, and click **Open Anyway** next to
+          the message about Delphi. Or clear the flag directly:
+          `xattr -dr com.apple.quarantine /Applications/Delphi.app`
+
+          On Windows, click **More info** and then **Run anyway**.
 
           The other files are for a future auto updater and can be ignored.
           BODY
