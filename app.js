@@ -381,6 +381,7 @@ function renderTabs() {
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
        ["activity", "Activity"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
+       ["queue", "Queue"],
        ["graph", "Mind map"],
        ["reminders", "Reminders", liveAlerts(state.alerts).length],
        ["history", "History"], ["settings", "Settings"]];
@@ -418,7 +419,7 @@ function render() {
     ? ["oracle", "tasks"]
     : state.projectId
     ? ["overview", "tasks", "notes", "links", "activity"]
-    : ["new", "tasks", "graph", "reminders", "history", "settings"];
+    : ["new", "tasks", "queue", "graph", "reminders", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
   // Hidden rather than disabled when there is nowhere to go: a button that is
@@ -444,6 +445,7 @@ function render() {
     tasks: renderTasks,
     notes: renderNotes,
     links: renderLinks,
+    queue: renderQueue,
     graph: renderMindMap,
     reminders: renderReminders,
     history: renderHistory,
@@ -4092,6 +4094,120 @@ function remindersSettings(settings) {
   rem.append(el("p", { className: "hint", style: "margin:12px 0 0",
     textContent: "The last one is a suggestion, not a rule: it sets the shortcut offered on a task that has a due date. Nothing is scheduled without you asking for it." }));
   return rem;
+}
+
+// ---------------------------------------------------------------------------
+// The queue
+//
+// What agents can take, what they are holding, and what has come back out. The
+// pool is not a status, so none of the other views show it: a task can be todo
+// and queued, or doing and claimed, and folding that into the status column
+// would mean a board column that only means something when an agent is watching.
+//
+// Reading the queue sweeps it first. claimNext already treats an expired lease
+// as unclaimed, so a stale claim on screen is a claim that does not exist, and
+// showing one would be a picture of a queue nobody would actually be handed.
+// ---------------------------------------------------------------------------
+
+const QUEUE_NAME = "ready";
+
+/** Minutes left on a lease, or how long ago it lapsed. */
+function leaseLeft(expires) {
+  if (!expires) return { text: "no lease", late: false };
+  const ms = new Date(expires.replace(" ", "T") + "Z").getTime() - Date.now();
+  const mins = Math.round(Math.abs(ms) / 60000);
+  const said = mins < 60 ? `${mins}m` : `${Math.round(mins / 60)}h`;
+  return ms >= 0 ? { text: `${said} left`, late: false } : { text: `${said} over`, late: true };
+}
+
+function queueSection(title, note, rows) {
+  const box = el("section", { className: "card q-sec" });
+  const head = el("div", { className: "q-head" });
+  head.append(el("span", { className: "q-title", textContent: title }));
+  head.append(el("span", { className: "q-n", textContent: String(rows.length) }));
+  if (note) head.append(el("span", { className: "hint grow q-note", textContent: note }));
+  box.append(head);
+  return box;
+}
+
+function queueRow(t, extra) {
+  const row = el("div", { className: "q-row" });
+  const name = el("button", { className: "q-name", textContent: t.title, title: "Open the task" });
+  name.onclick = () => openTaskSheet(t.id);
+  row.append(name);
+  const meta = el("span", { className: "q-meta" });
+  for (const bit of extra) if (bit) meta.append(bit);
+  row.append(meta);
+  return row;
+}
+
+async function renderQueue(root) {
+  const state_ = await window.delphi.tasks.queueState(QUEUE_NAME);
+
+  const bar = el("div", { className: "oracle-bar" });
+  bar.append(el("div", { className: "hint grow", textContent:
+    `The '${QUEUE_NAME}' pool. An agent calls queue_next to take the top of Waiting, and holds a lease it has to finish or renew before it lapses.` }));
+  const sweep = el("button", { className: "btn sm", textContent: "Sweep" });
+  sweep.title = "Put any expired claim back in the pool now";
+  sweep.onclick = async () => { await window.delphi.tasks.queueReclaim(QUEUE_NAME); render(); };
+  bar.append(sweep);
+  root.append(bar);
+
+  // Said rather than done silently: a task moving back to the pool on its own is
+  // exactly the event someone wonders about later.
+  if (state_.reclaimed && state_.reclaimed.length) {
+    const back = el("div", { className: "filter-note" });
+    back.append(el("span", { textContent:
+      `${plural(state_.reclaimed.length, "lease", "leases")} had expired and went back in the pool: ` +
+      state_.reclaimed.map((r) => `${r.title} (${r.agent})`).join(", ") }));
+    root.append(back);
+  }
+
+  const waiting = queueSection("Waiting", "Highest priority first, oldest first within it", state_.waiting);
+  if (!state_.waiting.length) {
+    waiting.append(el("div", { className: "hint pad", textContent:
+      "Nothing queued. Send a task here from its right click menu, or from the task itself." }));
+  }
+  for (const t of state_.waiting) {
+    waiting.append(queueRow(t, [
+      t.priority === "high" ? el("span", { className: "pill high", textContent: "high" }) : null,
+      t.ref ? el("span", { className: "t-ref", textContent: t.ref }) : null,
+    ]));
+  }
+  root.append(waiting);
+
+  const held = queueSection("In flight", "Claimed, with a lease running", state_.claimed);
+  if (!state_.claimed.length) {
+    held.append(el("div", { className: "hint pad", textContent: "No agent is holding anything." }));
+  }
+  for (const t of state_.claimed) {
+    const lease = leaseLeft(t.claim_expires);
+    const give = el("button", { className: "row-btn", textContent: "Release" });
+    give.title = "Put this back in the pool";
+    give.onclick = async () => {
+      await window.delphi.tasks.queueRelease(t.id, "Released by hand from the queue view.");
+      render();
+    };
+    held.append(queueRow(t, [
+      el("span", { className: "avatar sm agent", title: t.claimed_by, textContent: t.claimed_by.slice(0, 1).toUpperCase() }),
+      el("span", { className: "cell-text", textContent: t.claimed_by }),
+      el("span", { className: "pill " + (lease.late ? "overdue" : "muted"), textContent: lease.text }),
+      give,
+    ]));
+  }
+  root.append(held);
+
+  const done = queueSection("Finished", "Left the pool in the last week", state_.finished || []);
+  if (!(state_.finished || []).length) {
+    done.append(el("div", { className: "hint pad", textContent: "Nothing has come out of the queue this week." }));
+  }
+  for (const t of state_.finished || []) {
+    done.append(queueRow(t, [
+      t.assignee ? el("span", { className: "cell-text", textContent: t.assignee }) : null,
+      el("span", { className: "t-due", textContent: ago(t.completed_at) }),
+    ]));
+  }
+  root.append(done);
 }
 
 // ---------------------------------------------------------------------------

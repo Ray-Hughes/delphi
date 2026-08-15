@@ -756,6 +756,8 @@ handle("tasks:delete", (id) => { const r = db.deleteTask(id); scheduleVaultExpor
 handle("tasks:detail", (id) => db.taskDetail(id));
 handle("tasks:queue", (id, queue) => { const r = db.setQueue(id, queue); scheduleVaultExport(); return r; });
 handle("queue:state", (queue) => db.queueState(queue));
+handle("queue:release", (id, note) => { const r = db.releaseClaim(id, { agent: "you", note }); scheduleVaultExport(); return r; });
+handle("queue:reclaim", (queue) => db.reclaimExpired(queue || null));
 handle("tasks:comment", (taskId, body, author) => {
   const r = db.createComment({ taskId, body, author });
   scheduleVaultExport();

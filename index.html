@@ -1381,6 +1381,34 @@
   .rem-set .row > input[type="text"], .rem-set .row > input:not([type]) { flex: 1; min-width: 0; }
   .rem-set select.field { flex: 0 0 auto; }
 
+  /* The queue ---------------------------------------------------------------
+     Sections rather than columns: the three states are a sequence, not
+     alternatives, and reading them top to bottom is reading what happens to a
+     piece of work. */
+  .q-sec { margin-bottom: var(--s4); padding: 0; }
+  .q-head {
+    display: flex; align-items: center; gap: var(--s2);
+    padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line-soft);
+  }
+  .q-title { font-weight: 650; font-size: 13px; letter-spacing: .02em; }
+  .q-n {
+    font-size: 11px; color: var(--ink-faint); background: var(--raised);
+    border-radius: 999px; padding: 1px 7px; font-variant-numeric: tabular-nums;
+  }
+  .q-note { text-align: right; font-size: 11px; }
+  .q-row {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line-soft);
+  }
+  .q-row:last-child { border-bottom: 0; }
+  .q-row:hover { background: var(--raised); }
+  .q-name {
+    flex: 1; text-align: left; background: none; border: 0; padding: 0;
+    color: var(--ink); font: inherit; cursor: pointer; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .q-name:hover { color: var(--accent); }
+  .q-meta { display: flex; align-items: center; gap: var(--s2); flex: 0 0 auto; }
   /* Quick look: read the task without opening it */
   .qlook {
     width: min(520px, 100%); background: var(--surface);

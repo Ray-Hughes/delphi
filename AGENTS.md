@@ -27,6 +27,7 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `queue_next` | Claim the next piece of work and get everything needed to do it |
 | `queue_complete` | Finish a claimed task with a summary |
 | `queue_release` | Give a claimed task back, with a reason |
+| `queue_extend` | Push your lease out because you are still working |
 
 Every write is attributed. Set `DELPHI_ACTOR` in the server's environment to name the
 agent, and its changes appear in the History tab labelled with that name. Give each
@@ -128,11 +129,12 @@ holding a task should not take it with it.
 ```
 queue_next()                      claim the next one, and get its brief
 add_comment(task_id, body)        what you found, tried, decided
+queue_extend(task_id, minutes)    still working, give me longer
 queue_complete(task_id, summary)  finished, with what happened
 queue_release(task_id, reason)    could not finish, and why
 ```
 
-Three rules that make this work when more than one agent is doing it:
+Four rules that make this work when more than one agent is doing it:
 
 **Read before starting.** The claim returns the discussion and the history along with
 the task. Someone may have already tried this and left you the reason it failed.
@@ -145,6 +147,13 @@ change in the refund path" saves them the afternoon you just spent.
 **Release honestly.** If you are stuck, `queue_release` with the specific reason. A task
 released without one gets picked up and abandoned again by the next agent, and then the
 one after that.
+
+**Renew before you lapse, not after.** If a task is going to take longer than the lease,
+call `queue_extend` while you still hold it. Once the lease has expired the task is back
+in the pool and may already be someone else's, so extending is refused at that point
+rather than quietly taking it back from them. A lapse is visible rather than a task that
+mysteriously reset itself: the queue view reports the sweep, and the task's own timeline
+records which agent lost the claim.
 
 Do not claim more than one task at a time. Finish or release before taking another.
 

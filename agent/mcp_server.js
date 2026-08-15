@@ -429,6 +429,38 @@ const TOOLS = {
     },
   },
 
+  queue_extend: {
+    description:
+      "Push your claim's expiry out because you are still working. A lease is short so a dead agent's task comes back quickly, which makes a slow but healthy agent the awkward case. Call this rather than letting the lease lapse: once it has, the task may already belong to someone else.",
+    schema: {
+      type: "object",
+      required: ["task_id"],
+      properties: {
+        task_id: { type: "number" },
+        minutes: { type: "number", description: "How much longer you need. Defaults to another full lease." },
+      },
+    },
+    run: (a) => {
+      const minutes = a.minutes && a.minutes > 0 ? Math.round(a.minutes) : 30;
+      const task = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
+      if (!task) throw new Error(`No task ${a.task_id}`);
+      if (!task.claimed_by) throw new Error(`Task ${a.task_id} is not claimed`);
+      // Whoever is holding it is the only one who may move its expiry, and an
+      // expired claim is refused outright rather than quietly renewed, because
+      // by then it may be someone else's and extending would take it from them.
+      if (task.claimed_by !== ACTOR) throw new Error(`Task ${a.task_id} is held by ${task.claimed_by}`);
+      const stale = sql("SELECT datetime('now') AS now")[0].now;
+      if (task.claim_expires && task.claim_expires < stale) {
+        throw new Error("That claim has already expired. Call queue_next again rather than extending it.");
+      }
+      sql(`UPDATE tasks SET claim_expires = datetime('now', '+' || :p2 || ' minutes'),
+             updated_at = datetime('now') WHERE id = :p1`, [a.task_id, minutes]);
+      const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
+      audit("update", "task", a.task_id, `claim extended by ${ACTOR} to ${after.claim_expires}`, after.title);
+      return after;
+    },
+  },
+
   queue_complete: {
     description:
       "Finish a claimed task. The summary is left as a comment and is what the next person or agent reads to know what actually happened, so write it for them rather than for a changelog.",

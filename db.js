@@ -532,8 +532,12 @@ function setQueue(id, queue) {
 
 /** What is waiting, and what is being worked on, in one pool. */
 function queueState(queue = "ready") {
+  // Swept first, so what this reports is what an agent would actually be handed
+  // rather than a picture that includes leases nobody is holding any more.
+  const reclaimed = reclaimExpired(queue);
   return {
     queue,
+    reclaimed,
     waiting: all(
       `SELECT id, title, priority, project_id, ref FROM tasks
        WHERE queue = :queue AND status NOT IN ('done', 'blocked')
@@ -547,6 +551,14 @@ function queueState(queue = "ready") {
          AND claimed_by IS NOT NULL AND claim_expires >= datetime('now')
        ORDER BY claim_expires`,
       { queue }
+    ),
+    // Recently finished, so the view can show work leaving the pool rather than
+    // only what is still in it.
+    finished: all(
+      `SELECT id, title, assignee, completed_at FROM tasks
+       WHERE status = 'done' AND completed_at IS NOT NULL
+         AND completed_at > datetime('now', '-7 days')
+       ORDER BY completed_at DESC LIMIT 20`
     ),
   };
 }
@@ -593,6 +605,70 @@ function claimNext({ queue = "ready", agent, minutes = LEASE_MINUTES }) {
   record({ action: "update", entity: "task", entityId: claimed.id,
            summary: `claimed by ${agent}`, label: claimed.title });
   return taskDetail(claimed.id);
+}
+
+/**
+ * Pushes a claim's expiry out, for an agent still working.
+ *
+ * A lease is short so a dead agent's work comes back quickly, which makes a slow
+ * but healthy agent the awkward case: it is still going when its lease runs out,
+ * and without this the only honest options are a lease long enough to be useless
+ * or losing the work. Renewing is refused once the lease has already lapsed,
+ * because by then the task may belong to someone else and moving its expiry
+ * would take it from them.
+ */
+function extendClaim(id, { agent, minutes = LEASE_MINUTES } = {}) {
+  if (!agent) throw new Error("An extension needs to say who is asking");
+  const task = one("SELECT * FROM tasks WHERE id = :id", { id });
+  if (!task) throw new Error("No such task");
+  if (!task.claimed_by) throw new Error("That task is not claimed");
+  if (task.claimed_by !== agent) throw new Error(`That task is held by ${task.claimed_by}`);
+  if (task.claim_expires && task.claim_expires < nowStamp()) {
+    throw new Error("That claim has already expired. Claim it again rather than extending it.");
+  }
+  run(`UPDATE tasks SET claim_expires = datetime('now', '+' || :minutes || ' minutes'),
+       updated_at = datetime('now') WHERE id = :id`, { id, minutes });
+  const after = one("SELECT * FROM tasks WHERE id = :id", { id });
+  record({ action: "update", entity: "task", entityId: id,
+           summary: `claim extended by ${agent} to ${after.claim_expires}`, label: after.title });
+  return after;
+}
+
+const nowStamp = () => one("SELECT datetime('now') AS n").n;
+
+/**
+ * Puts expired claims back in the pool, and says so on the timeline.
+ *
+ * claimNext already treats an expired lease as unclaimed, so this changes no
+ * decision. What it changes is the record: without it a task silently goes from
+ * "in progress, held by agent-2" to "someone else's", and the history says the
+ * status moved with nobody moving it. Called on a schedule and before the queue
+ * is shown, so what is on screen is what an agent would actually be handed.
+ */
+function reclaimExpired(queue = null) {
+  const stale = all(
+    `SELECT * FROM tasks
+      WHERE claimed_by IS NOT NULL AND claim_expires IS NOT NULL
+        AND claim_expires < datetime('now')
+        AND status != 'done'
+        ${queue ? "AND queue = :queue" : ""}`,
+    queue ? { queue } : {}
+  );
+  for (const task of stale) {
+    const before = { ...task };
+    run(`UPDATE tasks SET claimed_by = NULL, claim_expires = NULL,
+         status = CASE WHEN status = 'doing' THEN 'todo' ELSE status END,
+         updated_at = datetime('now') WHERE id = :id`, { id: task.id });
+    const after = one("SELECT * FROM tasks WHERE id = :id", { id: task.id });
+    if (after.status !== before.status) {
+      run("INSERT INTO status_events (task_id, status, actor) VALUES (:id, :status, :actor)",
+          { id: task.id, status: after.status, actor: `${task.claimed_by} (lease expired)` });
+    }
+    record({ action: "update", entity: "task", entityId: task.id,
+             summary: `lease expired, ${task.claimed_by} lost the claim`,
+             label: after.title, before, after });
+  }
+  return stale.map((t) => ({ id: t.id, title: t.title, agent: t.claimed_by, expired: t.claim_expires }));
 }
 
 /** Gives a task back without finishing it. */
@@ -1074,7 +1150,7 @@ module.exports = {
   organizerByExternalKey, createExternalOrganizer,
   commentByExternalKey, createExternalComment, updateExternalComment, deleteTask,
   taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
-  setQueue, queueState, claimNext, releaseClaim, completeClaim,
+  setQueue, queueState, claimNext, releaseClaim, completeClaim, extendClaim, reclaimExpired,
   listNotes, createNote, updateNote, deleteNote,
   listLinks, createLink, deleteLink,
   search, stats,
