@@ -906,23 +906,301 @@ async function setTaskViewMode(mode) {
   refresh();
 }
 
-/** List, columns or board, as a segmented control. */
-function viewSwitcher() {
-  const seg = el("div", { className: "seg", role: "group" });
-  seg.setAttribute("aria-label", "Task layout");
-  const mode = taskViewMode();
-  for (const [value, label, title] of [
-    ["list", "List", "One column, top to bottom"],
-    ["table", "Table", "Columns you can compare down, and select across"],
-    ["columns", "Columns", "One column per status, side by side"],
-    ["board", "Board", "Drag between statuses"],
-  ]) {
-    const b = el("button", { type: "button", textContent: label, title });
-    b.setAttribute("aria-pressed", String(mode === value));
-    b.onclick = () => mode !== value && setTaskViewMode(value);
-    seg.append(b);
+const VIEWS = [
+  {
+    id: "list", group: "popular", glyph: "rows", name: "List",
+    desc: "Every open task in one column, top to bottom.",
+  },
+  {
+    id: "board", group: "popular", glyph: "board", name: "Board",
+    desc: "A column per status. Drag a card to move the work.",
+  },
+  {
+    id: "table", group: "popular", glyph: "grid", name: "Table",
+    desc: "A row per task. Compare down a column, select across.",
+  },
+  {
+    id: "calendar", group: "popular", glyph: "cal", name: "Calendar",
+    desc: "Tasks sitting on the day they are due.",
+  },
+  {
+    id: "gantt", group: "popular", glyph: "gantt", name: "Gantt",
+    desc: "Bars across a schedule, showing what blocks what.",
+    why: "Needs start dates and dependencies. A task has a due date and no notion of what must finish first.",
+  },
+  {
+    id: "doc", group: "popular", glyph: "doc", name: "Doc", tab: "notes",
+    desc: "This project's memory: decisions, gotchas and references.",
+  },
+
+  {
+    id: "columns", group: "more", glyph: "cols", name: "Columns",
+    desc: "A column per status, side by side, without the dragging.",
+  },
+  {
+    id: "dashboard", group: "more", glyph: "dash", name: "Dashboard", tab: "overview",
+    desc: "Counts, what is moving, what is stuck, and where to go next.",
+  },
+  {
+    id: "activity", group: "more", glyph: "feed", name: "Activity", tab: "activity",
+    desc: "Every change, newest first, and a way to undo one.",
+  },
+  {
+    id: "timeline", group: "more", glyph: "track", name: "Timeline",
+    desc: "The same work laid left to right over dates.",
+    why: "Needs start dates and dependencies, which tasks do not carry.",
+  },
+  {
+    id: "form", group: "more", glyph: "form", name: "Form",
+    desc: "A form that files whatever it collects as a task.",
+    why: "Nothing can post into Delphi from outside it. Work arrives from agents over MCP.",
+  },
+  {
+    id: "workload", group: "more", glyph: "bars", name: "Workload",
+    desc: "Who is over capacity this week, and who is not.",
+    why: "Needs people and capacity. An assignee here is free text, not an account with hours behind it.",
+  },
+  {
+    id: "team", group: "more", glyph: "people", name: "Team",
+    desc: "One lane per person, so a standup reads itself.",
+    why: "Needs people. Delphi stores an assignee name and nothing behind it.",
+  },
+  {
+    id: "mindmap", group: "more", glyph: "mind", name: "Mind Map", tab: "graph",
+    desc: "The knowledge graph: what this work keeps mentioning, and what sits near what.",
+  },
+  {
+    id: "whiteboard", group: "more", glyph: "canvas", name: "Whiteboard",
+    desc: "A canvas to sketch on beside the work.",
+    why: "Not built. There is nowhere to keep a drawing.",
+  },
+];
+
+const VIEW_GROUPS = [["popular", "Popular"], ["more", "More"]];
+
+const findView = (id) => VIEWS.find((v) => v.id === id) || null;
+
+/**
+ * The glyph beside each name.
+ *
+ * Drawn from empty elements and CSS rather than an icon font or an SVG file:
+ * the page runs with a strict CSP and no build step, so the cheapest thing that
+ * survives both is a handful of divs the stylesheet arranges. Each shape is a
+ * count of marks here and a rule in index.html.
+ */
+const GLYPH_MARKS = {
+  rows: 3, cols: 3, board: 3, grid: 9, cal: 12, doc: 4, dash: 3, feed: 3,
+  gantt: 3, track: 3, form: 3, people: 3, bars: 3, mind: 3, canvas: 2,
+};
+
+function viewGlyph(shape) {
+  const box = el("span", { className: `vp-glyph ${shape}` });
+  box.setAttribute("aria-hidden", "true");
+  for (let i = 0; i < (GLYPH_MARKS[shape] || 3); i++) box.append(el("i"));
+  return box;
+}
+
+/**
+ * Which view is showing.
+ *
+ * The tabs came first and still own state.view, so the three that became views
+ * are translated back here rather than being renamed everywhere. Inside the
+ * Tasks tab the answer is whatever layout the project is set to.
+ */
+function currentViewId() {
+  if (state.view === "tasks") return taskViewMode();
+  return { notes: "doc", overview: "dashboard", activity: "activity" }[state.view] || taskViewMode();
+}
+
+/** Switches to a view, whichever of the two mechanisms carries it. */
+async function applyView(view) {
+  if (view.why) return;
+  if (view.id === currentViewId()) return;
+  if (view.tab) return navigate({ view: view.tab });
+
+  try {
+    await setTaskViewMode(view.id);
+  } catch (error) {
+    // db.js validates task_view against a list of layouts. A layout offered
+    // here but never added there fails loudly rather than leaving a row that
+    // quietly does nothing, and the reload puts back the value the store
+    // actually holds after the optimistic write.
+    await refresh();
+    alert(`Cannot switch to ${view.name}: ${error.message}`);
   }
-  return seg;
+}
+
+/** One row of the popup: glyph, name, a line of prose, and a reason if it needs one. */
+function viewRow(view, currentId, pick) {
+  const chosen = view.id === currentId;
+  const row = el("button", {
+    type: "button",
+    className: "vp-item" + (view.why ? " off" : "") + (chosen ? " on" : ""),
+    tabIndex: -1,
+  });
+  row.dataset.name = view.name.toLowerCase();
+  row.setAttribute("role", "menuitemradio");
+  row.setAttribute("aria-checked", String(chosen));
+  // aria-disabled rather than the disabled attribute, because a disabled button
+  // cannot be focused and the reason it is disabled is the most useful thing on
+  // the row. It stays reachable by keyboard and refuses to act instead.
+  if (view.why) row.setAttribute("aria-disabled", "true");
+
+  row.append(viewGlyph(view.glyph));
+
+  const name = el("span", { className: "vp-name" }, view.name);
+  if (view.why) name.append(el("span", { className: "chip vp-flag", textContent: "not built" }));
+  else if (chosen) name.append(el("span", { className: "chip vp-now", textContent: "current" }));
+
+  const text = el("span", { className: "vp-text" },
+    name,
+    el("span", { className: "vp-desc", textContent: view.desc }),
+    view.why ? el("span", { className: "vp-why", textContent: view.why }) : null);
+
+  row.append(text);
+  row.onclick = () => pick(view);
+  return row;
+}
+
+/**
+ * Opens the popup under the trigger.
+ *
+ * Built on rowMenu, which already solves being a popup: one open at a time,
+ * kept inside the viewport, and closed by a click anywhere else. A second
+ * implementation of that would be a second set of the same bugs.
+ */
+function openViewMenu(trigger, land = "current") {
+  const currentId = currentViewId();
+  const rows = [];
+  const nodes = [];
+
+  for (const [group, heading] of VIEW_GROUPS) {
+    nodes.push(el("div", { className: "vp-group", textContent: heading }));
+    for (const view of VIEWS) {
+      if (view.group !== group) continue;
+      const row = viewRow(view, currentId, pick);
+      rows.push(row);
+      nodes.push(row);
+    }
+  }
+
+  const box = trigger.getBoundingClientRect();
+  // The class goes in rather than on, so the popup is measured at the size it
+  // will actually be before rowMenu clamps it into the viewport.
+  const menu = rowMenu(box.left, box.bottom + 6, nodes, { onClose: closed, className: "vp" });
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", "Choose a view");
+  menu.onkeydown = onKey;
+  trigger.setAttribute("aria-expanded", "true");
+
+  const start = land === "last" ? rows.length - 1 : Math.max(0, rows.findIndex((r) => r.classList.contains("on")));
+  rows[start].focus();
+
+  // Runs however the menu closed, including the click away that rowMenu owns,
+  // so the trigger cannot be left claiming to be expanded over nothing.
+  function closed() {
+    trigger.setAttribute("aria-expanded", "false");
+  }
+
+  function dismiss() {
+    closeRowMenu();
+    trigger.focus();
+  }
+
+  function pick(view) {
+    // The unavailable rows are focusable and clickable so their reason can be
+    // read. Acting on one does nothing, and closing the popup on the way would
+    // hide the answer just as it was asked for.
+    if (view.why) return;
+    dismiss();
+    applyView(view);
+  }
+
+  function step(from, by) {
+    if (from < 0) return by > 0 ? rows[0] : rows[rows.length - 1];
+    return rows[(from + by + rows.length) % rows.length];
+  }
+
+  function onKey(e) {
+    const at = rows.indexOf(document.activeElement);
+
+    if (e.key === "Escape") {
+      // Escape reaches the window handler otherwise, and hides the whole panel
+      // when all that was wanted was to shut this.
+      e.preventDefault();
+      e.stopPropagation();
+      dismiss();
+      return;
+    }
+    if (e.key === "Tab") {
+      // Not prevented: focus is handed back to the trigger and Tab carries on
+      // from there, which is where it would have been had this never opened.
+      dismiss();
+      return;
+    }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      step(at, e.key === "ArrowDown" ? 1 : -1).focus();
+      return;
+    }
+    if (e.key === "Home") { e.preventDefault(); rows[0].focus(); return; }
+    if (e.key === "End") { e.preventDefault(); rows[rows.length - 1].focus(); return; }
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (at >= 0) rows[at].click();
+      return;
+    }
+
+    // Type a letter to jump. Fifteen rows is enough that scanning with the
+    // arrows is slower than saying which one you meant.
+    if (e.key.length === 1 && /\S/.test(e.key) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      const letter = e.key.toLowerCase();
+      const order = rows.slice(at + 1).concat(rows.slice(0, at + 1));
+      const hit = order.find((r) => r.dataset.name.startsWith(letter));
+      if (hit) { e.preventDefault(); hit.focus(); }
+    }
+  }
+
+  return menu;
+}
+
+/** The trigger: what is showing now, and the way to change it. */
+function viewPicker() {
+  const current = findView(currentViewId()) || VIEWS[0];
+
+  const trigger = el("button", { type: "button", className: "btn vp-trigger", title: "Change view" });
+  trigger.append(
+    viewGlyph(current.glyph),
+    el("span", { className: "vp-trigger-name", textContent: current.name }),
+    el("span", { className: "vp-caret", textContent: "▾" }));
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", "false");
+
+  // Opened on mousedown rather than click, so that clicking the trigger while
+  // the popup is open closes it and leaves it closed. On click it would not:
+  // rowMenu's click away fires first on the same press, and the click that
+  // followed would open it straight back up.
+  trigger.onmousedown = (e) => {
+    e.preventDefault();
+    if (openMenu && openMenu.classList.contains("vp")) {
+      // Focused by hand, because preventDefault above stopped the press doing
+      // it, and the row that held focus is being removed from the document.
+      closeRowMenu();
+      trigger.focus();
+      return;
+    }
+    openViewMenu(trigger);
+  };
+
+  trigger.onkeydown = (e) => {
+    if (!["Enter", " ", "ArrowDown", "ArrowUp"].includes(e.key)) return;
+    // Prevented so the synthesised click does not arrive after the popup has
+    // opened and land on whichever row is under the pointer.
+    e.preventDefault();
+    openViewMenu(trigger, e.key === "ArrowUp" ? "last" : "current");
+  };
+
+  return trigger;
 }
 
 /** Tasks grouped into the four statuses, in board order. */
@@ -940,14 +1218,16 @@ function groupByStatus(tasks) {
  * Deliberately quieter than a row: in a narrow column there is no room for meta,
  * so it carries the title and only what changes a decision.
  */
-function taskCard(t, { draggable = false } = {}) {
+function taskCard(t, { draggable = false, showDue = true } = {}) {
   const card = el("div", { className: "tcard" + (t.status === "done" ? " done" : "") });
   card.append(el("div", { className: "tcard-title", textContent: t.title }));
 
   const foot = el("div", { className: "tcard-foot" });
   if (t.priority === "high") foot.append(el("span", { className: "pill high", textContent: "high" }));
-  if (isOverdue(t)) foot.append(el("span", { className: "pill overdue", textContent: t.due }));
-  else if (t.due) foot.append(el("span", { className: "t-due", textContent: t.due }));
+  // Inside a calendar cell the day is the cell, so repeating it on every card is
+  // noise. Overdue still says so, because that is not a date, it is a warning.
+  if (isOverdue(t)) foot.append(el("span", { className: "pill overdue", textContent: showDue ? t.due : "overdue" }));
+  else if (showDue && t.due) foot.append(el("span", { className: "t-due", textContent: t.due }));
   if (t.subtask_count) foot.append(el("span", { className: "t-due", textContent: `${t.subtask_done}/${t.subtask_count}` }));
   if (t.ref) foot.append(el("span", { className: "t-ref", textContent: t.ref }));
   if (t.assignee) {
@@ -1030,6 +1310,260 @@ function statusColumn(group, { board = false } = {}) {
 
   column.append(body, add);
   return column;
+}
+
+/* ---------------------------------------------------------------------------
+   The calendar
+
+   A fifth way to look at the same tasks, and the only one that answers what a
+   week is actually made of. It reads and writes one field, due, so a card
+   dropped on a day is the same edit as typing the date into the sheet, and it
+   lands on the timeline like any other change.
+
+   Weeks start on Monday. Every date in the store is an ISO string and ISO weeks
+   start there, so a locale-derived first day would put the grid and the data on
+   two different calendars.
+--------------------------------------------------------------------------- */
+
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+// A day with more than this many tasks shows a count instead, so one busy day
+// cannot set the height of the whole week.
+const CAL_STACK = 3;
+
+// Which month the grid is showing, as YYYY-MM. Module level for the same reason
+// the table's selection is: it is where the view is looking, not part of what
+// the app loads. Null means the month containing today.
+let calendarMonth = null;
+
+const DAY_MS = 86400000;
+
+// The arithmetic is done in UTC off the ISO strings the store already holds, so
+// the grid, isOverdue and the Due column can never disagree about which day it
+// is. Local components would drift by one whenever the clock is behind UTC.
+const dayStamp = (iso) => Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10));
+const dayIso = (stamp) => new Date(stamp).toISOString().slice(0, 10);
+const monthOf = (iso) => iso.slice(0, 7);
+
+/** The month delta months away. Date.UTC rolls the year over on its own. */
+function shiftMonth(month, delta) {
+  return monthOf(dayIso(Date.UTC(+month.slice(0, 4), +month.slice(5, 7) - 1 + delta, 1)));
+}
+
+const monthLabel = (month) =>
+  new Date(dayStamp(`${month}-01`)).toLocaleDateString(undefined, {
+    month: "long", year: "numeric", timeZone: "UTC",
+  });
+
+/**
+ * Every day the grid shows, including the days either side that fill the first
+ * and last week out. Those days are real due dates, so they carry their tasks
+ * rather than being drawn as padding.
+ */
+function monthGrid(month) {
+  const year = +month.slice(0, 4);
+  const index = +month.slice(5, 7);
+  const first = dayStamp(`${month}-01`);
+  const lead = (new Date(first).getUTCDay() + 6) % 7;
+  const length = new Date(Date.UTC(year, index, 0)).getUTCDate();
+  const start = first - lead * DAY_MS;
+  return Array.from({ length: Math.ceil((lead + length) / 7) * 7 }, (_, i) => dayIso(start + i * DAY_MS));
+}
+
+/** Tasks split by the day they are due, and the ones that are not due at all. */
+function byDueDay(tasks) {
+  const days = new Map();
+  const undated = [];
+  for (const t of tasks) {
+    if (!t.due) { undated.push(t); continue; }
+    const key = t.due.slice(0, 10);
+    if (!days.has(key)) days.set(key, []);
+    days.get(key).push(t);
+  }
+  return { days, undated };
+}
+
+// Inside a day the order is what is still to do, most urgent first. Finished
+// work sinks, because the reason to look at a past day is what is left on it.
+const dayOrder = (a, b) =>
+  Number(a.status === "done") - Number(b.status === "done") ||
+  Number(b.priority === "high") - Number(a.priority === "high") ||
+  a.id - b.id;
+
+/**
+ * Writes a due date from a drop.
+ *
+ * Dropping a card back on the day it already has is not an edit, and recording
+ * one would put a meaningless entry on the timeline. This is the same bargain
+ * the board makes with status.
+ */
+async function setDue(id, due) {
+  const moved = state.tasks.find((t) => t.id === id);
+  if (!moved || (moved.due ? moved.due.slice(0, 10) : null) === due) return;
+  await window.delphi.tasks.update(id, { due });
+  refresh();
+}
+
+/** Makes a node a landing place for a card, the way a board column is. */
+function acceptsDue(node, due) {
+  const land = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; node.classList.add("over"); };
+  node.ondragover = land;
+  node.ondragenter = land;
+  node.ondragleave = (e) => { if (!node.contains(e.relatedTarget)) node.classList.remove("over"); };
+  node.ondrop = (e) => {
+    e.preventDefault();
+    node.classList.remove("over");
+    const id = Number(e.dataTransfer.getData("text/plain"));
+    if (id) setDue(id, due);
+  };
+}
+
+/** One day. */
+function calendarDay(iso, tasks, month) {
+  const now = today();
+  const cell = el("div", {
+    className: "cal-day"
+      + (monthOf(iso) === month ? "" : " out")
+      + (iso === now ? " today" : iso < now ? " past" : ""),
+  });
+  cell.setAttribute("aria-label", iso);
+
+  const head = el("div", { className: "cal-daynum" });
+  head.append(el("span", { className: "cal-n", textContent: String(+iso.slice(8, 10)) }));
+  if (iso === now) head.append(el("span", { className: "cal-mark", textContent: "today" }));
+  head.append(el("span", { className: "grow" }));
+
+  // Typing into a day sets that due date, which is what someone means by
+  // starting a task on a Thursday, exactly as typing into a column sets status.
+  const add = el("button", { className: "cal-add", textContent: "＋", title: `Add a task due ${iso}` });
+  add.onclick = (e) => {
+    e.stopPropagation();
+    if (cell.querySelector(".cal-field")) return;
+    const field = el("input", { className: "cal-field", placeholder: "Task" });
+    field.onkeydown = async (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Escape") { field.remove(); return; }
+      if (ev.key !== "Enter" || !field.value.trim()) return;
+      let title = field.value.trim();
+      let priority = "med";
+      if (title.startsWith("!")) { priority = "high"; title = title.slice(1).trim(); }
+      await window.delphi.tasks.create({ projectId: state.projectId, title, priority, due: iso });
+      refresh();
+    };
+    field.onblur = () => field.remove();
+    cell.append(field);
+    field.focus();
+  };
+  head.append(add);
+  cell.append(head);
+
+  const stack = el("div", { className: "cal-stack" });
+  const ordered = [...tasks].sort(dayOrder);
+  for (const t of ordered.slice(0, CAL_STACK)) stack.append(taskCard(t, { draggable: true, showDue: false }));
+
+  const rest = ordered.slice(CAL_STACK);
+  if (rest.length) {
+    const more = el("button", { className: "cal-more", textContent: `${rest.length} more` });
+    // Expanded in place rather than through a repaint: nothing in the store has
+    // changed, and re-rendering to show three more cards would also throw away
+    // every other cell someone had already opened.
+    more.onclick = (e) => {
+      e.stopPropagation();
+      more.remove();
+      for (const t of rest) stack.append(taskCard(t, { draggable: true, showDue: false }));
+    };
+    stack.append(more);
+  }
+  cell.append(stack);
+
+  acceptsDue(cell, iso);
+  return cell;
+}
+
+/**
+ * The tasks with no due date.
+ *
+ * They sit under the grid rather than being left out of it. A calendar that can
+ * only show dated work quietly hides everything that has not been scheduled,
+ * which is the half most likely to need scheduling. Here they are visible,
+ * countable, and a drag away from having a date. Dropping a card back on the
+ * tray takes the date off again, so the move is reversible by the same gesture.
+ */
+function undatedTray(tasks) {
+  const tray = el("section", { className: "cal-tray" });
+
+  const head = el("div", { className: "cal-tray-head" });
+  head.append(el("span", { className: "tcol-dot" }));
+  head.append(el("span", { className: "tcol-name", textContent: "No due date" }));
+  head.append(el("span", { className: "tcol-n", textContent: String(tasks.length) }));
+  head.append(el("span", { className: "grow" }));
+  head.append(el("span", { className: "cal-hint", textContent: "Drag onto a day to schedule" }));
+  tray.append(head);
+
+  const body = el("div", { className: "cal-tray-body" });
+  if (!tasks.length) body.append(el("div", { className: "tcol-empty", textContent: "Drop here to clear a date" }));
+  for (const t of tasks) body.append(taskCard(t, { draggable: true }));
+  tray.append(body);
+
+  acceptsDue(tray, null);
+  return tray;
+}
+
+/** A chip that jumps to the month holding the nearest work outside this one. */
+function calendarJump(label, month) {
+  const chip = el("button", { className: "btn sm", textContent: label, title: `Go to ${monthLabel(month)}` });
+  chip.onclick = () => { calendarMonth = month; render(); };
+  return chip;
+}
+
+function renderTaskCalendar(root, tasks) {
+  const month = calendarMonth || monthOf(today());
+  calendarMonth = month;
+  const { days, undated } = byDueDay(tasks);
+
+  const head = el("div", { className: "cal-head" });
+  head.append(el("div", { className: "cal-title", textContent: monthLabel(month) }));
+
+  const nav = el("div", { className: "cal-nav" });
+  const step = (label, title, delta) => {
+    const b = el("button", { className: "btn sm icon", textContent: label, title });
+    // Moving months changes nothing in the store and every task of the project
+    // is already loaded, so this repaints rather than reloading.
+    b.onclick = () => { calendarMonth = shiftMonth(month, delta); render(); };
+    return b;
+  };
+  const home = el("button", { className: "btn sm", textContent: "Today", title: "Back to this month" });
+  home.onclick = () => { calendarMonth = monthOf(today()); render(); };
+  nav.append(step("‹", "Previous month", -1), home, step("›", "Next month", 1));
+  head.append(el("span", { className: "grow" }), nav);
+  root.append(head);
+
+  const scroll = el("div", { className: "cal-scroll" });
+  const grid = el("div", { className: "cal-grid" });
+  for (const name of WEEKDAYS) grid.append(el("div", { className: "cal-dow", textContent: name }));
+  for (const iso of monthGrid(month)) grid.append(calendarDay(iso, days.get(iso) || [], month));
+  scroll.append(grid);
+  root.append(scroll);
+
+  // Work in another month is reachable by stepping, but only if someone knows it
+  // is there. These say so, and land on the nearest month that has any.
+  const outside = tasks.filter((t) => t.due && monthOf(t.due) !== month);
+  const earlier = outside.filter((t) => monthOf(t.due) < month);
+  const later = outside.filter((t) => monthOf(t.due) > month);
+  if (earlier.length || later.length) {
+    const foot = el("div", { className: "cal-foot" });
+    if (earlier.length) {
+      const nearest = earlier.reduce((a, b) => (a.due > b.due ? a : b)).due;
+      foot.append(calendarJump(`‹ ${plural(earlier.length, "task", "tasks")} earlier`, monthOf(nearest)));
+    }
+    if (later.length) {
+      const nearest = later.reduce((a, b) => (a.due < b.due ? a : b)).due;
+      foot.append(calendarJump(`${plural(later.length, "task", "tasks")} later ›`, monthOf(nearest)));
+    }
+    root.append(foot);
+  }
+
+  root.append(undatedTray(undated));
 }
 
 /** The composer at the top of the flat list. */
@@ -1262,7 +1796,7 @@ function renderTasks(root) {
     bar.append(toggle);
     // Only inside a project: All work spans several and a per-project setting
     // has nothing to attach to.
-    if (state.projectId) bar.append(viewSwitcher());
+    if (state.projectId) bar.append(viewPicker());
     root.append(bar);
   }
 
@@ -1303,6 +1837,8 @@ function renderTasks(root) {
     root.append(list);
   } else if (mode === "table") {
     renderTaskTable(root, shown);
+  } else if (mode === "calendar") {
+    renderTaskCalendar(root, shown);
   } else {
     // Done is hidden by default everywhere else, so a Done column that is always
     // empty would be a lie. It appears only when done work is being shown.
@@ -1342,11 +1878,17 @@ function renderTasks(root) {
 --------------------------------------------------------------------------- */
 
 let openMenu = null;
+let onMenuClose = null;
 
 function closeRowMenu() {
   if (!openMenu) return;
   openMenu.remove();
   openMenu = null;
+  // Read and cleared before it runs, so a handler that opens another menu
+  // cannot have its own callback wiped by the one it replaced.
+  const done = onMenuClose;
+  onMenuClose = null;
+  if (done) done();
 }
 
 /**
@@ -1354,12 +1896,21 @@ function closeRowMenu() {
  *
  * Kept inside the viewport rather than allowed to run off the bottom, because a
  * menu opened on the last row of a long list is exactly where that happens.
+ *
+ * An item is a verb, a separator, or a node the caller built itself. The verb
+ * form stays the common case, because most menus are a list of things to do and
+ * should not have to build anything to say so.
  */
-function rowMenu(x, y, items) {
+function rowMenu(x, y, items, { onClose = null, className = "" } = {}) {
   closeRowMenu();
-  const menu = el("div", { className: "ctx" });
+  // The extra class goes on before the measurement below, not after. It is what
+  // sets the width and the height cap, so clamping first would fit the menu to
+  // the viewport at a size it is about to stop being.
+  const menu = el("div", { className: "ctx" + (className ? ` ${className}` : "") });
   for (const item of items) {
     if (item === "-") { menu.append(el("div", { className: "ctx-sep" })); continue; }
+    if (item.nodeType) { menu.append(item); continue; }
+    if (item.node) { menu.append(item.node); continue; }
     const b = el("button", { className: "ctx-item" + (item.danger ? " danger" : ""), textContent: item.label });
     b.onclick = async () => { closeRowMenu(); await item.run(); };
     menu.append(b);
@@ -1373,6 +1924,7 @@ function rowMenu(x, y, items) {
   menu.style.top = `${Math.min(y, window.innerHeight - box.height - 8)}px`;
 
   openMenu = menu;
+  onMenuClose = onClose;
   // Bound after this click finishes, or the click that opened it closes it.
   setTimeout(() => {
     const away = (e) => {

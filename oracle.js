@@ -293,4 +293,30 @@ function stats(db) {
   return { byKind, byRelation, top };
 }
 
-module.exports = { open, rebuild, extract, findEntities, neighbourhood, connection, stats };
+/**
+ * The graph as a drawing needs it: the strongest entities, and the entity to
+ * entity edges among them.
+ *
+ * Thinning for legibility is left to the caller. Which nodes are on screen
+ * changes every time a filter is switched, and rethinning there is instant
+ * where another round trip would not be.
+ */
+function graph(db, { limit = 250, edgeLimit = 4000 } = {}) {
+  open(db);
+  const nodes = db.prepare(`
+    SELECT id, kind, name, display, mentions FROM entities
+    ORDER BY mentions DESC, name LIMIT :limit
+  `).all({ limit });
+
+  const ids = new Set(nodes.map((n) => n.id));
+  const edges = db.prepare(`
+    SELECT source_id AS a, target_id AS b, weight FROM edges
+    WHERE relation = 'co_occurs' AND source_type = 'entity' AND target_type = 'entity'
+    ORDER BY weight DESC LIMIT :edgeLimit
+  `).all({ edgeLimit }).filter((e) => ids.has(e.a) && ids.has(e.b));
+
+  const total = db.prepare("SELECT COUNT(*) AS n FROM entities").get().n;
+  return { nodes, edges, total };
+}
+
+module.exports = { open, rebuild, extract, findEntities, neighbourhood, connection, stats, graph };

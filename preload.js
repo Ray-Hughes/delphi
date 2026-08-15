@@ -36,6 +36,12 @@ contextBridge.exposeInMainWorld("delphi", {
     create: (payload) => call("links:create", payload),
     remove: (id) => call("links:delete", id),
   },
+  organizers: {
+    list: (projectId) => call("organizers:list", projectId),
+    create: (payload) => call("organizers:create", payload),
+    update: (id, fields) => call("organizers:update", id, fields),
+    remove: (id) => call("organizers:delete", id),
+  },
   vault: {
     export: () => call("vault:export"),
     reveal: () => call("vault:reveal"),
@@ -58,6 +64,7 @@ contextBridge.exposeInMainWorld("delphi", {
     stats: () => call("oracle:stats"),
     rebuild: () => call("oracle:rebuild"),
     context: (name) => call("oracle:context", name),
+    graph: (opts) => call("oracle:graph", opts),
     nearest: (query, opts) => call("oracle:nearest", query, opts),
     reindex: (force) => call("oracle:reindex", force),
     provider: () => call("oracle:provider"),

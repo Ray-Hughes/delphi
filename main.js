@@ -772,6 +772,13 @@ handle("links:list", (projectId) => db.listLinks(projectId));
 handle("links:create", (payload) => db.createLink(payload));
 handle("links:delete", (id) => db.deleteLink(id));
 
+// No task handler is added for epics. organizer_id goes through tasks:update
+// like any other field, which is what gives the move its audit row for free.
+handle("organizers:list", (projectId) => db.listOrganizers(projectId));
+handle("organizers:create", (payload) => { const r = db.createOrganizer(payload); scheduleVaultExport(); return r; });
+handle("organizers:update", (id, fields) => { const r = db.updateOrganizer(id, fields); scheduleVaultExport(); return r; });
+handle("organizers:delete", (id) => { const r = db.deleteOrganizer(id); scheduleVaultExport(); return r; });
+
 handle("oracle:stats", () => ({
   ...oracle.stats(db.handle()),
   embeddings: embeddings.status(db.handle()),
@@ -784,6 +791,8 @@ handle("oracle:context", (name) => {
   const found = oracle.findEntities(db.handle(), name, 1)[0];
   return found ? oracle.neighbourhood(db.handle(), found.id) : null;
 });
+
+handle("oracle:graph", (opts) => oracle.graph(db.handle(), opts || {}));
 
 handle("vault:export", () => vault.exportAll(db, settings.vaultPath || vault.DEFAULT_VAULT));
 handle("vault:reveal", () => {
