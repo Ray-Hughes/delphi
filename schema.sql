@@ -43,10 +43,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   due          TEXT,
   source       TEXT,
   ref          TEXT,                       -- PROJ-123, PR number, whatever
+  -- Identity for a row an importer owns, namespaced: "jira:HELIO-14". Not ref,
+  -- which is free text anyone can edit, so a re-import matching on it would
+  -- duplicate the moment someone tidied one up.
+  external_key TEXT,
   -- A subtask is a task with a parent rather than a row in a second table, so
   -- everything that already works on a task works on a subtask: search, the
   -- audit trail, status events, the MCP tools, all of it.
   parent_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  -- The epic this task is filed under, if the project uses them. SET NULL
+  -- rather than CASCADE: deleting the shell must never delete the work, or
+  -- nobody can safely try epics and change their mind.
+  organizer_id INTEGER REFERENCES organizers(id) ON DELETE SET NULL,
   -- Free text until there is a people table. An agent name goes here too, which
   -- is what lets the queue show who is holding a piece of work.
   assignee     TEXT,
@@ -90,6 +98,7 @@ CREATE TABLE IF NOT EXISTS comments (
   task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   author     TEXT NOT NULL DEFAULT 'you',
   body       TEXT NOT NULL,
+  external_key TEXT,                        -- see tasks.external_key
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -194,3 +203,38 @@ CREATE INDEX IF NOT EXISTS idx_repos_project ON repos(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue, status);
+
+-- Organizers: the optional epic shell.
+--
+-- A project is the initiative and an organizer is a piece of it big enough to
+-- have its own name. Optional is the point: a project with none of these looks
+-- exactly as it did before they existed, and there is no flag to set, because
+-- having one is what "this project uses epics" means. A stored flag would be a
+-- second answer to that question and the two would eventually disagree.
+--
+-- Its own table rather than a kind of task with a parent, because an organizer
+-- is not something anyone finishes. It has no status, no assignee and no due
+-- date; its progress is whatever its tasks add up to. A task with a parent gets
+-- search, claims, status events and the queue for free, and a shell wearing
+-- those would be claimable by an agent that then has nothing to do. The row it
+-- resembles is a project, and a project is a table.
+CREATE TABLE IF NOT EXISTS organizers (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  summary     TEXT,                        -- one line: what this epic covers
+  colour      TEXT,                        -- falls back to the project's colour
+  sort_order  INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_organizers_project ON organizers(project_id, sort_order);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_organizer ON tasks(organizer_id);
+
+-- One row per imported thing. Partial, because every row Delphi created itself
+-- has no external key and those are not the rows this is protecting.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_external_key
+  ON tasks(external_key) WHERE external_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_comments_external_key
+  ON comments(external_key) WHERE external_key IS NOT NULL;

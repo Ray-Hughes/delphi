@@ -58,6 +58,13 @@ const LATER_COLUMNS = [
   ["tasks", "queue", "TEXT"],
   ["tasks", "claimed_by", "TEXT"],
   ["tasks", "claim_expires", "TEXT"],
+  // Names a table schema.sql has not created yet, which is legal: SQLite
+  // resolves foreign key targets when a row is written, not when the column is
+  // declared, and the CREATE TABLE lands a few statements later in the same open.
+  ["tasks", "organizer_id", "INTEGER REFERENCES organizers(id) ON DELETE SET NULL"],
+  ["tasks", "external_key", "TEXT"],
+  ["comments", "external_key", "TEXT"],
+  ["tasks", "colour", "TEXT"],
 ];
 
 function addLaterColumns(db) {
@@ -117,6 +124,8 @@ function describeUpdate(entity, before, after) {
       changes.push(after[key] === "done" ? "marked done" : `status ${before[key]} to ${after[key]}`);
     } else if (key === "project_id") {
       changes.push("moved project");
+    } else if (key === "organizer_id") {
+      changes.push(after[key] == null ? "taken out of its epic" : "filed under an epic");
     } else if (key === "body" || key === "detail") {
       changes.push(`edited ${key}`);
     } else {
@@ -225,7 +234,18 @@ function undoLast(count = 1) {
 // The layouts a project's tasks can be shown in. Here rather than as a CHECK
 // constraint, because a constraint cannot be added to a database that already
 // exists and the two would drift.
-const TASK_VIEWS = ["list", "table", "columns", "board"];
+const TASK_VIEWS = ["list", "table", "columns", "board", "calendar"];
+
+/**
+ * The colours a task may carry.
+ *
+ * Names, not hex. The renderer resolves each one against the theme in force, so
+ * a task coloured on a light screen is still legible on a dark one. Kept here
+ * rather than as a CHECK constraint for the same reason as TASK_VIEWS: a
+ * constraint cannot be added to a database that already exists, so the two
+ * would drift.
+ */
+const TASK_COLOURS = ["blue", "teal", "green", "amber", "orange", "red", "purple", "slate"];
 
 function listProjects() {
   return all(`
@@ -268,36 +288,131 @@ function updateProject(id, fields) {
   return getProject(id);
 }
 
+/**
+ * Checks an organizer is a legal home for a task, and says why when it is not.
+ *
+ * Both rules are about the relationship between two rows, and a CHECK
+ * constraint only ever sees one, so neither can live in the schema.
+ */
+function assertOrganizerFits(organizerId, { projectId, parentId }) {
+  if (organizerId == null) return null;
+  // A subtask is reached through its parent, so it takes its parent's epic
+  // rather than carrying one of its own. Two places to file the same piece of
+  // work is how a grouping stops being worth trusting.
+  if (parentId != null) throw new Error("A subtask takes its epic from its parent task");
+  const organizer = one("SELECT * FROM organizers WHERE id = :id", { id: organizerId });
+  if (!organizer) throw new Error("No such organizer");
+  if (organizer.project_id !== projectId) {
+    throw new Error("An organizer only holds tasks from its own project");
+  }
+  return organizer;
+}
+
+/**
+ * Every organizer in a project, each with what it contains.
+ *
+ * Subtasks never carry an organizer_id, so the counts are stories rather than
+ * pieces of stories, which is the number the header is asked for.
+ */
+function listOrganizers(projectId) {
+  return all(
+    `SELECT o.*,
+            (SELECT COUNT(*) FROM tasks t WHERE t.organizer_id = o.id) AS total_count,
+            (SELECT COUNT(*) FROM tasks t WHERE t.organizer_id = o.id AND t.status != 'done') AS open_count
+     FROM organizers o
+     WHERE o.project_id = :projectId
+     ORDER BY o.sort_order, o.id`,
+    { projectId }
+  );
+}
+
+const getOrganizer = (id) => one("SELECT * FROM organizers WHERE id = :id", { id });
+
+function createOrganizer({ projectId, name, summary = null, colour = null }) {
+  if (!projectId) throw new Error("An organizer belongs to a project");
+  if (!name || !String(name).trim()) throw new Error("An organizer needs a name");
+  const order = one(
+    "SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM organizers WHERE project_id = :projectId",
+    { projectId }
+  ).n;
+  const r = run(
+    `INSERT INTO organizers (project_id, name, summary, colour, sort_order)
+     VALUES (:projectId, :name, :summary, :colour, :sort_order)`,
+    { projectId, name: String(name).trim(), summary, colour, sort_order: order }
+  );
+  return getOrganizer(Number(r.lastInsertRowid));
+}
+
+function updateOrganizer(id, fields) {
+  const allowed = ["name", "summary", "colour", "sort_order"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return getOrganizer(id);
+  const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
+  run(`UPDATE organizers SET ${assignments}, updated_at = datetime('now') WHERE id = :id`, {
+    ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
+    id,
+  });
+  return getOrganizer(id);
+}
+
+/**
+ * Removes the shell and keeps the work.
+ *
+ * organizer_id is ON DELETE SET NULL, so the tasks stay exactly where they were
+ * and lose only the grouping. Nothing is written to the audit table: its entity
+ * column has a CHECK that cannot be widened on a database that already exists,
+ * and filing an organizer under 'project' would leave undo trying to insert an
+ * organizer's columns into the projects table. The count comes back so the
+ * caller can say what it is about to loosen, since it cannot offer to undo it.
+ */
+function deleteOrganizer(id) {
+  const organizer = getOrganizer(id);
+  if (!organizer) return { ok: false, loosened: 0, name: null };
+  const loosened = one("SELECT COUNT(*) AS n FROM tasks WHERE organizer_id = :id", { id }).n;
+  run("DELETE FROM organizers WHERE id = :id", { id });
+  return { ok: true, loosened, name: organizer.name };
+}
+
 // Tasks. Passing projectId of null means everything, which is what the All view
-// and the search box use.
-function listTasks({ projectId = null, includeDone = false, includeSubtasks = false } = {}) {
+// and the search box use. organizerId narrows to one epic, or to the work that
+// is in none when it is the string "none". A string rather than null for that,
+// because null and "no filter" have to stay distinguishable across IPC.
+function listTasks({ projectId = null, organizerId = null, includeDone = false, includeSubtasks = false } = {}) {
   const clauses = [];
   if (projectId !== null) clauses.push("t.project_id = :projectId");
+  if (organizerId === "none") clauses.push("t.organizer_id IS NULL");
+  else if (organizerId !== null) clauses.push("t.organizer_id = :organizerId");
   if (!includeDone) clauses.push("t.status != 'done'");
   // Subtasks are shown by their parent, not alongside it. Left in, a task broken
   // into six pieces makes the list longer rather than clearer, which is the
   // opposite of the point.
   if (!includeSubtasks) clauses.push("t.parent_id IS NULL");
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const params = {};
+  if (projectId !== null) params.projectId = projectId;
+  if (organizerId !== null && organizerId !== "none") params.organizerId = organizerId;
   return all(
     `SELECT t.*, p.name AS project_name, p.colour AS project_colour,
+            o.name AS organizer_name, o.colour AS organizer_colour,
             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id) AS subtask_count,
             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id AND s.status = 'done') AS subtask_done,
             (SELECT COUNT(*) FROM comments c WHERE c.task_id = t.id) AS comment_count
-     FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+     FROM tasks t
+     LEFT JOIN projects p ON p.id = t.project_id
+     LEFT JOIN organizers o ON o.id = t.organizer_id
      ${where}
      ORDER BY
        CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 1 WHEN 'todo' THEN 2 ELSE 3 END,
        CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END,
        COALESCE(t.due, '9999-99-99'),
        t.id DESC`,
-    projectId !== null ? { projectId } : {}
+    params
   );
 }
 
 function createTask({
-  projectId = null, title, detail = null, priority = "med",
-  ref = null, due = null, parentId = null, assignee = null, actor = null,
+  projectId = null, title, detail = null, priority = "med", status = "todo",
+  ref = null, due = null, parentId = null, assignee = null, organizerId = null, actor = null,
 }) {
   // A subtask belongs to the same project as its parent whatever the caller
   // says, because a subtask filed somewhere else is not a subtask.
@@ -305,12 +420,20 @@ function createTask({
     const parent = one("SELECT project_id FROM tasks WHERE id = :id", { id: parentId });
     if (!parent) throw new Error("No such parent task");
     projectId = parent.project_id;
+    organizerId = null;
   }
+  assertOrganizerFits(organizerId, { projectId, parentId });
 
   const r = run(
-    `INSERT INTO tasks (project_id, title, detail, priority, ref, due, parent_id, assignee, source)
-     VALUES (:projectId, :title, :detail, :priority, :ref, :due, :parentId, :assignee, 'app')`,
-    { projectId, title, detail, priority, ref, due, parentId, assignee }
+    // completed_at is derived from status here for the same reason updateTask
+    // derives it, and only an importer ever creates a task that is already done.
+    // Creating it as todo and updating it a statement later would stamp the
+    // import time over the date the work actually finished, and leave a status
+    // event saying it was open for a millisecond.
+    `INSERT INTO tasks (project_id, title, detail, priority, status, ref, due, parent_id, assignee, organizer_id, source, completed_at)
+     VALUES (:projectId, :title, :detail, :priority, :status, :ref, :due, :parentId, :assignee, :organizerId, 'app',
+             CASE WHEN :status = 'done' THEN datetime('now') END)`,
+    { projectId, title, detail, priority, status, ref, due, parentId, assignee, organizerId }
   );
   const created = one("SELECT * FROM tasks WHERE id = :id", { id: Number(r.lastInsertRowid) });
   // The opening status is an event like any other, so a timeline never starts
@@ -323,21 +446,46 @@ function createTask({
 }
 
 function updateTask(id, fields, { actor = null } = {}) {
-  const allowed = ["project_id", "title", "detail", "status", "priority", "owner", "due", "ref", "assignee", "parent_id", "queue"];
-  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  const allowed = ["project_id", "title", "detail", "status", "priority", "owner", "due", "ref",
+                   "assignee", "parent_id", "queue", "organizer_id", "colour"];
+  // Rejected here rather than stored and ignored: a colour outside the palette
+  // has no hex behind it in either theme, so it would paint nothing and look
+  // like the write silently failed.
+  if (fields.colour != null && !TASK_COLOURS.includes(fields.colour)) {
+    throw new Error(`colour must be one of ${TASK_COLOURS.join(", ")}`);
+  }
+  // Read before the statement is assembled, because two of the rules below need
+  // to know what the row currently is in order to decide what to write.
+  const before = rowOf("task", id);
+  const next = { ...fields };
+
+  if (before) {
+    const projectId = next.project_id !== undefined ? next.project_id : before.project_id;
+    // An epic belongs to one project, so a task that leaves its project cannot
+    // keep it. Cleared rather than refused: moving the task is the intent, and
+    // the grouping is the only part of it that stops making sense.
+    if (projectId !== before.project_id && next.organizer_id === undefined) next.organizer_id = null;
+    if (next.organizer_id !== undefined) {
+      assertOrganizerFits(next.organizer_id, {
+        projectId,
+        parentId: next.parent_id !== undefined ? next.parent_id : before.parent_id,
+      });
+    }
+  }
+
+  const sets = Object.keys(next).filter((k) => allowed.includes(k));
   if (!sets.length) return one("SELECT * FROM tasks WHERE id = :id", { id });
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
   // completed_at is derived rather than passed in, so it can never disagree with status.
   const completed =
-    fields.status === "done"
+    next.status === "done"
       ? ", completed_at = datetime('now')"
-      : fields.status
+      : next.status
       ? ", completed_at = NULL"
       : "";
-  const before = rowOf("task", id);
   run(
     `UPDATE tasks SET ${assignments}, updated_at = datetime('now')${completed} WHERE id = :id`,
-    { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id }
+    { ...Object.fromEntries(sets.map((k) => [k, next[k]])), id }
   );
   const after = one("SELECT * FROM tasks WHERE id = :id", { id });
   // Written here rather than by callers, so the history cannot drift from the
@@ -504,8 +652,18 @@ function deleteComment(id) {
 const statusEvents = (taskId) =>
   all("SELECT * FROM status_events WHERE task_id = :taskId ORDER BY at, id", { taskId });
 
+// The same three aggregates listTasks computes, because the parent's Details tab
+// shows subtasks as cards, and a card that cannot say "2/5" or how much has been
+// said about it is missing the two facts that decide whether to open it.
 const subtasks = (parentId) =>
-  all("SELECT * FROM tasks WHERE parent_id = :parentId ORDER BY id", { parentId });
+  all(
+    `SELECT t.*,
+            (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id) AS subtask_count,
+            (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id AND s.status = 'done') AS subtask_done,
+            (SELECT COUNT(*) FROM comments c WHERE c.task_id = t.id) AS comment_count
+     FROM tasks t WHERE t.parent_id = :parentId ORDER BY t.id`,
+    { parentId }
+  );
 
 /** Everything the detail view shows, in one call so it cannot half load. */
 function taskDetail(id) {
@@ -519,6 +677,11 @@ function taskDetail(id) {
     parent: task.parent_id
       ? one("SELECT id, title, status FROM tasks WHERE id = :id", { id: task.parent_id })
       : null,
+    organizer: task.organizer_id ? getOrganizer(task.organizer_id) : null,
+    // The whole list rather than only the one it is in, so the sheet can offer a
+    // change of epic without a second call. The sheet opens from All work and
+    // from search too, where the project's organizers are not already loaded.
+    organizers: task.project_id ? listOrganizers(task.project_id) : [],
     comments: listComments(id),
     events: statusEvents(id),
     subtasks: subtasks(id),
@@ -812,13 +975,79 @@ function stats() {
   `);
 }
 
+// ---------------------------------------------------------------------------
+// Imported rows
+//
+// Anything imported has to be importable twice, and that needs a handle on the
+// row that survives both a re-import and a person editing it afterwards. ref
+// cannot be that handle: it is free text, it is in updateTask's allowlist, and
+// the app lets anyone change it, so the first tidy-up would turn every following
+// import into a duplicate. tasks.legacy_id is here for the same reason, from the
+// last time this question came up.
+//
+// Keys are namespaced ("jira:HELIO-14"), so a second importer can share the
+// column without either having to guess whose key it is reading.
+// ---------------------------------------------------------------------------
+
+const projectByKey = (key) => one("SELECT * FROM projects WHERE key = :key", { key });
+
+const taskByExternalKey = (externalKey) =>
+  one("SELECT * FROM tasks WHERE external_key = :externalKey", { externalKey });
+
+/**
+ * Creates a task an importer owns.
+ *
+ * Goes through createTask rather than writing its own INSERT, so an imported
+ * task gets the same opening status event and the same audit row as one typed
+ * into the app. The columns createTask does not take are stamped on afterwards:
+ * external_key and source identify the importer, owner is the only mapped field
+ * with nowhere to ride in, and completedAt is the upstream tracker's own record
+ * of when this finished, which beats the moment the import happened to run.
+ */
+function createExternalTask({
+  externalKey, source = "import", owner = null, status = null, completedAt = null, ...fields
+}) {
+  const created = createTask({ ...fields, status: status || undefined });
+  run(
+    `UPDATE tasks SET external_key = :externalKey, source = :source, owner = :owner,
+            completed_at = COALESCE(:completedAt, completed_at)
+       WHERE id = :id`,
+    { externalKey, source, owner, completedAt, id: created.id }
+  );
+  return one("SELECT * FROM tasks WHERE id = :id", { id: created.id });
+}
+
+const commentByExternalKey = (externalKey) =>
+  one("SELECT * FROM comments WHERE external_key = :externalKey", { externalKey });
+
+function createExternalComment({ taskId, externalKey, body, author = "you" }) {
+  const created = createComment({ taskId, body, author });
+  run("UPDATE comments SET external_key = :externalKey WHERE id = :id", { externalKey, id: created.id });
+  return one("SELECT * FROM comments WHERE id = :id", { id: created.id });
+}
+
+/**
+ * Rewrites an imported comment whose text changed upstream.
+ *
+ * No audit row: a comment edited in Jira is not a change anyone made here, and
+ * the History tab is for things that happened in Delphi.
+ */
+function updateExternalComment(id, body) {
+  run("UPDATE comments SET body = :body, updated_at = datetime('now') WHERE id = :id",
+      { id, body: String(body).trim() });
+  return one("SELECT * FROM comments WHERE id = :id", { id });
+}
+
 module.exports = {
   DB_PATH,
   // The graph builder works against the connection directly, so it is exposed
   // rather than every graph query being proxied through this module.
   handle: open,
   listProjects, getProject, createProject, updateProject,
-  listTasks, createTask, updateTask, deleteTask,
+  listTasks, createTask, updateTask,
+  listOrganizers, getOrganizer, createOrganizer, updateOrganizer, deleteOrganizer,
+  projectByKey, taskByExternalKey, createExternalTask,
+  commentByExternalKey, createExternalComment, updateExternalComment, deleteTask,
   taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
   setQueue, queueState, claimNext, releaseClaim, completeClaim,
   listNotes, createNote, updateNote, deleteNote,
