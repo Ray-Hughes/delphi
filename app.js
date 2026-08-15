@@ -16,6 +16,10 @@ const state = {
   notes: [],
   links: [],
   repos: [],
+  organizers: [],
+  // Which epic the board and the column layouts are narrowed to. null is all of
+  // them, "none" is the work that is in none.
+  epicFilter: null,
   allTasks: [],
   // Where we have been, so Back can return. Holds the whole position rather than
   // just the project, because returning to the right project on the wrong tab is
@@ -224,6 +228,7 @@ async function refresh() {
     state.notes = notes;
     state.links = [];
     state.repos = [];
+    state.organizers = [];
 
     // Meaning-based ranking and the graph, in parallel with the literal match, so
     // the Oracle tab is ready rather than loading when it is opened.
@@ -253,10 +258,12 @@ async function refresh() {
       state.notes = await window.delphi.notes.list(state.projectId);
       state.links = await window.delphi.links.list(state.projectId);
       state.repos = await window.delphi.repos.list(state.projectId);
+      state.organizers = await window.delphi.organizers.list(state.projectId);
     } else {
       state.notes = [];
       state.links = [];
       state.repos = [];
+      state.organizers = [];
     }
   }
   render();
@@ -1213,13 +1220,80 @@ function groupByStatus(tasks) {
 }
 
 /**
+ * The colours a task may be given.
+ *
+ * A fixed set of names rather than a picker of arbitrary hex. The same value has
+ * to stay legible on a light ground and a dark one, and a colour chosen against
+ * either will fail on the other: a pastel disappears on white, a strong hue
+ * turns to mud on the dark surface. So what is stored is the name, and each name
+ * resolves to a different hex per theme in index.html.
+ */
+const TASK_COLOURS = [
+  ["blue", "Blue"],
+  ["teal", "Teal"],
+  ["green", "Green"],
+  ["amber", "Amber"],
+  ["orange", "Orange"],
+  ["red", "Red"],
+  ["purple", "Purple"],
+  ["slate", "Slate"],
+];
+
+const TASK_COLOUR_NAMES = new Map(TASK_COLOURS);
+
+// An unrecognised name paints nothing rather than an unstyled element, so a
+// colour written by an older or newer build degrades to no colour at all.
+const hasColour = (t) => Boolean(t && TASK_COLOUR_NAMES.has(t.colour));
+const colourClass = (t) => (hasColour(t) ? ` tinted c-${t.colour}` : "");
+const colourLabel = (name) => TASK_COLOUR_NAMES.get(name) || "";
+
+/**
+ * The palette, as a row of swatches.
+ *
+ * Used both inside the task sheet and inside the right click menu, so a colour
+ * is one gesture away wherever a task is shown. The last swatch clears it, which
+ * is the only way back to no colour once one is set.
+ */
+function swatchRow(current, onPick) {
+  const row = el("div", { className: "swatches", role: "group" });
+  row.setAttribute("aria-label", "Task colour");
+  for (const [value, label] of TASK_COLOURS) {
+    const b = el("button", {
+      className: `swatch c-${value}` + (current === value ? " on" : ""),
+      type: "button", title: label,
+    });
+    b.setAttribute("aria-label", label);
+    b.setAttribute("aria-pressed", String(current === value));
+    b.onclick = (e) => { e.stopPropagation(); onPick(value); };
+    row.append(b);
+  }
+  const clear = el("button", {
+    className: "swatch none" + (current ? "" : " on"),
+    type: "button", title: "No colour",
+  });
+  clear.setAttribute("aria-label", "No colour");
+  clear.setAttribute("aria-pressed", String(!current));
+  clear.onclick = (e) => { e.stopPropagation(); onPick(null); };
+  row.append(clear);
+  return row;
+}
+
+/** The swatches as a menu of their own, for anywhere without room to inline them. */
+function colourMenu(x, y, task, onPick) {
+  rowMenu(x, y, [{ node: swatchRow(task.colour, async (colour) => {
+    closeRowMenu();
+    await onPick(colour);
+  }) }]);
+}
+
+/**
  * A card, for the column and board layouts.
  *
  * Deliberately quieter than a row: in a narrow column there is no room for meta,
  * so it carries the title and only what changes a decision.
  */
 function taskCard(t, { draggable = false, showDue = true } = {}) {
-  const card = el("div", { className: "tcard" + (t.status === "done" ? " done" : "") });
+  const card = el("div", { className: "tcard" + (t.status === "done" ? " done" : "") + colourClass(t) });
   card.append(el("div", { className: "tcard-title", textContent: t.title }));
 
   const foot = el("div", { className: "tcard-foot" });
@@ -1678,7 +1752,7 @@ const TABLE_COLUMNS = ["", "Task", "Status", "Assignee", "Due", "Priority", ""];
 
 /** One task as a table row. */
 function taskTableRow(t) {
-  const row = el("div", { className: "trow" + (t.status === "done" ? " done" : "") + (selected.has(t.id) ? " picked" : "") });
+  const row = el("div", { className: "trow" + (t.status === "done" ? " done" : "") + (selected.has(t.id) ? " picked" : "") + colourClass(t) });
 
   row.append(selectBox(t, row));
 
@@ -1797,6 +1871,7 @@ function renderTasks(root) {
     // Only inside a project: All work spans several and a per-project setting
     // has nothing to attach to.
     if (state.projectId) bar.append(viewPicker());
+    if (state.projectId) bar.append(newEpicButton());
     root.append(bar);
   }
 
@@ -1809,7 +1884,7 @@ function renderTasks(root) {
     done: [(t) => t.status === "done", "done"],
   };
   const active = filters[state.taskFilter];
-  const shown = active ? state.tasks.filter(active[0]) : state.tasks;
+  let shown = active ? state.tasks.filter(active[0]) : state.tasks;
 
   if (active) {
     const clear = el("button", { className: "btn sm", textContent: "Clear filter" });
@@ -1819,12 +1894,22 @@ function renderTasks(root) {
       clear));
   }
 
+  // Epics separate the flat list into groups. The board and the two column
+  // layouts already group by status, so there an epic narrows what is shown
+  // rather than adding a second axis: a grid of mostly empty cells is harder to
+  // read than either axis on its own.
+  const epics = !state.query && state.projectId && state.organizers.length > 0;
+  if (epics && mode !== "list") {
+    root.append(epicStrip());
+    if (validEpicFilter() !== null) shown = shown.filter(epicFilterOf(state.epicFilter));
+  }
+
   // The columns and the board keep their shape when empty, because an empty
   // column is information and a board that vanishes when the last task moves is
   // disorienting.
   clearSelection();
 
-  if (!shown.length && mode === "list") {
+  if (!shown.length && mode === "list" && !epics) {
     root.append(emptyState(
       state.query ? "Nothing matched" : active ? `Nothing ${active[1]}` : "No open tasks",
       state.query ? "Try a different word." : active ? "Clear the filter to see the rest." : "Add one above."));
@@ -1832,9 +1917,13 @@ function renderTasks(root) {
   }
 
   if (mode === "list") {
-    const list = el("section", { className: "card" });
-    shown.forEach((t) => list.append(taskRow(t)));
-    root.append(list);
+    if (epics) {
+      renderEpicList(root, shown);
+    } else {
+      const list = el("section", { className: "card" });
+      shown.forEach((t) => list.append(taskRow(t)));
+      root.append(list);
+    }
   } else if (mode === "table") {
     renderTaskTable(root, shown);
   } else if (mode === "calendar") {
@@ -1964,6 +2053,7 @@ async function quickLook(taskId) {
     ["Due", t.due || "no due date"],
     ["Project", detail.project ? detail.project.name : "none"],
     ["Reference", t.ref || "none"],
+    ["Colour", colourLabel(t.colour) || "none"],
     ["Subtasks", detail.subtasks.length
       ? `${detail.subtasks.filter((s) => s.status === "done").length} of ${detail.subtasks.length} done`
       : "none"],
@@ -2000,8 +2090,9 @@ async function quickLook(taskId) {
 }
 
 /** The menu a task row offers, used by right click and by the row's own button. */
-function taskMenu(t, x, y) {
-  const set = async (fields) => { await window.delphi.tasks.update(t.id, fields); refresh(); };
+function taskMenu(t, x, y, { after = null } = {}) {
+  const repaint = async () => { refresh(); if (after) await after(); };
+  const set = async (fields) => { await window.delphi.tasks.update(t.id, fields); await repaint(); };
 
   const moves = state.projects
     .filter((p) => p.id !== t.project_id)
@@ -2012,6 +2103,8 @@ function taskMenu(t, x, y) {
     { label: "Open", run: () => openTaskSheet(t.id) },
     { label: "Quick look", run: () => quickLook(t.id) },
     "-",
+    { node: swatchRow(t.colour, async (colour) => { closeRowMenu(); await set({ colour }); }) },
+    "-",
     ...(t.status === "done"
       ? [{ label: "Reopen", run: () => set({ status: "todo" }) }]
       : [{ label: "Mark done", run: () => set({ status: "done" }) }]),
@@ -2021,21 +2114,280 @@ function taskMenu(t, x, y) {
       : [{ label: "Block", run: () => set({ status: "blocked" }) }]),
     "-",
     ...(t.queue
-      ? [{ label: "Take out of the agent queue", run: async () => { await window.delphi.tasks.queue(t.id, null); refresh(); } }]
-      : [{ label: "Send to the agent queue", run: async () => { await window.delphi.tasks.queue(t.id, "ready"); refresh(); } }]),
+      ? [{ label: "Take out of the agent queue", run: async () => { await window.delphi.tasks.queue(t.id, null); await repaint(); } }]
+      : [{ label: "Send to the agent queue", run: async () => { await window.delphi.tasks.queue(t.id, "ready"); await repaint(); } }]),
     "-",
+    ...epicMenuItems(t, repaint),
     ...(moves.length ? [...moves, "-"] : []),
     {
       label: "Delete", danger: true,
       run: async () => {
         await window.delphi.tasks.remove(t.id);
-        refresh();
+        await repaint();
         // Said where it happened, because that is when someone needs to know it
         // is not final.
         setTimeout(() => alert("Task deleted. Restore it from this project's Activity tab."), 30);
       },
     },
   ]);
+}
+
+// ---------------------------------------------------------------------------
+// Epics
+//
+// Optional is the whole point. A project with no organizers renders exactly as
+// it did before this existed, plus one button offering to start. There is no
+// setting to turn them on, because a stored flag is a second answer to "does
+// this project use epics" and the two can disagree: enabled with none made
+// looks broken, disabled with some made hides work. Having one is the answer.
+// ---------------------------------------------------------------------------
+
+/** Collapsed epics, by id. Deliberately not persisted: it is a reading
+    position, not a preference, and it should not follow you to tomorrow. */
+const collapsedEpics = new Set();
+
+/** An organizer's own colour, falling back to the project it lives in. */
+function epicColour(o) {
+  const project = currentProject();
+  return o.colour || (project && project.colour) || "var(--ink-faint)";
+}
+
+/** Drops a filter left pointing at an epic that has since gone. */
+function validEpicFilter() {
+  if (state.epicFilter == null) return null;
+  if (state.epicFilter === "none") return "none";
+  if (!state.organizers.some((o) => o.id === state.epicFilter)) state.epicFilter = null;
+  return state.epicFilter;
+}
+
+const epicFilterOf = (value) =>
+  value === "none" ? (t) => t.organizer_id == null : (t) => t.organizer_id === value;
+
+/**
+ * Tasks split into their epics, in the project's own epic order.
+ *
+ * An epic holding nothing at all is kept, because an empty epic is a commitment
+ * someone made and hiding it until it has work is how the same epic gets
+ * created twice. An epic whose work is merely filtered out of view is dropped,
+ * because that is not an empty epic, it is a hidden one, and a page of empty
+ * headers after "Hide done" would say nothing.
+ */
+function groupByOrganizer(tasks) {
+  const groups = state.organizers.map((o) => ({ organizer: o, tasks: [] }));
+  const index = new Map(groups.map((g) => [g.organizer.id, g]));
+  const loose = { organizer: null, tasks: [] };
+  for (const t of tasks) {
+    const group = t.organizer_id == null ? null : index.get(t.organizer_id);
+    (group || loose).tasks.push(t);
+  }
+  const kept = groups.filter((g) => g.tasks.length || g.organizer.total_count === 0);
+  return loose.tasks.length ? [...kept, loose] : kept;
+}
+
+/** The head of one epic: what it is, how far along, and what can be done to it. */
+function epicHead(o) {
+  const head = el("div", { className: "epic-head" });
+  const shut = collapsedEpics.has(o.id);
+
+  const fold = el("button", { className: "epic-fold", type: "button", textContent: shut ? "▸" : "▾" });
+  fold.title = shut ? "Expand" : "Collapse";
+  fold.setAttribute("aria-expanded", String(!shut));
+  fold.setAttribute("aria-label", `${shut ? "Expand" : "Collapse"} ${o.name}`);
+  // render rather than refresh: folding is a change to what is drawn, not to
+  // anything the database knows, and a round trip would be a visible stutter.
+  fold.onclick = (e) => {
+    e.stopPropagation();
+    if (shut) collapsedEpics.delete(o.id); else collapsedEpics.add(o.id);
+    render();
+  };
+  head.append(fold);
+
+  head.append(el("span", { className: "epic-dot", style: `background:${epicColour(o)}` }));
+
+  const naming = el("div", { className: "epic-naming" });
+  naming.append(el("div", { className: "epic-name", textContent: o.name }));
+  if (o.summary) naming.append(el("div", { className: "epic-sum", textContent: o.summary }));
+  head.append(naming);
+
+  const done = o.total_count - o.open_count;
+  if (o.total_count) {
+    head.append(el("span", { className: "epic-n", textContent: `${done}/${o.total_count}` }));
+    const bar = el("span", { className: "epic-bar" });
+    bar.append(el("span", { className: "epic-bar-fill", style: `width:${Math.round((done / o.total_count) * 100)}%` }));
+    head.append(bar);
+  } else {
+    head.append(el("span", { className: "epic-n empty", textContent: "empty" }));
+  }
+
+  const more = el("button", { className: "epic-more", type: "button", textContent: "⋯", title: "Epic actions" });
+  more.setAttribute("aria-label", `Actions for ${o.name}`);
+  more.onclick = (e) => {
+    e.stopPropagation();
+    const box = more.getBoundingClientRect();
+    epicMenu(o, box.left - 160, box.bottom + 4);
+  };
+  head.append(more);
+
+  head.onclick = () => fold.click();
+  return head;
+}
+
+/** The bucket for work that is in no epic. Quieter, and always last. */
+function looseHead(count) {
+  const head = el("div", { className: "epic-head loose" });
+  head.append(el("span", { className: "epic-name", textContent: "Not in an epic" }));
+  head.append(el("span", { className: "epic-n", textContent: String(count) }));
+  return head;
+}
+
+/** Adding here files the task into this epic, which is what typing here means. */
+function epicComposer(o) {
+  const add = el("input", { className: "epic-add", placeholder: `＋ Add to ${o.name}` });
+  add.setAttribute("aria-label", `Add a task to ${o.name}`);
+  add.onkeydown = async (e) => {
+    if (e.key !== "Enter" || !add.value.trim()) return;
+    let title = add.value.trim();
+    let priority = "med";
+    if (title.startsWith("!")) { priority = "high"; title = title.slice(1).trim(); }
+    const ref = (title.match(/\b([A-Z][A-Z0-9]+-\d+)\b/) || [])[1] || null;
+    await window.delphi.tasks.create({
+      projectId: state.projectId, title, priority, ref, organizerId: o.id,
+    });
+    add.value = "";
+    refresh();
+  };
+  return add;
+}
+
+function epicMenu(o, x, y) {
+  const rename = async () => {
+    const name = prompt("Epic name", o.name);
+    if (!name || !name.trim() || name.trim() === o.name) return;
+    await window.delphi.organizers.update(o.id, { name: name.trim() });
+    refresh();
+  };
+  const describe = async () => {
+    const summary = prompt("One line: what this epic covers", o.summary || "");
+    if (summary === null) return;
+    await window.delphi.organizers.update(o.id, { summary: summary.trim() || null });
+    refresh();
+  };
+  const remove = async () => {
+    // Asked before rather than reported after, which is the opposite of the way
+    // a deleted task is handled. A task can be restored from the Activity tab
+    // and an epic cannot, so this is the one delete that has to be agreed to.
+    const warning = o.total_count
+      ? `Delete the epic “${o.name}”?\n\nIts ${plural(o.total_count, "task", "tasks")} stay in the project and stop being grouped. The epic itself cannot be restored.`
+      : `Delete the epic “${o.name}”?\n\nIt cannot be restored.`;
+    if (!confirm(warning)) return;
+    await window.delphi.organizers.remove(o.id);
+    collapsedEpics.delete(o.id);
+    if (state.epicFilter === o.id) state.epicFilter = null;
+    refresh();
+  };
+
+  rowMenu(x, y, [
+    { label: "Rename", run: rename },
+    { label: o.summary ? "Edit the summary" : "Add a summary", run: describe },
+    "-",
+    { label: "Collapse every epic", run: () => { state.organizers.forEach((e) => collapsedEpics.add(e.id)); render(); } },
+    { label: "Expand every epic", run: () => { collapsedEpics.clear(); render(); } },
+    "-",
+    { label: "Delete the epic", danger: true, run: remove },
+  ]);
+}
+
+/** The flat list, separated into epics. */
+function renderEpicList(root, tasks) {
+  for (const group of groupByOrganizer(tasks)) {
+    const o = group.organizer;
+    const section = el("section", { className: "card epic" });
+    section.append(o ? epicHead(o) : looseHead(group.tasks.length));
+
+    if (o && collapsedEpics.has(o.id)) { root.append(section); continue; }
+
+    group.tasks.forEach((t) => section.append(taskRow(t)));
+    if (o) {
+      if (!group.tasks.length) {
+        section.append(el("div", { className: "epic-empty", textContent: "Nothing in this epic yet." }));
+      }
+      section.append(epicComposer(o));
+    }
+    root.append(section);
+  }
+}
+
+/**
+ * Epics as a filter, for the layouts that already group by something else.
+ *
+ * The board and the two column layouts group by status. Grouping by epic as
+ * well would be a grid, and a grid of mostly empty cells is harder to read than
+ * either axis alone. So there the epic narrows what is on the board rather than
+ * adding a second dimension to it.
+ */
+function epicStrip() {
+  const strip = el("div", { className: "epic-strip", role: "group" });
+  strip.setAttribute("aria-label", "Narrow to one epic");
+  const active = validEpicFilter();
+
+  const chip = (label, value, count, colour) => {
+    const on = active === value;
+    const b = el("button", { className: "epic-chip" + (on ? " on" : ""), type: "button" });
+    b.setAttribute("aria-pressed", String(on));
+    if (colour) b.append(el("span", { className: "epic-dot", style: `background:${colour}` }));
+    b.append(el("span", { textContent: label }));
+    if (count != null) b.append(el("span", { className: "epic-chip-n", textContent: String(count) }));
+    b.onclick = () => { state.epicFilter = on ? null : value; refresh(); };
+    return b;
+  };
+
+  strip.append(chip("Everything", null, null, null));
+  for (const o of state.organizers) strip.append(chip(o.name, o.id, o.open_count, epicColour(o)));
+  const loose = state.tasks.filter((t) => t.organizer_id == null).length;
+  if (loose) strip.append(chip("Not in an epic", "none", loose, null));
+  return strip;
+}
+
+/**
+ * The way in, and the way to add another.
+ *
+ * Worded as an offer the first time, because the first press is a decision
+ * about how this project is going to be organised and the ones after it are
+ * not.
+ */
+function newEpicButton() {
+  const first = !state.organizers.length;
+  const b = el("button", { className: "btn sm", textContent: first ? "Group into epics" : "New epic" });
+  b.title = first
+    ? "Wrap this project's tasks in epics. Nothing moves until you put something in one."
+    : "Add another epic to this project";
+  b.onclick = async () => {
+    const name = prompt(first ? "Name the first epic" : "Name the epic");
+    if (!name || !name.trim()) return;
+    await window.delphi.organizers.create({ projectId: state.projectId, name: name.trim() });
+    refresh();
+  };
+  return b;
+}
+
+/**
+ * The epic entries for a task's right click menu.
+ *
+ * Empty for a project with no epics and for a subtask, so the menu never offers
+ * to file something into nothing or to split a task from its parent.
+ */
+function epicMenuItems(t, repaint = refresh) {
+  if (!state.organizers.length || t.parent_id) return [];
+  const set = async (organizerId) => {
+    await window.delphi.tasks.update(t.id, { organizer_id: organizerId });
+    await repaint();
+  };
+  const items = state.organizers
+    .filter((o) => o.id !== t.organizer_id)
+    .slice(0, 8)
+    .map((o) => ({ label: `File under ${o.name}`, run: () => set(o.id) }));
+  if (t.organizer_id) items.push({ label: "Take out of its epic", run: () => set(null) });
+  return items.length ? [...items, "-"] : [];
 }
 
 /**
@@ -2046,7 +2398,7 @@ function taskMenu(t, x, y) {
  * right click away, so the row itself stays a target rather than a toolbar.
  */
 function taskRow(t) {
-  const row = el("div", { className: "task" + (t.status === "done" ? " done" : "") });
+  const row = el("div", { className: "task" + (t.status === "done" ? " done" : "") + colourClass(t) });
 
   const check = el("div", { className: "check", textContent: "✓", tabIndex: 0, role: "checkbox" });
   check.setAttribute("aria-checked", String(t.status === "done"));
@@ -3014,6 +3366,24 @@ async function openTaskSheet(taskId) {
       },
     }));
 
+    meta.append(chip({
+      icon: "◆", value: colourLabel(t.colour), empty: "no colour",
+      tone: t.colour ? `hue c-${t.colour}` : "",
+      build: (done) => {
+        // The swatches replace the chip in place, the same way every other
+        // chip becomes its own control, so there is no popover to dismiss.
+        const box = el("div", { className: "swatch-inline", tabIndex: -1 });
+        box.append(swatchRow(t.colour, (colour) =>
+          write({ colour }, colour ? "colour saved" : "colour cleared").then(done)));
+        box.addEventListener("focusout", () => {
+          // After the browser has moved focus, or a click on a swatch closes
+          // the editor before it has run.
+          setTimeout(() => { if (!box.contains(document.activeElement)) done(); }, 0);
+        });
+        return box;
+      },
+    }));
+
     if (t.ref) meta.append(el("span", { className: "ts-chip tone-ref" },
       el("span", { className: "ts-chip-icon", textContent: "⧉" }), el("span", { textContent: t.ref })));
 
@@ -3087,35 +3457,37 @@ async function openTaskSheet(taskId) {
     else paintActivity();
   }
 
+  /**
+   * Subtasks, as cards.
+   *
+   * Rows made a subtask look like a line item, which is the one thing it is not:
+   * it carries its own status, owner, description, discussion and colour, and a
+   * row had space for none of that. A card gives each of them somewhere to sit.
+   *
+   * Status is a control here rather than a label, because moving a piece of work
+   * along is the reason most people open a subtask at all, and doing it from the
+   * parent means never leaving the place the work is being read from.
+   */
   function paintSubtasks() {
+    const subs = detail.subtasks;
+    const finished = subs.filter((s) => s.status === "done").length;
+
     const head = el("div", { className: "ts-sec-head" }, el("h4", { textContent: "Subtasks" }));
-    if (detail.subtasks.length) {
-      head.append(el("span", { className: "ts-count", textContent: String(detail.subtasks.length) }));
+    if (subs.length) {
+      head.append(el("span", { className: "ts-count", textContent: `${finished}/${subs.length}` }));
+      const bar = el("span", { className: "ts-bar wide" });
+      bar.append(el("span", { className: "ts-bar-fill", style: `width:${Math.round((finished / subs.length) * 100)}%` }));
+      head.append(bar);
     }
     paneBox.append(head);
 
-    for (const s of detail.subtasks) {
-      const row = el("div", { className: "ts-sub" + (s.status === "done" ? " done" : "") });
-      const tick = el("button", { className: "ts-ring sm" + (s.status === "done" ? " on" : ""),
-                                  textContent: s.status === "done" ? "✓" : "" });
-      tick.setAttribute("aria-label", "Toggle subtask");
-      tick.onclick = async () => {
-        await window.delphi.tasks.update(s.id, { status: s.status === "done" ? "todo" : "done" });
-        await reload();
-        refresh();
-      };
-      const name = el("button", { className: "ts-sub-title", textContent: s.title });
-      name.onclick = () => openTaskSheet(s.id);
-      row.append(tick, name);
-
-      const bits = el("span", { className: "ts-sub-meta" });
-      if (s.due) bits.append(el("span", { className: "ts-chip mini" + (isOverdue(s) ? " tone-overdue" : "") },
-        el("span", { className: "ts-chip-icon", textContent: "◔" }), el("span", { textContent: s.due })));
-      if (s.priority === "high") bits.append(el("span", { className: "ts-chip mini tone-high" },
-        el("span", { className: "ts-chip-icon", textContent: "⚑" }), el("span", { textContent: "high" })));
-      if (s.assignee) bits.append(el("span", { className: "avatar sm", textContent: s.assignee.slice(0, 1).toUpperCase() }));
-      row.append(bits);
-      paneBox.append(row);
+    if (!subs.length) {
+      paneBox.append(el("div", { className: "hint pad",
+        textContent: "Nothing broken out yet. A subtask is a task, so each piece gets its own status, owner and discussion." }));
+    } else {
+      const grid = el("div", { className: "sub-grid" });
+      for (const s of subs) grid.append(subtaskCard(s));
+      paneBox.append(grid);
     }
 
     const add = el("input", { className: "ts-add", placeholder: "＋  Add a subtask" });
@@ -3127,6 +3499,84 @@ async function openTaskSheet(taskId) {
       refresh();
     };
     paneBox.append(add);
+  }
+
+  /** One subtask, as a card in the parent's Details tab. */
+  function subtaskCard(s) {
+    const card = el("div", { className: "subcard" + (s.status === "done" ? " done" : "") + colourClass(s) });
+
+    // Named apart from the sheet's own write(), which takes a note to flash and
+    // acts on the parent.
+    const save = async (fields) => {
+      await window.delphi.tasks.update(s.id, fields);
+      await reload();
+      refresh();
+    };
+
+    const head = el("div", { className: "subcard-head" });
+    const name = el("button", { className: "subcard-title", textContent: s.title, title: "Open this subtask" });
+    name.onclick = () => openTaskSheet(s.id);
+    const more = el("button", { className: "t-more", textContent: "⋯", title: "Actions" });
+    more.setAttribute("aria-label", "Subtask actions");
+    more.onclick = (e) => {
+      e.stopPropagation();
+      const box = more.getBoundingClientRect();
+      taskMenu(s, box.left - 150, box.bottom + 4, { after: reload });
+    };
+    head.append(name, more);
+    card.append(head);
+
+    // The first couple of lines of the description, as plain text. Markdown is for
+    // the task itself; here it would be six words of formatting in a box the size
+    // of a stamp.
+    if (s.detail && s.detail.trim()) {
+      card.append(el("p", { className: "subcard-note", textContent: s.detail.replace(/\s+/g, " ").trim() }));
+    }
+
+    const foot = el("div", { className: "subcard-foot" });
+
+    const status = el("select", { className: `cell-select st-${s.status}`, title: "Status" });
+    status.setAttribute("aria-label", "Subtask status");
+    for (const [value, label] of BOARD_COLUMNS) {
+      status.append(el("option", { value, textContent: label, selected: s.status === value }));
+    }
+    status.onchange = () => save({ status: status.value });
+    foot.append(status);
+
+    if (s.priority === "high") foot.append(el("span", { className: "pill high", textContent: "high" }));
+    if (isOverdue(s)) foot.append(el("span", { className: "pill overdue", textContent: s.due }));
+    else if (s.due) foot.append(el("span", { className: "t-due", textContent: s.due }));
+    // Present only when db.subtasks() carries the counts, so a build without that
+    // change shows nothing here rather than "undefined".
+    if (s.subtask_count) foot.append(el("span", { className: "t-due", textContent: `${s.subtask_done}/${s.subtask_count}` }));
+    if (s.comment_count) foot.append(el("span", { className: "t-due", textContent: `${s.comment_count} ✦` }));
+
+    const named = hasColour(s) ? `Colour: ${colourLabel(s.colour)}` : "Set a colour";
+    const hue = el("button", { className: "subcard-hue" + (hasColour(s) ? " on" : ""), title: named });
+    hue.setAttribute("aria-label", named);
+    hue.onclick = (e) => {
+      e.stopPropagation();
+      const box = hue.getBoundingClientRect();
+      colourMenu(box.left - 120, box.bottom + 6, s, (colour) => save({ colour }));
+    };
+    foot.append(hue);
+
+    const who = el("span", { className: "subcard-who" });
+    if (s.assignee) {
+      who.append(el("span", {
+        className: "avatar sm" + (isAgent(s.assignee) ? " agent" : ""),
+        title: s.assignee,
+        textContent: s.assignee.slice(0, 1).toUpperCase(),
+      }));
+      who.append(el("span", { className: "cell-text", textContent: s.assignee }));
+    } else {
+      who.append(el("span", { className: "cell-empty", textContent: "unassigned" }));
+    }
+    foot.append(who);
+
+    card.append(foot);
+    card.oncontextmenu = (e) => { e.preventDefault(); taskMenu(s, e.clientX, e.clientY, { after: reload }); };
+    return card;
   }
 
   function paintActivity() {
