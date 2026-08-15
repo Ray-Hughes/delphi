@@ -1,0 +1,423 @@
+{
+  "expand": "schema,names",
+  "startAt": 0,
+  "maxResults": 50,
+  "total": 9,
+  "issues": [
+    {
+      "id": "10001",
+      "key": "HELIO-1",
+      "self": "https://jira.example.com/rest/api/3/issue/10001",
+      "fields": {
+        "summary": "Card payout rebuild",
+        "issuetype": { "id": "10000", "name": "Epic", "subtask": false, "hierarchyLevel": 1 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "status": { "name": "In Progress", "statusCategory": { "id": 4, "key": "indeterminate", "name": "In Progress" } },
+        "priority": { "id": "3", "name": "Medium" },
+        "assignee": null,
+        "reporter": { "accountId": "6f2a11c0d3", "displayName": "Priya Nandakumar", "emailAddress": "priya.nandakumar@example.com" },
+        "duedate": null,
+        "created": "2026-05-04T09:12:33.101+0000",
+        "updated": "2026-08-11T16:40:02.550+0000",
+        "labels": ["payouts", "2026h2"],
+        "description": {
+          "type": "doc",
+          "version": 1,
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                { "type": "text", "text": "Replace the batch payout job with a per-transfer state machine, so a single failed transfer stops being able to hold up a whole run." }
+              ]
+            }
+          ]
+        },
+        "comment": { "comments": [], "maxResults": 0, "total": 0, "startAt": 0 }
+      }
+    },
+    {
+      "id": "10002",
+      "key": "HELIO-2",
+      "self": "https://jira.example.com/rest/api/3/issue/10002",
+      "fields": {
+        "summary": "Ledger reconciliation",
+        "issuetype": { "id": "10000", "name": "Epic", "subtask": false, "hierarchyLevel": 1 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "status": { "name": "To Do", "statusCategory": { "id": 2, "key": "new", "name": "To Do" } },
+        "priority": { "id": "4", "name": "Low" },
+        "assignee": null,
+        "reporter": { "accountId": "6f2a11c0d3", "displayName": "Priya Nandakumar", "emailAddress": "priya.nandakumar@example.com" },
+        "duedate": null,
+        "created": "2026-05-04T09:15:10.000+0000",
+        "updated": "2026-07-29T11:02:44.000+0000",
+        "description": {
+          "type": "doc",
+          "version": 1,
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                { "type": "text", "text": "Daily close should agree with the processor statement to the cent, and say where it does not." }
+              ]
+            }
+          ]
+        },
+        "comment": { "comments": [], "maxResults": 0, "total": 0, "startAt": 0 }
+      }
+    },
+    {
+      "id": "10014",
+      "key": "HELIO-14",
+      "self": "https://jira.example.com/rest/api/3/issue/10014",
+      "fields": {
+        "summary": "Retry failed transfers without replaying the batch",
+        "issuetype": { "id": "10002", "name": "Story", "subtask": false, "hierarchyLevel": 0 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "parent": {
+          "id": "10001",
+          "key": "HELIO-1",
+          "fields": { "summary": "Card payout rebuild", "issuetype": { "name": "Epic", "subtask": false, "hierarchyLevel": 1 } }
+        },
+        "status": { "name": "In Progress", "statusCategory": { "id": 4, "key": "indeterminate", "name": "In Progress" } },
+        "priority": { "id": "2", "name": "High" },
+        "assignee": { "accountId": "a91b4402ee", "displayName": "Marta Okonjo", "emailAddress": "marta.okonjo@example.com" },
+        "reporter": { "accountId": "6f2a11c0d3", "displayName": "Priya Nandakumar", "emailAddress": "priya.nandakumar@example.com" },
+        "duedate": "2026-09-04",
+        "created": "2026-06-02T13:44:00.000+0000",
+        "updated": "2026-08-12T08:21:19.000+0000",
+        "labels": ["payouts", "reliability"],
+        "components": [{ "id": "10300", "name": "payout-service" }],
+        "fixVersions": [{ "id": "10400", "name": "2026.9" }],
+        "customfield_10016": 5,
+        "customfield_10020": [{ "id": 812, "name": "Payouts Sprint 14", "state": "active" }],
+        "attachment": [
+          { "id": "20001", "filename": "failed-batch-2026-07-30.csv", "size": 40122, "author": { "displayName": "Marta Okonjo" } }
+        ],
+        "issuelinks": [
+          { "id": "30001", "type": { "name": "Blocks", "inward": "is blocked by", "outward": "blocks" }, "outwardIssue": { "key": "HELIO-21" } }
+        ],
+        "watches": { "watchCount": 4, "isWatching": false },
+        "description": {
+          "type": "doc",
+          "version": 1,
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                { "type": "text", "text": "A batch of 400 transfers currently fails as a unit. One declined card means the other 399 are replayed, and the processor charges us for every replay." }
+              ]
+            },
+            {
+              "type": "paragraph",
+              "content": [
+                { "type": "text", "text": "Acceptance:" }
+              ]
+            },
+            {
+              "type": "bulletList",
+              "content": [
+                {
+                  "type": "listItem",
+                  "content": [
+                    { "type": "paragraph", "content": [{ "type": "text", "text": "A transfer carries its own state and can be retried alone." }] }
+                  ]
+                },
+                {
+                  "type": "listItem",
+                  "content": [
+                    { "type": "paragraph", "content": [{ "type": "text", "text": "A retry is idempotent on the processor reference." }] }
+                  ]
+                },
+                {
+                  "type": "listItem",
+                  "content": [
+                    {
+                      "type": "paragraph",
+                      "content": [
+                        { "type": "text", "text": "Runbook updated: " },
+                        { "type": "text", "text": "payout retries", "marks": [{ "type": "link", "attrs": { "href": "https://docs.example.com/runbooks/payout-retries" } }] }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "codeBlock",
+              "attrs": { "language": "sql" },
+              "content": [
+                { "type": "text", "text": "SELECT id, state FROM transfers WHERE batch_id = ? AND state <> 'settled';" }
+              ]
+            }
+          ]
+        },
+        "comment": {
+          "startAt": 0,
+          "maxResults": 2,
+          "total": 2,
+          "comments": [
+            {
+              "id": "40001",
+              "self": "https://jira.example.com/rest/api/3/issue/10014/comment/40001",
+              "author": { "accountId": "c72d99f110", "displayName": "Devan Ruiz", "emailAddress": "devan.ruiz@example.com" },
+              "created": "2026-07-31T10:05:00.000+0000",
+              "updated": "2026-07-31T10:05:00.000+0000",
+              "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      { "type": "text", "text": "The processor reference is unique per attempt, not per transfer, so idempotency has to key off our own transfer id." }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "id": "40002",
+              "self": "https://jira.example.com/rest/api/3/issue/10014/comment/40002",
+              "author": { "accountId": "a91b4402ee", "displayName": "Marta Okonjo", "emailAddress": "marta.okonjo@example.com" },
+              "created": "2026-08-01T14:22:41.000+0000",
+              "updated": "2026-08-01T14:22:41.000+0000",
+              "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      { "type": "mention", "attrs": { "id": "c72d99f110", "text": "@Devan Ruiz" } },
+                      { "type": "text", "text": " agreed. Keying off the transfer id now, sandbox run attached." }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "10015",
+      "key": "HELIO-15",
+      "self": "https://jira.example.com/rest/api/3/issue/10015",
+      "fields": {
+        "summary": "Expose payout state on the customer receipt",
+        "issuetype": { "id": "10002", "name": "Story", "subtask": false, "hierarchyLevel": 0 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "customfield_10014": "HELIO-1",
+        "status": { "name": "Blocked", "statusCategory": { "id": 4, "key": "indeterminate", "name": "In Progress" } },
+        "priority": { "id": "3", "name": "Medium" },
+        "assignee": { "accountId": "c72d99f110", "displayName": "Devan Ruiz", "emailAddress": "devan.ruiz@example.com" },
+        "reporter": { "accountId": "a91b4402ee", "displayName": "Marta Okonjo", "emailAddress": "marta.okonjo@example.com" },
+        "duedate": null,
+        "created": "2026-06-09T08:30:00.000+0000",
+        "updated": "2026-08-10T09:00:00.000+0000",
+        "labels": [],
+        "description": {
+          "type": "doc",
+          "version": 1,
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                { "type": "text", "text": "Waiting on the receipt template rewrite before this can land." }
+              ]
+            }
+          ]
+        },
+        "comment": {
+          "startAt": 0,
+          "maxResults": 1,
+          "total": 1,
+          "comments": [
+            {
+              "id": "40003",
+              "author": { "accountId": "d40ee71ac2", "displayName": "Tomas Bergqvist", "emailAddress": "tomas.bergqvist@example.com" },
+              "created": "2026-08-10T09:00:00.000+0000",
+              "updated": "2026-08-10T09:00:00.000+0000",
+              "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      { "type": "text", "text": "Template rewrite is queued behind the tax line change. Blocked until at least the middle of the month." }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "10016",
+      "key": "HELIO-16",
+      "self": "https://jira.example.com/rest/api/3/issue/10016",
+      "fields": {
+        "summary": "Add transfer_state column and backfill",
+        "issuetype": { "id": "10003", "name": "Sub-task", "subtask": true, "hierarchyLevel": -1 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "parent": {
+          "id": "10014",
+          "key": "HELIO-14",
+          "fields": { "summary": "Retry failed transfers without replaying the batch", "issuetype": { "name": "Story", "subtask": false, "hierarchyLevel": 0 } }
+        },
+        "status": { "name": "To Do", "statusCategory": { "id": 2, "key": "new", "name": "To Do" } },
+        "priority": { "id": "3", "name": "Medium" },
+        "assignee": { "accountId": "a91b4402ee", "displayName": "Marta Okonjo", "emailAddress": "marta.okonjo@example.com" },
+        "reporter": { "accountId": "a91b4402ee", "displayName": "Marta Okonjo", "emailAddress": "marta.okonjo@example.com" },
+        "duedate": null,
+        "created": "2026-06-02T13:50:00.000+0000",
+        "updated": "2026-06-02T13:50:00.000+0000",
+        "description": null,
+        "comment": { "comments": [], "maxResults": 0, "total": 0, "startAt": 0 }
+      }
+    },
+    {
+      "id": "10017",
+      "key": "HELIO-17",
+      "self": "https://jira.example.com/rest/api/3/issue/10017",
+      "fields": {
+        "summary": "Idempotency key on the processor client",
+        "issuetype": { "id": "10003", "name": "Sub-task", "subtask": true, "hierarchyLevel": -1 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "parent": {
+          "id": "10014",
+          "key": "HELIO-14",
+          "fields": { "summary": "Retry failed transfers without replaying the batch", "issuetype": { "name": "Story", "subtask": false, "hierarchyLevel": 0 } }
+        },
+        "status": { "name": "Done", "statusCategory": { "id": 3, "key": "done", "name": "Done" } },
+        "priority": { "id": "4", "name": "Low" },
+        "assignee": { "accountId": "c72d99f110", "displayName": "Devan Ruiz", "emailAddress": "devan.ruiz@example.com" },
+        "reporter": { "accountId": "a91b4402ee", "displayName": "Marta Okonjo", "emailAddress": "marta.okonjo@example.com" },
+        "resolution": { "id": "10000", "name": "Done" },
+        "resolutiondate": "2026-07-28T15:11:00.000+0000",
+        "duedate": null,
+        "created": "2026-06-02T13:51:00.000+0000",
+        "updated": "2026-07-28T15:11:00.000+0000",
+        "description": {
+          "type": "doc",
+          "version": 1,
+          "content": [
+            { "type": "paragraph", "content": [{ "type": "text", "text": "Send our transfer id as the idempotency key on every attempt." }] }
+          ]
+        },
+        "comment": { "comments": [], "maxResults": 0, "total": 0, "startAt": 0 }
+      }
+    },
+    {
+      "id": "10021",
+      "key": "HELIO-21",
+      "self": "https://jira.example.com/rest/api/3/issue/10021",
+      "fields": {
+        "summary": "Nightly close report drops rows with a null settlement date",
+        "issuetype": { "id": "10004", "name": "Bug", "subtask": false, "hierarchyLevel": 0 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "parent": {
+          "id": "10002",
+          "key": "HELIO-2",
+          "fields": { "summary": "Ledger reconciliation", "issuetype": { "name": "Epic", "subtask": false, "hierarchyLevel": 1 } }
+        },
+        "status": { "name": "Done", "statusCategory": { "id": 3, "key": "done", "name": "Done" } },
+        "priority": { "id": "1", "name": "Highest" },
+        "assignee": { "accountId": "d40ee71ac2", "displayName": "Tomas Bergqvist", "emailAddress": "tomas.bergqvist@example.com" },
+        "reporter": { "accountId": "e11cc3b980", "displayName": "Alina Petrescu", "emailAddress": "alina.petrescu@example.com" },
+        "duedate": "2026-07-15",
+        "created": "2026-07-10T07:02:00.000+0000",
+        "updated": "2026-07-16T17:45:00.000+0000",
+        "resolution": { "id": "10000", "name": "Done" },
+        "resolutiondate": "2026-07-16T17:45:00.000+0000",
+        "timetracking": { "originalEstimate": "1d", "timeSpent": "6h", "remainingEstimate": "0m" },
+        "worklog": {
+          "total": 1,
+          "worklogs": [
+            { "id": "50001", "author": { "displayName": "Tomas Bergqvist" }, "timeSpent": "6h", "started": "2026-07-15T09:00:00.000+0000" }
+          ]
+        },
+        "environment": "production, eu region",
+        "description": {
+          "type": "doc",
+          "version": 1,
+          "content": [
+            { "type": "paragraph", "content": [{ "type": "text", "text": "An inner join hides transfers that have not settled yet, so the close looks balanced when it is not." }] }
+          ]
+        },
+        "comment": {
+          "startAt": 0,
+          "maxResults": 1,
+          "total": 1,
+          "comments": [
+            {
+              "id": "40004",
+              "author": { "accountId": "d40ee71ac2", "displayName": "Tomas Bergqvist", "emailAddress": "tomas.bergqvist@example.com" },
+              "created": "2026-07-16T17:44:00.000+0000",
+              "updated": "2026-07-16T17:44:00.000+0000",
+              "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  { "type": "paragraph", "content": [{ "type": "text", "text": "Left join plus an explicit unsettled bucket on the report. Verified against the 15th." }] }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "10022",
+      "key": "HELIO-22",
+      "self": "https://jira.example.com/rest/api/3/issue/10022",
+      "fields": {
+        "summary": "Rotate the sandbox processor credentials",
+        "issuetype": { "id": "10005", "name": "Task", "subtask": false, "hierarchyLevel": 0 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "status": { "name": "Selected for Development", "statusCategory": { "id": 2, "key": "new", "name": "To Do" } },
+        "priority": { "id": "3", "name": "Medium" },
+        "assignee": null,
+        "reporter": { "accountId": "e11cc3b980", "displayName": "Alina Petrescu", "emailAddress": "alina.petrescu@example.com" },
+        "duedate": null,
+        "created": "2026-08-01T12:00:00.000+0000",
+        "updated": "2026-08-01T12:00:00.000+0000",
+        "description": "The sandbox keys are shared in the team vault and have not been rotated since the platform move. No epic on this one on purpose.",
+        "comment": { "comments": [], "maxResults": 0, "total": 0, "startAt": 0 }
+      }
+    },
+    {
+      "id": "10030",
+      "key": "HELIO-30",
+      "self": "https://jira.example.com/rest/api/3/issue/10030",
+      "fields": {
+        "summary": "Chart the retry rate per processor",
+        "issuetype": { "id": "10003", "name": "Sub-task", "subtask": true, "hierarchyLevel": -1 },
+        "project": { "id": "10100", "key": "HELIO", "name": "Helio Billing Platform", "self": "https://jira.example.com/rest/api/3/project/10100" },
+        "parent": {
+          "id": "10029",
+          "key": "HELIO-29",
+          "fields": { "summary": "Payout observability", "issuetype": { "name": "Story", "subtask": false, "hierarchyLevel": 0 } }
+        },
+        "status": { "name": "In Progress", "statusCategory": { "id": 4, "key": "indeterminate", "name": "In Progress" } },
+        "priority": { "id": "3", "name": "Medium" },
+        "assignee": { "accountId": "e11cc3b980", "displayName": "Alina Petrescu", "emailAddress": "alina.petrescu@example.com" },
+        "reporter": { "accountId": "a91b4402ee", "displayName": "Marta Okonjo", "emailAddress": "marta.okonjo@example.com" },
+        "duedate": null,
+        "created": "2026-08-05T10:00:00.000+0000",
+        "updated": "2026-08-13T10:00:00.000+0000",
+        "description": {
+          "type": "doc",
+          "version": 1,
+          "content": [
+            { "type": "paragraph", "content": [{ "type": "text", "text": "Parent HELIO-29 is deliberately outside this export, so the importer has to decide what to do with an orphan." }] }
+          ]
+        },
+        "comment": { "comments": [], "maxResults": 0, "total": 0, "startAt": 0 }
+      }
+    }
+  ]
+}

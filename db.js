@@ -64,6 +64,7 @@ const LATER_COLUMNS = [
   ["tasks", "organizer_id", "INTEGER REFERENCES organizers(id) ON DELETE SET NULL"],
   ["tasks", "external_key", "TEXT"],
   ["comments", "external_key", "TEXT"],
+  ["organizers", "external_key", "TEXT"],
   ["tasks", "colour", "TEXT"],
 ];
 
@@ -1023,6 +1024,23 @@ function createExternalTask({
   return one("SELECT * FROM tasks WHERE id = :id", { id: created.id });
 }
 
+const organizerByExternalKey = (externalKey) =>
+  one("SELECT * FROM organizers WHERE external_key = :externalKey", { externalKey });
+
+/**
+ * Creates an epic an importer owns.
+ *
+ * Matched on the key rather than the name, because renaming an epic upstream is
+ * ordinary and re-importing after one should move the same shell rather than
+ * leave the old one behind and build a second.
+ */
+function createExternalOrganizer({ externalKey, projectId, name, summary = null, colour = null }) {
+  const created = createOrganizer({ projectId, name, summary, colour });
+  run("UPDATE organizers SET external_key = :externalKey WHERE id = :id",
+      { externalKey, id: created.id });
+  return getOrganizer(created.id);
+}
+
 const commentByExternalKey = (externalKey) =>
   one("SELECT * FROM comments WHERE external_key = :externalKey", { externalKey });
 
@@ -1053,6 +1071,7 @@ module.exports = {
   listTasks, createTask, updateTask,
   listOrganizers, getOrganizer, createOrganizer, updateOrganizer, deleteOrganizer,
   projectByKey, taskByExternalKey, createExternalTask,
+  organizerByExternalKey, createExternalOrganizer,
   commentByExternalKey, createExternalComment, updateExternalComment, deleteTask,
   taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
   setQueue, queueState, claimNext, releaseClaim, completeClaim,

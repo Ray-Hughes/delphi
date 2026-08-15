@@ -225,6 +225,7 @@ CREATE TABLE IF NOT EXISTS organizers (
   summary     TEXT,                        -- one line: what this epic covers
   colour      TEXT,                        -- falls back to the project's colour
   sort_order  INTEGER NOT NULL DEFAULT 0,
+  external_key TEXT,                       -- see tasks.external_key
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -238,3 +239,5 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_external_key
   ON tasks(external_key) WHERE external_key IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_comments_external_key
   ON comments(external_key) WHERE external_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_organizers_external_key
+  ON organizers(external_key) WHERE external_key IS NOT NULL;
