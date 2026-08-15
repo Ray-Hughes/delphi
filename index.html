@@ -512,6 +512,54 @@
   .act-delete { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--crit); }
   .audit-row.deleted { background: color-mix(in srgb, var(--crit) 5%, transparent); }
 
+  /* Columns and board ------------------------------------------------------
+     One column per status. The difference between the two modes is only whether
+     the cards can be dragged: a column is a status either way. */
+  .tcols {
+    display: grid; grid-auto-flow: column; grid-auto-columns: minmax(240px, 1fr);
+    gap: var(--s3); align-items: start; overflow-x: auto; padding-bottom: var(--s3);
+  }
+  .tcol {
+    background: var(--raised); border: 1px solid transparent;
+    border-radius: var(--r); padding: var(--s2);
+    display: flex; flex-direction: column; gap: var(--s2);
+    min-height: 120px; transition: border-color 120ms ease, background 120ms ease;
+  }
+  .tcol.over { border-color: var(--accent); background: var(--accent-soft); }
+  .tcol-head { display: flex; align-items: center; gap: 7px; padding: 5px 6px 2px; }
+  .tcol-dot { width: 7px; height: 7px; border-radius: 99px; background: var(--ink-faint); }
+  .tcol-head.st-doing .tcol-dot { background: var(--accent); }
+  .tcol-head.st-blocked .tcol-dot { background: var(--crit); }
+  .tcol-head.st-done .tcol-dot { background: var(--good); }
+  .tcol-name { font-size: 11.5px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
+  .tcol-n { font-size: 10.5px; font-weight: 700; color: var(--ink-faint); }
+  .tcol-body { display: flex; flex-direction: column; gap: var(--s2); }
+  .tcol-empty {
+    border: 1px dashed var(--line); border-radius: var(--r-sm);
+    padding: var(--s4); text-align: center; color: var(--ink-faint); font-size: 11.5px;
+  }
+  .tcol-add {
+    border: 1px solid transparent; background: transparent; border-radius: var(--r-sm);
+    padding: 7px 8px; font-size: 12.5px; color: var(--ink); outline: none; width: 100%;
+  }
+  .tcol-add:hover { border-color: var(--line); }
+  .tcol-add:focus { border-color: var(--accent); background: var(--surface); }
+
+  .tcard {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r-sm); padding: 9px 10px;
+    display: flex; flex-direction: column; gap: 6px; cursor: default;
+    transition: border-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+  }
+  .tcard:hover { border-color: var(--ink-faint); box-shadow: var(--shadow); }
+  .tcard.dragging { opacity: 0.4; }
+  .tcard.done .tcard-title { color: var(--ink-faint); text-decoration: line-through; }
+  .tcard-title { font-size: 13px; line-height: 1.45; }
+  .tcard-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .board .tcard { cursor: grab; }
+  .board .tcard:active { cursor: grabbing; }
+  .add-row .grow { flex: 1; }
+
   /* Task rows -------------------------------------------------------------
      What someone scans for and nothing else. Everything that used to be a button
      on the row is now a right click, so the row itself is the target. */

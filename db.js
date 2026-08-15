@@ -50,6 +50,7 @@ function open() {
 const LATER_COLUMNS = [
   ["tasks", "parent_id", "INTEGER REFERENCES tasks(id) ON DELETE CASCADE"],
   ["tasks", "assignee", "TEXT"],
+  ["projects", "task_view", "TEXT NOT NULL DEFAULT 'list'"],
 ];
 
 function addLaterColumns(db) {
@@ -241,7 +242,7 @@ function createProject({ key, name, summary = null, colour = "#7c8698" }) {
 }
 
 function updateProject(id, fields) {
-  const allowed = ["name", "summary", "status", "colour", "sort_order"];
+  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view"];
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getProject(id);
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");

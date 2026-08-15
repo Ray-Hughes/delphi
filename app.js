@@ -872,22 +872,197 @@ function renderOracle(root) {
   }
 }
 
-function renderTasks(root) {
-  if (!state.query) {
-    const input = el("input", { className: "field", placeholder: "Add a task and press Enter. Start with ! for high priority." });
-    input.onkeydown = async (e) => {
-      if (e.key !== "Enter" || !input.value.trim()) return;
-      let title = input.value.trim();
-      let priority = "med";
-      if (title.startsWith("!")) { priority = "high"; title = title.slice(1).trim(); }
-      const ref = (title.match(/\b([A-Z][A-Z0-9]+-\d+)\b/) || [])[1] || null;
-      await window.delphi.tasks.create({ projectId: state.projectId, title, priority, ref });
-      input.value = "";
+/* ---------------------------------------------------------------------------
+   Three ways to look at the same tasks
+
+   A flat list, the same list split into a column per status, and a board you can
+   drag between. The choice is remembered on the project rather than in settings,
+   because a project with four tasks and a project with forty want different
+   answers and a global preference forces one of them to be wrong.
+
+   The board is not a fourth data model. A column is a status, and dragging a card
+   writes that status, which means it also writes a status event and shows up in
+   the timeline like any other move. Nothing knows it came from a board.
+--------------------------------------------------------------------------- */
+
+const BOARD_COLUMNS = [
+  ["todo", "To do"],
+  ["doing", "In progress"],
+  ["blocked", "Blocked"],
+  ["done", "Done"],
+];
+
+/** The layout this project is set to, defaulting to the flat list. */
+function taskViewMode() {
+  const project = currentProject();
+  return (project && project.task_view) || "list";
+}
+
+async function setTaskViewMode(mode) {
+  const project = currentProject();
+  if (!project) return;
+  project.task_view = mode;           // so the repaint below is immediate
+  await window.delphi.projects.update(project.id, { task_view: mode });
+  refresh();
+}
+
+/** List, columns or board, as a segmented control. */
+function viewSwitcher() {
+  const seg = el("div", { className: "seg", role: "group" });
+  seg.setAttribute("aria-label", "Task layout");
+  const mode = taskViewMode();
+  for (const [value, label, title] of [
+    ["list", "List", "One column, top to bottom"],
+    ["columns", "Columns", "One column per status, side by side"],
+    ["board", "Board", "Drag between statuses"],
+  ]) {
+    const b = el("button", { type: "button", textContent: label, title });
+    b.setAttribute("aria-pressed", String(mode === value));
+    b.onclick = () => mode !== value && setTaskViewMode(value);
+    seg.append(b);
+  }
+  return seg;
+}
+
+/** Tasks grouped into the four statuses, in board order. */
+function groupByStatus(tasks) {
+  return BOARD_COLUMNS.map(([status, label]) => ({
+    status,
+    label,
+    tasks: tasks.filter((t) => t.status === status),
+  }));
+}
+
+/**
+ * A card, for the column and board layouts.
+ *
+ * Deliberately quieter than a row: in a narrow column there is no room for meta,
+ * so it carries the title and only what changes a decision.
+ */
+function taskCard(t, { draggable = false } = {}) {
+  const card = el("div", { className: "tcard" + (t.status === "done" ? " done" : "") });
+  card.append(el("div", { className: "tcard-title", textContent: t.title }));
+
+  const foot = el("div", { className: "tcard-foot" });
+  if (t.priority === "high") foot.append(el("span", { className: "pill high", textContent: "high" }));
+  if (isOverdue(t)) foot.append(el("span", { className: "pill overdue", textContent: t.due }));
+  else if (t.due) foot.append(el("span", { className: "t-due", textContent: t.due }));
+  if (t.subtask_count) foot.append(el("span", { className: "t-due", textContent: `${t.subtask_done}/${t.subtask_count}` }));
+  if (t.ref) foot.append(el("span", { className: "t-ref", textContent: t.ref }));
+  if (t.assignee) {
+    foot.append(el("span", {
+      className: "avatar sm" + (isAgent(t.assignee) ? " agent" : ""),
+      title: t.assignee,
+      textContent: t.assignee.slice(0, 1).toUpperCase(),
+    }));
+  }
+  if (foot.childNodes.length) card.append(foot);
+
+  card.onclick = () => openTaskSheet(t.id);
+  card.oncontextmenu = (e) => { e.preventDefault(); taskMenu(t, e.clientX, e.clientY); };
+  card.tabIndex = 0;
+  card.onkeydown = (e) => {
+    if (e.key === "Enter") { e.preventDefault(); openTaskSheet(t.id); }
+    if (e.key === " ") { e.preventDefault(); quickLook(t.id); }
+  };
+
+  if (draggable) {
+    card.draggable = true;
+    card.ondragstart = (e) => {
+      e.dataTransfer.setData("text/plain", String(t.id));
+      e.dataTransfer.effectAllowed = "move";
+      card.classList.add("dragging");
+    };
+    card.ondragend = () => card.classList.remove("dragging");
+  }
+  return card;
+}
+
+/** One status column, used by both the columns layout and the board. */
+function statusColumn(group, { board = false } = {}) {
+  const column = el("div", { className: "tcol" });
+  const head = el("div", { className: `tcol-head st-${group.status}` });
+  head.append(el("span", { className: "tcol-dot" }));
+  head.append(el("span", { className: "tcol-name", textContent: group.label }));
+  head.append(el("span", { className: "tcol-n", textContent: String(group.tasks.length) }));
+  column.append(head);
+
+  const body = el("div", { className: "tcol-body" });
+  for (const t of group.tasks) body.append(taskCard(t, { draggable: board }));
+
+  if (!group.tasks.length) {
+    body.append(el("div", { className: "tcol-empty", textContent: board ? "Drop here" : "Nothing" }));
+  }
+
+  // Adding into a column sets that status, which is what someone means by
+  // typing into the Blocked column.
+  const add = el("input", { className: "tcol-add", placeholder: "＋ Add" });
+  add.onkeydown = async (e) => {
+    if (e.key !== "Enter" || !add.value.trim()) return;
+    let title = add.value.trim();
+    let priority = "med";
+    if (title.startsWith("!")) { priority = "high"; title = title.slice(1).trim(); }
+    const created = await window.delphi.tasks.create({ projectId: state.projectId, title, priority });
+    if (group.status !== "todo") await window.delphi.tasks.update(created.id, { status: group.status });
+    add.value = "";
+    refresh();
+  };
+
+  if (board) {
+    const land = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; column.classList.add("over"); };
+    column.ondragover = land;
+    column.ondragenter = land;
+    column.ondragleave = (e) => { if (!column.contains(e.relatedTarget)) column.classList.remove("over"); };
+    column.ondrop = async (e) => {
+      e.preventDefault();
+      column.classList.remove("over");
+      const id = Number(e.dataTransfer.getData("text/plain"));
+      if (!id) return;
+      const moved = state.tasks.find((t) => t.id === id);
+      // Dropping a card back where it came from is not a status change, and
+      // recording one would put a meaningless entry on the timeline.
+      if (!moved || moved.status === group.status) return;
+      await window.delphi.tasks.update(id, { status: group.status });
       refresh();
     };
+  }
+
+  column.append(body, add);
+  return column;
+}
+
+/** The composer at the top of the flat list. */
+function taskComposer() {
+  const input = el("input", { className: "field", placeholder: "Add a task and press Enter. Start with ! for high priority." });
+  input.onkeydown = async (e) => {
+    if (e.key !== "Enter" || !input.value.trim()) return;
+    let title = input.value.trim();
+    let priority = "med";
+    if (title.startsWith("!")) { priority = "high"; title = title.slice(1).trim(); }
+    const ref = (title.match(/\b([A-Z][A-Z0-9]+-\d+)\b/) || [])[1] || null;
+    await window.delphi.tasks.create({ projectId: state.projectId, title, priority, ref });
+    input.value = "";
+    refresh();
+  };
+  return input;
+}
+
+function renderTasks(root) {
+  const mode = state.projectId && !state.query ? taskViewMode() : "list";
+
+  if (!state.query) {
+    const bar = el("div", { className: "add-row" });
+    // The composer belongs to the flat list. The other two put an input at the
+    // foot of each column, where it also decides the status.
+    if (mode === "list") bar.append(taskComposer());
+    else bar.append(el("span", { className: "grow" }));
     const toggle = el("button", { className: "btn", textContent: state.showDone ? "Hide done" : "Show done" });
     toggle.onclick = () => { state.showDone = !state.showDone; refresh(); };
-    root.append(el("div", { className: "add-row" }, input, toggle));
+    bar.append(toggle);
+    // Only inside a project: All work spans several and a per-project setting
+    // has nothing to attach to.
+    if (state.projectId) bar.append(viewSwitcher());
+    root.append(bar);
   }
 
   // Applied here rather than in refresh so the tab count keeps reporting the
@@ -909,16 +1084,28 @@ function renderTasks(root) {
       clear));
   }
 
-  if (!shown.length) {
+  // The columns and the board keep their shape when empty, because an empty
+  // column is information and a board that vanishes when the last task moves is
+  // disorienting.
+  if (!shown.length && mode === "list") {
     root.append(emptyState(
       state.query ? "Nothing matched" : active ? `Nothing ${active[1]}` : "No open tasks",
       state.query ? "Try a different word." : active ? "Clear the filter to see the rest." : "Add one above."));
     return;
   }
 
-  const list = el("section", { className: "card" });
-  shown.forEach((t) => list.append(taskRow(t)));
-  root.append(list);
+  if (mode === "list") {
+    const list = el("section", { className: "card" });
+    shown.forEach((t) => list.append(taskRow(t)));
+    root.append(list);
+  } else {
+    // Done is hidden by default everywhere else, so a Done column that is always
+    // empty would be a lie. It appears only when done work is being shown.
+    const groups = groupByStatus(shown).filter((g) => g.status !== "done" || state.showDone || g.tasks.length);
+    const wrap = el("div", { className: "tcols" + (mode === "board" ? " board" : "") });
+    for (const group of groups) wrap.append(statusColumn(group, { board: mode === "board" }));
+    root.append(wrap);
+  }
 
   if (state.query && state.notes.length) {
     root.append(el("div", { className: "side-label", textContent: "Matching memory" }));

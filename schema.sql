@@ -16,6 +16,11 @@ CREATE TABLE IF NOT EXISTS projects (
   status      TEXT NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active', 'paused', 'blocked', 'done', 'archived')),
   colour      TEXT,                        -- accent for the sidebar dot
+  -- How this project's tasks are laid out: a flat list, one column per status
+  -- side by side, or a board you can drag between. Per project rather than a
+  -- setting, because two projects can reasonably want different answers.
+  task_view   TEXT NOT NULL DEFAULT 'list'
+                CHECK (task_view IN ('list', 'columns', 'board')),
   sort_order  INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
