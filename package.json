@@ -5,10 +5,10 @@
   "main": "main.js",
   "author": "Ray Hughes",
   "license": "MIT",
-  "homepage": "https://github.com/Ray-Hughes/Delphi",
+  "homepage": "https://github.com/Ray-Hughes/delphi",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Ray-Hughes/Delphi.git"
+    "url": "https://github.com/Ray-Hughes/delphi.git"
   },
   "scripts": {
     "start": "electron .",

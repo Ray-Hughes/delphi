@@ -42,7 +42,7 @@ extraResources:
     to: agent/guard.py
 
 # No version in the filename, on purpose. It makes
-# github.com/Ray-Hughes/Delphi/releases/latest/download/Delphi-mac-arm64.dmg a
+# github.com/Ray-Hughes/delphi/releases/latest/download/Delphi-mac-arm64.dmg a
 # permanent address, so the download page and the README never go stale and never
 # need editing on release day.
 artifactName: ${productName}-${os}-${arch}.${ext}
@@ -101,7 +101,7 @@ afterPack: ./tools/after-pack.js
 publish:
   - provider: github
     owner: Ray-Hughes
-    repo: Delphi
+    repo: delphi
     # Published outright rather than left as a draft, which is the default.
     # The download page and the README link to /releases/latest/download/, and a
     # draft is not "latest": it is invisible to everyone without push access, so

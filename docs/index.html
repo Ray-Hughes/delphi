@@ -9,7 +9,7 @@
 
 <meta property="og:title" content="Delphi" />
 <meta property="og:description" content="A project tracker with a knowledge graph, that your AI agents keep current themselves." />
-<meta property="og:image" content="https://ray-hughes.github.io/Delphi/icon.png" />
+<meta property="og:image" content="https://ray-hughes.github.io/delphi/icon.png" />
 <meta property="og:type" content="website" />
 
 <style>
@@ -159,7 +159,7 @@
     <p class="oracle-line">The app is Delphi. The thing you ask is the Oracle.</p>
 
     <div class="downloads">
-      <a class="btn" id="primary" href="https://github.com/Ray-Hughes/Delphi/releases/latest">
+      <a class="btn" id="primary" href="https://github.com/Ray-Hughes/delphi/releases/latest">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16l-6-6h4V3h4v7h4l-6 6zm-8 2h16v3H4v-3z"/></svg>
         <span id="primary-label">Download Delphi</span>
       </a>
@@ -243,7 +243,7 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
       registered mid session does not appear until the editor restarts. That is the
       single most common reason people think the connection failed.
     </p>
-    <p><a href="https://github.com/Ray-Hughes/Delphi#connecting-an-ai-agent">Full instructions, and how to do it by hand</a></p>
+    <p><a href="https://github.com/Ray-Hughes/delphi#connecting-an-ai-agent">Full instructions, and how to do it by hand</a></p>
   </div>
 </section>
 
@@ -261,7 +261,7 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
       search rather than disappearing when it is not.
     </p>
     <p>
-      Prefer to run from source? <a href="https://github.com/Ray-Hughes/Delphi#from-source">Clone the repository</a>.
+      Prefer to run from source? <a href="https://github.com/Ray-Hughes/delphi#from-source">Clone the repository</a>.
     </p>
   </div>
 </section>
@@ -269,8 +269,8 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
 <footer>
   <div class="wrap">
     <p>
-      <a href="https://github.com/Ray-Hughes/Delphi">Source on GitHub</a> &middot;
-      <a href="https://github.com/Ray-Hughes/Delphi/issues">Report an issue</a> &middot;
+      <a href="https://github.com/Ray-Hughes/delphi">Source on GitHub</a> &middot;
+      <a href="https://github.com/Ray-Hughes/delphi/issues">Report an issue</a> &middot;
       MIT licensed
     </p>
   </div>
@@ -279,7 +279,7 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
 <script>
   // Stable file names, so these addresses keep working across every release and
   // this page never needs editing on release day.
-  const BASE = "https://github.com/Ray-Hughes/Delphi/releases/latest/download/";
+  const BASE = "https://github.com/Ray-Hughes/delphi/releases/latest/download/";
   const BUILDS = {
     "mac-arm64": { file: "Delphi-mac-arm64.dmg", label: "Download for Mac", note: "Apple Silicon" },
     "mac-x64":   { file: "Delphi-mac-x64.dmg",   label: "Download for Mac", note: "Intel" },
@@ -332,7 +332,7 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
 
   // Version and size, if GitHub answers. The page is complete without this, so a
   // rate limited or offline visitor loses a line of text rather than the download.
-  fetch("https://api.github.com/repos/Ray-Hughes/Delphi/releases/latest")
+  fetch("https://api.github.com/repos/Ray-Hughes/delphi/releases/latest")
     .then((r) => (r.ok ? r.json() : Promise.reject()))
     .then((release) => {
       const asset = chosen && release.assets.find((a) => a.name === BUILDS[chosen].file);

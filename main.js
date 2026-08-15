@@ -16,7 +16,7 @@ const embeddings = require("./embeddings");
 const isMac = process.platform === "darwin";
 const SETTINGS_PATH = paths.SETTINGS_PATH;
 const DEFAULT_HOTKEY = "Control+T";
-const REPO = "https://github.com/Ray-Hughes/Delphi";
+const REPO = "https://github.com/Ray-Hughes/delphi";
 
 let win = null;
 let tray = null;

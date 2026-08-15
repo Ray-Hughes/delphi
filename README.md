@@ -10,8 +10,8 @@
 
 <br>
 
-[![Download](https://img.shields.io/badge/download-macOS%20%26%20Windows-0B7285?style=for-the-badge&labelColor=1B2B34)](https://ray-hughes.github.io/Delphi/)
-[![CI](https://img.shields.io/github/actions/workflow/status/Ray-Hughes/Delphi/ci.yml?branch=main&style=for-the-badge&label=tests&labelColor=1B2B34&logo=githubactions&logoColor=white)](https://github.com/Ray-Hughes/Delphi/actions/workflows/ci.yml)
+[![Download](https://img.shields.io/badge/download-macOS%20%26%20Windows-0B7285?style=for-the-badge&labelColor=1B2B34)](https://ray-hughes.github.io/delphi/)
+[![CI](https://img.shields.io/github/actions/workflow/status/Ray-Hughes/delphi/ci.yml?branch=main&style=for-the-badge&label=tests&labelColor=1B2B34&logo=githubactions&logoColor=white)](https://github.com/Ray-Hughes/delphi/actions/workflows/ci.yml)
 [![Licence](https://img.shields.io/badge/licence-MIT-0B7285?style=for-the-badge&labelColor=1B2B34)](#licence)
 [![Data stays local](https://img.shields.io/badge/data-never%20leaves%20your%20machine-1B2B34?style=for-the-badge)](#your-data)
 
@@ -39,7 +39,7 @@ learns is still there for the next session.
 </div>
 
 > [!TIP]
-> No terminal needed. [Download the installer](https://ray-hughes.github.io/Delphi/),
+> No terminal needed. [Download the installer](https://ray-hughes.github.io/delphi/),
 > open it, and connect your AI agent afterwards with one command.
 
 ---
@@ -64,14 +64,14 @@ want to finish. Collapsing the two is how trackers turn into junk drawers.
 
 ## Install
 
-**[Download for macOS or Windows](https://ray-hughes.github.io/Delphi/)**, or take
+**[Download for macOS or Windows](https://ray-hughes.github.io/delphi/)**, or take
 a file directly:
 
 | | | |
 | --- | --- | --- |
-| **macOS**, Apple Silicon | [Delphi-mac-arm64.dmg](https://github.com/Ray-Hughes/Delphi/releases/latest/download/Delphi-mac-arm64.dmg) | Any Mac since 2020 |
-| **macOS**, Intel | [Delphi-mac-x64.dmg](https://github.com/Ray-Hughes/Delphi/releases/latest/download/Delphi-mac-x64.dmg) | |
-| **Windows** | [Delphi-Setup.exe](https://github.com/Ray-Hughes/Delphi/releases/latest/download/Delphi-Setup.exe) | 64 bit, Windows 10 or 11 |
+| **macOS**, Apple Silicon | [Delphi-mac-arm64.dmg](https://github.com/Ray-Hughes/delphi/releases/latest/download/Delphi-mac-arm64.dmg) | Any Mac since 2020 |
+| **macOS**, Intel | [Delphi-mac-x64.dmg](https://github.com/Ray-Hughes/delphi/releases/latest/download/Delphi-mac-x64.dmg) | |
+| **Windows** | [Delphi-Setup.exe](https://github.com/Ray-Hughes/delphi/releases/latest/download/Delphi-Setup.exe) | 64 bit, Windows 10 or 11 |
 
 Nothing else is needed to run it. Node is required only to connect an AI agent,
 because your editor launches the MCP server with its own Node rather than with
@@ -118,7 +118,7 @@ For running the development copy, which is also the only way to get the
 `make` targets and the Desktop launcher.
 
 ```bash
-git clone https://github.com/Ray-Hughes/Delphi.git ~/delphi
+git clone https://github.com/Ray-Hughes/delphi.git ~/delphi
 cd ~/delphi
 make setup     # dependencies, AI agents, Desktop icon
 make start
