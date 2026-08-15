@@ -12,269 +12,783 @@
 <meta property="og:image" content="https://ray-hughes.github.io/delphi/icon.png" />
 <meta property="og:type" content="website" />
 
+<script>
+  // Applied before the first paint. Reading the preference after the stylesheet
+  // has run means the wrong theme is briefly visible, which on a dark page is a
+  // white flash in the face.
+  (function () {
+    try {
+      var saved = localStorage.getItem("delphi-theme");
+      if (saved === "light" || saved === "dark") {
+        document.documentElement.setAttribute("data-theme", saved);
+      }
+    } catch (e) {}
+  })();
+</script>
+
 <style>
-  /* Colours are taken from the icon rather than chosen alongside it: the navy it
-     sits on, the cyan of the flame, the violet at its base. */
+  /* Tokens ---------------------------------------------------------------
+     Taken from the icon: the navy it sits on, the cyan of the flame. Light is
+     the base set and dark redefines the same names, twice on purpose, so the
+     toggle wins in both directions and an untouched visit still follows the
+     system. */
   :root {
-    --ground:     #f2f5f8;
-    --panel:      #ffffff;
-    --panel-edge: #dde4ec;
-    --ink:        #0d1420;
-    --ink-soft:   #4a5768;
-    --ink-faint:  #78879a;
-    --accent:     #0e6f9c;
-    --accent-ink: #ffffff;
-    --note-bg:    #fff8e8;
-    --note-edge:  #e2b96b;
-    --note-ink:   #6a4a10;
-    --shadow:     0 1px 2px rgba(13, 20, 32, .05), 0 10px 30px rgba(13, 20, 32, .07);
+    --ground:      #ffffff;
+    --raised:      #f5f7fa;
+    --panel:       #ffffff;
+    --line:        #e2e8f0;
+    --line-soft:   #eef2f7;
+
+    --ink:         #0d1420;
+    --ink-soft:    #46546a;
+    --ink-faint:   #75849a;
+
+    --accent:      #0d6f8f;
+    --accent-ink:  #ffffff;
+
+    --note-bg:     #fdf7e8;
+    --note-line:   #e6c485;
+    --note-ink:    #634810;
+
+    --shadow-sm:   0 1px 2px rgba(13, 20, 32, .06);
+    --shadow-lg:   0 2px 4px rgba(13, 20, 32, .04), 0 12px 40px rgba(13, 20, 32, .10);
+
+    --bar-h:       58px;
+    --side-w:      248px;
+    --content-w:   792px;
   }
+
   @media (prefers-color-scheme: dark) {
-    :root {
-      --ground:     #080d16;
-      --panel:      #111a28;
-      --panel-edge: #23303f;
-      --ink:        #e9eff7;
-      --ink-soft:   #a2b2c6;
-      --ink-faint:  #6d7f95;
-      --accent:     #4fd8e0;
-      --accent-ink: #06202b;
-      --note-bg:    #211a0c;
-      --note-edge:  #5f4a1c;
-      --note-ink:   #e6c98a;
-      --shadow:     0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px rgba(0, 0, 0, .35);
+    :root:not([data-theme="light"]) {
+      --ground:      #080d15;
+      --raised:      #0f1723;
+      --panel:       #101927;
+      --line:        #202c3d;
+      --line-soft:   #182231;
+
+      --ink:         #e8eef7;
+      --ink-soft:    #9dadc2;
+      --ink-faint:   #6b7c93;
+
+      --accent:      #4fd8e0;
+      --accent-ink:  #04222b;
+
+      --note-bg:     #1d1709;
+      --note-line:   #574318;
+      --note-ink:    #e3c489;
+
+      --shadow-sm:   0 1px 2px rgba(0, 0, 0, .5);
+      --shadow-lg:   0 2px 4px rgba(0, 0, 0, .4), 0 12px 40px rgba(0, 0, 0, .45);
     }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #080d15;
+    --raised:      #0f1723;
+    --panel:       #101927;
+    --line:        #202c3d;
+    --line-soft:   #182231;
+
+    --ink:         #e8eef7;
+    --ink-soft:    #9dadc2;
+    --ink-faint:   #6b7c93;
+
+    --accent:      #4fd8e0;
+    --accent-ink:  #04222b;
+
+    --note-bg:     #1d1709;
+    --note-line:   #574318;
+    --note-ink:    #e3c489;
+
+    --shadow-sm:   0 1px 2px rgba(0, 0, 0, .5);
+    --shadow-lg:   0 2px 4px rgba(0, 0, 0, .4), 0 12px 40px rgba(0, 0, 0, .45);
   }
 
   * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
-  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+  html { scroll-behavior: smooth; scroll-padding-top: calc(var(--bar-h) + 24px); }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { transition: none !important; animation: none !important; }
+  }
 
   body {
     margin: 0;
     background: var(--ground);
     color: var(--ink);
-    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
 
-  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; text-wrap: balance; margin: 0; }
-  h1 { font-size: clamp(44px, 8vw, 68px); font-weight: 700; }
-  h2 { font-size: clamp(26px, 4vw, 34px); font-weight: 650; margin-bottom: 10px; }
-  h3 { font-size: 17px; font-weight: 650; margin-bottom: 6px; letter-spacing: -0.01em; }
-  p { margin: 0 0 14px; color: var(--ink-soft); max-width: 64ch; }
-  a { color: var(--accent); }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
 
-  code, kbd {
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    font-size: .9em;
+  code, kbd, pre {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
+  code {
+    font-size: .875em;
+    background: var(--raised);
+    border: 1px solid var(--line-soft);
+    border-radius: 5px;
+    padding: 1px 5px;
+  }
+  pre {
+    background: var(--raised);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 13.5px;
+    line-height: 1.65;
+    margin: 0 0 18px;
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: inherit; }
   kbd {
-    background: var(--ground); border: 1px solid var(--panel-edge);
-    border-radius: 5px; padding: 1px 6px; color: var(--ink);
+    font-size: 12px;
+    background: var(--raised);
+    border: 1px solid var(--line);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    padding: 2px 6px;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  /* Top bar --------------------------------------------------------------- */
+  .bar {
+    position: sticky; top: 0; z-index: 50;
+    height: var(--bar-h);
+    display: flex; align-items: center; gap: 18px;
+    padding: 0 22px;
+    background: color-mix(in srgb, var(--ground) 94%, transparent);
+    backdrop-filter: saturate(180%) blur(14px);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--ink); }
+  .brand img { width: 26px; height: 26px; border-radius: 7px; display: block; }
+  .brand b { font-size: 16.5px; font-weight: 650; letter-spacing: -.015em; }
+  .bar .spacer { flex: 1; }
+  .bar nav { display: flex; gap: 4px; }
+  .bar nav a {
+    color: var(--ink-soft); text-decoration: none; font-size: 14.5px; font-weight: 500;
+    padding: 6px 11px; border-radius: 7px;
+  }
+  .bar nav a:hover { color: var(--ink); background: var(--raised); }
+
+  .icon-btn {
+    display: grid; place-items: center;
+    width: 34px; height: 34px; flex: 0 0 34px;
+    background: none; border: 1px solid var(--line); border-radius: 8px;
+    color: var(--ink-soft); cursor: pointer; padding: 0;
+  }
+  .icon-btn:hover { color: var(--ink); background: var(--raised); }
+  .icon-btn svg { width: 16px; height: 16px; fill: currentColor; }
+  #menu-btn { display: none; }
+  :root[data-theme="dark"] .sun, .moon { display: none; }
+  :root[data-theme="dark"] .moon { display: block; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .sun { display: none; }
+    :root:not([data-theme="light"]) .moon { display: block; }
+  }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 8px;
+    padding: 9px 17px; font-size: 14.5px; font-weight: 620;
+    text-decoration: none; cursor: pointer; white-space: nowrap;
+    transition: filter 120ms ease;
+  }
+  .btn:hover { filter: brightness(1.08); }
+  .btn.big { padding: 14px 26px; font-size: 16px; border-radius: 10px; }
+  .btn.ghost {
+    background: none; color: var(--ink);
+    border: 1px solid var(--line);
+  }
+  .btn.ghost:hover { background: var(--raised); }
+  .btn svg { width: 16px; height: 16px; fill: currentColor; }
+
+  /* Shell ----------------------------------------------------------------- */
+  .shell {
+    display: grid;
+    grid-template-columns: var(--side-w) minmax(0, 1fr);
+    max-width: 1240px;
+    margin: 0 auto;
+  }
+
+  .side {
+    position: sticky; top: var(--bar-h);
+    height: calc(100vh - var(--bar-h));
+    overflow-y: auto;
+    padding: 30px 20px 60px 0;
+    border-right: 1px solid var(--line-soft);
+  }
+  .side h4 {
+    margin: 22px 0 7px; padding: 0 12px;
+    font-size: 11px; font-weight: 650; letter-spacing: .11em; text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .side h4:first-child { margin-top: 0; }
+  .side a {
+    display: block;
+    padding: 5px 12px;
+    font-size: 14.5px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    border-left: 2px solid transparent;
+    border-radius: 0 6px 6px 0;
+  }
+  .side a:hover { color: var(--ink); background: var(--raised); }
+  .side a.on { color: var(--accent); border-left-color: var(--accent); font-weight: 560; }
+
+  main { padding: 0 40px 120px; min-width: 0; max-width: calc(var(--content-w) + 80px); }
+  section { padding-top: 56px; scroll-margin-top: calc(var(--bar-h) + 16px); }
+
+  h1, h2, h3 { letter-spacing: -.025em; text-wrap: balance; margin: 0; line-height: 1.2; }
+  h1 { font-size: clamp(34px, 4.6vw, 46px); font-weight: 700; }
+  h2 { font-size: 27px; font-weight: 650; margin-bottom: 12px; }
+  h3 { font-size: 17.5px; font-weight: 620; margin: 28px 0 8px; letter-spacing: -.01em; }
+  p { margin: 0 0 15px; color: var(--ink-soft); max-width: 68ch; }
+  ul, ol { color: var(--ink-soft); max-width: 68ch; padding-left: 22px; margin: 0 0 15px; }
+  li { margin-bottom: 7px; }
+  strong { color: var(--ink); font-weight: 620; }
+
+  .eyebrow {
+    font-size: 12px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 14px;
   }
 
   /* Hero ------------------------------------------------------------------ */
-  header { padding: 84px 0 64px; text-align: center; }
-  header img.logo {
-    width: 128px; height: 128px; display: block; margin: 0 auto 26px;
-    filter: drop-shadow(0 12px 28px rgba(13, 20, 32, .28));
-  }
-  .tagline {
-    font-size: clamp(18px, 2.6vw, 22px); color: var(--ink-soft);
-    max-width: 30ch; margin: 16px auto 4px;
-  }
-  .oracle-line { font-size: 15px; color: var(--ink-faint); margin: 0 auto 34px; }
+  .hero { padding-top: 60px; }
+  .hero .lede { font-size: 19px; line-height: 1.6; color: var(--ink-soft); margin: 16px 0 10px; max-width: 56ch; }
+  .hero .aside { font-size: 15px; color: var(--ink-faint); margin-bottom: 26px; }
+  .cta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .cta .meta { font-size: 13px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+  .alt-links { display: flex; gap: 16px; flex-wrap: wrap; margin: 14px 0 0; font-size: 14px; }
+  .alt-links a { color: var(--ink-faint); }
 
-  /* Download -------------------------------------------------------------- */
-  .downloads { display: flex; flex-direction: column; align-items: center; gap: 14px; }
-  .btn {
-    display: inline-flex; align-items: center; justify-content: center; gap: 10px;
-    background: var(--accent); color: var(--accent-ink);
-    border: 0; border-radius: 10px;
-    padding: 15px 30px; font-size: 17px; font-weight: 620;
-    text-decoration: none; cursor: pointer;
-    transition: transform 120ms ease, filter 120ms ease;
+  .shot {
+    margin: 40px 0 0;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--panel);
+    box-shadow: var(--shadow-lg);
   }
-  .btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
-  .btn:active { transform: translateY(0); }
-  .btn svg { width: 19px; height: 19px; fill: currentColor; }
-  .alt { display: flex; gap: 18px; flex-wrap: wrap; justify-content: center; font-size: 14.5px; }
-  .alt a { color: var(--ink-soft); }
-  .meta { font-size: 13px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
+  .shot-bar {
+    display: flex; align-items: center; gap: 7px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line-soft);
+    background: var(--raised);
+  }
+  .shot-bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line); display: block; }
+  .shot img { width: 100%; height: auto; display: block; }
+  figure { margin: 26px 0; }
+  figcaption { font-size: 13.5px; color: var(--ink-faint); margin-top: 10px; }
 
-  /* Sections -------------------------------------------------------------- */
-  section { padding: 44px 0; }
-  section + section { border-top: 1px solid var(--panel-edge); }
-
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px; margin-top: 22px; }
+  /* Pieces ---------------------------------------------------------------- */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 16px; margin: 22px 0; }
   .card {
-    background: var(--panel); border: 1px solid var(--panel-edge);
-    border-radius: 12px; padding: 22px; box-shadow: var(--shadow);
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 11px; padding: 20px; box-shadow: var(--shadow-sm);
   }
+  .card h3 { margin: 0 0 6px; font-size: 16px; }
   .card p { margin: 0; font-size: 14.5px; }
 
-  /* First launch ---------------------------------------------------------- */
-  .tabs { display: flex; gap: 8px; margin: 18px 0 18px; }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 11px; margin: 0 0 20px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--line-soft); color: var(--ink-soft); vertical-align: top; }
+  th { font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--ink-faint); font-weight: 650; }
+  td:first-child { color: var(--ink); font-weight: 560; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+
+  .note {
+    background: var(--note-bg); border: 1px solid var(--note-line); border-left-width: 3px;
+    border-radius: 9px; padding: 15px 19px; margin: 20px 0;
+  }
+  .note p { color: var(--note-ink); margin: 0; font-size: 14.5px; }
+  .note p + p { margin-top: 9px; }
+  .note strong { color: var(--note-ink); }
+  .note code { background: color-mix(in srgb, var(--note-ink) 12%, transparent); border-color: transparent; color: inherit; }
+
+  .tabs { display: flex; gap: 7px; margin: 20px 0 16px; }
   .tab {
-    background: var(--panel); border: 1px solid var(--panel-edge); color: var(--ink-soft);
-    border-radius: 9px; padding: 9px 18px; font: inherit; font-size: 14.5px; font-weight: 560;
+    background: var(--panel); border: 1px solid var(--line); color: var(--ink-soft);
+    border-radius: 8px; padding: 8px 16px; font: inherit; font-size: 14.5px; font-weight: 560;
     cursor: pointer;
   }
   .tab[aria-selected="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
-  .panel-body[hidden] { display: none; }
-
-  .note {
-    background: var(--note-bg); border: 1px solid var(--note-edge); border-left-width: 3px;
-    border-radius: 9px; padding: 16px 20px; margin: 18px 0;
-  }
-  .note p { color: var(--note-ink); margin: 0; font-size: 14.5px; }
-  .note strong { color: var(--note-ink); }
-
-  ol.steps { margin: 0; padding-left: 22px; color: var(--ink-soft); max-width: 64ch; }
-  ol.steps li { margin-bottom: 9px; }
-
-  pre {
-    background: var(--panel); border: 1px solid var(--panel-edge);
-    border-radius: 10px; padding: 16px 18px; overflow-x: auto;
-    font-size: 13.5px; line-height: 1.6; color: var(--ink);
-  }
+  .pane[hidden] { display: none; }
 
   footer {
-    padding: 40px 0 64px; text-align: center; color: var(--ink-faint); font-size: 14px;
-    border-top: 1px solid var(--panel-edge);
+    border-top: 1px solid var(--line);
+    margin-top: 80px; padding-top: 28px;
+    font-size: 14px; color: var(--ink-faint);
+    display: flex; gap: 18px; flex-wrap: wrap;
   }
   footer a { color: var(--ink-soft); }
+
+  /* Narrow ---------------------------------------------------------------- */
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; }
+    main { padding: 0 22px 80px; }
+    #menu-btn { display: grid; }
+    .bar nav { display: none; }
+    .side {
+      position: fixed; top: var(--bar-h); left: 0; width: 270px;
+      background: var(--ground); border-right: 1px solid var(--line);
+      padding: 22px 16px 60px; z-index: 40;
+      transform: translateX(-102%);
+      transition: transform 180ms ease;
+    }
+    .side.open { transform: none; box-shadow: var(--shadow-lg); }
+  }
 </style>
 </head>
 <body>
 
-<header>
-  <div class="wrap">
-    <img class="logo" src="icon.png" alt="" />
-    <h1>Delphi</h1>
-    <p class="tagline">A project tracker with a knowledge graph, that your AI agents keep current themselves.</p>
-    <p class="oracle-line">The app is Delphi. The thing you ask is the Oracle.</p>
-
-    <div class="downloads">
-      <a class="btn" id="primary" href="https://github.com/Ray-Hughes/delphi/releases/latest">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16l-6-6h4V3h4v7h4l-6 6zm-8 2h16v3H4v-3z"/></svg>
-        <span id="primary-label">Download Delphi</span>
-      </a>
-      <div class="alt" id="alt"></div>
-      <p class="meta" id="meta">Free and open source. MIT licensed.</p>
-    </div>
-  </div>
+<header class="bar">
+  <a class="brand" href="#top"><img src="icon.png" alt="" /><b>Delphi</b></a>
+  <button class="icon-btn" id="menu-btn" aria-label="Sections" aria-expanded="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+  </button>
+  <div class="spacer"></div>
+  <nav>
+    <a href="#install">Install</a>
+    <a href="#using">Using it</a>
+    <a href="#agents">Agents</a>
+    <a href="#data">Your data</a>
+    <a href="https://github.com/Ray-Hughes/delphi">GitHub</a>
+  </nav>
+  <button class="icon-btn" id="theme-btn" aria-label="Switch theme">
+    <svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 17a5 5 0 110-10 5 5 0 010 10zm0-13a1 1 0 011 1v1a1 1 0 11-2 0V5a1 1 0 011-1zm0 14a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zM4 12a1 1 0 011-1h1a1 1 0 110 2H5a1 1 0 01-1-1zm14 0a1 1 0 011-1h1a1 1 0 110 2h-1a1 1 0 01-1-1zM6.3 6.3a1 1 0 011.4 0l.8.8a1 1 0 01-1.4 1.4l-.8-.8a1 1 0 010-1.4zm9.2 9.2a1 1 0 011.4 0l.8.8a1 1 0 01-1.4 1.4l-.8-.8a1 1 0 010-1.4zm2.2-9.2a1 1 0 010 1.4l-.8.8a1 1 0 01-1.4-1.4l.8-.8a1 1 0 011.4 0zM8.5 15.5a1 1 0 010 1.4l-.8.8a1 1 0 01-1.4-1.4l.8-.8a1 1 0 011.4 0z"/></svg>
+    <svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12.3 3a1 1 0 00-1 1.4 6.5 6.5 0 01-8.2 8.4 1 1 0 00-1.3 1.3A9 9 0 1012.3 3z"/></svg>
+  </button>
+  <a class="btn" id="bar-download" href="#install">Download</a>
 </header>
 
-<section>
-  <div class="wrap">
-    <h2>The first time you open it</h2>
-    <p>
-      Delphi is not signed with a paid developer certificate yet, so both systems will
-      stop you once and ask. This is expected, and it is a one time step: after the
-      first launch it opens like anything else.
-    </p>
+<div class="shell">
+  <aside class="side" id="side">
+    <h4>Getting started</h4>
+    <a href="#top">What Delphi is</a>
+    <a href="#install">Install</a>
+    <a href="#first-launch">The first launch</a>
+    <a href="#opening">Opening it</a>
 
-    <div class="tabs" role="tablist">
-      <button class="tab" role="tab" id="tab-mac" aria-controls="panel-mac" aria-selected="true">macOS</button>
-      <button class="tab" role="tab" id="tab-win" aria-controls="panel-win" aria-selected="false">Windows</button>
-    </div>
+    <h4>Using it</h4>
+    <a href="#using">Projects and tasks</a>
+    <a href="#memory">Memory notes</a>
+    <a href="#search">Search and the Oracle</a>
 
-    <div class="panel-body" id="panel-mac" role="tabpanel" aria-labelledby="tab-mac">
-      <ol class="steps">
-        <li>Open the downloaded <code>.dmg</code> and drag <strong>Delphi</strong> into Applications.</li>
-        <li>In Applications, <strong>right click</strong> Delphi and choose <strong>Open</strong>. Do not double click it the first time: double clicking offers only a Cancel button, while right click and Open gives you the button that lets it through.</li>
-        <li>Choose <strong>Open</strong> in the dialog. macOS remembers, so every launch after this is a normal one.</li>
-      </ol>
+    <h4>AI agents</h4>
+    <a href="#agents">Connect an agent</a>
+    <a href="#tools">What agents can do</a>
+    <a href="#unprompted">Making it automatic</a>
+
+    <h4>Reference</h4>
+    <a href="#data">Where your data lives</a>
+    <a href="#shortcuts">Keyboard shortcuts</a>
+    <a href="#trouble">Troubleshooting</a>
+    <a href="#source">Running from source</a>
+  </aside>
+
+  <main>
+    <section class="hero" id="top">
+      <p class="eyebrow">Free and open source</p>
+      <h1>A project tracker your AI agents keep current themselves</h1>
+      <p class="lede">
+        Projects hold tasks, memory notes and links. Claude Code and GitHub Copilot
+        read and write the same store over MCP, so what one of them works out is
+        still there for the next session.
+      </p>
+      <p class="aside">The app is Delphi. The thing you ask is the Oracle.</p>
+
+      <div class="cta">
+        <a class="btn big" id="primary" href="#install">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16l-6-6h4V3h4v7h4l-6 6zm-8 2h16v3H4v-3z"/></svg>
+          <span id="primary-label">Download</span>
+        </a>
+        <a class="btn big ghost" href="https://github.com/Ray-Hughes/delphi">View source</a>
+      </div>
+      <div class="alt-links" id="alt"></div>
+      <p class="meta" id="meta" style="margin-top:12px">macOS 11 or newer. Windows 10 and 11. MIT licensed.</p>
+
+      <div class="shot">
+        <div class="shot-bar"><i></i><i></i><i></i></div>
+        <img id="shot-main" src="shot-overview-dark.png" width="1320" height="880"
+             alt="A Delphi project showing open, blocked and overdue counts, the tasks needing attention, its linked repositories and its memory notes." />
+      </div>
+    </section>
+
+    <section id="install">
+      <h2>Install</h2>
+      <p>
+        Nothing else is needed to run it. Node is required only to connect an AI
+        agent, because your editor launches the MCP server with its own Node
+        rather than with the app.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Platform</th><th>File</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>macOS, Apple Silicon</td>
+              <td><a href="https://github.com/Ray-Hughes/delphi/releases/latest/download/Delphi-mac-arm64.dmg">Delphi-mac-arm64.dmg</a></td>
+              <td>Any Mac since 2020</td>
+            </tr>
+            <tr>
+              <td>macOS, Intel</td>
+              <td><a href="https://github.com/Ray-Hughes/delphi/releases/latest/download/Delphi-mac-x64.dmg">Delphi-mac-x64.dmg</a></td>
+              <td>macOS 11 or newer</td>
+            </tr>
+            <tr>
+              <td>Windows</td>
+              <td><a href="https://github.com/Ray-Hughes/delphi/releases/latest/download/Delphi-Setup.exe">Delphi-Setup.exe</a></td>
+              <td>64 bit, Windows 10 or 11</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Local search is sharper with <a href="https://ollama.com">Ollama</a>
+        running, and falls back to a lexical search rather than disappearing when
+        it is not.
+      </p>
+    </section>
+
+    <section id="first-launch">
+      <h2>The first launch</h2>
+      <p>
+        Delphi is not signed with a paid developer certificate yet, so both
+        systems stop you once and ask. This is expected, and it happens once:
+        after the first launch it opens like anything else.
+      </p>
+
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" id="tab-mac" aria-controls="pane-mac" aria-selected="true">macOS</button>
+        <button class="tab" role="tab" id="tab-win" aria-controls="pane-win" aria-selected="false">Windows</button>
+      </div>
+
+      <div class="pane" id="pane-mac" role="tabpanel" aria-labelledby="tab-mac">
+        <ol>
+          <li>Open the <code>.dmg</code> and drag <strong>Delphi</strong> into Applications.</li>
+          <li>
+            In Applications, <strong>right click</strong> Delphi and choose
+            <strong>Open</strong>. Do not double click it the first time: double
+            clicking offers only a Cancel button, while right click and Open gives
+            you the button that lets it through.
+          </li>
+          <li>Choose <strong>Open</strong> in the dialog. macOS remembers, so every launch after this is a normal one.</li>
+        </ol>
+        <div class="note">
+          <p>
+            <strong>If macOS says the app is damaged,</strong> it is not. That message
+            means the quarantine flag survived the copy. Clear it with
+            <code>xattr -dr com.apple.quarantine /Applications/Delphi.app</code>
+          </p>
+        </div>
+      </div>
+
+      <div class="pane" id="pane-win" role="tabpanel" aria-labelledby="tab-win" hidden>
+        <ol>
+          <li>Run <code>Delphi-Setup.exe</code>.</li>
+          <li>
+            SmartScreen shows a blue box saying it protected your PC. Click
+            <strong>More info</strong>, then <strong>Run anyway</strong>. That
+            button only appears after More info, which is why the box looks like a
+            dead end.
+          </li>
+          <li>Follow the installer. It installs for your user only, so it never asks for administrator rights.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section id="opening">
+      <h2>Opening it</h2>
+      <p>Three ways in, and they all reach the same window.</p>
+      <ul>
+        <li><strong>The application</strong>, from Launchpad, the Start menu or the desktop shortcut.</li>
+        <li><strong>The keyboard.</strong> <kbd>Ctrl</kbd> <kbd>T</kbd> shows and hides it from anywhere, even when another app has focus.</li>
+        <li><strong>The menu bar icon</strong> on macOS, or the <strong>system tray icon</strong> on Windows.</li>
+      </ul>
+      <p>
+        To change the shortcut, open <strong>Settings</strong>, click the recorder
+        and press the combination you want. It registers straight away and tells
+        you if another application already owns it.
+      </p>
+      <h3>Panel mode</h3>
+      <p>
+        By default Delphi is an ordinary window you can full screen and switch to
+        like anything else. Turn on <strong>panel mode</strong> in Settings, or in
+        the <strong>View</strong> menu, and it floats above your work and
+        disappears the moment you click away.
+      </p>
+    </section>
+
+    <section id="using">
+      <h2>Projects and tasks</h2>
+      <p>
+        The unit here is the project, not the task. Past about thirty items a flat
+        list stops telling you which entries belong to the same piece of work, so
+        each project holds its own tasks, its own notes, and links to the pull
+        requests and tickets that go with it.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>To do this</th><th>Do that</th></tr></thead>
+          <tbody>
+            <tr><td>Add a task</td><td>Type on the Tasks tab and press Enter</td></tr>
+            <tr><td>Make it high priority</td><td>Start the line with <code>!</code></td></tr>
+            <tr><td>Link a ticket</td><td>Include a reference like <code>ABC-1234</code> and it is picked up automatically</td></tr>
+            <tr><td>Change status</td><td>Hover a task and click <strong>status</strong> to cycle todo, doing, blocked, done</td></tr>
+            <tr><td>Move between projects</td><td>Hover a task and use the <strong>move to</strong> menu</td></tr>
+            <tr><td>Narrow the list</td><td>Click any count on a project's Overview</td></tr>
+            <tr><td>Undo a mistake</td><td>The History tab. Every change is reversible, not just the last one</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="memory">
+      <h2>Memory notes</h2>
+      <p>
+        Notes are deliberately not tasks. A note is something you want to remember;
+        a task is something you want to finish. Collapsing the two is how trackers
+        turn into junk drawers.
+      </p>
+      <p>Each note has a kind, which is the difference between a useful store and a pile of text.</p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Kind</th><th>What belongs in it</th></tr></thead>
+          <tbody>
+            <tr><td>decision</td><td>What was chosen and, more importantly, why the alternative was not</td></tr>
+            <tr><td>gotcha</td><td>Something that cost time once and should not cost it twice</td></tr>
+            <tr><td>reference</td><td>A value, path or piece of protocol that is hard to look up again</td></tr>
+            <tr><td>contact</td><td>Who owns a thing</td></tr>
+            <tr><td>note</td><td>Everything else</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <figure>
+        <div class="shot">
+          <div class="shot-bar"><i></i><i></i><i></i></div>
+          <img id="shot-memory" src="shot-memory-dark.png" width="1320" height="880"
+               alt="The Memory tab, showing a pinned gotcha and a decision note rendered as prose." />
+        </div>
+        <figcaption>
+          Notes are written as markdown and render as prose by default. Switch to
+          Raw markdown to edit the source, or double click a rendered note.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section id="search">
+      <h2>Search and the Oracle</h2>
+      <p>
+        Type in the box at the top, or press <kbd>Cmd</kbd> <kbd>F</kbd>, and
+        Delphi searches tasks and notes together. Behind it sits a knowledge graph:
+        notes and tasks are indexed as entities and the relationships between them,
+        so an agent can ask what connects to a thing rather than only what reads
+        similarly to it.
+      </p>
+      <p>
+        The payoff is multi-hop. Asking about a database concern can return a
+        version ticket it never mentions, because both were discussed alongside the
+        same build pipeline. That is the question a plain text search cannot answer.
+      </p>
+      <p>
+        Extraction is deterministic rather than model driven. An invented node is
+        worse than a missing one: a missing node makes a query return less, a wrong
+        one makes it return something false.
+      </p>
+    </section>
+
+    <section id="agents">
+      <h2>Connect an AI agent</h2>
+      <p>
+        Delphi ships an MCP server, so any agent that speaks MCP can use it, and
+        several agents can share one store, because none of them talk to each other.
+        They all talk to this.
+      </p>
+      <p>One command connects both Claude Code and Copilot, and skips whichever you do not have:</p>
+      <pre><code>macOS      bash install/mcp.sh
+Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
       <div class="note">
         <p>
-          <strong>If macOS says the app is damaged,</strong> it is not. That message means the
-          quarantine flag survived the copy. Clear it with:
-          <br /><code>xattr -dr com.apple.quarantine /Applications/Delphi.app</code>
+          <strong>Restart your editor afterwards.</strong> MCP servers are loaded at
+          startup, so one registered mid session does not appear until the editor is
+          restarted. This is the single most common reason people think the
+          connection failed.
         </p>
       </div>
-    </div>
+      <p>
+        Give each agent a different <code>DELPHI_ACTOR</code>. That name is recorded
+        against every change it makes, which is what makes the History tab readable
+        when more than one agent is working.
+      </p>
+      <p><a href="https://github.com/Ray-Hughes/delphi#connecting-an-ai-agent">Full instructions, and how to register it by hand</a></p>
+    </section>
 
-    <div class="panel-body" id="panel-win" role="tabpanel" aria-labelledby="tab-win" hidden>
-      <ol class="steps">
-        <li>Run the downloaded <code>Delphi-Setup.exe</code>.</li>
-        <li>Windows SmartScreen will show a blue box saying it protected your PC. Click <strong>More info</strong>, then <strong>Run anyway</strong>. The Run anyway button only appears after More info, which is why the box looks like a dead end.</li>
-        <li>Follow the installer. It installs for your user only, so it never asks for administrator rights.</li>
-      </ol>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>What it does</h2>
-    <div class="cards">
-      <div class="card">
-        <h3>Projects, not one long list</h3>
-        <p>Past thirty items a flat task list stops telling you which entries belong to the same piece of work. Each project holds its own tasks, notes and links.</p>
+    <section id="tools">
+      <h2>What agents can do</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>list_projects</td><td>Projects with open task counts</td></tr>
+            <tr><td>add_project</td><td>Create a project when work fits none of the existing ones</td></tr>
+            <tr><td>list_tasks</td><td>Tasks, filtered by project or status</td></tr>
+            <tr><td>add_task</td><td>Create a task</td></tr>
+            <tr><td>update_task</td><td>Change status, priority, detail or project</td></tr>
+            <tr><td>add_note</td><td>Store a decision, gotcha or reference</td></tr>
+            <tr><td>search</td><td>Search tasks and notes</td></tr>
+            <tr><td>oracle_context</td><td>Everything connected to a ticket, service, repo, file or concept</td></tr>
+            <tr><td>oracle_entities</td><td>What the graph knows about, most referenced first</td></tr>
+            <tr><td>oracle_ask</td><td>Meaning and connections together. The main way to ask what we know</td></tr>
+            <tr><td>recent_activity</td><td>What changed, and which agent changed it</td></tr>
+          </tbody>
+        </table>
       </div>
-      <div class="card">
-        <h3>Your agents remember</h3>
-        <p>Claude Code and GitHub Copilot read and write it over MCP, so what one of them works out is still there for the next session, and for the other one.</p>
+      <p>
+        Agents coordinate through shared state, not messages. One writes a task,
+        another sees it and picks it up, and both leave a trail. There is no
+        mechanism here for one agent to command another.
+      </p>
+    </section>
+
+    <section id="unprompted">
+      <h2>Making it automatic</h2>
+      <p>
+        Connecting the server is not enough on its own. Paste the prompt from
+        <a href="https://github.com/Ray-Hughes/delphi/blob/main/AGENTS.md">AGENTS.md</a>
+        into your agent's standing instructions, whether that is
+        <code>CLAUDE.md</code>, <code>.github/copilot-instructions.md</code>, or
+        wherever yours reads from.
+      </p>
+      <p>
+        It tells the agent to check the tracker at the start of a session, search
+        stored notes before searching a repository, and record findings as it goes
+        rather than waiting to be asked.
+      </p>
+    </section>
+
+    <section id="data">
+      <h2>Where your data lives</h2>
+      <p>
+        One SQLite file, <code>delphi.db</code>. Nothing is sent anywhere, there is
+        no account, and search runs against a model on your own machine.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Install</th><th>Database and settings</th><th>Markdown vault</th></tr></thead>
+          <tbody>
+            <tr><td>macOS</td><td><code>~/Library/Application Support/Delphi</code></td><td><code>~/Documents/Delphi</code></td></tr>
+            <tr><td>Windows</td><td><code>%APPDATA%\Delphi</code></td><td><code>Documents\Delphi</code></td></tr>
+            <tr><td>From source</td><td>Beside the source</td><td><code>vault/</code>, beside the source</td></tr>
+          </tbody>
+        </table>
       </div>
-      <div class="card">
-        <h3>It stays on your machine</h3>
-        <p>One SQLite file. Nothing is uploaded, there is no account, and search runs locally against a model on your own computer.</p>
+      <p>
+        <strong>Help</strong>, then <strong>Show Data Folder</strong> opens whichever
+        applies. The first time an installed copy starts it looks for a checkout's
+        database in the usual places and brings it across, so upgrading from a
+        source install does not present you with an empty tracker.
+      </p>
+      <h3>Backups</h3>
+      <p>
+        <strong>File</strong>, then <strong>Back Up Database</strong>. That runs
+        <code>VACUUM INTO</code> rather than copying the file, which matters: the
+        database uses write-ahead logging, so recent rows can still be sitting in
+        <code>delphi.db-wal</code> and a plain copy produces a backup quietly
+        missing the last session.
+      </p>
+      <h3>The markdown mirror</h3>
+      <p>
+        Every note is also written out as a markdown file, so the knowledge is not
+        trapped in a format only this application understands. Obsidian, ripgrep,
+        git or any editor can read it. The database is the source of truth and the
+        mirror is one way, deliberately: two way sync between a folder and a
+        database is where these things break.
+      </p>
+    </section>
+
+    <section id="shortcuts">
+      <h2>Keyboard shortcuts</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Keys</th><th>Does</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>Ctrl</kbd> <kbd>T</kbd></td><td>Show or hide Delphi, from anywhere</td></tr>
+            <tr><td><kbd>Cmd</kbd> <kbd>F</kbd></td><td>Search everything</td></tr>
+            <tr><td><kbd>Cmd</kbd> <kbd>N</kbd></td><td>New task</td></tr>
+            <tr><td><kbd>Cmd</kbd> <kbd>Shift</kbd> <kbd>N</kbd></td><td>New memory note</td></tr>
+            <tr><td><kbd>Cmd</kbd> <kbd>Shift</kbd> <kbd>P</kbd></td><td>New project</td></tr>
+            <tr><td><kbd>Cmd</kbd> <kbd>1</kbd> to <kbd>4</kbd></td><td>What's new, Tasks, Memory, History</td></tr>
+            <tr><td><kbd>Cmd</kbd> <kbd>[</kbd></td><td>Back</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Clear the search, or dismiss the panel</td></tr>
+          </tbody>
+        </table>
       </div>
-    </div>
-  </div>
-</section>
+      <p>On Windows, read <kbd>Cmd</kbd> as <kbd>Ctrl</kbd> throughout.</p>
+    </section>
 
-<section>
-  <div class="wrap">
-    <h2>Connect an AI agent</h2>
-    <p>
-      Delphi ships an MCP server, so any agent that speaks MCP can use it, and several
-      can share one store. Open Delphi, then run the connector for your system from the
-      folder it was installed in.
-    </p>
-    <pre><code>macOS      bash install/mcp.sh
-Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
-    <p>
-      Restart your editor afterwards. MCP servers are loaded at startup, so one
-      registered mid session does not appear until the editor restarts. That is the
-      single most common reason people think the connection failed.
-    </p>
-    <p><a href="https://github.com/Ray-Hughes/delphi#connecting-an-ai-agent">Full instructions, and how to do it by hand</a></p>
-  </div>
-</section>
+    <section id="trouble">
+      <h2>Troubleshooting</h2>
+      <h3>My agent cannot see Delphi</h3>
+      <p>
+        Restart the editor. MCP servers are loaded at startup and one registered
+        mid session will not appear until then. If it still does not, check the
+        server is registered with <code>claude mcp list</code>, and note that
+        Copilot needs <strong>Agent mode</strong>: Ask mode ignores MCP tools.
+      </p>
+      <h3>macOS says the app is damaged</h3>
+      <p>
+        It is not. The quarantine flag survived the copy. Run
+        <code>xattr -dr com.apple.quarantine /Applications/Delphi.app</code>
+      </p>
+      <h3>The shortcut does nothing</h3>
+      <p>
+        Another application already owns that combination. Open Settings, click the
+        recorder and choose a different one. Delphi tells you when a combination is
+        taken rather than failing silently.
+      </p>
+      <h3>Search results seem shallow</h3>
+      <p>
+        Embeddings need Ollama running with <code>nomic-embed-text</code> pulled.
+        Without it, search falls back to a lexical match: it degrades rather than
+        disappearing, but it will not find things that are worded differently.
+      </p>
+    </section>
 
-<section>
-  <div class="wrap">
-    <h2>Requirements</h2>
-    <p>
-      macOS 11 or newer, on Apple Silicon or Intel. Windows 10 or 11, 64 bit.
-      Nothing else: the installers carry everything the app needs.
-    </p>
-    <p>
-      Node is needed only to connect an AI agent, because the editor launches the MCP
-      server with its own Node rather than with the app. Local search is sharper with
-      <a href="https://ollama.com">Ollama</a> running, and falls back to a lexical
-      search rather than disappearing when it is not.
-    </p>
-    <p>
-      Prefer to run from source? <a href="https://github.com/Ray-Hughes/delphi#from-source">Clone the repository</a>.
-    </p>
-  </div>
-</section>
+    <section id="source">
+      <h2>Running from source</h2>
+      <p>
+        For the development copy, which is also the only way to get the
+        <code>make</code> targets and the Desktop launcher.
+      </p>
+      <pre><code>git clone https://github.com/Ray-Hughes/delphi.git ~/delphi
+cd ~/delphi
+make setup     # dependencies, AI agents, Desktop icon
+make start</code></pre>
+      <p>
+        A checkout keeps its database, settings and vault beside the source, so it
+        does not touch anything an installed copy is using and the two can be run
+        side by side.
+      </p>
+      <p>
+        Building the installers needs <code>npm run dist:mac</code> or
+        <code>npm run dist:win</code>, each on its own platform: a Windows installer
+        built on macOS needs Wine, and a dmg cannot be made anywhere but macOS.
+      </p>
 
-<footer>
-  <div class="wrap">
-    <p>
-      <a href="https://github.com/Ray-Hughes/delphi">Source on GitHub</a> &middot;
-      <a href="https://github.com/Ray-Hughes/delphi/issues">Report an issue</a> &middot;
-      MIT licensed
-    </p>
-  </div>
-</footer>
+      <footer>
+        <a href="https://github.com/Ray-Hughes/delphi">Source on GitHub</a>
+        <a href="https://github.com/Ray-Hughes/delphi/issues">Report an issue</a>
+        <a href="https://github.com/Ray-Hughes/delphi/releases">Releases</a>
+        <span>MIT licensed</span>
+      </footer>
+    </section>
+  </main>
+</div>
 
 <script>
   // Stable file names, so these addresses keep working across every release and
@@ -289,10 +803,10 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
   /**
    * Which build to offer first.
    *
-   * Apple Silicon cannot be read from the user agent, which reports Intel on both.
-   * The renderer string from WebGL does distinguish them, so it is tried, and when
-   * it tells us nothing the Apple Silicon build is the one offered: it has been
-   * the only Mac sold for years, and the Intel build is one click away regardless.
+   * Apple Silicon cannot be read from the user agent, which reports Intel on
+   * both. The WebGL renderer string does distinguish them, so it is tried, and
+   * when it says nothing the Apple Silicon build is offered: it has been the only
+   * Mac sold for years, and the Intel build is one line below regardless.
    */
   function detect() {
     const ua = navigator.userAgent;
@@ -301,32 +815,29 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
       try {
         const gl = document.createElement("canvas").getContext("webgl");
         const info = gl && gl.getExtension("WEBGL_debug_renderer_info");
-        const renderer = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "";
-        if (/Intel/i.test(renderer)) return "mac-x64";
-      } catch {}
+        if (info && /Intel/i.test(String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)))) return "mac-x64";
+      } catch (e) {}
       return "mac-arm64";
     }
     return null;
   }
 
-  const primary = document.getElementById("primary");
-  const primaryLabel = document.getElementById("primary-label");
-  const alt = document.getElementById("alt");
-
   const chosen = detect();
-  const order = chosen ? [chosen, ...Object.keys(BUILDS).filter((k) => k !== chosen)] : Object.keys(BUILDS);
 
   if (chosen) {
-    primary.href = BASE + BUILDS[chosen].file;
-    primaryLabel.textContent = BUILDS[chosen].label;
+    document.getElementById("primary").href = BASE + BUILDS[chosen].file;
+    document.getElementById("primary-label").textContent = BUILDS[chosen].label;
+    document.getElementById("bar-download").href = BASE + BUILDS[chosen].file;
   }
 
   // Everything not offered as the main button still gets a link, so nobody on an
   // unrecognised system, or on the wrong Mac, is left without a way to download.
-  for (const key of order.slice(chosen ? 1 : 0)) {
+  const alt = document.getElementById("alt");
+  for (const key of Object.keys(BUILDS)) {
+    if (key === chosen) continue;
     const link = document.createElement("a");
     link.href = BASE + BUILDS[key].file;
-    link.textContent = `${BUILDS[key].label.replace("Download for ", "")} (${BUILDS[key].note})`;
+    link.textContent = BUILDS[key].label.replace("Download for ", "") + " (" + BUILDS[key].note + ")";
     alt.append(link);
   }
 
@@ -336,24 +847,74 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
     .then((r) => (r.ok ? r.json() : Promise.reject()))
     .then((release) => {
       const asset = chosen && release.assets.find((a) => a.name === BUILDS[chosen].file);
-      const size = asset ? ` &middot; ${(asset.size / 1048576).toFixed(0)} MB` : "";
-      document.getElementById("meta").innerHTML =
-        `${release.tag_name}${size} &middot; free and open source, MIT licensed`;
+      const size = asset ? " and " + (asset.size / 1048576).toFixed(0) + " MB" : "";
+      document.getElementById("meta").textContent =
+        release.tag_name + size + ". macOS 11 or newer, Windows 10 and 11. MIT licensed.";
     })
     .catch(() => {});
 
-  // Tabs
-  const tabs = [["tab-mac", "panel-mac"], ["tab-win", "panel-win"]];
-  for (const [tabId, panelId] of tabs) {
+  // Theme -------------------------------------------------------------------
+  const system = () => (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const current = () => document.documentElement.getAttribute("data-theme") || system();
+
+  function paintShots() {
+    const suffix = current() === "dark" ? "dark" : "light";
+    document.getElementById("shot-main").src = "shot-overview-" + suffix + ".png";
+    document.getElementById("shot-memory").src = "shot-memory-" + suffix + ".png";
+  }
+  paintShots();
+
+  document.getElementById("theme-btn").addEventListener("click", () => {
+    const next = current() === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("delphi-theme", next); } catch (e) {}
+    paintShots();
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", paintShots);
+
+  // Sidebar -----------------------------------------------------------------
+  const side = document.getElementById("side");
+  const menu = document.getElementById("menu-btn");
+  menu.addEventListener("click", () => {
+    const open = side.classList.toggle("open");
+    menu.setAttribute("aria-expanded", String(open));
+  });
+  side.addEventListener("click", (e) => {
+    if (e.target.tagName === "A") {
+      side.classList.remove("open");
+      menu.setAttribute("aria-expanded", "false");
+    }
+  });
+
+  // Which section is being read. Nearest to the top of the viewport wins rather
+  // than whichever crossed the boundary last, because a short section can be
+  // fully on screen at the same time as the one above it.
+  const links = new Map();
+  for (const link of side.querySelectorAll("a")) links.set(link.getAttribute("href").slice(1), link);
+
+  const sections = [...document.querySelectorAll("section[id]")];
+  function spy() {
+    const line = 140;
+    let active = sections[0];
+    for (const section of sections) {
+      if (section.getBoundingClientRect().top <= line) active = section;
+    }
+    for (const [id, link] of links) link.classList.toggle("on", id === active.id);
+  }
+  addEventListener("scroll", spy, { passive: true });
+  spy();
+
+  // Tabs --------------------------------------------------------------------
+  const tabs = [["tab-mac", "pane-mac"], ["tab-win", "pane-win"]];
+  for (const [tabId, paneId] of tabs) {
     document.getElementById(tabId).addEventListener("click", () => {
       for (const [t, p] of tabs) {
-        const active = t === tabId;
-        document.getElementById(t).setAttribute("aria-selected", String(active));
-        document.getElementById(p).hidden = !active;
+        const on = t === tabId;
+        document.getElementById(t).setAttribute("aria-selected", String(on));
+        document.getElementById(p).hidden = !on;
       }
     });
   }
-  // Opened on the tab for the system the visitor is using.
   if (chosen === "win") document.getElementById("tab-win").click();
 </script>
 
