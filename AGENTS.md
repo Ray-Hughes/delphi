@@ -21,6 +21,12 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `oracle_entities` | What the graph knows about, most referenced first |
 | `oracle_ask` | Meaning and connections together. The main way to ask what we know |
 | `recent_activity` | What changed lately and which agent changed it |
+| `get_task` | One task in full: detail, subtasks, discussion, every status it has been through |
+| `add_comment` | Leave your reasoning on a task, for whoever picks it up next |
+| `queue_status` | What is waiting for an agent and what other agents are holding |
+| `queue_next` | Claim the next piece of work and get everything needed to do it |
+| `queue_complete` | Finish a claimed task with a summary |
+| `queue_release` | Give a claimed task back, with a reason |
 
 Every write is attributed. Set `DELPHI_ACTOR` in the server's environment to name the
 agent, and its changes appear in the History tab labelled with that name. Give each
@@ -105,6 +111,42 @@ What not to store: secrets, tokens, anything that belongs in a password manager,
 restatements of what the code already says plainly.
 
 ---
+
+## Taking work from the queue
+
+Tasks placed in the queue are work someone has decided is ready for an agent. Nobody
+will hand them to you: you take them.
+
+**At the start of a session, and again after finishing anything, call `queue_next`.**
+If it returns a task, work it. If it returns nothing, the queue is empty and you should
+say so and stop, rather than inventing work to look busy.
+
+A claim is a lease, not an assignment. It lasts thirty minutes, and when it lapses the
+task returns to the pool for someone else. That is deliberate: an agent that dies
+holding a task should not take it with it.
+
+```
+queue_next()                      claim the next one, and get its brief
+add_comment(task_id, body)        what you found, tried, decided
+queue_complete(task_id, summary)  finished, with what happened
+queue_release(task_id, reason)    could not finish, and why
+```
+
+Three rules that make this work when more than one agent is doing it:
+
+**Read before starting.** The claim returns the discussion and the history along with
+the task. Someone may have already tried this and left you the reason it failed.
+
+**Write before finishing.** `queue_complete` takes a summary, and that summary is what
+the next person reads. Write it for them, not for a changelog. "Fixed" tells them
+nothing; "the provider ignores the idempotency key on refunds, so this needs the same
+change in the refund path" saves them the afternoon you just spent.
+
+**Release honestly.** If you are stuck, `queue_release` with the specific reason. A task
+released without one gets picked up and abandoned again by the next agent, and then the
+one after that.
+
+Do not claim more than one task at a time. Finish or release before taking another.
 
 ## Delegation
 

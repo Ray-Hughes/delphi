@@ -1263,6 +1263,10 @@ function taskMenu(t, x, y) {
       ? [{ label: "Unblock", run: () => set({ status: "todo" }) }]
       : [{ label: "Block", run: () => set({ status: "blocked" }) }]),
     "-",
+    ...(t.queue
+      ? [{ label: "Take out of the agent queue", run: async () => { await window.delphi.tasks.queue(t.id, null); refresh(); } }]
+      : [{ label: "Send to the agent queue", run: async () => { await window.delphi.tasks.queue(t.id, "ready"); refresh(); } }]),
+    "-",
     ...(moves.length ? [...moves, "-"] : []),
     {
       label: "Delete", danger: true,
@@ -1317,6 +1321,13 @@ function taskRow(t) {
   if (t.status === "blocked") right.append(el("span", { className: "pill blocked", textContent: "Blocked" }));
   if (isOverdue(t)) right.append(el("span", { className: "pill overdue", textContent: t.due }));
   else if (t.due) right.append(el("span", { className: "t-due", textContent: t.due }));
+  if (t.queue) {
+    right.append(el("span", {
+      className: "pill queued",
+      title: t.claimed_by ? `Claimed by ${t.claimed_by}` : "Waiting for an agent",
+      textContent: t.claimed_by ? `◆ ${t.claimed_by}` : "◆ queued",
+    }));
+  }
   if (t.assignee) {
     right.append(el("span", {
       className: "avatar sm" + (isAgent(t.assignee) ? " agent" : ""),

@@ -582,6 +582,9 @@
   .pill.doing   { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
   .pill.blocked { color: var(--crit); background: color-mix(in srgb, var(--crit) 12%, transparent); }
   .pill.overdue { color: var(--crit); background: color-mix(in srgb, var(--crit) 12%, transparent); }
+  /* Queued for an agent. Its own colour because it is not a status: a task can
+     be queued and blocked at the same time. */
+  .pill.queued { color: var(--accent); background: var(--accent-soft); font-family: var(--mono); font-size: 10px; }
   .t-more {
     width: 24px; height: 24px; flex: 0 0 24px; padding: 0;
     border: 0; border-radius: 6px; background: none;

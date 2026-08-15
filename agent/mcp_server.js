@@ -90,6 +90,10 @@ function openDatabase() {
   try {
     const { DatabaseSync } = require("node:sqlite");
     const handle = new DatabaseSync(DB);
+    // Wait for another writer rather than failing on contention. Two agents
+    // claiming from the same queue at the same moment is the normal case here,
+    // not the edge one.
+    handle.exec("PRAGMA busy_timeout = 5000");
     return {
       kind: "node:sqlite",
       query(statement) {
@@ -108,7 +112,14 @@ function openDatabase() {
         // a dot command and therefore line-oriented: a note body containing a
         // newline silently breaks it halfway through. A quoted SQL literal inside
         // a script file spans lines happily.
-        const lines = [".mode json", ".headers on", statement];
+        // The sqlite3 binary has no busy timeout by default: a locked database
+        // is an immediate error rather than a wait, and two agents claiming at
+        // once hit exactly that.
+        //
+        // The dot command rather than the pragma. PRAGMA busy_timeout prints the
+        // value it set, and that line lands in stdout ahead of the results,
+        // where it makes the JSON unparseable and every query look empty.
+        const lines = [".timeout 5000", ".mode json", ".headers on", statement];
         const file = path.join(os.tmpdir(), `delphi-${process.pid}-${Date.now()}.sql`);
         fs.writeFileSync(file, lines.join("\n"));
         try {
@@ -325,6 +336,151 @@ const TOOLS = {
       }
       audit("update", "task", a.id, a.status ? `status to ${a.status}` : "updated", after.title);
       return after;
+    },
+  },
+
+  queue_next: {
+    description:
+      "Claim the next piece of work from the queue and get everything needed to do it. Call this when you are ready to work rather than waiting to be given something. Returns null when the queue is empty, which means there is nothing to do and you should stop rather than invent work.",
+    schema: {
+      type: "object",
+      properties: {
+        queue: { type: "string", description: "Which pool. Defaults to ready." },
+        minutes: { type: "number", description: "How long to hold it before the claim lapses. Defaults to 30." },
+      },
+    },
+    run: (a) => {
+      const queue = a.queue || "ready";
+      const minutes = a.minutes || 30;
+      // One statement, because two with a gap between them is exactly where two
+      // agents both win. An expired claim counts as unclaimed, so a task held by
+      // an agent that died comes back on its own.
+      const claimed = sql(
+        `UPDATE tasks
+            SET claimed_by = :p1,
+                claim_expires = datetime('now', '+' || :p2 || ' minutes'),
+                status = CASE WHEN status = 'todo' THEN 'doing' ELSE status END,
+                updated_at = datetime('now')
+          WHERE id = (
+            SELECT id FROM tasks
+             WHERE queue = :p3
+               -- Blocked work is not available work: something outside the task
+               -- is being waited on, and an agent given it can only hand it back.
+               AND status NOT IN ('done', 'blocked')
+               AND (claimed_by IS NULL OR claim_expires < datetime('now'))
+             ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
+             LIMIT 1)
+          RETURNING *`,
+        [ACTOR, minutes, queue]
+      )[0];
+
+      if (!claimed) return { claimed: null, message: `Nothing waiting in the ${queue} queue.` };
+
+      // Only when the claim moved it. Nothing but todo is claimable, so this is
+      // always a real transition rather than a repeat of the current status.
+      if (claimed.status === "doing") {
+        sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
+            [claimed.id, claimed.status, ACTOR]);
+      }
+      audit("update", "task", claimed.id, `claimed by ${ACTOR}`, claimed.title);
+
+      return {
+        claimed: claimed.id,
+        expires: claimed.claim_expires,
+        task: claimed,
+        project: claimed.project_id
+          ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [claimed.project_id])[0]
+          : null,
+        subtasks: sql("SELECT id, title, status FROM tasks WHERE parent_id = :p1 ORDER BY id", [claimed.id]),
+        comments: sql("SELECT author, body, created_at FROM comments WHERE task_id = :p1 ORDER BY id", [claimed.id]),
+        next_steps:
+          "Work it, comment what you did with add_comment, then queue_complete. " +
+          "If you cannot finish it, queue_release with a reason so someone else can pick it up.",
+      };
+    },
+  },
+
+  queue_release: {
+    description:
+      "Give a claimed task back without finishing it. Always say why: the next agent reads that reason before starting, and an unexplained release is a task that gets picked up and abandoned again.",
+    schema: {
+      type: "object",
+      required: ["task_id", "reason"],
+      properties: {
+        task_id: { type: "number" },
+        reason: { type: "string", description: "What stopped you, specifically." },
+      },
+    },
+    run: (a) => {
+      const before = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
+      if (!before) throw new Error(`No task ${a.task_id}`);
+      sql(`UPDATE tasks SET claimed_by = NULL, claim_expires = NULL,
+             status = CASE WHEN status = 'doing' THEN 'todo' ELSE status END,
+             updated_at = datetime('now') WHERE id = :p1`, [a.task_id]);
+      sql("INSERT INTO comments (task_id, author, body) VALUES (:p1, :p2, :p3)",
+          [a.task_id, ACTOR, `Released: ${a.reason}`]);
+      const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
+      if (after.status !== before.status) {
+        sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
+            [a.task_id, after.status, ACTOR]);
+      }
+      audit("update", "task", a.task_id, `released by ${ACTOR}`, after.title);
+      return after;
+    },
+  },
+
+  queue_complete: {
+    description:
+      "Finish a claimed task. The summary is left as a comment and is what the next person or agent reads to know what actually happened, so write it for them rather than for a changelog.",
+    schema: {
+      type: "object",
+      required: ["task_id", "summary"],
+      properties: {
+        task_id: { type: "number" },
+        summary: { type: "string", description: "What you did, and anything the next person needs to know." },
+      },
+    },
+    run: (a) => {
+      const before = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
+      if (!before) throw new Error(`No task ${a.task_id}`);
+      sql("INSERT INTO comments (task_id, author, body) VALUES (:p1, :p2, :p3)",
+          [a.task_id, ACTOR, a.summary]);
+      sql(`UPDATE tasks SET status = 'done', completed_at = datetime('now'),
+             claimed_by = NULL, claim_expires = NULL, queue = NULL,
+             updated_at = datetime('now') WHERE id = :p1`, [a.task_id]);
+      if (before.status !== "done") {
+        sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'done', :p2)", [a.task_id, ACTOR]);
+      }
+      audit("update", "task", a.task_id, "status to done", before.title);
+      return sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
+    },
+  },
+
+  queue_status: {
+    description: "What is waiting in the queue and what other agents are already holding. Read it before claiming if you want to know whether it is worth starting.",
+    schema: {
+      type: "object",
+      properties: { queue: { type: "string" } },
+    },
+    run: (a) => {
+      const queue = a.queue || "ready";
+      return {
+        queue,
+        waiting: sql(
+          `SELECT id, title, priority FROM tasks
+            WHERE queue = :p1 AND status NOT IN ('done', 'blocked')
+              AND (claimed_by IS NULL OR claim_expires < datetime('now'))
+            ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id`,
+          [queue]
+        ),
+        in_flight: sql(
+          `SELECT id, title, claimed_by, claim_expires FROM tasks
+            WHERE queue = :p1 AND status != 'done'
+              AND claimed_by IS NOT NULL AND claim_expires >= datetime('now')
+            ORDER BY claim_expires`,
+          [queue]
+        ),
+      };
     },
   },
 

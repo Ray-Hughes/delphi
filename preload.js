@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld("delphi", {
     update: (id, fields) => call("tasks:update", id, fields),
     remove: (id) => call("tasks:delete", id),
     detail: (id) => call("tasks:detail", id),
+    queue: (id, queue) => call("tasks:queue", id, queue),
     comment: (id, body, author) => call("tasks:comment", id, body, author),
     uncomment: (id) => call("tasks:uncomment", id),
   },

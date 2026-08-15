@@ -23,6 +23,10 @@ function open() {
   paths.ensureDataDir();
   db = new DatabaseSync(DB_PATH);
   db.exec("PRAGMA foreign_keys = ON");
+  // SQLite allows one writer at a time and, without this, a second writer fails
+  // immediately rather than waiting its turn. The app and any number of agents
+  // write to this file concurrently, so "immediately" is a lost write.
+  db.exec("PRAGMA busy_timeout = 5000");
   // Schema is idempotent, so applying it on every open keeps a hand-copied
   // database in step without a migration framework.
   const schema = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
@@ -51,6 +55,9 @@ const LATER_COLUMNS = [
   ["tasks", "parent_id", "INTEGER REFERENCES tasks(id) ON DELETE CASCADE"],
   ["tasks", "assignee", "TEXT"],
   ["projects", "task_view", "TEXT NOT NULL DEFAULT 'list'"],
+  ["tasks", "queue", "TEXT"],
+  ["tasks", "claimed_by", "TEXT"],
+  ["tasks", "claim_expires", "TEXT"],
 ];
 
 function addLaterColumns(db) {
@@ -308,7 +315,7 @@ function createTask({
 }
 
 function updateTask(id, fields, { actor = null } = {}) {
-  const allowed = ["project_id", "title", "detail", "status", "priority", "owner", "due", "ref", "assignee", "parent_id"];
+  const allowed = ["project_id", "title", "detail", "status", "priority", "owner", "due", "ref", "assignee", "parent_id", "queue"];
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return one("SELECT * FROM tasks WHERE id = :id", { id });
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
@@ -336,6 +343,125 @@ function updateTask(id, fields, { actor = null } = {}) {
            summary: describeUpdate("task", before, after), label: after.title,
            before, after });
   return after;
+}
+
+// ---------------------------------------------------------------------------
+// The agent queue
+//
+// A pool an agent pulls from, rather than an assignment someone makes. Whichever
+// agent asks next gets the next piece of work, which needs no scheduler and no
+// knowledge of who is available.
+//
+// A claim is a lease, not an assignment. An agent that takes a task and then dies
+// would otherwise hold it forever, which is how every queue discovers it needed
+// expiry. Claiming takes the oldest highest-priority task whose lease is absent
+// or expired, in one statement, so two agents asking at the same moment cannot
+// get the same task.
+// ---------------------------------------------------------------------------
+
+const LEASE_MINUTES = 30;
+
+/** Puts a task in a pool, or takes it out when queue is null. */
+function setQueue(id, queue) {
+  const before = rowOf("task", id);
+  if (!before) throw new Error("No such task");
+  run("UPDATE tasks SET queue = :queue, updated_at = datetime('now') WHERE id = :id", { id, queue });
+  const after = one("SELECT * FROM tasks WHERE id = :id", { id });
+  record({ action: "update", entity: "task", entityId: id,
+           summary: queue ? `queued for agents (${queue})` : "taken out of the queue",
+           label: after.title, before, after });
+  return after;
+}
+
+/** What is waiting, and what is being worked on, in one pool. */
+function queueState(queue = "ready") {
+  return {
+    queue,
+    waiting: all(
+      `SELECT id, title, priority, project_id, ref FROM tasks
+       WHERE queue = :queue AND status NOT IN ('done', 'blocked')
+         AND (claimed_by IS NULL OR claim_expires < datetime('now'))
+       ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id`,
+      { queue }
+    ),
+    claimed: all(
+      `SELECT id, title, claimed_by, claim_expires FROM tasks
+       WHERE queue = :queue AND status != 'done'
+         AND claimed_by IS NOT NULL AND claim_expires >= datetime('now')
+       ORDER BY claim_expires`,
+      { queue }
+    ),
+  };
+}
+
+/**
+ * Takes the next piece of work, atomically.
+ *
+ * The whole claim is one UPDATE with a subquery, because two statements with a
+ * gap between them is exactly where two agents both win. An expired lease counts
+ * as unclaimed, which is what makes a dead agent's task come back on its own
+ * rather than needing a sweeper.
+ */
+function claimNext({ queue = "ready", agent, minutes = LEASE_MINUTES }) {
+  if (!agent) throw new Error("A claim needs to say who is claiming");
+  const claimed = one(
+    `UPDATE tasks
+        SET claimed_by = :agent,
+            claim_expires = datetime('now', '+' || :minutes || ' minutes'),
+            status = CASE WHEN status = 'todo' THEN 'doing' ELSE status END,
+            updated_at = datetime('now')
+      WHERE id = (
+        SELECT id FROM tasks
+         WHERE queue = :queue
+           -- Blocked work is not available work. Something outside this task is
+           -- being waited on, and handing it to an agent produces an agent that
+           -- discovers it is blocked and hands it straight back.
+           AND status NOT IN ('done', 'blocked')
+           AND (claimed_by IS NULL OR claim_expires < datetime('now'))
+         ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
+         LIMIT 1
+      )
+      RETURNING *`,
+    { queue, agent, minutes }
+  );
+  if (!claimed) return null;
+
+  // Only when the claim actually moved it. Nothing but todo can be claimed now,
+  // so this is always a real todo to doing transition, and writing one
+  // unconditionally would put a repeat of the current status on the timeline.
+  if (claimed.status === "doing") {
+    run("INSERT INTO status_events (task_id, status, actor) VALUES (:id, :status, :actor)",
+        { id: claimed.id, status: claimed.status, actor: agent });
+  }
+  record({ action: "update", entity: "task", entityId: claimed.id,
+           summary: `claimed by ${agent}`, label: claimed.title });
+  return taskDetail(claimed.id);
+}
+
+/** Gives a task back without finishing it. */
+function releaseClaim(id, { agent = null, note = null } = {}) {
+  const before = rowOf("task", id);
+  if (!before) throw new Error("No such task");
+  run(`UPDATE tasks SET claimed_by = NULL, claim_expires = NULL,
+       status = CASE WHEN status = 'doing' THEN 'todo' ELSE status END,
+       updated_at = datetime('now') WHERE id = :id`, { id });
+  if (note) createComment({ taskId: id, body: note, author: agent || "agent" });
+  const after = one("SELECT * FROM tasks WHERE id = :id", { id });
+  if (after.status !== before.status) {
+    run("INSERT INTO status_events (task_id, status, actor) VALUES (:id, :status, :actor)",
+        { id, status: after.status, actor: agent });
+  }
+  record({ action: "update", entity: "task", entityId: id,
+           summary: `released by ${agent || "an agent"}`, label: after.title, before, after });
+  return after;
+}
+
+/** Finishes a claimed task and takes it out of the pool. */
+function completeClaim(id, { agent = null, note = null } = {}) {
+  if (note) createComment({ taskId: id, body: note, author: agent || "agent" });
+  const after = updateTask(id, { status: "done" }, { actor: agent });
+  run(`UPDATE tasks SET claimed_by = NULL, claim_expires = NULL, queue = NULL WHERE id = :id`, { id });
+  return one("SELECT * FROM tasks WHERE id = :id", { id });
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +812,7 @@ module.exports = {
   listProjects, getProject, createProject, updateProject,
   listTasks, createTask, updateTask, deleteTask,
   taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
+  setQueue, queueState, claimNext, releaseClaim, completeClaim,
   listNotes, createNote, updateNote, deleteNote,
   listLinks, createLink, deleteLink,
   search, stats,

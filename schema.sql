@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- Free text until there is a people table. An agent name goes here too, which
   -- is what lets the queue show who is holding a piece of work.
   assignee     TEXT,
+  -- The pool an agent may pull this from. Membership rather than a status,
+  -- deliberately: "ready for an agent" is a different question from "what state
+  -- is this in", and folding them together would mean a board column that only
+  -- means something when an agent is watching.
+  queue        TEXT,
+  -- A claim, which is not the same as an assignee. An assignee is a decision
+  -- someone made; a claim is a lease an agent took and can lose.
+  claimed_by   TEXT,
+  claim_expires TEXT,
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT
@@ -180,3 +189,5 @@ CREATE TABLE IF NOT EXISTS repos (
 CREATE INDEX IF NOT EXISTS idx_repos_project ON repos(project_id);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue, status);

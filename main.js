@@ -745,6 +745,8 @@ handle("tasks:create", (payload) => { const r = db.createTask(payload); schedule
 handle("tasks:update", (id, fields) => { const r = db.updateTask(id, fields); scheduleVaultExport(); return r; });
 handle("tasks:delete", (id) => { const r = db.deleteTask(id); scheduleVaultExport(); return r; });
 handle("tasks:detail", (id) => db.taskDetail(id));
+handle("tasks:queue", (id, queue) => { const r = db.setQueue(id, queue); scheduleVaultExport(); return r; });
+handle("queue:state", (queue) => db.queueState(queue));
 handle("tasks:comment", (taskId, body, author) => {
   const r = db.createComment({ taskId, body, author });
   scheduleVaultExport();
