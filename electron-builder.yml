@@ -21,6 +21,7 @@ files:
   - index.html
   - db.js
   - paths.js
+  - version.js
   - vault.js
   - oracle.js
   - embeddings.js

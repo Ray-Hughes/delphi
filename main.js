@@ -2,6 +2,7 @@ const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, 
 const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
+const { isNewer } = require("./version");
 
 // Before anything reads it. Packaged, the name comes from the bundle, but running
 // from a checkout Electron falls back to its own name and the macOS menu bar reads
@@ -224,7 +225,23 @@ function rebuildWindow() {
 }
 
 function hide() {
-  if (win && win.isVisible()) win.hide();
+  if (!win || !win.isVisible()) return;
+
+  // Closing a full screened window used to leave macOS sitting in the empty
+  // space it had made for it. The window was hidden, the space was not, so the
+  // screen went black and looked like the app had failed to close.
+  //
+  // Leaving full screen has to finish before the hide, or the hide races the
+  // animation and the space is kept anyway.
+  if (win.isFullScreen()) {
+    win.once("leave-full-screen", () => {
+      if (win && !win.isDestroyed()) win.hide();
+    });
+    win.setFullScreen(false);
+    return;
+  }
+
+  win.hide();
 }
 
 function toggle() {
@@ -426,6 +443,14 @@ function buildMenu() {
   template.push({
     role: "help",
     submenu: [
+      { label: "Check for Updates", click: () => checkForUpdate({ quiet: false }) },
+      ...(latestSeen
+        ? [{
+            label: `Download ${latestSeen.tag_name}`,
+            click: () => shell.openExternal(latestSeen.html_url),
+          }]
+        : []),
+      { type: "separator" },
       { label: "Documentation", click: () => shell.openExternal(REPO) },
       { label: "Report an Issue", click: () => shell.openExternal(`${REPO}/issues/new`) },
       { type: "separator" },
@@ -493,6 +518,56 @@ async function runAndReport(message, work) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Updates
+//
+// Not an auto updater. Squirrel, which is what electron-updater drives on macOS,
+// will not install over an app that is not signed with a Developer ID, and these
+// builds are ad-hoc signed. Wiring one in would fail silently on the platform
+// most of these installs are on, which is worse than not having it.
+//
+// So this checks and tells you, and takes you to the download. When there is a
+// certificate, this becomes the notification that an update is already
+// installing rather than the one that asks you to go and get it.
+// ---------------------------------------------------------------------------
+
+let latestSeen = null;
+
+async function checkForUpdate({ quiet = true } = {}) {
+  try {
+    const response = await fetch("https://api.github.com/repos/Ray-Hughes/delphi/releases/latest", {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!response.ok) throw new Error(`GitHub answered ${response.status}`);
+    const release = await response.json();
+    const available = isNewer(release.tag_name, app.getVersion());
+    latestSeen = available ? release : null;
+    refreshMenu();
+
+    if (available) {
+      // Announced once per launch rather than every check, because a reminder
+      // every hour about the same version is nagging, not helping.
+      const note = new Notification({
+        title: `Delphi ${release.tag_name} is out`,
+        body: "You are on " + app.getVersion() + ". Click to download it.",
+      });
+      note.on("click", () => shell.openExternal(release.html_url));
+      note.show();
+    } else if (!quiet) {
+      dialog.showMessageBox({
+        type: "info",
+        message: "Delphi is up to date",
+        detail: `You are on ${app.getVersion()}, which is the latest release.`,
+      });
+    }
+    return available;
+  } catch (error) {
+    // Offline, rate limited, or GitHub having a bad day. Silent unless asked.
+    if (!quiet) dialog.showErrorBox("Could not check for updates", String(error.message || error));
+    return false;
+  }
+}
+
 app.whenReady().then(() => {
   loadSettings();
   // Before the database is opened for the first time, or the migration finds a
@@ -507,6 +582,10 @@ app.whenReady().then(() => {
 
   // A panel has no dock presence; a normal application does.
   if (app.dock && settings.panelMode === true) app.dock.hide();
+
+  // Late enough not to compete with the first paint, and once only: a desktop
+  // app that phones home on a timer is a desktop app people firewall.
+  setTimeout(() => checkForUpdate({ quiet: true }), 12000);
 
   // Following the system means following it while running, not only at startup.
   nativeTheme.on("updated", () => {

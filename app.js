@@ -936,11 +936,174 @@ function renderTasks(root) {
   }
 }
 
+/* ---------------------------------------------------------------------------
+   Row menus and quick look
+
+   The row used to carry eleven separate controls: a status cycler, a project
+   dropdown, a notes toggle, a delete, and a chip for every attribute. Between
+   them there was barely any row left to click, and the one thing anyone wants,
+   opening the task, was the hardest target on it.
+
+   The row now shows what you scan for and nothing else. Everything that was a
+   button lives in a menu on right click, and a quick look reads the task without
+   opening it.
+--------------------------------------------------------------------------- */
+
+let openMenu = null;
+
+function closeRowMenu() {
+  if (!openMenu) return;
+  openMenu.remove();
+  openMenu = null;
+}
+
+/**
+ * A menu at a point on screen.
+ *
+ * Kept inside the viewport rather than allowed to run off the bottom, because a
+ * menu opened on the last row of a long list is exactly where that happens.
+ */
+function rowMenu(x, y, items) {
+  closeRowMenu();
+  const menu = el("div", { className: "ctx" });
+  for (const item of items) {
+    if (item === "-") { menu.append(el("div", { className: "ctx-sep" })); continue; }
+    const b = el("button", { className: "ctx-item" + (item.danger ? " danger" : ""), textContent: item.label });
+    b.onclick = async () => { closeRowMenu(); await item.run(); };
+    menu.append(b);
+  }
+  menu.style.left = "0px";
+  menu.style.top = "0px";
+  document.body.append(menu);
+
+  const box = menu.getBoundingClientRect();
+  menu.style.left = `${Math.min(x, window.innerWidth - box.width - 8)}px`;
+  menu.style.top = `${Math.min(y, window.innerHeight - box.height - 8)}px`;
+
+  openMenu = menu;
+  // Bound after this click finishes, or the click that opened it closes it.
+  setTimeout(() => {
+    const away = (e) => {
+      if (!menu.contains(e.target)) { closeRowMenu(); document.removeEventListener("mousedown", away); }
+    };
+    document.addEventListener("mousedown", away);
+  }, 0);
+  return menu;
+}
+
+const STATUS_WORD = { todo: "To do", doing: "In progress", blocked: "Blocked", done: "Done" };
+
+/**
+ * The task at a glance, without opening it.
+ *
+ * Read only on purpose. It answers "what is this" in one keypress and gets out
+ * of the way; anything that changes the task happens in the task.
+ */
+async function quickLook(taskId) {
+  const detail = await window.delphi.tasks.detail(taskId);
+  if (!detail) return;
+  const t = detail.task;
+
+  const overlay = el("div", { className: "overlay" });
+  const card = el("div", { className: "qlook", role: "dialog" });
+  card.setAttribute("aria-modal", "true");
+  card.setAttribute("aria-label", "Quick look");
+
+  card.append(el("div", { className: "qlook-head" },
+    el("span", { className: `dot-status st-${t.status}` }),
+    el("h3", { textContent: t.title })));
+
+  const rows = [
+    ["Status", STATUS_WORD[t.status] || t.status],
+    ["Priority", t.priority],
+    ["Assignee", t.assignee || "unassigned"],
+    ["Due", t.due || "no due date"],
+    ["Project", detail.project ? detail.project.name : "none"],
+    ["Reference", t.ref || "none"],
+    ["Subtasks", detail.subtasks.length
+      ? `${detail.subtasks.filter((s) => s.status === "done").length} of ${detail.subtasks.length} done`
+      : "none"],
+    ["Comments", String(detail.comments.length)],
+    ["Created", ago(t.created_at)],
+  ];
+  const grid = el("div", { className: "qlook-grid" });
+  for (const [label, value] of rows) {
+    grid.append(el("span", { className: "qlook-label", textContent: label }));
+    grid.append(el("span", { className: "qlook-value", textContent: value }));
+  }
+  card.append(grid);
+
+  if (t.detail) {
+    const body = el("div", { className: "qlook-detail" });
+    body.append(renderMarkdown(t.detail));
+    card.append(body);
+  }
+
+  const close = async () => { overlay.remove(); openSheet = null; };
+  const foot = el("div", { className: "qlook-foot" });
+  const openIt = el("button", { className: "btn primary", textContent: "Open task" });
+  openIt.onclick = async () => { await close(); openTaskSheet(taskId); };
+  const shut = el("button", { className: "btn", textContent: "Close" });
+  shut.onclick = close;
+  foot.append(el("span", { className: "hint", textContent: "Escape to close" }), openIt, shut);
+  card.append(foot);
+
+  overlay.append(card);
+  overlay.onclick = (e) => { if (e.target === overlay) close(); };
+  document.body.append(overlay);
+  openSheet = { overlay, close };
+  openIt.focus();
+}
+
+/** The menu a task row offers, used by right click and by the row's own button. */
+function taskMenu(t, x, y) {
+  const set = async (fields) => { await window.delphi.tasks.update(t.id, fields); refresh(); };
+
+  const moves = state.projects
+    .filter((p) => p.id !== t.project_id)
+    .slice(0, 8)
+    .map((p) => ({ label: `Move to ${p.name}`, run: () => set({ project_id: p.id }) }));
+
+  rowMenu(x, y, [
+    { label: "Open", run: () => openTaskSheet(t.id) },
+    { label: "Quick look", run: () => quickLook(t.id) },
+    "-",
+    ...(t.status === "done"
+      ? [{ label: "Reopen", run: () => set({ status: "todo" }) }]
+      : [{ label: "Mark done", run: () => set({ status: "done" }) }]),
+    ...(t.status === "doing" ? [] : [{ label: "Start", run: () => set({ status: "doing" }) }]),
+    ...(t.status === "blocked"
+      ? [{ label: "Unblock", run: () => set({ status: "todo" }) }]
+      : [{ label: "Block", run: () => set({ status: "blocked" }) }]),
+    "-",
+    ...(moves.length ? [...moves, "-"] : []),
+    {
+      label: "Delete", danger: true,
+      run: async () => {
+        await window.delphi.tasks.remove(t.id);
+        refresh();
+        // Said where it happened, because that is when someone needs to know it
+        // is not final.
+        setTimeout(() => alert("Task deleted. Restore it from this project's Activity tab."), 30);
+      },
+    },
+  ]);
+}
+
+/**
+ * One task, as a line.
+ *
+ * Only what someone scans for: whether it is done, what it is called, and the
+ * two or three facts that decide whether to look closer. Everything else is a
+ * right click away, so the row itself stays a target rather than a toolbar.
+ */
 function taskRow(t) {
   const row = el("div", { className: "task" + (t.status === "done" ? " done" : "") });
 
   const check = el("div", { className: "check", textContent: "✓", tabIndex: 0, role: "checkbox" });
-  const toggle = async () => {
+  check.setAttribute("aria-checked", String(t.status === "done"));
+  const toggle = async (e) => {
+    if (e) e.stopPropagation();
     await window.delphi.tasks.update(t.id, { status: t.status === "done" ? "todo" : "done" });
     refresh();
   };
@@ -949,62 +1112,51 @@ function taskRow(t) {
   row.append(check);
 
   const body = el("div", { className: "t-body" });
-  // The title is the way in. A task is a line until you open it, and everything
-  // worth knowing about it lives behind that click.
-  const heading = el("div", { className: "t-title", textContent: t.title, tabIndex: 0, role: "button" });
-  heading.onclick = () => openTaskSheet(t.id);
-  heading.onkeydown = (e) => {
-    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTaskSheet(t.id); }
-  };
+  const heading = el("div", { className: "t-title", textContent: t.title });
   body.append(heading);
 
-  const meta = el("div", { className: "t-meta" });
-  if (!state.projectId && t.project_name) {
-    meta.append(el("span", { className: "chip", textContent: t.project_name }));
-  }
-  if (t.priority === "high") meta.append(el("span", { className: "chip high", textContent: "high" }));
-  if (t.status === "doing") meta.append(el("span", { className: "chip doing", textContent: "in progress" }));
-  if (t.status === "blocked") meta.append(el("span", { className: "chip blocked", textContent: "blocked" }));
-  if (isOverdue(t)) meta.append(el("span", { className: "chip overdue", textContent: `overdue ${t.due}` }));
-  else if (t.due) meta.append(el("span", { className: "chip", textContent: `due ${t.due}` }));
-  if (t.ref) meta.append(el("span", { className: "chip ref", textContent: t.ref }));
-  if (t.subtask_count) {
-    meta.append(el("span", { className: "chip", textContent: `${t.subtask_done}/${t.subtask_count} subtasks` }));
-  }
-  if (t.comment_count) meta.append(el("span", { className: "chip", textContent: `${t.comment_count} comments` }));
-  if (t.assignee) meta.append(el("span", { className: "chip who", textContent: t.assignee }));
-
-  if (t.detail) {
-    const detail = el("div", { className: "t-detail", textContent: t.detail });
-    detail.style.display = "none";
-    const more = el("button", { className: "btn sm", textContent: "notes" });
-    more.onclick = () => { detail.style.display = detail.style.display === "none" ? "" : "none"; };
-    meta.append(more);
-    body.append(meta, detail);
-  } else {
-    body.append(meta);
-  }
-
-  const actions = el("div", { className: "t-actions" });
-  const cycle = el("button", { className: "btn sm", textContent: "status" });
-  cycle.onclick = async () => {
-    const order = ["todo", "doing", "blocked", "done"];
-    await window.delphi.tasks.update(t.id, { status: order[(order.indexOf(t.status) + 1) % order.length] });
-    refresh();
-  };
-  const move = el("select", { className: "btn sm" });
-  move.append(el("option", { value: "", textContent: "move…" }));
-  state.projects.forEach((p) =>
-    move.append(el("option", { value: String(p.id), textContent: p.name, selected: p.id === t.project_id })));
-  move.onchange = async () => {
-    if (move.value) { await window.delphi.tasks.update(t.id, { project_id: Number(move.value) }); refresh(); }
-  };
-  const del = el("button", { className: "btn sm", textContent: "×", title: "Delete" });
-  del.onclick = async () => { await window.delphi.tasks.remove(t.id); refresh(); };
-  actions.append(cycle, move, del);
-  meta.append(actions);
-
+  // A second line only when there is something worth putting on it.
+  const sub = el("div", { className: "t-sub" });
+  if (!state.projectId && t.project_name) sub.append(el("span", { textContent: t.project_name }));
+  if (t.ref) sub.append(el("span", { className: "t-ref", textContent: t.ref }));
+  if (t.subtask_count) sub.append(el("span", { textContent: `${t.subtask_done}/${t.subtask_count}` }));
+  if (t.comment_count) sub.append(el("span", { textContent: `${t.comment_count} ✦` }));
+  if (sub.childNodes.length) body.append(sub);
   row.append(body);
+
+  const right = el("div", { className: "t-right" });
+  if (t.priority === "high") right.append(el("span", { className: "pill high", textContent: "high" }));
+  if (t.status === "doing") right.append(el("span", { className: "pill doing", textContent: "In progress" }));
+  if (t.status === "blocked") right.append(el("span", { className: "pill blocked", textContent: "Blocked" }));
+  if (isOverdue(t)) right.append(el("span", { className: "pill overdue", textContent: t.due }));
+  else if (t.due) right.append(el("span", { className: "t-due", textContent: t.due }));
+  if (t.assignee) {
+    right.append(el("span", {
+      className: "avatar sm" + (isAgent(t.assignee) ? " agent" : ""),
+      title: t.assignee,
+      textContent: t.assignee.slice(0, 1).toUpperCase(),
+    }));
+  }
+
+  const more = el("button", { className: "t-more", textContent: "⋯", title: "Actions" });
+  more.setAttribute("aria-label", "Task actions");
+  more.onclick = (e) => {
+    e.stopPropagation();
+    const box = more.getBoundingClientRect();
+    taskMenu(t, box.left - 150, box.bottom + 4);
+  };
+  right.append(more);
+  row.append(right);
+
+  // The whole row opens the task, so the target is the row and not a word in it.
+  row.onclick = () => openTaskSheet(t.id);
+  row.oncontextmenu = (e) => { e.preventDefault(); taskMenu(t, e.clientX, e.clientY); };
+  row.tabIndex = 0;
+  row.onkeydown = (e) => {
+    if (e.key === "Enter") { e.preventDefault(); openTaskSheet(t.id); }
+    if (e.key === " ") { e.preventDefault(); quickLook(t.id); }
+  };
+
   return row;
 }
 
