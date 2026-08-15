@@ -7,6 +7,13 @@ name: Release
 # Each platform is built on its own runner because neither can produce the other's
 # installer without help: a Windows installer built on macOS needs Wine, and a mac
 # build cannot be signed or made into a dmg anywhere but macOS.
+#
+# Nothing is published until both have finished. Letting each runner publish its
+# own output looks simpler and is how v1.0.0 lost its Windows installer: both jobs
+# asked GitHub to create a release for the same tag at the same time, neither saw
+# the other's, and GitHub happily made two drafts. The mac assets went into one and
+# the exe into the other, so publishing the visible one produced a release that
+# offered Windows users a 404.
 
 on:
   push:
@@ -43,10 +50,10 @@ jobs:
 
       - run: npm ci
 
-      - name: Build and publish
-        run: npx electron-builder ${{ matrix.args }} --publish always
+      - name: Build
+        # Never published from here. This job's only output is files.
+        run: npx electron-builder ${{ matrix.args }} --publish never
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Signing, for when there are certificates to sign with. Every one of
           # these is empty today, and electron-builder treats an empty signing
           # variable as "do not sign" rather than as an error, so this block is
@@ -63,14 +70,72 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
-      - name: Keep the installers even if publishing failed
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}-installers
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 14
           path: |
             release/*.dmg
-            release/*.zip
             release/*.exe
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only for a tag. A manual run is for checking the build still works, and
+    # should not create a release from whatever happens to be on the branch.
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: Check both platforms are here
+        # A release missing one platform is worse than no release: the download
+        # page offers the file either way, and the visitor gets a 404 rather than
+        # a message. Better to fail loudly and leave the previous release as the
+        # latest one.
+        run: |
+          ls -lh installers
+          for required in "*.dmg" "*.exe"; do
+            count=$(find installers -name "$required" -type f | wc -l)
+            [ "$count" -gt 0 ] || { echo "No file matching $required was built"; exit 1; }
+          done
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes=$(cat <<'BODY'
+          Download for your platform below, or from https://ray-hughes.github.io/delphi/
+
+          | Platform | File |
+          | --- | --- |
+          | macOS, Apple Silicon | `Delphi-mac-arm64.dmg` |
+          | macOS, Intel | `Delphi-mac-x64.dmg` |
+          | Windows 10 and 11 | `Delphi-Setup.exe` |
+
+          **The first launch will stop you once.** These builds are not signed with a
+          paid certificate yet. On macOS, right click Delphi in Applications and choose
+          Open rather than double clicking it: double clicking offers only a Cancel
+          button. On Windows, click More info and then Run anyway.
+
+          The other files are for a future auto updater and can be ignored.
+          BODY
+          )
+          # Created and filled in one call, so the release is never briefly visible
+          # holding one platform's files.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" installers/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" installers/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Delphi ${TAG#v}" \
+              --notes "$notes"
+          fi
