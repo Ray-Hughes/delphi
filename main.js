@@ -590,8 +590,24 @@ function sweep() {
 // about, and costs a stat call a minute.
 function checkForExternalWrites() {
   try {
-    const stat = fs.statSync(db.DB_PATH);
-    const changed = stat.mtimeMs;
+    // The write-ahead log as well as the database, and the newest of the two.
+    //
+    // In WAL mode another process's writes land in delphi.db-wal, and delphi.db
+    // itself is not touched until a checkpoint. A checkpoint does not happen
+    // while this app holds the database open, so watching delphi.db alone meant
+    // an agent could write through the MCP server and nothing here ever noticed:
+    // no vault export, no graph rebuild, no refresh. That is the exact case this
+    // function was written for, and it could not see it.
+    let changed = 0;
+    for (const suffix of ["", "-wal"]) {
+      try {
+        changed = Math.max(changed, fs.statSync(db.DB_PATH + suffix).mtimeMs);
+      } catch {
+        // No write-ahead log yet, which is normal on a fresh database.
+      }
+    }
+    if (!changed) return;
+
     if (lastSeenDbChange === 0) {
       lastSeenDbChange = changed;
       return;
