@@ -71,14 +71,25 @@ jobs:
         run: |
           npm ci
           node -e "
-            const yaml = require('js-yaml');
             const fs = require('fs');
-            const config = yaml.load(fs.readFileSync('electron-builder.yml', 'utf8'));
-            for (const file of [...config.files, config.mac.icon, config.win.icon]) {
-              const path = file.replace(/\/$/, '');
-              if (!fs.existsSync(path)) throw new Error('electron-builder.yml refers to a missing path: ' + path);
+            // Checked in both modes, because the signed one only comes to life
+            // on a release runner and would otherwise be exercised for the first
+            // time by a real release.
+            for (const signing of [false, true]) {
+              if (signing) process.env.CSC_LINK = 'test'; else delete process.env.CSC_LINK;
+              delete require.cache[require.resolve('./electron-builder.config.js')];
+              const config = require('./electron-builder.config.js');
+              for (const file of [...config.files, config.mac.icon, config.win.icon]) {
+                const path = file.replace(/\/\$/, '');
+                if (!fs.existsSync(path)) throw new Error('config refers to a missing path: ' + path);
+              }
+              if (signing && !config.mac.notarize) throw new Error('signing mode should notarise');
+              if (signing && config.mac.entitlements && !fs.existsSync(config.mac.entitlements)) {
+                throw new Error('missing entitlements: ' + config.mac.entitlements);
+              }
+              if (!signing && config.mac.identity !== null) throw new Error('unsigned mode must set identity null');
             }
-            console.log('ok  electron-builder.yml, ' + config.files.length + ' entries all present');
+            console.log('ok  electron-builder.config.js, both signing modes');
           "
 
       # The database holds work content rather than code. It reached a public

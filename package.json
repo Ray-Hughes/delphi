@@ -13,11 +13,11 @@
   "scripts": {
     "start": "electron .",
     "icons": "python3 tools/make_icons.py",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder",
-    "dist:mac": "electron-builder --mac",
-    "dist:win": "electron-builder --win",
-    "release": "electron-builder --publish always"
+    "pack": "electron-builder --dir --config electron-builder.config.js",
+    "dist": "electron-builder --config electron-builder.config.js",
+    "dist:mac": "electron-builder --mac --config electron-builder.config.js",
+    "dist:win": "electron-builder --win --config electron-builder.config.js",
+    "release": "electron-builder --config electron-builder.config.js --publish always"
   },
   "devDependencies": {
     "electron": "^43.3.0",

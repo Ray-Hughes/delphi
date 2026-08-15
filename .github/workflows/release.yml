@@ -52,7 +52,10 @@ jobs:
 
       - name: Build
         # Never published from here. This job's only output is files.
-        run: npx electron-builder ${{ matrix.args }} --publish never
+        # The config is named rather than discovered: electron-builder does not
+        # auto-detect electron-builder.config.js, and silently falls back to its
+        # defaults, which put the output somewhere else under another name.
+        run: npx electron-builder ${{ matrix.args }} --config electron-builder.config.js --publish never
         env:
           # Signing, for when there are certificates to sign with. Every one of
           # these is empty today, and electron-builder treats an empty signing
