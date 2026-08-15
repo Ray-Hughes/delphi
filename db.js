@@ -172,11 +172,29 @@ function undo(auditId) {
     run(`UPDATE ${table} SET ${sets} WHERE id = :id`, { ...before, id: entry.entity_id });
   } else if (entry.action === "delete") {
     if (!before) throw new Error("That deletion has no recorded contents");
+    // Keys beginning with two underscores are the subtree the cascade took, not
+    // columns of this row.
+    const carried = {};
+    for (const key of Object.keys(before)) {
+      if (key.startsWith("__")) { carried[key] = before[key]; delete before[key]; }
+    }
     const cols = Object.keys(before);
     run(
       `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${cols.map((c) => ":" + c).join(", ")})`,
       before
     );
+    // The parent first, then everything that pointed at it, or the foreign keys
+    // have nothing to point at.
+    for (const [key, rows] of [["__subtasks", "tasks"], ["__comments", "comments"], ["__events", "status_events"]]
+           .map(([k, t]) => [t, carried[k] || []])) {
+      for (const row of rows) {
+        const rowCols = Object.keys(row);
+        run(
+          `INSERT OR IGNORE INTO ${key} (${rowCols.join(", ")}) VALUES (${rowCols.map((c) => ":" + c).join(", ")})`,
+          row
+        );
+      }
+    }
   }
 
   run("UPDATE audit SET undone = 1, undone_at = datetime('now') WHERE id = :id", { id: auditId });
@@ -372,11 +390,33 @@ function taskDetail(id) {
   };
 }
 
+/**
+ * Deletes a task, keeping enough to put the whole thing back.
+ *
+ * Subtasks, comments and status events are removed by ON DELETE CASCADE, and
+ * none of them were being recorded. Restoring a deleted task therefore returned
+ * an empty shell: the row came back, everything it contained did not, and the
+ * activity list still said "restored". So the copy taken here is the subtree,
+ * not the row.
+ */
 function deleteTask(id) {
   const before = rowOf("task", id);
+  if (!before) return;
+
+  // Grandchildren too. A subtask can have its own comments and history.
+  const subtaskRows = all("SELECT * FROM tasks WHERE parent_id = :id", { id });
+  const ids = [id, ...subtaskRows.map((s) => s.id)];
+  const placeholders = ids.map((_, i) => `:id${i}`).join(", ");
+  const params = Object.fromEntries(ids.map((v, i) => [`id${i}`, v]));
+
+  before.__subtasks = subtaskRows;
+  before.__comments = all(`SELECT * FROM comments WHERE task_id IN (${placeholders})`, params);
+  before.__events = all(`SELECT * FROM status_events WHERE task_id IN (${placeholders})`, params);
+
   run("DELETE FROM tasks WHERE id = :id", { id });
   record({ action: "delete", entity: "task", entityId: id,
-           summary: "deleted", label: before ? before.title : null, before });
+           summary: subtaskRows.length ? `deleted with ${subtaskRows.length} subtasks` : "deleted",
+           label: before.title, before });
 }
 
 // Notes are the memory spots.
