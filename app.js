@@ -367,7 +367,8 @@ function renderTabs() {
     ? [["oracle", "Oracle", state.oracleHits.length], ["tasks", "Matches", state.tasks.length + state.notes.length]]
     : state.projectId
     ? [["overview", "Overview"], ["tasks", "Tasks", state.tasks.length],
-       ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length]]
+       ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
+       ["activity", "Activity"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
        ["history", "History"], ["settings", "Settings"]];
 
@@ -403,7 +404,7 @@ function render() {
   const valid = state.query
     ? ["oracle", "tasks"]
     : state.projectId
-    ? ["overview", "tasks", "notes", "links"]
+    ? ["overview", "tasks", "notes", "links", "activity"]
     : ["new", "tasks", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
@@ -424,6 +425,7 @@ function render() {
     notes: renderNotes,
     links: renderLinks,
     history: renderHistory,
+    activity: renderActivity,
     settings: renderSettings,
   })[state.view];
 
@@ -1269,6 +1271,76 @@ function renderLinks(root) {
 // ---------------------------------------------------------------------------
 // History
 // ---------------------------------------------------------------------------
+
+/**
+ * What has happened inside this project, and how to put it back.
+ *
+ * The same audit trail the History tab reads, narrowed to one project. It exists
+ * because a task deleted inside a project could previously only be recovered from
+ * the All view, which is not where anyone looks after deleting something.
+ */
+async function renderActivity(root) {
+  const entries = await window.delphi.audit.project(state.projectId, 200);
+
+  if (!entries.length) {
+    root.append(emptyState("Nothing has happened here yet",
+      "Every change in this project is recorded, and every one of them can be put back."));
+    return;
+  }
+
+  const deletes = entries.filter((e) => e.action === "delete" && !e.undone && e.restorable);
+  if (deletes.length) {
+    const bar = el("div", { className: "restore-bar" });
+    bar.append(el("span", {
+      textContent: `${plural(deletes.length, "deleted item", "deleted items")} can still be restored.`,
+    }));
+    const all = el("button", { className: "btn primary sm", textContent: "Restore all" });
+    all.onclick = async () => {
+      // Oldest first, so anything that depended on something else comes back
+      // after the thing it depended on.
+      for (const e of [...deletes].reverse()) {
+        try { await window.delphi.audit.undo(e.id); } catch { /* keep going */ }
+      }
+      refresh();
+    };
+    bar.append(all);
+    root.append(bar);
+  }
+
+  const list = el("section", { className: "card" });
+  for (const e of entries) {
+    const row = el("div", {
+      className: "audit-row" + (e.undone ? " undone" : "") + (e.action === "delete" ? " deleted" : ""),
+    });
+    row.append(el("span", { className: "audit-when", textContent: ago(e.at) }));
+
+    const what = el("div", { className: "audit-what" },
+      el("div", {}, el("span", { className: `act act-${e.action}`, textContent: e.action }),
+                    el("span", { textContent: ` ${e.entity} ${e.summary}` })));
+    if (e.label) what.append(el("div", { className: "lbl", textContent: e.label.slice(0, 140) }));
+    row.append(what);
+
+    if (e.undone) {
+      row.append(el("span", { className: "chip", textContent: "restored" }));
+    } else if (e.action === "delete" && !e.restorable) {
+      // Honest rather than hopeful: with no stored copy there is nothing to put
+      // back, and a button that cannot work is worse than no button.
+      row.append(el("span", { className: "chip", textContent: "not recoverable" }));
+    } else {
+      const b = el("button", {
+        className: "btn sm" + (e.action === "delete" ? " primary" : ""),
+        textContent: e.action === "delete" ? "restore" : "undo",
+      });
+      b.onclick = async () => {
+        try { await window.delphi.audit.undo(e.id); } catch (err) { alert(err.message); }
+        refresh();
+      };
+      row.append(b);
+    }
+    list.append(row);
+  }
+  root.append(list);
+}
 
 async function renderHistory(root) {
   const bar = el("div", { className: "add-row" });

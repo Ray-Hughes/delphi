@@ -492,6 +492,26 @@
   .kind.gotcha   { color: var(--warn); background: transparent; border: 1px solid var(--warn); }
   .kind.reference{ color: var(--good); background: transparent; border: 1px solid var(--good); }
 
+  /* Project activity ------------------------------------------------------
+     The same audit trail as the History tab, narrowed to a project, because a
+     delete has to be reversible from where it happened. */
+  .restore-bar {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: var(--s3) var(--s4); margin-bottom: var(--s3);
+    border: 1px solid var(--warn); border-radius: var(--r);
+    background: color-mix(in srgb, var(--warn) 10%, var(--surface));
+    color: var(--ink);
+  }
+  .restore-bar span { flex: 1; font-weight: 550; }
+  .act {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 1px 5px; border-radius: 4px; margin-right: 6px;
+    background: var(--raised); color: var(--ink-dim);
+  }
+  .act-create { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good); }
+  .act-delete { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--crit); }
+  .audit-row.deleted { background: color-mix(in srgb, var(--crit) 5%, transparent); }
+
   /* Task sheet ------------------------------------------------------------
      Two columns: what the task is on the left, what has happened to it on the
      right. The rail is narrow on purpose, because history is glanced at and the

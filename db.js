@@ -118,6 +118,31 @@ function describeUpdate(entity, before, after) {
   return changes.length ? changes.join(", ") : "no visible change";
 }
 
+/**
+ * Everything that has happened inside one project.
+ *
+ * The audit table records what changed, not where it lived, so a project has to
+ * be worked out per row. For rows that still exist that is a lookup. For deleted
+ * ones the row is gone, and the only surviving copy of its project is inside the
+ * stored before_json, which is exactly the case someone needs most: a delete is
+ * the change people come here to reverse.
+ */
+function projectActivity(projectId, limit = 200) {
+  return all(
+    `SELECT id, at, action, entity, entity_id, summary, label, undone, undone_at,
+            CASE WHEN before_json IS NULL THEN 0 ELSE 1 END AS restorable
+     FROM audit
+     WHERE (entity = 'project' AND entity_id = :projectId)
+        OR (entity = 'task'  AND entity_id IN (SELECT id FROM tasks  WHERE project_id = :projectId))
+        OR (entity = 'note'  AND entity_id IN (SELECT id FROM notes  WHERE project_id = :projectId))
+        OR (entity = 'link'  AND entity_id IN (SELECT id FROM links  WHERE project_id = :projectId))
+        OR json_extract(COALESCE(before_json, after_json), '$.project_id') = :projectId
+     ORDER BY id DESC
+     LIMIT :limit`,
+    { projectId, limit }
+  );
+}
+
 function listAudit(limit = 100) {
   return all(
     `SELECT id, at, action, entity, entity_id, summary, label, undone, undone_at
@@ -623,7 +648,7 @@ module.exports = {
   listNotes, createNote, updateNote, deleteNote,
   listLinks, createLink, deleteLink,
   search, stats,
-  listAudit, undo, undoLast,
+  listAudit, projectActivity, undo, undoLast,
   recentItems,
   dueAlerts, listAlerts, createAlert, updateAlert, deleteAlert,
   markFired, snoozeAlert, actOnAlert,

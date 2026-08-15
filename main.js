@@ -716,6 +716,7 @@ handle("repos:delete", (id) => db.deleteRepo(id));
 
 handle("recent", (limit) => db.recentItems(limit));
 handle("audit:list", (limit) => db.listAudit(limit));
+handle("audit:project", (projectId, limit) => db.projectActivity(projectId, limit));
 handle("audit:undo", (id) => db.undo(id));
 handle("audit:undoLast", (n) => db.undoLast(n));
 

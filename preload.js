@@ -63,6 +63,7 @@ contextBridge.exposeInMainWorld("delphi", {
   },
   audit: {
     list: (limit) => call("audit:list", limit),
+    project: (projectId, limit) => call("audit:project", projectId, limit),
     undo: (id) => call("audit:undo", id),
     undoLast: (n) => call("audit:undoLast", n),
   },
