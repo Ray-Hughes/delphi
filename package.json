@@ -1,6 +1,6 @@
 {
   "name": "delphi",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A project tracker with a knowledge graph, that your AI agents keep current themselves",
   "main": "main.js",
   "author": "Ray Hughes",
