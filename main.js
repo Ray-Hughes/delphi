@@ -300,10 +300,7 @@ function createTray() {
         // shortcut the platform does not have is worse than one with none.
         label: "Quit Delphi",
         accelerator: "CmdOrCtrl+Q",
-        click: () => {
-          app.isQuitting = true;
-          app.quit();
-        },
+        click: () => app.quit(),
       },
     ])
   );
@@ -350,7 +347,7 @@ function buildMenu() {
         { type: "separator" },
         { role: "hide" }, { role: "hideOthers" }, { role: "unhide" },
         { type: "separator" },
-        { label: "Quit Delphi", accelerator: "CmdOrCtrl+Q", click: () => { app.isQuitting = true; app.quit(); } },
+        { label: "Quit Delphi", accelerator: "CmdOrCtrl+Q", click: () => app.quit() },
       ],
     });
   }
@@ -371,7 +368,7 @@ function buildMenu() {
         : [
             { label: "Settings", accelerator: "CmdOrCtrl+,", click: () => toRenderer("settings") },
             { type: "separator" },
-            { label: "Quit Delphi", accelerator: "CmdOrCtrl+Q", click: () => { app.isQuitting = true; app.quit(); } },
+            { label: "Quit Delphi", accelerator: "CmdOrCtrl+Q", click: () => app.quit() },
           ]),
     ],
   });
@@ -713,6 +710,18 @@ function startScheduler() {
 }
 
 app.on("window-all-closed", (e) => e.preventDefault());
+
+// Every route out of the app, not every button that offers one.
+//
+// Closing the window hides it rather than quitting, which is what the tray and
+// the hotkey need, and that is only correct while the app is not actually
+// quitting. The flag saying so was set by the menu items that quit. Every other
+// way out left it false: the Dock's own Quit, the Apple menu, a Command Q the
+// system handles rather than the menu. The window refused to close, the quit was
+// cancelled, and the app carried on running with no window and no explanation.
+//
+// before-quit fires for all of them, so the flag is set once, here.
+app.on("before-quit", () => { app.isQuitting = true; });
 app.on("will-quit", () => globalShortcut.unregisterAll());
 
 // ---------------------------------------------------------------------------
