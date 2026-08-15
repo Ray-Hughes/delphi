@@ -102,3 +102,9 @@ publish:
   - provider: github
     owner: Ray-Hughes
     repo: Delphi
+    # Published outright rather than left as a draft, which is the default.
+    # The download page and the README link to /releases/latest/download/, and a
+    # draft is not "latest": it is invisible to everyone without push access, so
+    # every download link on the site stays broken until someone remembers to go
+    # and press publish. Pushing a version tag is already the deliberate step.
+    releaseType: release
