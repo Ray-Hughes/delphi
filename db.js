@@ -838,8 +838,14 @@ function dueAlerts() {
   `);
 }
 
-function listAlerts({ includeFinished = true } = {}) {
-  const where = includeFinished ? "" : "WHERE a.status IN ('pending','snoozed','fired')";
+// taskId narrows to one task's reminders. Without it the sheet has to filter the
+// global list, which stops at 200 rows, and a busy database quietly drops a
+// task's older finished reminders off the end of it.
+function listAlerts({ includeFinished = true, taskId = null } = {}) {
+  const clauses = [];
+  if (!includeFinished) clauses.push("a.status IN ('pending','snoozed','fired')");
+  if (taskId) clauses.push("a.task_id = :taskId");
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   return all(`
     SELECT a.*, t.title AS task_title, t.status AS task_status, t.project_id,
            p.name AS project_name, p.colour AS project_colour
@@ -850,7 +856,7 @@ function listAlerts({ includeFinished = true } = {}) {
     ORDER BY CASE a.status WHEN 'fired' THEN 0 WHEN 'snoozed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END,
              a.fire_at DESC
     LIMIT 200
-  `);
+  `, taskId ? { taskId } : {});
 }
 
 function createAlert({ taskId, fireAt, message = null, repeatEveryMinutes = null }) {

@@ -345,6 +345,107 @@
   .ent b { font-weight: 600; }
   .ent .c { color: var(--ink-faint); font-variant-numeric: tabular-nums; margin-left: 5px; font-size: 11px; }
 
+  /* Mind map ------------------------------------------------------------
+     A colour per entity kind, mixed from the palette that is already here
+     rather than picked fresh, so the map cannot end up with a hue that only
+     works in one theme. The canvas cannot read a token, so it resolves these
+     through a probe element and follows a theme change with them. */
+  :root {
+    --graph-service: var(--good);
+    --graph-ticket:  var(--accent);
+    --graph-concept: color-mix(in srgb, var(--accent) 40%, var(--crit));
+    --graph-repo:    color-mix(in srgb, var(--good) 60%, var(--accent));
+    --graph-file:    var(--ink-faint);
+    --graph-env:     var(--warn);
+    --graph-person:  color-mix(in srgb, var(--crit) 75%, var(--warn));
+    --graph-pr:      color-mix(in srgb, var(--warn) 60%, var(--accent));
+  }
+
+  .mm-tools { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; margin-bottom: var(--s3); }
+  .mm-legend { display: flex; flex-wrap: wrap; gap: var(--s2); flex: 1; }
+  .mm-key {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; padding: 3px 9px; border-radius: 20px;
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink-dim);
+    cursor: default;
+    transition: opacity 100ms ease, border-color 100ms ease, color 100ms ease;
+  }
+  .mm-key:hover { border-color: var(--ink-faint); color: var(--ink); }
+  /* Switched off rather than removed: the count is still worth reading, and a
+     legend that loses entries as you use it stops being a legend. */
+  .mm-key.off { opacity: 0.42; }
+  .mm-key .c { color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+  .mm-swatch { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: 0 0 8px; }
+  .mm-limit { width: auto; flex: 0 0 auto; }
+
+  .mm-wrap {
+    display: grid; grid-template-columns: minmax(0, 1fr) 300px;
+    gap: var(--s4); align-items: start;
+  }
+  @media (max-width: 1000px) { .mm-wrap { grid-template-columns: 1fr; } }
+
+  .mm-stage {
+    position: relative; height: 58vh; min-height: 360px;
+    background: var(--surface); border: 1px solid var(--line-soft);
+    border-radius: var(--r); overflow: hidden;
+  }
+  .mm-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  /* The one element whose only job is to resolve a token into a colour the
+     canvas can use. */
+  .mm-probe { position: absolute; width: 0; height: 0; overflow: hidden; visibility: hidden; }
+
+  .mm-readout {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2);
+    padding: var(--s2) var(--s3);
+    background: color-mix(in srgb, var(--surface) 92%, transparent);
+    border-top: 1px solid var(--line-soft);
+    font-size: 12px; color: var(--ink-dim);
+    pointer-events: none;
+  }
+  .mm-readout:empty { display: none; }
+  .mm-readout b { color: var(--ink); font-weight: 600; }
+  .mm-kind {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--ink-faint); border: 1px solid var(--line); border-radius: 20px; padding: 1px 7px;
+  }
+
+  .mm-panel {
+    background: var(--surface); border: 1px solid var(--line-soft);
+    border-radius: var(--r); padding: var(--s3) var(--s4) var(--s4);
+    max-height: 58vh; overflow-y: auto;
+  }
+  .mm-panel .side-label { padding-left: 0; }
+  .mm-panel .empty { padding: var(--s5) 0; text-align: left; }
+  .mm-head { display: flex; align-items: flex-start; gap: var(--s2); }
+  .mm-head h3 { margin: 0; font-size: 15px; font-weight: 600; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .mm-search { width: 100%; margin-top: var(--s3); }
+  .mm-note { margin-top: var(--s2); }
+
+  .mm-list { display: flex; flex-direction: column; gap: 3px; }
+  .mm-row {
+    display: flex; align-items: center; gap: var(--s2); width: 100%; text-align: left;
+    padding: 6px var(--s2); border-radius: var(--r-sm);
+    border: 1px solid transparent; background: transparent; color: inherit; cursor: default;
+    transition: background 100ms ease;
+  }
+  .mm-row:hover { background: var(--raised); }
+  .mm-row .c { color: var(--ink-faint); font-variant-numeric: tabular-nums; font-size: 11px; }
+  .mm-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; }
+
+  .mm-item { padding: var(--s2) var(--s3); border: 1px solid var(--line-soft); border-radius: var(--r-sm); }
+  .mm-item.clickable { cursor: default; transition: border-color 100ms ease, background 100ms ease; }
+  .mm-item.clickable:hover, .mm-item.clickable:focus-visible { border-color: var(--accent); background: var(--raised); }
+  .mm-item-title { line-height: 1.45; }
+  /* The sentence the edge was drawn from. It is the reason to believe the edge,
+     so it is quoted rather than summarised. */
+  .mm-ev {
+    margin-top: 5px; font-size: 11.5px; color: var(--ink-faint);
+    border-left: 2px solid var(--line); padding-left: var(--s2);
+  }
+
+  .mm-foot { margin-top: var(--s2); }
+
   /* Dashboard ------------------------------------------------------------ */
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--s3); margin-bottom: var(--s5); }
   .stat {
@@ -1220,6 +1321,65 @@
   /* The epic chip in the task sheet, alongside status, priority and the rest.
      Named to sit with the other .tone-* rules further up the file. */
   .tone-epic { border-color: var(--ink-faint); }
+
+  /* Reminders -------------------------------------------------------------
+     One row shape for both places a reminder is shown, the list and the task
+     sheet, so the same thing does not look like two. The time leads, because
+     when it fires is the only question a reminder is ever asked. */
+  .rem-row {
+    display: flex; gap: var(--s3); align-items: flex-start;
+    padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line-soft);
+    transition: background 100ms ease;
+  }
+  .rem-row:last-child { border-bottom: 0; }
+  .rem-row:hover { background: var(--raised); }
+  /* Dealt with, so still readable and no longer competing for attention. */
+  .rem-row.spent { opacity: 0.55; }
+
+  .rem-dot {
+    width: 8px; height: 8px; border-radius: 99px; flex: 0 0 8px; margin-top: 6px;
+    background: var(--ink-faint);
+  }
+  .rem-dot.st-pending   { background: var(--accent); }
+  .rem-dot.st-snoozed   { background: var(--warn); }
+  .rem-dot.st-done      { background: var(--good); }
+  .rem-dot.st-dismissed { background: var(--ink-faint); }
+  /* Ringing carries a halo rather than an animation: it has to read as urgent
+     from the corner of the eye without moving while someone is trying to work. */
+  .rem-dot.st-fired {
+    background: var(--crit);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--crit) 22%, transparent);
+  }
+
+  .rem-when { flex: 0 0 132px; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .rem-rel { font-weight: 600; font-size: 12.5px; }
+  .rem-row.spent .rem-rel { font-weight: 500; color: var(--ink-dim); }
+
+  .rem-body { flex: 1; min-width: 0; }
+  .rem-title { line-height: 1.45; }
+  .rem-sub {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    margin-top: 4px; color: var(--ink-faint); font-size: 11.5px;
+  }
+
+  .rem-actions { display: flex; gap: var(--s1); align-items: center; flex: 0 0 auto; opacity: 0; transition: opacity 100ms ease; }
+  .rem-row:hover .rem-actions, .rem-row:focus-within .rem-actions { opacity: 1; }
+  /* The delete cross is shared with comments, where it hides until the row is
+     hovered. The row above already does that, so it stays visible inside it. */
+  .rem-row .ts-kill { opacity: 1; }
+
+  /* Setting one. The time field and the shortcuts sit together rather than one
+     replacing the other, so "tomorrow morning" is a click and half past four on
+     Thursday is still reachable without leaving the row. */
+  .rem-set {
+    margin-top: var(--s4); padding: var(--s3);
+    border: 1px dashed var(--line); border-radius: var(--r);
+    display: flex; flex-direction: column; gap: var(--s2);
+  }
+  .rem-set .field { width: auto; }
+  .rem-set .row > input[type="datetime-local"] { flex: 0 0 auto; }
+  .rem-set .row > input[type="text"], .rem-set .row > input:not([type]) { flex: 1; min-width: 0; }
+  .rem-set select.field { flex: 0 0 auto; }
 
   /* Quick look: read the task without opening it */
   .qlook {

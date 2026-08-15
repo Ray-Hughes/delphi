@@ -21,6 +21,9 @@ const state = {
   // them, "none" is the work that is in none.
   epicFilter: null,
   allTasks: [],
+  // Every reminder, live and spent, so the tab badge and the task sheet come
+  // from one read rather than one each.
+  alerts: [],
   // Where we have been, so Back can return. Holds the whole position rather than
   // just the project, because returning to the right project on the wrong tab is
   // not returning.
@@ -221,6 +224,7 @@ function ago(iso) {
 
 async function refresh() {
   state.projects = await window.delphi.projects.list();
+  state.alerts = await loadAlerts();
 
   if (state.query) {
     const { tasks, notes } = await window.delphi.search(state.query);
@@ -377,6 +381,8 @@ function renderTabs() {
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
        ["activity", "Activity"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
+       ["graph", "Mind map"],
+       ["reminders", "Reminders", liveAlerts(state.alerts).length],
        ["history", "History"], ["settings", "Settings"]];
 
   for (const [key, label, count] of tabs) {
@@ -412,7 +418,7 @@ function render() {
     ? ["oracle", "tasks"]
     : state.projectId
     ? ["overview", "tasks", "notes", "links", "activity"]
-    : ["new", "tasks", "history", "settings"];
+    : ["new", "tasks", "graph", "reminders", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
   // Hidden rather than disabled when there is nowhere to go: a button that is
@@ -422,8 +428,15 @@ function render() {
   renderMetrics();
   renderTabs();
 
-  const content = $("content");
-  content.textContent = "";
+  // Replaced rather than emptied, so that a slow async view cannot paint into a
+  // pane that has moved on. Several views await an IPC call before appending,
+  // and two renders close together would otherwise both append to the one
+  // element: the second finishes first, the first lands on top of it, and the
+  // view appears twice. Anything still holding the old node now writes into a
+  // detached element that nobody sees.
+  const previous = $("content");
+  const content = el("div", { className: previous.className, id: "content" });
+  previous.replaceWith(content);
   const view = ({
     new: renderWhatsNew,
     oracle: renderOracle,
@@ -431,6 +444,8 @@ function render() {
     tasks: renderTasks,
     notes: renderNotes,
     links: renderLinks,
+    graph: renderMindMap,
+    reminders: renderReminders,
     history: renderHistory,
     activity: renderActivity,
     settings: renderSettings,
@@ -876,6 +891,804 @@ function renderOracle(root) {
       cloud.append(chip);
     }
     root.append(cloud);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mind map: the knowledge graph, drawn
+//
+// The entities and edges tables have been there since the Oracle was built and
+// nothing has ever shown them. This is the picture: entities as nodes, the
+// stored co-occurrence edges as links, sized by how often each thing is
+// mentioned.
+//
+// Three decisions keep it readable at the size the graph actually is (111
+// entities and 733 co-occurrence edges here, which drawn naively is a grey
+// hairball):
+//
+//   Limit.   Only the strongest N entities are drawn, N chosen in the toolbar.
+//            Everything past the cut is counted, not drawn, because a node with
+//            one mention adds a dot and no information.
+//   Thin.    An edge survives only if it is among the strongest few links of at
+//            least one of its endpoints. That keeps the shape of the graph, and
+//            the ones it drops are the weak pairs that made the mesh.
+//   Cluster. Layout is grouped by entity kind, so services sit with services and
+//            tickets with tickets. Colour says the same thing twice, which is
+//            what makes the picture scannable before anything is hovered.
+//
+// The layout settles once and then holds still. A drifting graph is pleasant at
+// fifteen nodes and unusable at a hundred: labels smear and every target moves
+// while you aim at it. The only thing that moves afterwards is the single node
+// nearest the pointer, which leans towards it to make itself easier to hit.
+// ---------------------------------------------------------------------------
+
+// Kind order, label, and the token each kind draws with. Canvas needs a literal
+// colour, so these are token names resolved through the DOM rather than values
+// copied out of the stylesheet, and the map follows a theme change for free.
+const MIND_MAP_KINDS = [
+  ["service", "Services", "--graph-service"],
+  ["ticket", "Tickets", "--graph-ticket"],
+  ["concept", "Concepts", "--graph-concept"],
+  ["repo", "Repos", "--graph-repo"],
+  ["file", "Files", "--graph-file"],
+  ["env", "Environments", "--graph-env"],
+  ["person", "People", "--graph-person"],
+  ["pr", "Pull requests", "--graph-pr"],
+];
+
+const MIND_MAP_LIMITS = [40, 60, 100, 250];
+
+const kindToken = (kind) => {
+  const found = MIND_MAP_KINDS.find(([k]) => k === kind);
+  return found ? found[2] : "--ink-faint";
+};
+
+// Kept outside `state` because it survives a repaint of the view and nothing
+// else in the app reads it. The graph is fetched once and reused, so switching
+// tabs does not refetch and relayout.
+const mindMap = {
+  data: null,        // { nodes, edges, total, partial }
+  error: null,
+  limit: 60,
+  hidden: new Set(), // kinds switched off in the legend
+  selected: null,    // entity name
+  context: null,     // the oracle:context payload for the selection
+  contextError: null,
+};
+
+/**
+ * The whole entity graph, or as much of it as the bridge can give.
+ *
+ * The direct call is one query and the honest answer. Without it the view falls
+ * back to expanding the strongest entities through oracle:context, which is a
+ * real graph but only the part reachable in one hop from the top twelve, so it
+ * says so rather than passing itself off as the whole thing.
+ */
+async function loadGraphData() {
+  if (window.delphi.oracle.graph) {
+    const data = await window.delphi.oracle.graph({ limit: 250 });
+    return { nodes: data.nodes, edges: data.edges, total: data.total, partial: false };
+  }
+
+  const { top } = await window.delphi.oracle.stats();
+  const seeds = await Promise.all(top.map((t) => window.delphi.oracle.context(t.name).catch(() => null)));
+
+  const nodes = new Map();
+  const edges = [];
+  const keep = (e) => {
+    if (!e || !e.id) return null;
+    if (!nodes.has(e.id)) nodes.set(e.id, { id: e.id, kind: e.kind, name: e.name, mentions: e.mentions || 1 });
+    return nodes.get(e.id);
+  };
+
+  for (const ctx of seeds) {
+    if (!ctx || !ctx.entity) continue;
+    const from = keep(ctx.entity);
+    for (const r of ctx.related || []) {
+      const to = keep(r);
+      if (to) edges.push({ a: from.id, b: to.id, weight: r.weight || 1 });
+    }
+  }
+  return { nodes: [...nodes.values()], edges, total: nodes.size, partial: true };
+}
+
+/** The nodes the current limit and legend leave on screen, strongest first. */
+function mindMapVisible() {
+  const all = (mindMap.data && mindMap.data.nodes) || [];
+  return all
+    .filter((n) => !mindMap.hidden.has(n.kind))
+    .sort((a, b) => b.mentions - a.mentions || a.name.localeCompare(b.name))
+    .slice(0, mindMap.limit);
+}
+
+/**
+ * Drops every edge that is not one of the strongest few at either end.
+ *
+ * Taken in descending weight, an edge is kept while either endpoint still has
+ * room. That is what leaves a skeleton rather than a mesh: a node's important
+ * links survive even when its neighbour is already full, and the weak pairs that
+ * every entity has with every other entity never get drawn.
+ */
+function thinEdges(nodes, edges, perNode, cap) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const degree = new Map();
+  const kept = new Map();
+
+  const candidates = edges
+    .filter((e) => byId.has(e.a) && byId.has(e.b) && e.a !== e.b)
+    .sort((x, y) => y.weight - x.weight);
+
+  for (const e of candidates) {
+    const key = e.a < e.b ? `${e.a}:${e.b}` : `${e.b}:${e.a}`;
+    if (kept.has(key)) continue;
+    const da = degree.get(e.a) || 0;
+    const db = degree.get(e.b) || 0;
+    if (da >= perNode && db >= perNode) continue;
+    kept.set(key, { a: byId.get(e.a), b: byId.get(e.b), weight: e.weight });
+    degree.set(e.a, da + 1);
+    degree.set(e.b, db + 1);
+    if (kept.size >= cap) break;
+  }
+  return [...kept.values()];
+}
+
+/**
+ * Relaxes the layout in place.
+ *
+ * Position based rather than velocity based, and run to completion before the
+ * first frame, so the picture that appears is the finished one. Cooling means
+ * the early passes untangle and the late ones only tidy.
+ */
+function relaxLayout(nodes, links, W, H, ticks) {
+  // How much room each node can expect. Fixed distances jam a hundred nodes into
+  // the middle and leave sixty adrift, so both the separation the nodes want and
+  // the length a link settles at come from the space there actually is.
+  const room = Math.sqrt((W * H) / Math.max(nodes.length, 1));
+  const apart = Math.min(1.9, room / 40);
+  const rest = Math.min(62, room * 0.8);
+
+  for (let step = 0; step < ticks; step++) {
+    const cool = 0.15 + 0.85 * (1 - step / ticks);
+
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        const d = Math.hypot(dx, dy) || 0.01;
+        const want = (a.r + b.r + 26) * apart;
+        if (d < want) {
+          const push = ((want - d) / d) * 0.2 * cool;
+          dx *= push; dy *= push;
+          a.x -= dx; a.y -= dy;
+          b.x += dx; b.y += dy;
+        }
+      }
+    }
+
+    for (const l of links) {
+      let dx = l.b.x - l.a.x;
+      let dy = l.b.y - l.a.y;
+      const d = Math.hypot(dx, dy) || 0.01;
+      const want = rest + l.a.r + l.b.r;
+      const pull = ((d - want) / d) * 0.055 * l.k * cool;
+      dx *= pull; dy *= pull;
+      l.a.x += dx; l.a.y += dy;
+      l.b.x -= dx; l.b.y -= dy;
+    }
+
+    for (const n of nodes) {
+      // Cluster gravity is the strongest force here on purpose. Left to the
+      // links alone every kind ends up in one blob around the busiest entity,
+      // and the grouping that makes the picture legible disappears.
+      n.x += (n.cx - n.x) * 0.06 * cool;
+      n.y += (n.cy - n.y) * 0.06 * cool;
+      // Labels sit above a node, so the top margin is deeper than the others.
+      n.x = Math.max(n.r + 14, Math.min(W - n.r - 14, n.x));
+      n.y = Math.max(n.r + 26, Math.min(H - n.r - 12, n.y));
+    }
+  }
+}
+
+/**
+ * Centres the settled layout and opens it out to use the stage.
+ *
+ * Where a graph lands depends on which kinds happen to be in it, so without this
+ * the picture drifts into a corner and half the panel is white space. Positions
+ * are scaled but radii are not, so the gaps only ever grow.
+ */
+function fitToStage(nodes, W, H) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const n of nodes) {
+    x0 = Math.min(x0, n.x - n.r); y0 = Math.min(y0, n.y - n.r);
+    x1 = Math.max(x1, n.x + n.r); y1 = Math.max(y1, n.y + n.r);
+  }
+  const pad = 34;
+  const width = Math.max(x1 - x0, 1);
+  const height = Math.max(y1 - y0, 1);
+  // Never below 1: the relaxation already respects the edges of the stage, and
+  // shrinking to reach the padding would close the gaps it worked to open.
+  const scale = Math.max(1, Math.min((W - pad * 2) / width, (H - pad * 2) / height, 1.4));
+  const cx = (x0 + x1) / 2;
+  const cy = (y0 + y1) / 2;
+  for (const n of nodes) {
+    n.x = W / 2 + (n.x - cx) * scale;
+    n.y = H / 2 + (n.y - cy) * scale;
+    n.x = Math.max(n.r + 14, Math.min(W - n.r - 14, n.x));
+    n.y = Math.max(n.r + 26, Math.min(H - n.r - 12, n.y));
+  }
+}
+
+/** rgb(a, b, c) with an alpha put on it. */
+function fadeColour(colour, a) {
+  const parts = String(colour).match(/[\d.]+/g);
+  if (!parts || parts.length < 3) return colour;
+  return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${a})`;
+}
+
+async function renderMindMap(root) {
+  if (!mindMap.data && !mindMap.error) {
+    try {
+      mindMap.data = await loadGraphData();
+    } catch (error) {
+      mindMap.error = String(error.message || error);
+    }
+  }
+
+  const bar = el("div", { className: "oracle-bar" });
+  bar.append(el("div", { className: "hint grow", textContent:
+    "Everything the notes and tasks mention, and what appears alongside what. Hover to name a thing and its connections, click to open it." }));
+
+  const rebuild = el("button", { className: "btn sm", textContent: "Rebuild" });
+  rebuild.title = "Read the notes and tasks again and rebuild the graph from them";
+  rebuild.onclick = async () => {
+    rebuild.disabled = true;
+    try {
+      await window.delphi.oracle.rebuild();
+      mindMap.data = null;
+      mindMap.error = null;
+      mindMap.selected = null;
+      mindMap.context = null;
+    } catch (error) {
+      mindMap.error = String(error.message || error);
+    }
+    render();
+  };
+  bar.append(rebuild);
+  root.append(bar);
+
+  if (mindMap.error) {
+    root.append(emptyState("The graph could not be read", mindMap.error));
+    return;
+  }
+
+  const all = mindMap.data.nodes;
+  if (!all.length) {
+    root.append(emptyState("Nothing in the graph yet",
+      "Rebuild reads every note and task and extracts what they mention."));
+    return;
+  }
+
+  // --- toolbar -------------------------------------------------------------
+  const tools = el("div", { className: "mm-tools" });
+
+  const counts = new Map();
+  for (const n of all) counts.set(n.kind, (counts.get(n.kind) || 0) + 1);
+
+  const legend = el("div", { className: "mm-legend", role: "group" });
+  legend.setAttribute("aria-label", "Entity kinds");
+  for (const [kind, label, token] of MIND_MAP_KINDS) {
+    if (!counts.get(kind)) continue;
+    const off = mindMap.hidden.has(kind);
+    const chip = el("button", { className: "mm-key" + (off ? " off" : ""), type: "button" });
+    chip.setAttribute("aria-pressed", String(!off));
+    chip.append(
+      el("i", { className: "mm-swatch", style: `background: var(${token})` }),
+      el("span", { textContent: label }),
+      el("span", { className: "c", textContent: String(counts.get(kind)) })
+    );
+    chip.title = off ? `Show ${label.toLowerCase()}` : `Hide ${label.toLowerCase()}`;
+    chip.onclick = () => {
+      if (off) mindMap.hidden.delete(kind);
+      else mindMap.hidden.add(kind);
+      render();
+    };
+    legend.append(chip);
+  }
+  tools.append(legend);
+
+  const limit = el("select", { className: "field mm-limit" });
+  limit.setAttribute("aria-label", "How many entities to draw");
+  const steps = MIND_MAP_LIMITS.filter((n) => n < all.length);
+  steps.push(all.length);
+  // "All" only when it really is all of them. The bridge caps what it sends, so
+  // on a bigger graph than that cap the last option is still a top slice.
+  const everything = !mindMap.data.total || mindMap.data.total <= all.length;
+  for (const n of steps) {
+    limit.append(el("option", {
+      value: String(n),
+      textContent: n === all.length && everything ? `All ${n}` : `Top ${n}`,
+      selected: Math.min(mindMap.limit, all.length) === n,
+    }));
+  }
+  limit.onchange = () => { mindMap.limit = Number(limit.value); render(); };
+  tools.append(limit);
+  root.append(tools);
+
+  // --- the two panes -------------------------------------------------------
+  const wrap = el("div", { className: "mm-wrap" });
+  const stage = el("div", { className: "mm-stage" });
+  const canvas = el("canvas", { className: "mm-canvas" });
+  canvas.setAttribute("role", "img");
+  const probe = el("span", { className: "mm-probe" });
+  probe.setAttribute("aria-hidden", "true");
+  const readout = el("div", { className: "mm-readout" });
+  stage.append(canvas, probe, readout);
+  wrap.append(stage);
+
+  const panel = el("aside", { className: "mm-panel" });
+  wrap.append(panel);
+  root.append(wrap);
+
+  const visible = mindMapVisible();
+  const known = mindMap.data.total || all.length;
+  const hiddenCount = known - visible.length;
+  canvas.setAttribute("aria-label", `Knowledge graph, ${visible.length} of ${known} entities drawn`);
+
+  if (!visible.length) {
+    stage.replaceChildren(emptyState("Every kind is switched off", "Turn one back on above."));
+  }
+
+  const foot = el("div", { className: "mm-foot hint" });
+  foot.append(
+    `${plural(visible.length, "entity", "entities")} drawn`,
+    hiddenCount > 0 ? `, ${hiddenCount} left out by the limit and the legend` : "",
+    mindMap.data.partial
+      ? ". Partial view: the strongest entities and what they connect to."
+      : ""
+  );
+  root.append(foot);
+
+  // --- the graph -----------------------------------------------------------
+  if (!visible.length) {
+    paintPanel(panel, null);
+    return;
+  }
+
+  const links = thinEdges(visible, mindMap.data.edges || [], 3, 320);
+  const maxWeight = links.reduce((m, l) => Math.max(m, l.weight), 1);
+  for (const l of links) l.k = 0.35 + 0.65 * (l.weight / maxWeight);
+
+  const adjacency = new Map(visible.map((n) => [n, new Set()]));
+  for (const l of links) {
+    adjacency.get(l.a).add(l.b);
+    adjacency.get(l.b).add(l.a);
+  }
+
+  const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let hover = null;
+  let named = null;   // what the readout is currently saying, so it is not rewritten every frame
+
+  const select = async (name) => {
+    mindMap.selected = name;
+    mindMap.context = null;
+    mindMap.contextError = null;
+    paintPanel(panel, select);
+    requestDraw();
+    const token = name;
+    try {
+      const ctx = await window.delphi.oracle.context(name);
+      if (mindMap.selected !== token) return;   // a second click landed while this was in flight
+      mindMap.context = ctx;
+    } catch (error) {
+      if (mindMap.selected !== token) return;
+      mindMap.contextError = String(error.message || error);
+    }
+    paintPanel(panel, select);
+    requestDraw();
+  };
+
+  const ctx2d = canvas.getContext("2d");
+  let W = 0;
+  let H = 0;
+  let palette = null;
+  let fontStack = "system-ui, sans-serif";
+  let dirty = true;
+  let frame = 0;
+
+  const requestDraw = () => { dirty = true; };
+
+  const colours = () => {
+    if (palette) return palette;
+    const read = (token) => {
+      probe.style.color = `var(${token})`;
+      return getComputedStyle(probe).color;
+    };
+    fontStack = getComputedStyle(probe).fontFamily || fontStack;
+    palette = {
+      ink: read("--ink"),
+      dim: read("--ink-dim"),
+      faint: read("--ink-faint"),
+      surface: read("--surface"),
+      accent: read("--accent"),
+      line: read("--line"),
+      kind: Object.fromEntries(MIND_MAP_KINDS.map(([kind, , token]) => [kind, read(token)])),
+    };
+    return palette;
+  };
+
+  const layout = () => {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = stage.clientWidth;
+    const h = stage.clientHeight;
+    // The observer fires once on its own as well as on a real resize, and
+    // settling the layout again for the same box would throw away a picture the
+    // reader is already looking at.
+    if (!w || !h || (w === W && h === H)) return;
+    W = w;
+    H = h;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Ring order comes from the kind table rather than from the data, so the
+    // same kind sits in the same place whatever the limit is set to.
+    const kinds = MIND_MAP_KINDS.map(([k]) => k).filter((k) => visible.some((n) => n.kind === k));
+    const strongest = visible[0].mentions || 1;
+    const many = kinds.length > 1 ? 1 : 0;
+
+    visible.forEach((n, i) => {
+      const group = kinds.indexOf(n.kind);
+      const angle = -Math.PI / 2 + (group / kinds.length) * Math.PI * 2;
+      n.cx = W / 2 + Math.cos(angle) * W * 0.31 * many;
+      n.cy = H / 2 + Math.sin(angle) * H * 0.32 * many;
+      // Seeded placement, not random: the same graph settles the same way every
+      // time, so it can be recognised rather than relearned on each visit.
+      const golden = i * 2.399963;
+      n.x = n.cx + Math.cos(golden) * (18 + (i % 7) * 9);
+      n.y = n.cy + Math.sin(golden) * (18 + (i % 5) * 9);
+      n.r = 5 + 10 * Math.sqrt(n.mentions / strongest);
+      n.ox = 0;
+      n.oy = 0;
+    });
+
+    relaxLayout(visible, links, W, H, 260);
+    fitToStage(visible, W, H);
+    requestDraw();
+  };
+
+  const nodeAt = (px, py) => {
+    let found = null;
+    let best = Infinity;
+    for (const n of visible) {
+      const d = Math.hypot(n.x + n.ox - px, n.y + n.oy - py);
+      // A generous reach, because an eight pixel circle is a target you aim at
+      // rather than one you can simply arrive at.
+      if (d < n.r + 16 && d < best) { best = d; found = n; }
+    }
+    return found;
+  };
+
+  const pointer = { x: -9999, y: -9999, inside: false };
+
+  const draw = () => {
+    if (!W || !H) return;
+    const c = colours();
+    const selected = mindMap.selected
+      ? visible.find((n) => n.name === mindMap.selected) || null
+      : null;
+    const focus = hover || selected;
+    const near = focus ? adjacency.get(focus) : null;
+
+    ctx2d.clearRect(0, 0, W, H);
+    ctx2d.lineCap = "round";
+
+    for (const l of links) {
+      const lit = focus && (l.a === focus || l.b === focus);
+      if (lit) {
+        ctx2d.strokeStyle = fadeColour(c.accent, 0.65);
+        ctx2d.lineWidth = 1 + l.k * 1.6;
+      } else if (focus) {
+        ctx2d.strokeStyle = fadeColour(c.faint, 0.09);
+        ctx2d.lineWidth = 0.7;
+      } else {
+        ctx2d.strokeStyle = fadeColour(c.faint, 0.3);
+        ctx2d.lineWidth = 0.6 + l.k * 0.8;
+      }
+      ctx2d.beginPath();
+      ctx2d.moveTo(l.a.x + l.a.ox, l.a.y + l.a.oy);
+      ctx2d.lineTo(l.b.x + l.b.ox, l.b.y + l.b.oy);
+      ctx2d.stroke();
+    }
+
+    for (const n of visible) {
+      const dim = focus && n !== focus && !near.has(n);
+      const x = n.x + n.ox;
+      const y = n.y + n.oy;
+      ctx2d.globalAlpha = dim ? 0.22 : 1;
+      ctx2d.fillStyle = c.kind[n.kind] || c.dim;
+      ctx2d.beginPath();
+      ctx2d.arc(x, y, n.r * (n === focus ? 1.18 : 1), 0, Math.PI * 2);
+      ctx2d.fill();
+
+      if (n === selected || n === hover) {
+        ctx2d.strokeStyle = n === selected ? c.accent : fadeColour(c.ink, 0.55);
+        ctx2d.lineWidth = n === selected ? 2 : 1.2;
+        ctx2d.beginPath();
+        ctx2d.arc(x, y, n.r + 5, 0, Math.PI * 2);
+        ctx2d.stroke();
+      }
+      ctx2d.globalAlpha = 1;
+    }
+
+    // Labels where they earn their place. With nothing held, the anchors of the
+    // graph are named; holding a node names it and everything it connects to,
+    // because "what is this connected to" answered with unlabelled lines is not
+    // an answer.
+    const labelled = new Set();
+    if (focus) {
+      labelled.add(focus);
+      for (const n of near) labelled.add(n);
+      if (selected) labelled.add(selected);
+    } else {
+      visible.slice(0, 8).forEach((n) => labelled.add(n));
+    }
+
+    // Most important first, because the loser of an overlap is the one that gets
+    // dropped and two names written over each other are worth less than one.
+    const order = [...labelled].sort((a, b) =>
+      (b === focus) - (a === focus) || b.mentions - a.mentions);
+    const plates = [];
+
+    for (const n of order) {
+      const strong = n === focus || n === selected;
+      const y = n.y + n.oy - n.r - 9;
+      ctx2d.font = `${strong ? 600 : 500} ${strong ? 12.5 : 11.5}px ${fontStack}`;
+      ctx2d.textAlign = "center";
+      ctx2d.textBaseline = "alphabetic";
+
+      // A plate behind the text, or a label lands on top of an edge and neither
+      // is readable.
+      const w = ctx2d.measureText(n.name).width;
+      // File paths are long enough to run off the side, so a label near an edge
+      // slides back in rather than being cut in half.
+      const x = Math.max(w / 2 + 6, Math.min(W - w / 2 - 6, n.x + n.ox));
+      const plate = { x: x - w / 2 - 4, y: y - 11, w: w + 8, h: 15 };
+      const clash = plates.some((p) =>
+        plate.x < p.x + p.w && plate.x + plate.w > p.x &&
+        plate.y < p.y + p.h && plate.y + plate.h > p.y);
+      if (clash && !strong) continue;
+      plates.push(plate);
+
+      ctx2d.fillStyle = fadeColour(c.surface, focus ? 0.92 : 0.78);
+      ctx2d.fillRect(plate.x, plate.y, plate.w, plate.h);
+      ctx2d.fillStyle = strong ? c.ink : c.dim;
+      ctx2d.fillText(n.name, x, y);
+    }
+
+    // The readout says in words what the picture says in dots, which is also the
+    // only version of it a screen reader can reach.
+    const wanted = focus ? focus.name : null;
+    if (wanted !== named) {
+      named = wanted;
+      readout.textContent = "";
+      if (focus) {
+        const neighbours = [...adjacency.get(focus)].sort((a, b) => b.mentions - a.mentions);
+        readout.append(el("b", { textContent: focus.name }));
+        readout.append(el("span", { className: "mm-kind", textContent: focus.kind }));
+        readout.append(el("span", { textContent: `${plural(focus.mentions, "mention", "mentions")}` }));
+        readout.append(el("span", {
+          textContent: neighbours.length
+            ? `connects to ${neighbours.slice(0, 6).map((n) => n.name).join(", ")}${neighbours.length > 6 ? ` and ${neighbours.length - 6} more` : ""}`
+            : "no drawn connections at this limit",
+        }));
+      }
+    }
+  };
+
+  const tick = () => {
+    if (!canvas.isConnected) { teardown(); return; }
+    frame = requestAnimationFrame(tick);
+
+    if (!still) {
+      // Only one node is magnetic, and it is the one already under the pointer.
+      // Making everything flee the cursor is fun for a second and then makes the
+      // graph impossible to click.
+      const magnet = pointer.inside ? hover : null;
+      for (const n of visible) {
+        const tx = magnet === n ? (pointer.x - n.x) * 0.28 : 0;
+        const ty = magnet === n ? (pointer.y - n.y) * 0.28 : 0;
+        const nx = n.ox + (Math.max(-14, Math.min(14, tx)) - n.ox) * 0.18;
+        const ny = n.oy + (Math.max(-14, Math.min(14, ty)) - n.oy) * 0.18;
+        if (Math.abs(nx - n.ox) > 0.05 || Math.abs(ny - n.oy) > 0.05) dirty = true;
+        n.ox = nx;
+        n.oy = ny;
+      }
+    }
+
+    if (!dirty) return;
+    dirty = false;
+    draw();
+  };
+
+  const onMove = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    pointer.x = e.clientX - rect.left;
+    pointer.y = e.clientY - rect.top;
+    pointer.inside = true;
+    const next = nodeAt(pointer.x, pointer.y);
+    if (next !== hover) {
+      hover = next;
+      canvas.style.cursor = hover ? "pointer" : "default";
+      dirty = true;
+    }
+  };
+  const onLeave = () => {
+    pointer.inside = false;
+    pointer.x = -9999;
+    pointer.y = -9999;
+    if (hover) { hover = null; canvas.style.cursor = "default"; dirty = true; }
+  };
+  const onClick = () => { if (hover) select(hover.name); };
+
+  const resize = new ResizeObserver(() => layout());
+  // A theme change repaints nothing by itself, and the canvas holds resolved
+  // colours rather than tokens, so both routes into a theme change invalidate them.
+  const themeWatch = new MutationObserver(() => { palette = null; dirty = true; });
+  const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+  const onSystemTheme = () => { palette = null; dirty = true; };
+
+  function teardown() {
+    cancelAnimationFrame(frame);
+    resize.disconnect();
+    themeWatch.disconnect();
+    systemTheme.removeEventListener("change", onSystemTheme);
+    canvas.removeEventListener("pointermove", onMove);
+    canvas.removeEventListener("pointerleave", onLeave);
+    canvas.removeEventListener("click", onClick);
+  }
+
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerleave", onLeave);
+  canvas.addEventListener("click", onClick);
+  resize.observe(stage);
+  themeWatch.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  systemTheme.addEventListener("change", onSystemTheme);
+
+  layout();
+  paintPanel(panel, select);
+  // The loop runs even under reduced motion, where it moves nothing: it is what
+  // notices the view has been replaced and takes the observers down with it.
+  frame = requestAnimationFrame(tick);
+}
+
+/**
+ * The side panel: what the selected entity connects to.
+ *
+ * Everything here is reachable by keyboard, which the canvas is not. With
+ * nothing selected it lists the strongest entities as buttons, so the graph has
+ * a text equivalent rather than being a picture with a mouse-only door.
+ */
+function paintPanel(panel, select) {
+  panel.textContent = "";
+
+  if (!mindMap.selected) {
+    panel.append(el("div", { className: "side-label", textContent: "Strongest entities" }));
+    const list = el("div", { className: "mm-list" });
+    for (const n of mindMapVisible().slice(0, 12)) {
+      const row = el("button", { className: "mm-row", type: "button" });
+      row.append(
+        el("span", { className: "mm-dot", style: `background: var(${kindToken(n.kind)})` }),
+        el("span", { className: "grow", textContent: n.name }),
+        el("span", { className: "c", textContent: String(n.mentions) })
+      );
+      row.onclick = () => select && select(n.name);
+      list.append(row);
+    }
+    panel.append(list);
+    panel.append(el("div", { className: "hint mm-note", textContent:
+      "Pick one to see the notes and tasks it came from." }));
+    return;
+  }
+
+  const head = el("div", { className: "mm-head" });
+  head.append(el("h3", { textContent: mindMap.selected }));
+  const close = el("button", { className: "btn sm", textContent: "Clear" });
+  close.onclick = () => { mindMap.selected = null; mindMap.context = null; paintPanel(panel, select); };
+  head.append(close);
+  panel.append(head);
+
+  const ctx = mindMap.context;
+  if (mindMap.contextError) {
+    panel.append(emptyState("Could not open that", mindMap.contextError));
+    return;
+  }
+  if (!ctx) {
+    panel.append(el("div", { className: "hint mm-note", textContent: "Reading the graph…" }));
+    return;
+  }
+  if (!ctx.entity) {
+    panel.append(emptyState("Nothing stored for that", "It may have been dropped by the last rebuild."));
+    return;
+  }
+
+  const meta = el("div", { className: "t-meta" });
+  meta.append(el("span", { className: "chip", textContent: ctx.entity.kind }));
+  meta.append(el("span", { className: "hint", textContent: plural(ctx.entity.mentions, "mention", "mentions") }));
+  panel.append(meta);
+
+  const search = el("button", { className: "btn sm mm-search", textContent: "Ask the Oracle about this" });
+  search.onclick = () => {
+    $("search").value = ctx.entity.name;
+    navigate({ query: ctx.entity.name, view: "oracle" });
+  };
+  panel.append(search);
+
+  if (ctx.projects && ctx.projects.length) {
+    panel.append(el("div", { className: "side-label", textContent: "Projects" }));
+    const row = el("div", { className: "entity-cloud" });
+    for (const p of ctx.projects) {
+      const chip = el("div", { className: "ent" }, el("b", { textContent: p.name }));
+      chip.onclick = () => navigate({ projectId: p.id, view: "overview" });
+      row.append(chip);
+    }
+    panel.append(row);
+  }
+
+  const openIn = (projectName, view) => {
+    const project = state.projects.find((p) => p.name === projectName);
+    if (project) navigate({ projectId: project.id, view });
+  };
+
+  const section = (label, rows, view) => {
+    if (!rows || !rows.length) return;
+    panel.append(el("div", { className: "side-label", textContent: label }));
+    const list = el("div", { className: "mm-list" });
+    for (const r of rows.slice(0, 8)) {
+      const row = el("div", { className: "mm-item" });
+      row.append(el("div", { className: "mm-item-title", textContent: r.title }));
+      const foot = el("div", { className: "t-meta" });
+      if (r.project) foot.append(el("span", { className: "chip", textContent: r.project }));
+      if (r.status) foot.append(el("span", { className: "chip", textContent: r.status }));
+      if (r.kind) foot.append(el("span", { className: `kind ${r.kind}`, textContent: r.kind }));
+      row.append(foot);
+      // The evidence is the sentence the edge was drawn from, which is the whole
+      // argument for trusting the edge.
+      if (r.evidence) row.append(el("div", { className: "mm-ev", textContent: r.evidence }));
+      if (r.project) {
+        row.classList.add("clickable");
+        row.tabIndex = 0;
+        row.setAttribute("role", "link");
+        row.title = `Open in ${r.project}`;
+        const go = () => openIn(r.project, view);
+        row.onclick = go;
+        row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+      }
+      list.append(row);
+    }
+    panel.append(list);
+  };
+
+  section("Tasks", ctx.tasks, "tasks");
+  section("Memory", ctx.notes, "notes");
+
+  if (ctx.related && ctx.related.length) {
+    panel.append(el("div", { className: "side-label", textContent: "Appears alongside" }));
+    const cloud = el("div", { className: "entity-cloud" });
+    for (const e of ctx.related) {
+      const chip = el("div", { className: "ent" },
+        el("b", { textContent: e.name }),
+        el("span", { className: "c", textContent: String(Math.round(e.weight)) }));
+      chip.title = `${e.kind}, appears alongside this in ${Math.round(e.weight)} places`;
+      chip.onclick = () => select && select(e.name);
+      cloud.append(chip);
+    }
+    panel.append(cloud);
+  }
+
+  if (!(ctx.tasks || []).length && !(ctx.notes || []).length) {
+    panel.append(emptyState("Nothing cites this directly", "It was reached through what it appears alongside."));
   }
 }
 
@@ -2848,6 +3661,440 @@ async function renderHistory(root) {
 }
 
 // ---------------------------------------------------------------------------
+// Reminders
+//
+// The store, the scheduler and the notification were all here already and none
+// of it could be reached from the window. This is the interface over what
+// exists: a reminder is set from the task it belongs to, and every reminder in
+// flight is listed in one place, because a snoozed one that is only a pending
+// notification is a reminder you have already lost.
+// ---------------------------------------------------------------------------
+
+// SQLite writes and compares these in UTC, and Date reads a bare
+// "2026-08-15 09:00:00" as local time. Left alone, a reminder set for nine in
+// Berlin would be described as firing at eleven and the arithmetic under
+// "in 20m" would be two hours out.
+const parseFireAt = (text) => new Date(`${String(text || "").replace(" ", "T").replace(/z$/i, "")}Z`);
+const toFireAt = (date) => date.toISOString().slice(0, 19).replace("T", " ");
+
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/** What <input type="datetime-local"> wants: local wall clock, to the minute. */
+const localInputValue = (date) =>
+  `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}` +
+  `T${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+
+// Seconds are dropped so a reminder set at 10:31:47 reads back as 10:46 rather
+// than as a time nobody chose.
+const inMinutes = (n) => {
+  const d = new Date(Date.now() + n * 60000);
+  d.setSeconds(0, 0);
+  return d;
+};
+
+const atHour = (daysAhead, hour) => {
+  const d = new Date();
+  d.setDate(d.getDate() + daysAhead);
+  d.setHours(hour, 0, 0, 0);
+  return d;
+};
+
+/** "in 20m", "in 3h", "12m ago". Relative, because that is the question. */
+function whenLabel(fireAt) {
+  const mins = Math.round((parseFireAt(fireAt).getTime() - Date.now()) / 60000);
+  const n = Math.abs(mins);
+  if (n < 1) return "now";
+  const text = n < 60 ? `${n}m` : n < 2880 ? `${Math.round(n / 60)}h` : `${Math.round(n / 1440)}d`;
+  return mins < 0 ? `${text} ago` : `in ${text}`;
+}
+
+/** The absolute time, for the row that has room for it. */
+const clockLabel = (fireAt) =>
+  parseFireAt(fireAt).toLocaleString([], {
+    weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+  });
+
+const REMINDER_LIVE = ["pending", "fired", "snoozed"];
+const REMINDER_WORD = {
+  pending: "scheduled", fired: "ringing", snoozed: "snoozed", done: "acted on", dismissed: "dismissed",
+};
+
+/** Reminders still ahead of you. Tolerates being called before the first load. */
+const liveAlerts = (list) => (list || []).filter((a) => REMINDER_LIVE.includes(a.status));
+
+const nextAlert = (list) =>
+  liveAlerts(list).slice().sort((a, b) => (a.fire_at < b.fire_at ? -1 : 1))[0] || null;
+
+// Read once per load rather than per chip, because the presets are built while
+// painting and a preset cannot wait on a round trip.
+let reminderPrefs = { snoozeMinutes: 10, autoRemindBeforeDueHours: 24 };
+
+/**
+ * Loads every reminder, and the two settings the interface quotes back.
+ *
+ * Called from refresh so the tab badge, the list and the chip all come from one
+ * read, and so a reminder fired by the scheduler appears without a click.
+ */
+async function loadAlerts() {
+  const [alerts, settings] = await Promise.all([
+    window.delphi.alerts.list(),
+    window.delphi.settings.get(),
+  ]);
+  reminderPrefs = {
+    snoozeMinutes: Number(settings.snoozeMinutes) || 10,
+    autoRemindBeforeDueHours: Number(settings.autoRemindBeforeDueHours) || 24,
+  };
+  return alerts;
+}
+
+/** Every reminder on one task, newest life first. */
+const alertsForTask = (taskId) => (state.alerts || []).filter((a) => a.task_id === taskId);
+
+/**
+ * The times worth offering as one click.
+ *
+ * "This evening" and "before it is due" are only offered while they are still
+ * ahead of you: a preset that sets a reminder for this morning is a preset that
+ * fires the moment you choose it.
+ */
+function reminderPresets(task) {
+  const out = [
+    ["m15", "In 15 minutes", () => inMinutes(15)],
+    ["h1", "In an hour", () => inMinutes(60)],
+    ["h3", "In three hours", () => inMinutes(180)],
+  ];
+  const evening = atHour(0, 18);
+  if (evening.getTime() > Date.now() + 60000) out.push(["evening", "This evening", () => atHour(0, 18)]);
+  out.push(["tomorrow", "Tomorrow morning", () => atHour(1, 9)]);
+  out.push(["week", "Next week", () => atHour(7, 9)]);
+
+  if (task && task.due) {
+    const hours = reminderPrefs.autoRemindBeforeDueHours;
+    const before = new Date(new Date(`${task.due}T09:00:00`).getTime() - hours * 3600000);
+    if (before.getTime() > Date.now()) {
+      out.push(["due", `${hours}h before it is due`, () => before]);
+    }
+  }
+  return out;
+}
+
+const createAlertAt = (taskId, date, extra = {}) =>
+  window.delphi.alerts.create({ taskId, fireAt: toFireAt(date), ...extra });
+
+// ---------------------------------------------------------------------------
+// The chip on the task sheet
+// ---------------------------------------------------------------------------
+
+/**
+ * The spec for the reminder chip, for openTaskSheet's own chip() to build.
+ *
+ * Returned as a spec rather than an element because chip() owns the swap from
+ * fact to control, and a second implementation of that would drift from the
+ * rest of the row.
+ */
+function reminderChipSpec({ task, alerts, after, openList }) {
+  const next = nextAlert(alerts);
+  const extra = liveAlerts(alerts).length - 1;
+  const overdue = next && parseFireAt(next.fire_at).getTime() <= Date.now();
+
+  return {
+    icon: "◷",
+    value: next ? whenLabel(next.fire_at) + (extra > 0 ? ` +${extra}` : "") : "",
+    empty: "no reminder",
+    tone: overdue ? "tone-overdue" : "",
+    build: (done) => {
+      const presets = reminderPresets(task);
+      const s = el("select", { className: "ts-inline" });
+      s.append(el("option", { value: "", textContent: "Remind me..." }));
+      for (const [key, label] of presets) s.append(el("option", { value: key, textContent: label }));
+      s.append(el("option", { value: "custom", textContent: "Pick a date and time" }));
+      if (next) s.append(el("option", { value: "manage", textContent: "See all reminders" }));
+      if (next) s.append(el("option", { value: "clear", textContent: "Clear reminders" }));
+
+      const finish = async () => { await after(); done(); };
+
+      s.onchange = async () => {
+        const choice = s.value;
+        if (!choice) return;
+
+        if (choice === "custom") {
+          // The select's own blur repaints the chip row, which would take this
+          // input with it the moment it replaces the select.
+          s.onblur = null;
+          const i = el("input", {
+            className: "ts-inline", type: "datetime-local", value: localInputValue(inMinutes(60)),
+          });
+          i.onchange = async () => {
+            if (i.value) { await createAlertAt(task.id, new Date(i.value)); await finish(); }
+            else done();
+          };
+          i.onblur = done;
+          s.replaceWith(i);
+          i.focus();
+          return;
+        }
+
+        if (choice === "manage") { openList(); return; }
+
+        if (choice === "clear") {
+          for (const a of liveAlerts(alerts)) await window.delphi.alerts.remove(a.id);
+          await finish();
+          return;
+        }
+
+        const preset = presets.find((p) => p[0] === choice);
+        if (preset) await createAlertAt(task.id, preset[2]());
+        await finish();
+      };
+      s.onblur = done;
+      return s;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// A reminder, as a row
+// ---------------------------------------------------------------------------
+
+const REPEATS = [
+  ["", "once"],
+  ["60", "every hour"],
+  ["1440", "every day"],
+  ["10080", "every week"],
+];
+
+const repeatWord = (mins) =>
+  (REPEATS.find(([v]) => Number(v) === Number(mins)) || [null, `every ${mins}m`])[1];
+
+/**
+ * One reminder.
+ *
+ * Snooze, done and delete are all offered on every live row: a reminder is
+ * something you deal with where you find it, and sending someone to another
+ * screen to silence one is how they end up ignored.
+ */
+function reminderRow(a, { onChange, showTask = true }) {
+  const live = REMINDER_LIVE.includes(a.status);
+  const row = el("div", { className: "rem-row" + (live ? "" : " spent") });
+
+  row.append(el("span", { className: `rem-dot st-${a.status}`, title: REMINDER_WORD[a.status] || a.status }));
+
+  const when = el("span", { className: "rem-when" });
+  when.append(el("span", { className: "rem-rel", textContent: live ? whenLabel(a.fire_at) : REMINDER_WORD[a.status] }));
+  when.append(el("span", { className: "hint", textContent: clockLabel(a.fire_at) }));
+  row.append(when);
+
+  const bodyBox = el("div", { className: "rem-body" });
+  bodyBox.append(el("div", { className: "rem-title", textContent: a.message || a.task_title }));
+
+  const sub = el("div", { className: "rem-sub" });
+  if (showTask && a.project_name) {
+    sub.append(el("span", { className: "dot", style: `background:${a.project_colour || "var(--ink-faint)"}` }));
+    sub.append(el("span", { textContent: a.project_name }));
+  }
+  if (showTask && a.message) sub.append(el("span", { textContent: a.task_title }));
+  if (a.repeat_every_minutes) sub.append(el("span", { className: "chip", textContent: repeatWord(a.repeat_every_minutes) }));
+  if (a.snooze_count) sub.append(el("span", { className: "chip", textContent: `snoozed ${a.snooze_count}×` }));
+  // A reminder on a finished task is skipped by the sweep, so it would sit here
+  // looking scheduled forever without saying why.
+  if (live && a.task_status === "done") sub.append(el("span", { className: "chip overdue", textContent: "task is done, will not fire" }));
+  if (sub.children.length) bodyBox.append(sub);
+  row.append(bodyBox);
+
+  const actions = el("div", { className: "rem-actions" });
+  if (live) {
+    const snooze = el("button", { className: "btn sm", textContent: `Snooze ${reminderPrefs.snoozeMinutes}m` });
+    snooze.title = "Put this off. The length is set under Settings, Reminders.";
+    snooze.onclick = async () => { await window.delphi.alerts.snooze(a.id); await onChange(); };
+
+    const act = el("button", { className: "btn sm", textContent: "Done" });
+    act.title = "Close this reminder. It does not complete the task.";
+    act.onclick = async () => { await window.delphi.alerts.act(a.id); await onChange(); };
+
+    actions.append(snooze, act);
+  }
+  if (showTask) {
+    const open = el("button", { className: "btn sm", textContent: "Open task" });
+    open.onclick = () => openTaskSheet(a.task_id);
+    actions.append(open);
+  }
+  const kill = el("button", { className: "ts-kill", textContent: "×", title: "Delete this reminder" });
+  kill.onclick = async () => { await window.delphi.alerts.remove(a.id); await onChange(); };
+  actions.append(kill);
+  row.append(actions);
+
+  return row;
+}
+
+/**
+ * The control that sets one.
+ *
+ * A time field with the quick choices beside it rather than instead of it, so
+ * "tomorrow morning" is one click and half past four on Thursday is still
+ * possible without leaving the row.
+ */
+function reminderComposer({ task, onCreate }) {
+  const box = el("div", { className: "rem-set" });
+  const when = el("input", { type: "datetime-local", className: "field", value: localInputValue(inMinutes(60)) });
+  when.setAttribute("aria-label", "When to remind you");
+
+  const quick = el("select", { className: "field" });
+  quick.setAttribute("aria-label", "Quick times");
+  quick.append(el("option", { value: "", textContent: "Quick times" }));
+  const presets = reminderPresets(task);
+  for (const [key, label] of presets) quick.append(el("option", { value: key, textContent: label }));
+  quick.onchange = () => {
+    const preset = presets.find((p) => p[0] === quick.value);
+    if (preset) when.value = localInputValue(preset[2]());
+    quick.value = "";
+  };
+
+  const repeat = el("select", { className: "field" });
+  repeat.setAttribute("aria-label", "How often");
+  for (const [value, label] of REPEATS) repeat.append(el("option", { value, textContent: label }));
+
+  const message = el("input", { className: "field", placeholder: "What to say when it fires (optional)" });
+  message.setAttribute("aria-label", "Reminder message");
+
+  const note = el("span", { className: "hint" });
+  const add = el("button", { className: "btn primary sm", textContent: "Set reminder" });
+  add.onclick = async () => {
+    if (!when.value) {
+      note.className = "err-msg";
+      note.textContent = "Pick a time first.";
+      return;
+    }
+    try {
+      await createAlertAt(task.id, new Date(when.value), {
+        message: message.value.trim() || null,
+        repeatEveryMinutes: repeat.value ? Number(repeat.value) : null,
+      });
+      message.value = "";
+      note.className = "hint";
+      note.textContent = "";
+      await onCreate();
+    } catch (e) {
+      note.className = "err-msg";
+      note.textContent = e.message;
+    }
+  };
+
+  box.append(el("div", { className: "row" }, when, quick, repeat));
+  box.append(el("div", { className: "row" }, message, add));
+  box.append(note);
+  return box;
+}
+
+// ---------------------------------------------------------------------------
+// The reminders pane on the task sheet
+// ---------------------------------------------------------------------------
+
+function paintTaskReminders(box, { task, alerts, after }) {
+  const live = liveAlerts(alerts);
+  const head = el("div", { className: "ts-sec-head" }, el("h4", { textContent: "Reminders" }));
+  if (live.length) head.append(el("span", { className: "ts-count", textContent: String(live.length) }));
+  box.append(head);
+
+  if (!alerts.length) {
+    box.append(el("div", { className: "hint pad",
+      textContent: "Nothing set. A reminder arrives as a system notification, and stays on the Reminders tab until it is dealt with." }));
+  }
+
+  for (const a of alerts) box.append(reminderRow(a, { onChange: after, showTask: false }));
+  box.append(reminderComposer({ task, onCreate: after }));
+}
+
+// ---------------------------------------------------------------------------
+// The reminders view
+// ---------------------------------------------------------------------------
+
+const REMINDER_GROUPS = [
+  ["fired", "Ringing now", "Shown already, and not yet dealt with."],
+  ["snoozed", "Snoozed", "Put off, and coming back."],
+  ["pending", "Scheduled", "Waiting for their time."],
+];
+
+async function renderReminders(root) {
+  const alerts = state.alerts || [];
+  const after = () => refresh();
+
+  if (!alerts.length) {
+    root.append(emptyState("No reminders yet",
+      "Open a task and use the reminder chip beside its due date. Reminders arrive as a system notification and stay here until they are dealt with, so a snoozed one is not lost."));
+    return;
+  }
+
+  for (const [status, title, blurb] of REMINDER_GROUPS) {
+    const group = alerts.filter((a) => a.status === status);
+    if (!group.length) continue;
+    const { card: box, body } = card(title, el("span", { className: "hint", textContent: blurb }));
+    body.className = "card-body flush";
+    for (const a of group) body.append(reminderRow(a, { onChange: after }));
+    root.append(box);
+  }
+
+  const spent = alerts.filter((a) => !REMINDER_LIVE.includes(a.status));
+  if (spent.length) {
+    const { card: box, body } = card("Finished",
+      el("span", { className: "hint", textContent: `${plural(spent.length, "reminder", "reminders")} acted on or dismissed` }));
+    body.className = "card-body flush";
+    let shown = false;
+    const toggle = el("button", { className: "btn sm", textContent: "Show" });
+    toggle.onclick = () => {
+      shown = !shown;
+      toggle.textContent = shown ? "Hide" : "Show";
+      body.textContent = "";
+      if (shown) for (const a of spent) body.append(reminderRow(a, { onChange: after }));
+    };
+    box.querySelector(".card-head").append(toggle);
+    root.append(box);
+  }
+
+  root.append(el("p", { className: "hint", style: "margin:var(--s4) 0 0",
+    textContent: `Snooze puts a reminder off for ${plural(reminderPrefs.snoozeMinutes, "minute", "minutes")}. Change that under Settings.` }));
+}
+
+// ---------------------------------------------------------------------------
+// The reminders settings block
+//
+// Replaces the block that set snoozeMinutes and checkIntervalSeconds, and adds
+// the third setting, which has been stored and honoured by nothing since the
+// day it was added.
+// ---------------------------------------------------------------------------
+
+function remindersSettings(settings) {
+  const rem = el("div", { className: "setting" });
+  rem.append(el("h3", { textContent: "Reminders" }));
+  rem.append(el("p", {
+    textContent: "How long Snooze puts a reminder off for, how often the app looks for reminders that have come due, and how far ahead of a due date the task sheet offers to remind you.",
+  }));
+
+  const numberField = (label, key, suffix) => {
+    const row = el("div", { className: "row", style: "margin-bottom:10px" });
+    row.append(el("span", { textContent: label, style: "flex:0 0 210px" }));
+    const input = el("input", { type: "number", min: "1", value: String(settings[key] ?? ""), className: "field", style: "width:92px" });
+    const note = el("span", { className: "hint" });
+    input.onchange = async () => {
+      try {
+        const updated = await window.delphi.settings.set({ [key]: Number(input.value) });
+        settings[key] = updated[key];
+        note.className = "ok-msg";
+        note.textContent = "saved";
+      } catch (e) { note.className = "err-msg"; note.textContent = e.message; }
+    };
+    row.append(input, el("span", { className: "hint", textContent: suffix }), note);
+    return row;
+  };
+
+  rem.append(numberField("Snooze for", "snoozeMinutes", "minutes"));
+  rem.append(numberField("Check for due reminders every", "checkIntervalSeconds", "seconds"));
+  rem.append(numberField("Offer to remind me", "autoRemindBeforeDueHours", "hours before a task is due"));
+  rem.append(el("p", { className: "hint", style: "margin:12px 0 0",
+    textContent: "The last one is a suggestion, not a rule: it sets the shortcut offered on a task that has a due date. Nothing is scheduled without you asking for it." }));
+  return rem;
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -3002,28 +4249,7 @@ async function renderSettings(root) {
   root.append(mode);
 
   // --- reminders -----------------------------------------------------------
-  const rem = el("div", { className: "setting" });
-  rem.append(el("h3", { textContent: "Reminders" }));
-  rem.append(el("p", { textContent: "How long Snooze puts a reminder off for, and how often the app looks for reminders that have come due." }));
-  const numberField = (label, key, suffix) => {
-    const row = el("div", { className: "row", style: "margin-bottom:10px" });
-    row.append(el("span", { textContent: label, style: "flex:0 0 210px" }));
-    const input = el("input", { type: "number", min: "1", value: String(settings[key] ?? ""), className: "field", style: "width:92px" });
-    const note = el("span", { className: "hint" });
-    input.onchange = async () => {
-      try {
-        const updated = await window.delphi.settings.set({ [key]: Number(input.value) });
-        settings[key] = updated[key];
-        note.className = "ok-msg";
-        note.textContent = "saved";
-      } catch (e) { note.className = "err-msg"; note.textContent = e.message; }
-    };
-    row.append(input, el("span", { className: "hint", textContent: suffix }), note);
-    return row;
-  };
-  rem.append(numberField("Snooze for", "snoozeMinutes", "minutes"));
-  rem.append(numberField("Check for due reminders every", "checkIntervalSeconds", "seconds"));
-  root.append(rem);
+  root.append(remindersSettings(settings));
 
   // --- vault ---------------------------------------------------------------
   const v = el("div", { className: "setting" });
@@ -3212,6 +4438,14 @@ async function openTaskSheet(taskId) {
     refresh();
   };
 
+  // A reminder write repaints the sheet from the shared load rather than from a
+  // second query, so the tab badge behind the sheet cannot disagree with it.
+  const remindersChanged = async () => { await refresh(); paintAll(); };
+  const openReminders = async () => {
+    await closeSheet();
+    goTo({ projectId: null, view: "reminders", query: "" });
+  };
+
   // --- header ---------------------------------------------------------------
 
   function paintTop() {
@@ -3355,6 +4589,10 @@ async function openTaskSheet(taskId) {
       },
     }));
 
+    meta.append(chip(reminderChipSpec({
+      task: t, alerts: alertsForTask(taskId), after: remindersChanged, openList: openReminders,
+    })));
+
     meta.append(chip({
       icon: "◎", value: t.assignee || "", empty: "unassigned",
       tone: isAgent(t.assignee) ? "tone-agent" : "",
@@ -3439,6 +4677,7 @@ async function openTaskSheet(taskId) {
     tabs.textContent = "";
     const entries = [
       ["details", "Details", detail.subtasks.length || null],
+      ["reminders", "Reminders", liveAlerts(alertsForTask(taskId)).length || null],
       ["activity", "Activity", detail.events.length || null],
     ];
     for (const [key, label, count] of entries) {
@@ -3454,7 +4693,11 @@ async function openTaskSheet(taskId) {
   function paintPane() {
     paneBox.textContent = "";
     if (pane === "details") paintSubtasks();
-    else paintActivity();
+    else if (pane === "reminders") {
+      paintTaskReminders(paneBox, {
+        task: detail.task, alerts: alertsForTask(taskId), after: remindersChanged,
+      });
+    } else paintActivity();
   }
 
   /**
