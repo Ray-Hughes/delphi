@@ -40,10 +40,18 @@ let settings = {
   // Memory notes are markdown written by agents and read by people, so reading
   // is the default and the source is a switch away.
   noteView: "formatted",
+  // Whether connected agents are told to use this tracker as their scratchpad
+  // instead of writing drafts to temporary files. Off by default: it changes how
+  // every agent sharing this database behaves, which is not something to turn on
+  // for someone without asking. See agent/directives.js for how it reaches them.
+  scratchpadMode: false,
+  scratchpadProjectId: null,   // null means "no default, pick a project"
 };
 let schedulerTimer = null;
 let vaultTimer = null;
 let lastSeenDbChange = 0;
+let dbWatcher = null;
+let dbWatchTimer = null;
 
 // The vault is a mirror, so it is rebuilt after changes rather than kept in step
 // edit by edit. Debounced because typing in a note fires an update per blur and
@@ -575,6 +583,7 @@ app.whenReady().then(() => {
   refreshMenu();
   registerHotkey(settings.hotkey);
   startScheduler();
+  watchForExternalWrites();
   scheduleVaultExport();
 
   // A panel has no dock presence; a normal application does.
@@ -695,6 +704,37 @@ function checkForExternalWrites() {
     }
   } catch (error) {
     console.error("could not check the database for external writes", error);
+  }
+}
+
+/**
+ * Notices an agent's write as it happens rather than at the next sweep.
+ *
+ * The interval below is a minute by default, which is the right cadence for
+ * reminders and far too slow for this: an agent says it has written a note, you
+ * look, and it is not there. It arrives a minute later, or you restart the app
+ * and assume that is what was needed. Watching the file closes that gap to
+ * roughly the write itself.
+ *
+ * The directory is watched rather than the two files. In WAL mode the interesting
+ * write lands in delphi.db-wal, which is created and removed rather than only
+ * modified, and a watch on a path that disappears stops firing. Debounced because
+ * one logical write touches the log several times.
+ *
+ * The interval stays as the fallback: fs.watch is famously uneven across
+ * platforms and network filesystems, so this makes the common case fast without
+ * being the only thing that works.
+ */
+function watchForExternalWrites() {
+  if (dbWatcher) { try { dbWatcher.close(); } catch {} dbWatcher = null; }
+  try {
+    dbWatcher = fs.watch(path.dirname(db.DB_PATH), (_event, filename) => {
+      if (filename && !String(filename).startsWith("delphi.db")) return;
+      clearTimeout(dbWatchTimer);
+      dbWatchTimer = setTimeout(checkForExternalWrites, 250);
+    });
+  } catch (error) {
+    console.error("could not watch the database directory, falling back to polling", error);
   }
 }
 
@@ -847,6 +887,22 @@ handle("settings:set", (fields) => {
     if (fields[key] !== undefined) {
       if (!allowed.includes(fields[key])) throw new Error(`${key} must be one of ${allowed.join(", ")}`);
       settings[key] = fields[key];
+    }
+  }
+
+  if (fields.scratchpadMode !== undefined) settings.scratchpadMode = fields.scratchpadMode === true;
+
+  // Checked against the projects that exist, because this id is handed to agents
+  // as the place to write. A stale id would send them at a project that is not
+  // there and turn every draft into a failed call.
+  if (fields.scratchpadProjectId !== undefined) {
+    const value = fields.scratchpadProjectId;
+    if (value === null || value === "") {
+      settings.scratchpadProjectId = null;
+    } else {
+      const id = Number(value);
+      if (!Number.isInteger(id) || !db.getProject(id)) throw new Error(`No project ${value}`);
+      settings.scratchpadProjectId = id;
     }
   }
 

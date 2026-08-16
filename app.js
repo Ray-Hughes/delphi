@@ -48,6 +48,81 @@ const today = () => new Date().toISOString().slice(0, 10);
 const isOverdue = (t) => t.due && t.status !== "done" && t.due < today();
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
+/**
+ * Asks for one line of text. Resolves to the string, or null if cancelled.
+ *
+ * This exists because Electron does not implement window.prompt. It does not
+ * return null the way a browser does when you dismiss one, it throws outright,
+ * and every caller here was an async click handler, so the throw became an
+ * unhandled rejection and the button did nothing at all. Silent, and the same
+ * shape as a dead onclick, which is why it survived: New Project, both epic
+ * dialogs and Add Repository were all broken this way.
+ *
+ * alert and confirm are fine and are left alone. prompt is the only one Electron
+ * refuses.
+ */
+function askText({ title, label, value = "", placeholder = "", confirmLabel = "Create", allowEmpty = false }) {
+  return new Promise((resolve) => {
+    const overlay = el("div", { className: "overlay" });
+    const box = el("div", { className: "ask" });
+    const input = el("input", { className: "field", value, placeholder, type: "text" });
+    const error = el("div", { className: "err-msg", style: "display:none" });
+
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKey, true);
+      overlay.remove();
+      resolve(result);
+    };
+
+    const submit = () => {
+      const text = input.value.trim();
+      // Empty is a legitimate answer where the field is being cleared rather than
+      // set, so those callers get "" back and cancelling still gives them null.
+      // The two have to stay distinguishable.
+      if (!text && !allowEmpty) {
+        error.style.display = "";
+        error.textContent = "Needs a value.";
+        input.focus();
+        return;
+      }
+      finish(text);
+    };
+
+    // Captured on the document, because the window-level handler treats Escape as
+    // "hide the window" and would take the whole app away instead of this box.
+    const onKey = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(null);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        submit();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+
+    const cancel = el("button", { className: "btn", textContent: "Cancel", type: "button" });
+    const ok = el("button", { className: "btn primary", textContent: confirmLabel, type: "button" });
+    cancel.onclick = () => finish(null);
+    ok.onclick = submit;
+
+    box.append(el("h3", { textContent: title }));
+    if (label) box.append(el("p", { className: "hint", textContent: label }));
+    box.append(input, error, el("div", { className: "ask-actions" }, cancel, ok));
+    overlay.append(box);
+    overlay.onclick = (event) => { if (event.target === overlay) finish(null); };
+    document.body.append(overlay);
+
+    input.focus();
+    input.select();
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Theme
 // ---------------------------------------------------------------------------
@@ -126,6 +201,12 @@ function renderMarkdown(source) {
 
   while (i < lines.length) {
     const line = lines[i];
+    // Where this pass started. Every branch below is supposed to consume at
+    // least one line, and the one that stopped doing so locked the window hard
+    // enough to need a force quit. A renderer for text people paste in should
+    // degrade to an ugly paragraph, never to a spin, so the guarantee is made
+    // structural at the bottom of the loop rather than trusted to each branch.
+    const started = i;
 
     if (!line.trim()) { i += 1; continue; }
 
@@ -143,7 +224,13 @@ function renderMarkdown(source) {
 
     if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { root.append(el("hr")); i += 1; continue; }
 
-    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    // Leading whitespace is allowed, and has to be, because the paragraph loop
+    // below refuses any line matching /^\s*#{1,6}\s/. When this pattern was
+    // anchored at column 0 the two disagreed about indented headings: an
+    // indented "# text" was not a heading, was not any other block, and was
+    // rejected by the paragraph loop, so i never advanced and the outer while
+    // spun forever on that one line. A single line of " # x" hung the window.
+    const heading = line.match(/^\s*(#{1,6})\s+(.*)$/);
     if (heading) {
       const level = Math.min(heading[1].length, 3);
       root.append(el(`h${level}`, {}, inlineMarkdown(heading[2].trim())));
@@ -200,6 +287,13 @@ function renderMarkdown(source) {
       !/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])
     ) { para.push(lines[i].trim()); i += 1; }
     if (para.length) root.append(el("p", {}, ...inlineMarkdown(para.join(" "))));
+
+    // Nothing above took the line. Render it as a paragraph and move on, so an
+    // unforeseen combination costs one oddly formatted line instead of the app.
+    if (i === started) {
+      root.append(el("p", {}, ...inlineMarkdown(line.trim())));
+      i += 1;
+    }
   }
 
   return root;
@@ -624,8 +718,13 @@ async function renderOverview(root) {
   const addRepo = el("button", { className: "btn sm", textContent: "Add" });
   const repoCard = card("Repositories", addRepo);
   addRepo.onclick = async () => {
-    const path = prompt("Path to the repository folder");
-    if (!path || !path.trim()) return;
+    const path = await askText({
+      title: "Add a repository",
+      label: "The absolute path to the folder on this machine.",
+      placeholder: "/Users/you/code/project",
+      confirmLabel: "Add",
+    });
+    if (!path) return;
     const name = path.trim().replace(/\/+$/, "").split("/").pop();
     await window.delphi.repos.create({
       projectId: project.id, name, path: path.trim(),
@@ -3076,13 +3175,23 @@ function epicComposer(o) {
 
 function epicMenu(o, x, y) {
   const rename = async () => {
-    const name = prompt("Epic name", o.name);
-    if (!name || !name.trim() || name.trim() === o.name) return;
+    const name = await askText({
+      title: "Rename epic",
+      value: o.name,
+      confirmLabel: "Rename",
+    });
+    if (!name || name.trim() === o.name) return;
     await window.delphi.organizers.update(o.id, { name: name.trim() });
     refresh();
   };
   const describe = async () => {
-    const summary = prompt("One line: what this epic covers", o.summary || "");
+    const summary = await askText({
+      title: "Describe epic",
+      label: "One line: what this epic covers. Leave it empty to clear it.",
+      value: o.summary || "",
+      confirmLabel: "Save",
+      allowEmpty: true,
+    });
     if (summary === null) return;
     await window.delphi.organizers.update(o.id, { summary: summary.trim() || null });
     refresh();
@@ -3177,8 +3286,11 @@ function newEpicButton() {
     ? "Wrap this project's tasks in epics. Nothing moves until you put something in one."
     : "Add another epic to this project";
   b.onclick = async () => {
-    const name = prompt(first ? "Name the first epic" : "Name the epic");
-    if (!name || !name.trim()) return;
+    const name = await askText({
+      title: first ? "Name the first epic" : "Name the epic",
+      label: "Epics group a project's tasks. Nothing moves until you put something in one.",
+    });
+    if (!name) return;
     await window.delphi.organizers.create({ projectId: state.projectId, name: name.trim() });
     refresh();
   };
@@ -4391,6 +4503,53 @@ async function renderSettings(root) {
     textContent: "The database stays the source of truth and the mirror is one way. Two way sync between a database and a folder is where these break, so edits made in Obsidian are not read back." }));
   root.append(v);
 
+  // --- agent scratchpad ----------------------------------------------------
+  const scratch = el("div", { className: "setting" });
+  scratch.append(el("h3", { textContent: "Agent scratchpad" }));
+  scratch.append(el("p", {
+    textContent: "Agents write drafts, plans and working documents to temporary files by default, and those files are gone by the next session. Turn this on and every agent connected to this tracker is told to write them here as notes instead, where you and the next agent can both find them.",
+  }));
+
+  const scratchRow = el("div", { className: "row" });
+  const scratchBox = el("input", { type: "checkbox", checked: settings.scratchpadMode === true, id: "scratchpad-mode" });
+  const scratchLbl = el("label", { htmlFor: "scratchpad-mode", textContent: "Use this tracker as the scratchpad for connected agents" });
+  const scratchMsg = el("span", { className: "hint" });
+  scratchRow.append(scratchBox, scratchLbl, scratchMsg);
+  scratch.append(scratchRow);
+
+  // Where drafts land unless they plainly belong somewhere else. Offered whether
+  // or not the checkbox is on, because choosing the destination first and then
+  // switching it on is the order most people do it in.
+  const destRow = el("div", { className: "row", style: "margin-top:12px" });
+  destRow.append(el("label", { htmlFor: "scratchpad-project", textContent: "Default project" }));
+  const dest = el("select", { className: "field", id: "scratchpad-project", style: "width:auto" });
+  dest.append(el("option", { value: "", textContent: "No default, let the agent choose" }));
+  for (const p of state.projects) {
+    dest.append(el("option", { value: String(p.id), textContent: p.name, selected: settings.scratchpadProjectId === p.id }));
+  }
+  const destMsg = el("span", { className: "hint" });
+  destRow.append(dest, destMsg);
+  scratch.append(destRow);
+
+  const saveScratch = async (fields, msg, node) => {
+    try {
+      const updated = await window.delphi.settings.set(fields);
+      Object.assign(settings, updated);
+      msg.className = "ok-msg";
+      msg.textContent = "Saved";
+    } catch (e) {
+      msg.className = "err-msg";
+      msg.textContent = e.message;
+      if (node) node.checked = !node.checked;
+    }
+  };
+  scratchBox.onchange = () => saveScratch({ scratchpadMode: scratchBox.checked }, scratchMsg, scratchBox);
+  dest.onchange = () => saveScratch({ scratchpadProjectId: dest.value || null }, destMsg, null);
+
+  scratch.append(el("p", { className: "hint", style: "margin:12px 0 0",
+    textContent: "Agents already connected pick this up within a few seconds; there is nothing to restart. It does not apply to files that have to be files to work, such as scripts an agent runs or documents it generates." }));
+  root.append(scratch);
+
   // --- mouse buttons -------------------------------------------------------
   const mouse = el("div", { className: "setting" });
   mouse.append(el("h3", { textContent: "Using a mouse button" }));
@@ -5062,19 +5221,32 @@ $("search").addEventListener("input", (e) => {
 });
 
 async function createProject() {
-  const name = prompt("Project name");
-  if (!name || !name.trim()) return null;
-  const key = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  const palette = ["#4a63d8", "#e0803a", "#2f8757", "#a86fd1", "#c9546b", "#3fa7a1"];
-  const created = await window.delphi.projects.create({
-    key: key || `p${Date.now()}`,
-    name: name.trim(),
-    colour: palette[state.projects.length % palette.length],
+  const name = await askText({
+    title: "New project",
+    label: "What is this project called? You can rename it later.",
+    placeholder: "Hearing transcripts",
   });
-  state.projectId = created.id;
-  state.view = "overview";
-  await refresh();
-  return created;
+  if (!name) return null;
+
+  const key = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const palette = ["#4a63d8", "#e0803a", "#2f8757", "#a86fd1", "#c9546b", "#3fa7a1"];
+  try {
+    const created = await window.delphi.projects.create({
+      key: key || `p${Date.now()}`,
+      name,
+      colour: palette[state.projects.length % palette.length],
+    });
+    state.projectId = created.id;
+    state.view = "overview";
+    await refresh();
+    return created;
+  } catch (error) {
+    // The slug is unique, and two projects named closely enough can produce the
+    // same one. Saying so beats a button that appears to do nothing, which is
+    // exactly the failure this whole path just had.
+    alert(`Could not create the project: ${error.message}`);
+    return null;
+  }
 }
 
 $("new-project").onclick = createProject;

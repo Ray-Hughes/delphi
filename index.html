@@ -1645,6 +1645,22 @@
     animation: fade 120ms ease;
   }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+
+  /* Asking for one line ----------------------------------------------------
+     Stands in for window.prompt, which Electron does not implement. Sized to the
+     question rather than to the window, so it reads as a question and not as
+     another full sheet. */
+  .ask {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r-lg); box-shadow: var(--shadow);
+    width: min(440px, 100%); padding: var(--s5);
+    display: flex; flex-direction: column; gap: var(--s3);
+  }
+  .ask h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .ask p { margin: 0; }
+  .ask .field { width: 100%; }
+  .ask-actions { display: flex; justify-content: flex-end; gap: var(--s2); margin-top: var(--s2); }
+
   .sheet {
     background: var(--surface); border: 1px solid var(--line);
     border-radius: var(--r-lg); box-shadow: var(--shadow);

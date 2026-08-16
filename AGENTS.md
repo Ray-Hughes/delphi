@@ -34,6 +34,23 @@ agent, and its changes appear in the History tab labelled with that name. Give e
 agent a different one. That is the only thing making History useful when more than one
 is working.
 
+## Which database it writes to
+
+An installed copy keeps its database in the per-user data directory
+(`~/Library/Application Support/Delphi` on macOS, `%APPDATA%\Delphi` on Windows,
+`$XDG_CONFIG_HOME/Delphi` otherwise). A checkout keeps one beside the source. If you
+have both, the installed one wins, because that is the one the app you are looking at
+is reading.
+
+This ordering matters more than it sounds. The server is registered by its path inside
+the checkout, so it used to find the neighbouring database first and write there, while
+the app read the other one. Nothing errors in that state: notes and tasks are written,
+and simply never appear. If two databases exist, the server says which it chose on
+stderr, which your client will have in its MCP log.
+
+Set `DELPHI_DB` to an absolute path to override, which is how you point the server at a
+checkout on purpose.
+
 ## Connecting
 
 **Claude Code** writes to `~/.claude.json`:
@@ -112,6 +129,38 @@ What not to store: secrets, tokens, anything that belongs in a password manager,
 restatements of what the code already says plainly.
 
 ---
+
+## Using the tracker as the scratchpad
+
+Settings has a switch called **Agent scratchpad**. Off by default. Turned on,
+every agent connected to this database is told to write its drafts, plans and
+working documents here as notes instead of to temporary files, and given a
+default project to put them in.
+
+The point is that the default is otherwise a temp directory, which is emptied
+between sessions and invisible to every other agent sharing this tracker. You
+ask for a draft, you get one, and the next session has no idea it existed.
+
+A setting only changes behaviour if it reaches the model, and no agent reads
+`settings.json`. An MCP server has three ways into a model's context, and the
+switch writes to all of them:
+
+| Channel | When it is read | Weight |
+| --- | --- | --- |
+| `initialize` → `instructions` | Once, on connect | Varies by client; some ignore it |
+| `tools/list` → tool descriptions | Whenever the model considers a tool | Where the behaviour comes from |
+| `tools/call` → result | While the agent is already working | Last chance to correct course |
+
+The middle one does the work. A directive sitting in `add_note`'s own description
+is read at the moment the model is deciding where to put something.
+
+Turning it on or off reaches agents that are already connected, within a few
+seconds and with nothing to restart: the server declares `tools.listChanged` and
+pushes `notifications/tools/list_changed` when the setting changes, so the client
+re-reads the descriptions. Wording lives in `agent/directives.js`.
+
+It deliberately does not cover files that have to be files to work: scripts an
+agent executes, generated documents, anything a command needs a path for.
 
 ## Taking work from the queue
 

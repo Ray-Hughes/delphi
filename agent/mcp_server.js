@@ -17,22 +17,8 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
-/**
- * Finds the database.
- *
- * A checkout keeps it beside the source, an installed copy keeps it in the
- * per-user data directory, and the same server file is used by both: from a
- * checkout it is agent/mcp_server.js, and from an installed app it is the copy in
- * Resources. Looking for the neighbour first is what tells the two apart, since
- * only a checkout has one. This duplicates paths.js on purpose, because that file
- * ends up inside app.asar and a plain Node process cannot read in there.
- */
-function findDatabase() {
-  if (process.env.DELPHI_DB) return path.resolve(process.env.DELPHI_DB);
-
-  const beside = path.join(__dirname, "..", "delphi.db");
-  if (fs.existsSync(beside)) return beside;
-
+/** Where an installed copy keeps its data, worked out without Electron. */
+function installedDatabase() {
   if (process.platform === "darwin") {
     return path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db");
   }
@@ -44,7 +30,83 @@ function findDatabase() {
   return path.join(configHome, "Delphi", "delphi.db");
 }
 
+/**
+ * Finds the database.
+ *
+ * A checkout keeps it beside the source, an installed copy keeps it in the
+ * per-user data directory, and the same server file is used by both. This
+ * duplicates paths.js on purpose, because that file ends up inside app.asar and a
+ * plain Node process cannot read in there.
+ *
+ * The installed copy is preferred, and that ordering is the whole point. It used
+ * to look beside the source first, on the reasoning that only a checkout has a
+ * neighbouring database. True, but it assumed a checkout means you are *running*
+ * from the checkout, and someone who has cloned the repository and also installed
+ * the app has both. Their editor then registers the server by its path inside the
+ * checkout, so the neighbour won, and the agent wrote to a database the app does
+ * not read. Nothing errors: notes and tasks are written, and simply never appear.
+ * Preferring the installed copy fixes it, and costs nothing for a developer
+ * working purely from a checkout, who has no installed copy to prefer.
+ *
+ * DELPHI_DB still overrides both, which is the escape hatch for running the
+ * server against a checkout on purpose.
+ */
+function findDatabase() {
+  if (process.env.DELPHI_DB) return path.resolve(process.env.DELPHI_DB);
+
+  const installed = installedDatabase();
+  const beside = path.join(__dirname, "..", "delphi.db");
+
+  if (fs.existsSync(installed)) {
+    // Worth saying out loud. stderr goes to the client's MCP log rather than into
+    // the protocol stream on stdout, so it cannot corrupt a response.
+    if (fs.existsSync(beside)) {
+      process.stderr.write(
+        `delphi: two databases exist. Using the installed one at ${installed}. ` +
+        `The checkout copy at ${beside} is being ignored. ` +
+        `Set DELPHI_DB to override.\n`
+      );
+    }
+    return installed;
+  }
+
+  if (fs.existsSync(beside)) return beside;
+  return installed;
+}
+
 const DB = findDatabase();
+
+const directives = require("./directives");
+const readSettings = directives.makeSettingsReader(directives.settingsBesideDatabase(DB));
+
+/**
+ * The scratchpad setting, resolved against the projects that actually exist.
+ *
+ * The project is looked up rather than trusted, because a project can be deleted
+ * after being chosen as the destination. Naming a project_id that no longer
+ * exists would send agents to write notes that fail, so a dangling id degrades to
+ * "no default set" instead.
+ */
+function scratchpadState() {
+  const settings = readSettings();
+  if (settings.scratchpadMode !== true) return { on: false, project: null };
+  let project = null;
+  if (settings.scratchpadProjectId != null) {
+    try {
+      project = sql("SELECT id, name FROM projects WHERE id = :p1 AND status != 'archived'",
+                    [settings.scratchpadProjectId])[0] || null;
+    } catch {
+      project = null;
+    }
+  }
+  return { on: true, project };
+}
+
+// Which tools carry the directive in their description. add_note is where a draft
+// is actually written, and list_projects is what the standing prompt tells agents
+// to call first, so it is where an agent is oriented before it has decided
+// anything. The rest would be noise.
+const SCRATCHPAD_TOOLS = new Set(["add_note", "list_projects"]);
 const ACTOR = process.env.DELPHI_ACTOR || "agent";
 
 /**
@@ -748,18 +810,27 @@ function handle(req) {
   const { id, method, params } = req;
 
   if (method === "initialize") {
+    const scratchpad = scratchpadState();
     return {
       protocolVersion: "2024-11-05",
-      capabilities: { tools: {} },
+      // listChanged, because the scratchpad setting rewrites tool descriptions.
+      // Without it a client caches the list from startup and the toggle does
+      // nothing until the agent is restarted.
+      capabilities: { tools: { listChanged: true } },
       serverInfo: { name: "brain", version: "1.0.0" },
+      ...(scratchpad.on
+        ? { instructions: directives.scratchpadInstructions(scratchpad.project) }
+        : {}),
     };
   }
 
   if (method === "tools/list") {
+    const scratchpad = scratchpadState();
+    const suffix = scratchpad.on ? directives.scratchpadToolNote(scratchpad.project) : "";
     return {
       tools: Object.entries(TOOLS).map(([name, t]) => ({
         name,
-        description: t.description,
+        description: t.description + (suffix && SCRATCHPAD_TOOLS.has(name) ? suffix : ""),
         inputSchema: t.schema,
       })),
     };
@@ -769,11 +840,56 @@ function handle(req) {
     const tool = TOOLS[params.name];
     if (!tool) throw new Error(`Unknown tool ${params.name}`);
     const result = tool.run(params.arguments || {});
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    const content = [{ type: "text", text: JSON.stringify(result, null, 2) }];
+
+    // The last word, and the one an agent is most likely to act on, because it
+    // arrives while it is already working rather than at startup. Only on
+    // list_projects: that is the orienting call, and repeating this on every
+    // result would train the model to skip it.
+    const scratchpad = scratchpadState();
+    if (scratchpad.on && params.name === "list_projects") {
+      content.push({ type: "text", text: directives.scratchpadReminder(scratchpad.project) });
+    }
+    return { content };
   }
 
   if (method === "ping") return {};
   throw new Error(`Unknown method ${method}`);
+}
+
+/**
+ * Tells the client to re-read the tool list when the scratchpad setting changes.
+ *
+ * Tool descriptions carry the directive, and a client fetches them once at
+ * startup. Without this, turning the setting on has no effect on an agent that is
+ * already connected, which is the case that matters: someone flips the checkbox
+ * because of what the agent is doing right now.
+ *
+ * The directory is watched rather than settings.json itself, because a settings
+ * file is typically written by replacement and a watch on the old inode stops
+ * firing. Only a real change in the effective state is announced, so an unrelated
+ * write such as a theme change stays quiet.
+ */
+function watchSettings() {
+  const settingsPath = directives.settingsBesideDatabase(DB);
+  let previous = JSON.stringify(scratchpadState());
+  let timer = null;
+
+  try {
+    fs.watch(path.dirname(settingsPath), (_event, filename) => {
+      if (filename && String(filename) !== path.basename(settingsPath)) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const next = JSON.stringify(scratchpadState());
+        if (next === previous) return;
+        previous = next;
+        send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+      }, 200);
+    }).unref();
+  } catch {
+    // Not fatal. The setting still applies to every client that connects after
+    // it was changed; only the live update is lost.
+  }
 }
 
 let buffer = "";
@@ -803,5 +919,7 @@ process.stdin.on("data", (chunk) => {
     }
   }
 });
+
+watchSettings();
 
 process.stdin.on("end", () => process.exit(0));
