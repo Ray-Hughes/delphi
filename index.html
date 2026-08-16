@@ -596,6 +596,59 @@
   .check:hover { border-color: var(--accent); }
   .task.done .check { background: var(--good); border-color: var(--good); color: #fff; }
   .task.done .t-title { text-decoration: line-through; color: var(--ink-faint); }
+
+  /* Finishing something --------------------------------------------------
+     Ticking a task used to do nothing visible except remove the row on the
+     next repaint, which reads as "have I just deleted that?" rather than as
+     "done". The row now says so first and leaves afterwards.
+
+     The whole of this is switched off by the reduced motion rule further up,
+     and the JavaScript checks the same preference so the row does not sit
+     there for the length of an animation that is not playing. */
+  .task { position: relative; }
+
+  @keyframes task-wiggle {
+    0%, 100% { transform: translateX(0) rotate(0deg); }
+    18% { transform: translateX(-5px) rotate(-1.2deg); }
+    36% { transform: translateX(5px)  rotate(1.2deg); }
+    54% { transform: translateX(-3px) rotate(-0.7deg); }
+    72% { transform: translateX(3px)  rotate(0.7deg); }
+    86% { transform: translateX(-1px) rotate(-0.2deg); }
+  }
+  @keyframes task-glow {
+    0%   { background: transparent; }
+    30%  { background: color-mix(in srgb, var(--good) 20%, transparent); }
+    100% { background: transparent; }
+  }
+  @keyframes check-pop {
+    0%   { transform: scale(1); }
+    45%  { transform: scale(1.4); }
+    75%  { transform: scale(0.92); }
+    100% { transform: scale(1); }
+  }
+  /* Each spark is given its own direction as --dx/--dy, so one keyframe set
+     throws all of them outwards without needing a rule per spark. */
+  @keyframes spark-fly {
+    0%   { opacity: 0; transform: translate(0, 0) scale(0.2) rotate(0deg); }
+    22%  { opacity: 1; }
+    100% { opacity: 0; transform: translate(var(--dx), var(--dy)) scale(1) rotate(160deg); }
+  }
+
+  .task.celebrate { animation: task-wiggle 520ms ease-out, task-glow 760ms ease-out; }
+  .task.celebrate .check {
+    background: var(--good); border-color: var(--good); color: #fff;
+    animation: check-pop 440ms cubic-bezier(0.2, 1.7, 0.45, 1);
+  }
+  .task.celebrate .t-title { text-decoration: line-through; color: var(--ink-faint); }
+  /* Placed on the middle of the tick box, not its corner: .task is padded
+     12px/16px and .check is 16px square at margin-top 2px, so its centre is
+     about (24, 22), less half a glyph. */
+  .spark {
+    position: absolute; left: 19px; top: 17px;
+    font-size: 11px; line-height: 1; color: var(--good);
+    pointer-events: none; opacity: 0;
+    animation: spark-fly 720ms ease-out forwards;
+  }
   .t-body { flex: 1; min-width: 0; }
   .t-title { line-height: 1.45; }
   .t-meta { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: 6px; align-items: center; }

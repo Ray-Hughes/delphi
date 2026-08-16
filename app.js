@@ -52,6 +52,34 @@ const today = () => new Date().toISOString().slice(0, 10);
 const isOverdue = (t) => t.due && t.status !== "done" && t.due < today();
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
+const prefersReducedMotion = () =>
+  window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/**
+ * The small celebration when a task is ticked off.
+ *
+ * The row wiggles, washes green and pops its tick, and a handful of sparks fly
+ * out of the checkbox. Then the row leaves, because the list hides finished
+ * work. The point is the order: confirm, then remove. Removing first is what
+ * made completing a task feel like losing one.
+ *
+ * Directions are set per spark as custom properties so a single keyframe throws
+ * all of them outwards. Delays are jittered because six sparks leaving on
+ * exactly the same frame reads as one shape rather than as a burst.
+ */
+function celebrateDone(row) {
+  if (prefersReducedMotion()) return;
+  row.classList.add("celebrate");
+  const directions = [[-24, -18], [-2, -28], [22, -20], [-22, 14], [20, 16], [3, 24]];
+  for (const [dx, dy] of directions) {
+    const spark = el("span", { className: "spark", textContent: "✦" });
+    spark.style.setProperty("--dx", `${dx}px`);
+    spark.style.setProperty("--dy", `${dy}px`);
+    spark.style.animationDelay = `${Math.round(Math.random() * 90)}ms`;
+    row.append(spark);
+  }
+}
+
 /**
  * Asks for one line of text. Resolves to the string, or null if cancelled.
  *
@@ -65,7 +93,7 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
  * alert and confirm are fine and are left alone. prompt is the only one Electron
  * refuses.
  */
-function askText({ title, label, value = "", placeholder = "", confirmLabel = "Create", allowEmpty = false }) {
+function askText({ title, label, value = "", placeholder = "", confirmLabel = "Create", allowEmpty = false, pickFolder = false }) {
   return new Promise((resolve) => {
     const overlay = el("div", { className: "overlay" });
     const box = el("div", { className: "ask" });
@@ -115,9 +143,34 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
     cancel.onclick = () => finish(null);
     ok.onclick = submit;
 
+    const actions = el("div", { className: "ask-actions" });
+
+    // Typing an absolute path means going to look it up and retyping it without
+    // a typo. The field stays, because pasting a path you already have is faster
+    // than browsing to it, but it is no longer the only way in.
+    if (pickFolder) {
+      const browse = el("button", { className: "btn", textContent: "Choose folder…", type: "button" });
+      browse.onclick = async () => {
+        try {
+          const picked = await window.delphi.dialog.pickFolder(title);
+          if (!picked) return;          // cancelled in the native dialog
+          input.value = picked;
+          error.style.display = "none";
+          input.focus();
+        } catch (e) {
+          error.style.display = "";
+          error.textContent = e.message;
+        }
+      };
+      actions.append(browse);
+      actions.style.justifyContent = "space-between";
+    }
+
+    actions.append(el("div", { style: "display:flex; gap:8px" }, cancel, ok));
+
     box.append(el("h3", { textContent: title }));
     if (label) box.append(el("p", { className: "hint", textContent: label }));
-    box.append(input, error, el("div", { className: "ask-actions" }, cancel, ok));
+    box.append(input, error, actions);
     overlay.append(box);
     overlay.onclick = (event) => { if (event.target === overlay) finish(null); };
     document.body.append(overlay);
@@ -756,9 +809,10 @@ async function renderOverview(root) {
   addRepo.onclick = async () => {
     const path = await askText({
       title: "Add a repository",
-      label: "The absolute path to the folder on this machine.",
+      label: "Choose the folder, or paste its absolute path.",
       placeholder: "/Users/you/code/project",
       confirmLabel: "Add",
+      pickFolder: true,
     });
     if (!path) return;
     const name = path.trim().replace(/\/+$/, "").split("/").pop();
@@ -3367,8 +3421,25 @@ function taskRow(t) {
   check.setAttribute("aria-checked", String(t.status === "done"));
   const toggle = async (e) => {
     if (e) e.stopPropagation();
-    await window.delphi.tasks.update(t.id, { status: t.status === "done" ? "todo" : "done" });
-    refresh();
+    const completing = t.status !== "done";
+
+    // Started before the animation, not after. What is being waited on is the
+    // celebration, not the write: closing the window part way through has to
+    // still leave the task done.
+    const saved = window.delphi.tasks.update(t.id, { status: completing ? "done" : "todo" });
+
+    if (!completing) {
+      await saved;
+      refresh();
+      return;
+    }
+
+    celebrateDone(row);
+    await saved;
+    // Long enough to see it, short enough not to be in the way of ticking off
+    // the next one. Skipped entirely when animations are turned off, since
+    // there would be nothing to wait for.
+    setTimeout(refresh, prefersReducedMotion() ? 0 : 640);
   };
   check.onclick = toggle;
   check.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };

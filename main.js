@@ -850,6 +850,20 @@ handle("alerts:snooze", (id) => db.snoozeAlert(id, settings.snoozeMinutes));
 handle("alerts:act", (id) => db.actOnAlert(id));
 
 handle("repos:list", (projectId) => db.listRepos(projectId));
+// Asking for a folder by typing its absolute path is asking someone to go and
+// look it up in Finder and then retype it correctly. The native picker is right
+// there and already knows how to browse.
+//
+// Parented to the window so macOS attaches it as a sheet rather than floating a
+// separate dialog that can end up behind the app.
+handle("dialog:pickFolder", async (title) => {
+  const result = await dialog.showOpenDialog(win, {
+    title: title || "Choose a folder",
+    properties: ["openDirectory", "createDirectory"],
+  });
+  return result.canceled || !result.filePaths.length ? null : result.filePaths[0];
+});
+
 handle("repos:create", (payload) => db.createRepo(payload));
 handle("repos:setPrimary", (id) => db.setPrimaryRepo(id));
 handle("repos:delete", (id) => db.deleteRepo(id));

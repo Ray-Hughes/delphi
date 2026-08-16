@@ -49,6 +49,9 @@ contextBridge.exposeInMainWorld("delphi", {
     export: () => call("vault:export"),
     reveal: () => call("vault:reveal"),
   },
+  dialog: {
+    pickFolder: (title) => call("dialog:pickFolder", title),
+  },
   alerts: {
     list: (opts) => call("alerts:list", opts),
     create: (payload) => call("alerts:create", payload),
