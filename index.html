@@ -540,6 +540,11 @@
     flex: 1; overflow-y: auto;
     border: 1px solid var(--line); border-radius: var(--r);
     background: var(--bg); padding: var(--s4) var(--s5);
+    /* Matched to .sheet-body textarea below, deliberately. Rendered markdown
+       otherwise inherits the 13px body size while the editor is set to 14px, so
+       clicking the text to edit made everything jump a size. Only the typeface
+       should change between reading and editing, not the measure. */
+    font-size: 14px; line-height: 1.7;
   }
   .note-body .md {
     border: 1px solid var(--line); border-radius: var(--r-sm);
