@@ -49,6 +49,8 @@ let settings = {
 };
 let schedulerTimer = null;
 let vaultTimer = null;
+// The last value of PRAGMA data_version, not a timestamp. 0 means "not looked
+// yet". See checkForExternalWrites for why it cannot be an mtime.
 let lastSeenDbChange = 0;
 let dbWatcher = null;
 let dbWatchTimer = null;
@@ -671,34 +673,31 @@ function sweep() {
 // but it never reaches the markdown mirror and the Oracle cannot find it, which
 // defeats the point of letting agents record what they learn.
 //
-// Watching the file covers every external writer rather than only the one we know
-// about, and costs a stat call a minute.
+// This asks SQLite who wrote, rather than asking the filesystem that something
+// did. PRAGMA data_version changes only when a DIFFERENT connection commits;
+// writes made through this app's own connection leave it alone. db.js opens
+// exactly one connection for the whole app, so "changed" here means precisely
+// "an agent, or another copy of Delphi, wrote something".
+//
+// It has to be that and not a file timestamp, because reacting to an external
+// write means rebuilding the graph and re-embedding, and both of those are
+// writes. Keyed on mtime, the reaction was itself a change, which triggered the
+// next reaction, and the app rewrote the database every couple of seconds
+// forever. Every cycle also told the window to refresh, so the view was rebuilt
+// under the reader: scrolling jumped back to the top and a selection in progress
+// was destroyed as its nodes were replaced.
 function checkForExternalWrites() {
   try {
-    // The write-ahead log as well as the database, and the newest of the two.
-    //
-    // In WAL mode another process's writes land in delphi.db-wal, and delphi.db
-    // itself is not touched until a checkpoint. A checkpoint does not happen
-    // while this app holds the database open, so watching delphi.db alone meant
-    // an agent could write through the MCP server and nothing here ever noticed:
-    // no vault export, no graph rebuild, no refresh. That is the exact case this
-    // function was written for, and it could not see it.
-    let changed = 0;
-    for (const suffix of ["", "-wal"]) {
-      try {
-        changed = Math.max(changed, fs.statSync(db.DB_PATH + suffix).mtimeMs);
-      } catch {
-        // No write-ahead log yet, which is normal on a fresh database.
-      }
-    }
-    if (!changed) return;
+    const version = db.handle().prepare("PRAGMA data_version").get().data_version;
 
+    // First look establishes the baseline. Reacting here would rebuild
+    // everything on every launch for no reason.
     if (lastSeenDbChange === 0) {
-      lastSeenDbChange = changed;
+      lastSeenDbChange = version;
       return;
     }
-    if (changed > lastSeenDbChange) {
-      lastSeenDbChange = changed;
+    if (version !== lastSeenDbChange) {
+      lastSeenDbChange = version;
       scheduleVaultExport();
       if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
     }

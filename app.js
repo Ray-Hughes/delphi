@@ -11,6 +11,10 @@ const state = {
   taskFilter: null,    // null | doing | blocked | overdue | done
   theme: "system",     // system | light | dark
   noteView: "formatted", // formatted | raw
+  // Which single note is open for editing. Deliberately not persisted and
+  // deliberately not noteView: editing one note says nothing about how you want
+  // to read the rest of them.
+  editingNoteId: null,
   query: "",
   tasks: [],
   notes: [],
@@ -369,6 +373,10 @@ async function refresh() {
 
 const currentProject = () => state.projects.find((p) => p.id === state.projectId) || null;
 
+// The position the last render painted, so the next one can tell a repaint from
+// a move and decide whether to keep the reader's scroll position.
+let lastRenderedPosition = null;
+
 // ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
@@ -530,6 +538,20 @@ function render() {
   // view appears twice. Anything still holding the old node now writes into a
   // detached element that nobody sees.
   const previous = $("content");
+
+  // Where the reader was, kept across a repaint that is not a move.
+  //
+  // #content is the scrolling element and it is replaced rather than emptied, so
+  // every render used to put you back at the top. That is invisible when a render
+  // means "you went somewhere", and maddening when it means "a note you were not
+  // looking at changed": renaming a note, an agent writing one, or a reminder
+  // firing all call refresh(), and all of them threw away your place halfway down
+  // a long note. Restored only when the position is unchanged, because arriving
+  // at a new project or tab part way down would be worse than the problem.
+  const staying = lastRenderedPosition && samePosition(position(), lastRenderedPosition);
+  const previousScroll = staying ? previous.scrollTop : 0;
+  lastRenderedPosition = position();
+
   const content = el("div", { className: previous.className, id: "content" });
   previous.replaceWith(content);
   const view = ({
@@ -557,15 +579,29 @@ function render() {
     return;
   }
 
+  // Restored after the view has put its content in, since scrollTop on an empty
+  // element is silently clamped to zero. Applied twice for the async views: once
+  // when their promise settles, and once more on the next frame, because a view
+  // that appends and then measures can still be growing when the promise
+  // resolves.
+  const restoreScroll = () => {
+    if (!previousScroll || content !== $("content")) return;
+    content.scrollTop = previousScroll;
+    requestAnimationFrame(() => {
+      if (content === $("content")) content.scrollTop = previousScroll;
+    });
+  };
+
   try {
     const result = view(content);
     if (result && typeof result.then === "function") {
-      result.catch((error) => showViewError(content, error));
+      result.then(restoreScroll).catch((error) => showViewError(content, error));
+    } else {
+      restoreScroll();
     }
   } catch (error) {
     showViewError(content, error);
   }
-
 }
 
 // Counts for whatever is selected. Shown in the header on every view so the
@@ -3479,16 +3515,34 @@ function noteCard(n) {
   head.append(del);
   wrap.append(head);
 
-  if (state.noteView === "formatted") {
-    // Read mode. Double click drops into the source at the note you are looking
-    // at, so switching to edit does not mean changing a global setting first.
+  // Editing is per note and does not touch state.noteView.
+  //
+  // It used to: double clicking a formatted note set the global view to raw,
+  // which put every other note on the page into source at the same time, and
+  // left it that way for the next session. Editing one note is not a statement
+  // about how you want to read all of them.
+  const editing = state.editingNoteId === n.id;
+
+  if (state.noteView === "formatted" && !editing) {
+    const edit = el("button", { className: "btn sm", textContent: "Edit", title: "Edit this note" });
+    edit.onclick = () => { state.editingNoteId = n.id; refresh(); };
+    head.insertBefore(edit, expand);
+
     const rendered = renderMarkdown(n.body);
-    rendered.title = "Double click to edit the markdown";
-    rendered.ondblclick = () => { state.noteView = "raw"; refresh(); };
+    rendered.title = "Click to edit";
+    // A click that ends a drag is someone selecting text to copy, not someone
+    // asking to edit. Swapping in a textarea there would drop the selection they
+    // just made, which is the whole reason they clicked.
+    rendered.onclick = () => {
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      state.editingNoteId = n.id;
+      refresh();
+    };
     wrap.append(el("div", { className: "note-body" },
       (n.body || "").trim()
         ? rendered
-        : el("div", { className: "hint", textContent: "Empty. Switch to raw markdown to write something." })));
+        : el("div", { className: "hint", textContent: "Empty. Click Edit to write something." })));
     return wrap;
   }
 
@@ -3498,9 +3552,45 @@ function noteCard(n) {
     rows: Math.min(18, Math.max(4, (n.body || "").split("\n").length + 1)),
     placeholder: "What is worth remembering here",
   });
-  body.onblur = async () => {
-    if (body.value !== n.body) { await window.delphi.notes.update(n.id, { body: body.value }); n.body = body.value; }
+
+  const save = async () => {
+    if (body.value === n.body) return;
+    await window.delphi.notes.update(n.id, { body: body.value });
+    n.body = body.value;
   };
+  body.onblur = save;
+
+  if (editing) {
+    // Saved before the repaint rather than left to blur. Both fire, but blur is
+    // async and the render that follows would read the old body and paint what
+    // you just finished changing away.
+    const done = el("button", { className: "btn sm primary", textContent: "Done", title: "Stop editing" });
+    done.onclick = async () => {
+      await save();
+      state.editingNoteId = null;
+      refresh();
+    };
+    head.insertBefore(done, expand);
+
+    // Escape leaves the note rather than the window. Without this it reaches the
+    // document handler, which hides the whole app.
+    body.addEventListener("keydown", async (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      await save();
+      state.editingNoteId = null;
+      refresh();
+    });
+
+    // Focus after this render has landed, so clicking the text puts the caret in
+    // it rather than leaving you looking at a box you still have to click.
+    requestAnimationFrame(() => {
+      if (!document.body.contains(body)) return;
+      body.focus();
+      body.setSelectionRange(body.value.length, body.value.length);
+    });
+  }
   // The moment you want more room is while typing in too little of it.
   body.onkeydown = (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -3548,12 +3638,35 @@ function openNoteSheet(note) {
 
   const pane = el("div", { className: "sheet-body" });
 
+  // Whether this sheet is being edited, as distinct from how notes are read.
+  // Clicking the text drops into the source for this note only, and leaves the
+  // Formatted/Raw preference alone.
+  let editing = false;
+
   // Rendering reads from the textarea rather than from the note, so switching
   // to formatted shows what you have just typed and not what was last saved.
   const paint = () => {
+    const wasScrolled = pane.scrollTop;
     pane.textContent = "";
-    pane.append(state.noteView === "formatted" ? renderMarkdown(area.value) : area);
-    if (state.noteView === "raw") area.focus();
+
+    if (editing || state.noteView === "raw") {
+      pane.append(area);
+      area.focus();
+      return;
+    }
+
+    const rendered = renderMarkdown(area.value);
+    rendered.title = "Click to edit";
+    // Ignored when a selection is open, so dragging to copy does not swap the
+    // text out from under the drag.
+    rendered.onclick = () => {
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      editing = true;
+      paint();
+    };
+    pane.append(rendered);
+    pane.scrollTop = wasScrolled;
   };
 
   const seg = el("div", { className: "seg", role: "group" });
@@ -3562,7 +3675,10 @@ function openNoteSheet(note) {
     const button = el("button", { type: "button", textContent: label });
     button.setAttribute("aria-pressed", String(state.noteView === value));
     button.onclick = async () => {
-      if (state.noteView === value) return;
+      // Choosing Formatted is a request to read, so it ends an edit started by
+      // clicking the text. Otherwise the button would appear to do nothing.
+      if (value === "formatted") editing = false;
+      if (state.noteView === value) { paint(); return; }
       state.noteView = value;
       for (const b of seg.children) b.setAttribute("aria-pressed", String(b.textContent.toLowerCase().startsWith(value)));
       try { await window.delphi.settings.set({ noteView: value }); } catch {}
