@@ -930,13 +930,49 @@ function render() {
   try {
     const result = view(content);
     if (result && typeof result.then === "function") {
-      result.then(restoreScroll).catch((error) => showViewError(content, error));
+      const done = spinWhile(content);
+      result
+        .then(() => { done(); restoreScroll(); })
+        .catch((error) => { done(); showViewError(content, error); });
     } else {
       restoreScroll();
     }
   } catch (error) {
     showViewError(content, error);
   }
+}
+
+/**
+ * Shows a spinner over a pane while something is loading, and returns the way to
+ * stop it.
+ *
+ * Held back for a moment first. Most of these views resolve in a few
+ * milliseconds, and a spinner that appears and vanishes inside one frame is a
+ * flicker that reads as a fault rather than as progress. Only work that is
+ * actually slow enough to notice gets announced, which in practice means the
+ * settings page, where finding out what this machine can talk to means starting
+ * login shells.
+ *
+ * The pane keeps whatever the view has already put in it, so a partly built page
+ * dims rather than disappearing and coming back.
+ */
+function spinWhile(pane, { delay = 140 } = {}) {
+  let node = null;
+  let cancelled = false;
+
+  const timer = setTimeout(() => {
+    if (cancelled) return;
+    node = el("div", { className: "pane-loading", role: "status" });
+    node.setAttribute("aria-live", "polite");
+    node.append(el("span", { className: "spinner" }), el("span", { textContent: "Loading" }));
+    pane.append(node);
+  }, delay);
+
+  return () => {
+    cancelled = true;
+    clearTimeout(timer);
+    if (node) node.remove();
+  };
 }
 
 // Counts for whatever is selected. Shown in the header on every view so the
@@ -5580,11 +5616,16 @@ async function renderSettings(root) {
   const providerList = el("div", { className: "provider-list" });
   aiBox.append(providerList);
 
-  const paintProviders = async () => {
+  const paintProviders = async (force = false) => {
     providerList.textContent = "";
+    // This is the slow one: it starts a login shell per tool to ask whether each
+    // is signed in. Saying so beats an empty box that looks like the answer.
+    providerList.append(el("div", { className: "provider-probing" },
+      el("span", { className: "spinner" }),
+      el("span", { textContent: "Checking what this machine can reach" })));
     let providers = [];
     try {
-      providers = await window.delphi.ai.providers();
+      providers = await window.delphi.ai.providers(force);
       state.providers = providers;
     } catch (error) {
       providerList.append(el("div", { className: "err-msg", textContent: String(error.message || error) }));
@@ -5621,7 +5662,7 @@ async function renderSettings(root) {
     }
 
     const recheck = el("button", { className: "btn sm", textContent: "Check again" });
-    recheck.onclick = async () => { await paintProviders(); };
+    recheck.onclick = async () => { await paintProviders(true); };
     providerList.append(el("div", { className: "provider-foot" }, recheck));
   };
   await paintProviders();

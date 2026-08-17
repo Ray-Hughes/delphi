@@ -131,6 +131,36 @@ function ghToken(host) {
   }
 }
 
+
+/**
+ * The last thing the Copilot CLI complained about, from its own log.
+ *
+ * It fails by exiting with nothing on either stream and writing the reason to a
+ * file, so without reading that file every failure looks identical. Guessing at
+ * the cause is worse than saying nothing: the first version of this blamed the
+ * token type, which stayed on screen as the explanation long after the token had
+ * been replaced and the real problem was elsewhere.
+ */
+function lastCopilotError() {
+  try {
+    const dir = path.join(os.homedir(), ".copilot", "logs");
+    if (!fs.existsSync(dir)) return null;
+    const newest = fs.readdirSync(dir)
+      .filter((f) => f.endsWith(".log"))
+      .map((f) => ({ f, at: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.at - a.at)[0];
+    if (!newest) return null;
+    const lines = fs.readFileSync(path.join(dir, newest.f), "utf8").split("\n");
+    const errors = lines.filter((l) => l.includes("[ERROR]"));
+    if (!errors.length) return null;
+    // Trim the timestamp and level, which are noise in a sentence shown to a
+    // person who is looking at the app rather than at a log.
+    return errors[errors.length - 1].replace(/^\S+\s+\[ERROR\]\s*/, "").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 function streamViaCopilot({ cli, cwd, model, prompt, host, token, autoAllow }, emit) {
   return new Promise((resolve) => {
     // Same rule as the Claude path: tools only when the session asks for them.
@@ -156,13 +186,12 @@ function streamViaCopilot({ cli, cwd, model, prompt, host, token, autoAllow }, e
       if (code !== 0 && !saidAnything) {
         // It fails silently on a rejected token, so the likely cause is named
         // rather than leaving an empty reply and an exit code nobody sees.
+        const logged = lastCopilotError();
         emit({
           type: "error",
-          message: stderr.trim() ||
-            "Copilot exited without saying anything. The usual cause is the token: " +
-            "classic personal access tokens are refused. Run " +
-            `gh auth login --hostname ${host || "your-enterprise-host"} --web ` +
-            "to get one Copilot accepts, then try again.",
+          message: stderr.trim() || (logged
+            ? `Copilot stopped without answering. Its log says: ${logged}`
+            : "Copilot exited without saying anything, and left nothing in its log."),
         });
       }
       emit({ type: "done" });
@@ -177,7 +206,22 @@ function streamViaCopilot({ cli, cwd, model, prompt, host, token, autoAllow }, e
  * Reported rather than assumed, so the window can say "connected through your
  * Claude login" or ask for a key, instead of failing at the first message.
  */
-async function providers({ apiKey } = {}) {
+// Asking costs about four seconds: a login shell per tool, each starting the
+// user's whole profile. Sign-in state does not change on that timescale, so the
+// answer is kept and the settings page asks for a fresh one explicitly.
+let providerCache = null;
+let providerAt = 0;
+const PROVIDER_TTL = 60000;
+
+async function providers({ apiKey, force = false } = {}) {
+  if (!force && providerCache && Date.now() - providerAt < PROVIDER_TTL) {
+    // The key is the one part that changes from inside the app, so it is
+    // re-read rather than served from a cache that could be a minute stale.
+    return providerCache.map((p) =>
+      p.id === "anthropic"
+        ? { ...p, ready: Boolean(apiKey), detail: apiKey ? "key saved" : "no key saved" }
+        : p);
+  }
   const out = [];
 
   const cli = findClaudeCli();
@@ -225,6 +269,8 @@ async function providers({ apiKey } = {}) {
     detail: apiKey ? "key saved" : "no key saved",
   });
 
+  providerCache = out;
+  providerAt = Date.now();
   return out;
 }
 

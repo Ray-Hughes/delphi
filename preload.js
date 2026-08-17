@@ -53,7 +53,7 @@ contextBridge.exposeInMainWorld("delphi", {
     reveal: () => call("vault:reveal"),
   },
   ai: {
-    providers: () => call("ai:providers"),
+    providers: (force) => call("ai:providers", force),
     hasKey: () => call("ai:hasKey"),
     setKey: (key) => call("ai:setKey", key),
     send: (payload) => call("ai:send", payload),

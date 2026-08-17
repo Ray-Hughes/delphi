@@ -966,7 +966,7 @@ function readApiKey() {
   }
 }
 
-handle("ai:providers", async () => ai.providers({ apiKey: readApiKey() }));
+handle("ai:providers", async (force) => ai.providers({ apiKey: readApiKey(), force: force === true }));
 handle("ai:hasKey", () => Boolean(readApiKey()));
 
 handle("ai:setKey", (key) => {
