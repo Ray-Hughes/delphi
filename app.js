@@ -583,11 +583,6 @@ function renderSidebar() {
       textContent: state.projects.length
         ? "Pick a project from the rail to see its sessions."
         : "No projects yet. Use + on the rail to make one." }));
-    if (foot) {
-      const add = el("button", { className: "btn wide", textContent: "New project" });
-      add.onclick = createProject;
-      foot.append(add);
-    }
     return;
   }
 
@@ -6306,13 +6301,18 @@ function renderRail() {
     }
   }
 
+  // A drawn plus rather than the "+" character, which rendered as a stray glyph
+  // sitting in the column rather than as something you could press.
   const add = el("div", {
-    className: "rail-tile bare",
+    className: "rail-tile rail-add",
     tabIndex: 0,
     role: "button",
     title: "New project",
-    textContent: "+",
   });
+  add.innerHTML =
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" aria-hidden="true">' +
+    '<path d="M12 5v14M5 12h14"/></svg>';
   add.onclick = createProject;
   add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); createProject(); } };
   rail.append(el("div", { className: "rail-sp" }), el("div", { className: "rail-div" }), add);
@@ -6702,8 +6702,6 @@ async function createProject() {
     return null;
   }
 }
-
-$("new-project").onclick = createProject;
 
 $("back").onclick = () => goBack();
 

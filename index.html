@@ -317,6 +317,9 @@
     background: var(--line); color: var(--ink);
   }
   .sidebar-foot { border-top: 1px solid var(--line-soft); padding: var(--s3); }
+  /* With no project open the foot holds nothing, and the border alone reads as a
+     bar the eye keeps looking for content in. */
+  .sidebar-foot:empty { display: none; }
 
   /* Buttons -------------------------------------------------------------- */
   .btn {
@@ -2042,8 +2045,20 @@
     border-color: var(--c-acc); color: var(--c-ink);
     box-shadow: inset 0 1px 0 rgba(255,255,255,.25), 0 8px 24px rgba(0,0,0,.35);
   }
-  .rail-tile.bare { border-color: transparent; background: transparent; color: var(--c-faint); }
-  .rail-tile.bare:hover { color: var(--c-acc); }
+  /* Same 36px square as a project tile, so the column keeps one rhythm, but
+     dashed and empty so it reads as the slot a project has yet to fill. */
+  .rail-add {
+    border-style: dashed; border-color: var(--c-edge2);
+    background: transparent; color: var(--c-faint);
+    cursor: pointer;
+  }
+  .rail-add:hover, .rail-add:focus-visible {
+    border-style: solid; border-color: var(--c-acc); color: var(--c-acc);
+    background: color-mix(in srgb, var(--c-acc) 10%, transparent);
+  }
+  .rail-add:active { transform: scale(.94); }
+  @media (prefers-reduced-motion: reduce) { .rail-add:active { transform: none; } }
+  :root[data-motion="off"] .rail-add:active { transform: none; }
   .rail-sp { flex: 1 1 auto; }
   .rail-div { height: 1px; width: 24px; margin: 0 auto; background: var(--line); flex: 0 0 auto; }
   /* A tile whose folder has gone. Stated rather than silently working, because
