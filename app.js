@@ -638,12 +638,12 @@ function renderSidebar() {
   }
 
   if (foot) {
-    const pick = el("button", {
-      className: "btn wide",
-      textContent: project.path ? "Open folder" : "Link a folder",
+    const settings = el("button", {
+      className: "btn wide" + (state.view === "project" ? " primary" : ""),
+      textContent: "Project settings",
     });
-    pick.onclick = () => (project.path ? window.delphi.fs.reveal(project.path) : linkFolder(project));
-    foot.append(pick);
+    settings.onclick = () => navigate({ view: "project" });
+    foot.append(settings);
   }
 }
 
@@ -739,7 +739,7 @@ function renderTabs() {
        ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
-       ["activity", "Activity"], ["project", "Settings"]]
+       ["activity", "Activity"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
        ["graph", "Mind map"],
