@@ -13,6 +13,9 @@ const state = {
   // not blank a conversation mid-read.
   sessions: [],
   sessionId: null,
+  // What this machine can talk to, asked once at boot. Probing spawns login
+  // shells, which is far too slow to repeat on every render.
+  providers: [],
   messages: [],
   // What is typed but not yet sent. render() rebuilds #content wholesale, so a
   // draft that lived only in the textarea would be destroyed by an alert
@@ -549,15 +552,141 @@ function goBack() {
   return true;
 }
 
+/** Short label for a persona, shown on the right of a session row. */
+const AGENT_SHORT = {
+  boss: "boss", designer: "design", content: "content", data: "data", assistant: "asst",
+};
+
+/**
+ * The sidebar, which is now the open project's own panel.
+ *
+ * It used to list every project, which is what the rail does. Two lists of the
+ * same thing side by side is one list too many, and it left nowhere for the
+ * things belonging to a single project to live. So this is that: the project,
+ * its folder, its sessions, and the way to start another.
+ */
 function renderSidebar() {
   renderRail();
   const box = $("projects");
+  const foot = $("sidebar-foot");
   box.textContent = "";
+  if (foot) foot.textContent = "";
 
-  const allOpen = state.projects.reduce((n, p) => n + p.open_count, 0);
-  box.append(projectRow({ id: null, name: "All work", colour: "var(--ink-faint)", open_count: allOpen }));
+  const project = currentProject();
 
-  for (const p of state.projects) box.append(projectRow(p));
+  if (!project) {
+    const allOpen = state.projects.reduce((n, p) => n + p.open_count, 0);
+    box.append(el("div", { className: "pp-sec" },
+      el("span", { textContent: "Everything" }),
+      el("span", { className: "n", textContent: String(allOpen) })));
+    box.append(el("div", { className: "pp-empty",
+      textContent: state.projects.length
+        ? "Pick a project from the rail to see its sessions."
+        : "No projects yet. Use + on the rail to make one." }));
+    if (foot) {
+      const add = el("button", { className: "btn wide", textContent: "New project" });
+      add.onclick = createProject;
+      foot.append(add);
+    }
+    return;
+  }
+
+  const head = el("div", { className: "pp-head" });
+  const name = el("div", { className: "nm" });
+  name.append(el("span", { className: "t", textContent: project.name, title: project.name }));
+  name.append(project.path
+    ? el("span", { className: "p", textContent: project.path, title: project.path })
+    : el("span", { className: "p none", textContent: "No folder linked" }));
+  head.append(name);
+  box.append(head);
+
+  box.append(el("div", { className: "pp-sec" },
+    el("span", { textContent: "Sessions" }),
+    el("span", { className: "n", textContent: String(state.sessions.length) })));
+
+  const add = el("div", { className: "gnew", tabIndex: 0, role: "button" },
+    el("span", { textContent: "+" }), el("span", { textContent: "New session" }));
+  const start = async () => { await newSession(); navigate({ view: "chat" }); };
+  add.onclick = start;
+  add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); start(); } };
+  box.append(add);
+
+  if (!state.sessions.length) {
+    box.append(el("div", { className: "pp-empty",
+      textContent: "None yet. Start one to talk to an agent about this project." }));
+  }
+
+  for (const sn of state.sessions) {
+    const row = el("div", {
+      className: "gs" + (sn.id === state.sessionId && state.view === "chat" ? " on" : ""),
+      tabIndex: 0,
+      role: "button",
+      title: sn.title || "New session",
+    });
+    row.append(
+      el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
+      el("span", { className: "nm", textContent: sn.title || "New session" })
+    );
+    if (sn.agent && AGENT_SHORT[sn.agent]) {
+      row.append(el("span", { className: "kbd", textContent: AGENT_SHORT[sn.agent] }));
+    }
+    const open = async () => {
+      // Opening a session is also opening the chat, or clicking one from another
+      // tab would change something nobody could see.
+      if (state.view !== "chat") { state.sessionId = sn.id; navigate({ view: "chat" }); return; }
+      await openSession(sn.id);
+    };
+    row.onclick = open;
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+    row.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, e.clientX, e.clientY); };
+    box.append(row);
+  }
+
+  if (foot) {
+    const pick = el("button", {
+      className: "btn wide",
+      textContent: project.path ? "Open folder" : "Link a folder",
+    });
+    pick.onclick = () => (project.path ? window.delphi.fs.reveal(project.path) : linkFolder(project));
+    foot.append(pick);
+  }
+}
+
+/** Binds a project to a folder after the fact. */
+async function linkFolder(project) {
+  const folder = await window.delphi.dialog.pickFolder(
+    `Which folder is ${project.name}?`,
+    { defaultPath: lastProjectParent(), buttonLabel: "Link it" }
+  );
+  if (!folder) return;
+  await window.delphi.projects.update(project.id, { path: folder });
+  await refresh();
+}
+
+function sessionMenu(session, x, y) {
+  rowMenu(x, y, [
+    {
+      label: "Rename",
+      run: async () => {
+        const title = await askText({
+          title: "Rename session", label: "What should this be called?",
+          value: session.title || "", confirmLabel: "Rename",
+        });
+        if (!title) return;
+        await window.delphi.sessions.update(session.id, { title });
+        await refresh();
+      },
+    },
+    {
+      label: "Delete",
+      danger: true,
+      run: async () => {
+        await window.delphi.sessions.remove(session.id);
+        if (state.sessionId === session.id) { state.sessionId = null; state.messages = []; }
+        await refresh();
+      },
+    },
+  ]);
 }
 
 function projectRow(p) {
@@ -6136,16 +6265,15 @@ function renderRail() {
   if (!rail) return;
   rail.textContent = "";
 
-  // "All work" keeps its place at the top. Everything downstream branches on a
-  // null id meaning "no project", so the rail has to offer that too or the view
-  // becomes unreachable once the rail is the way people move around.
-  const all = el("div", {
-    className: "rail-tile bare" + (state.projectId === null ? " on" : ""),
-    tabIndex: 0,
-    role: "button",
+  // The mark is the way back to everything. Everything downstream branches on a
+  // null id meaning "no project", so the rail has to offer that or the view
+  // becomes unreachable once the rail is how people move around.
+  const all = el("button", {
+    className: "rail-mark" + (state.projectId === null ? " on" : ""),
+    type: "button",
     title: "All work",
-    textContent: "≣",
   });
+  all.append(el("img", { src: "assets/mark-64.png", width: 26, height: 26, alt: "Delphi" }));
   const goAll = () => navigate({ projectId: null, view: "new", query: "" });
   all.onclick = goAll;
   all.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); goAll(); } };
@@ -6245,31 +6373,6 @@ function renderChat(root) {
 
   const wrap = el("div", { className: "chat" });
 
-  // --- sessions -----------------------------------------------------------
-  const list = el("div", { style: "padding:0 0 8px" });
-  const add = el("div", { className: "gnew", tabIndex: 0, role: "button" },
-    el("span", { textContent: "+" }), el("span", { textContent: "New session" }));
-  add.onclick = newSession;
-  add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); newSession(); } };
-  list.append(add);
-
-  for (const sn of state.sessions) {
-    const row = el("div", {
-      className: "gs" + (sn.id === state.sessionId ? " on" : ""),
-      tabIndex: 0,
-      role: "button",
-    });
-    row.append(
-      el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
-      el("span", { className: "nm", textContent: sn.title || "New session" })
-    );
-    if (sn.message_count) row.append(el("span", { className: "kbd", textContent: String(sn.message_count) }));
-    row.onclick = () => openSession(sn.id);
-    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSession(sn.id); } };
-    list.append(row);
-  }
-  wrap.append(list);
-
   // --- stream -------------------------------------------------------------
   const stream = el("div", { className: "gstream" });
   if (!state.sessionId) {
@@ -6333,11 +6436,20 @@ function renderChat(root) {
   // --- model row and meter ------------------------------------------------
   const session = currentSession();
   const model = el("div", { className: "gmodel" });
-  const conn = el("div", { className: "gconn", tabIndex: 0, role: "button", title: "Choose the agent" },
-    el("span", { className: "mk", textContent: "✦" }),
-    el("span", { textContent: session && session.provider ? session.provider : "Not connected" }),
+  // Named from what this machine can actually reach rather than from what the
+  // session recorded, so a chip never claims a connection that is not there.
+  const ready = state.providers.filter((x) => x.ready);
+  const chosen = (session && session.provider && ready.find((x) => x.id === session.provider))
+    || ready[0] || null;
+  const conn = el("div", {
+    className: "gconn" + (chosen ? "" : " open"),
+    tabIndex: 0, role: "button",
+    title: chosen ? chosen.detail : "Nothing is connected yet. Click to choose.",
+  },
+    el("span", { className: "mk", textContent: chosen ? "✦" : "!" }),
+    el("span", { textContent: chosen ? chosen.label : "Not connected" }),
     el("span", { className: "cv", textContent: "▾" }));
-  conn.onclick = () => navigate({ view: "project" });
+  conn.onclick = (e) => providerMenu(e.clientX, e.clientY);
   model.append(conn);
   for (const [label, bordered] of [["Auto-allow", true], ["Auto", false], ["high", false]]) {
     model.append(el("div", { className: "gpill" + (bordered ? " bd" : "") },
@@ -6370,6 +6482,25 @@ function renderChat(root) {
       stream.scrollTop = stream.scrollHeight;
     });
   }
+}
+
+/** Which agent this session talks to. */
+function providerMenu(x, y) {
+  const session = currentSession();
+  const items = state.providers.map((p) => ({
+    label: p.ready ? p.label : `${p.label}  (${p.detail})`,
+    run: async () => {
+      if (!p.ready) {
+        // Saying why beats refusing silently, and the reason is usually one
+        // command away from being fixed.
+        await askText({ title: p.label, label: p.detail, value: "", allowEmpty: true, confirmLabel: "Close" });
+        return;
+      }
+      if (session) await window.delphi.sessions.update(session.id, { provider: p.id });
+      await refresh();
+    },
+  }));
+  rowMenu(x, y, items.length ? items : [{ label: "Nothing available", run: async () => {} }]);
 }
 
 async function sendMessage() {

@@ -2195,10 +2195,63 @@
   }
   :root[data-motion="off"] .gs .sd.live { animation: none; background: var(--c-acc); border-color: transparent; }
 
+
+  /* Project panel, in the sidebar ---------------------------------------- */
+  .pp-head { display: flex; align-items: flex-start; gap: 8px; padding: 4px 4px 10px; }
+  .pp-head .nm { min-width: 0; flex: 1; }
+  .pp-head .t {
+    display: block; font-family: var(--mono); font-size: 10px; letter-spacing: .2em;
+    color: var(--ink-dim); text-transform: uppercase;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* The folder, shown under the name. A project is a place now, and this is the
+     only spot that says which one without opening settings. */
+  .pp-head .p {
+    display: block; font-family: var(--mono); font-size: 9px; color: var(--ink-faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px;
+    direction: rtl; text-align: left;   /* keeps the last segment visible when it clips */
+  }
+  .pp-head .p.none { color: var(--warn); direction: ltr; }
+  .pp-sec {
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--ink-faint); padding: 10px 4px 6px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .pp-sec .n { color: var(--ink-faint); font-weight: 400; font-family: var(--mono); }
+  .pp-empty { color: var(--ink-faint); font-size: 11px; padding: 2px 4px 6px; line-height: 1.45; }
+
+  /* The wordmark in the title bar, left of the search. */
+  .titlebar .wordmark {
+    flex: 0 0 auto; -webkit-app-region: drag;
+    display: flex; align-items: baseline; gap: 6px;
+    font-family: var(--display); font-size: 14px; font-weight: 650; letter-spacing: -0.01em;
+    margin-right: var(--s2);
+  }
+  .titlebar .wordmark .sub {
+    font-size: 9px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  @media (max-width: 780px) { .titlebar .wordmark .sub { display: none; } }
+
+  /* The mark at the top of the rail. Same footprint as a project tile so the
+     column reads as one stack rather than a logo with a list under it. */
+  .rail-mark {
+    width: 36px; aspect-ratio: 1; border-radius: 9px; padding: 0;
+    display: grid; place-items: center; flex: 0 0 auto;
+    border: 1px solid transparent; background: transparent; cursor: default;
+    -webkit-app-region: no-drag;
+    transition: border-color 100ms ease, transform 100ms ease;
+  }
+  .rail-mark img { width: 26px; height: 26px; display: block; border-radius: 7px; }
+  .rail-mark:hover { transform: translateY(-1px); }
+  .rail-mark.on { border-color: var(--c-acc); box-shadow: 0 8px 24px rgba(0,0,0,.35); }
 </style>
 </head>
 <body>
   <header class="titlebar">
+    <!-- The name sits with the window chrome now. The mark went to the rail,
+         where it is the way back to everything rather than decoration. -->
+    <span class="wordmark">Delphi<span class="sub">Oracle</span></span>
     <div class="search"><input id="search" type="search" placeholder="Ask the Oracle, or search" aria-label="Ask the Oracle" /></div>
     <div class="spacer"></div>
   </header>
@@ -2208,17 +2261,13 @@
          sidebar, so the two can never disagree about which project is open. -->
     <nav class="project-rail" id="rail" aria-label="Projects"></nav>
     <nav class="sidebar">
-      <div class="brand">
-        <img class="mark" src="assets/mark-64.png" width="26" height="26" alt="" aria-hidden="true" />
-        <span class="wordmark">Delphi<span class="sub">Oracle</span></span>
-      </div>
+      <!-- The project's own panel. The rail is how you move between projects,
+           so this is everything that belongs to the one that is open: its
+           sessions, its agents, and where new ones are started. -->
       <div class="sidebar-scroll">
-        <div class="side-label">Projects</div>
         <div id="projects"></div>
       </div>
-      <div class="sidebar-foot">
-        <button class="btn wide" id="new-project">New project</button>
-      </div>
+      <div class="sidebar-foot" id="sidebar-foot"></div>
     </nav>
 
     <main class="main">
