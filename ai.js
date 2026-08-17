@@ -59,6 +59,116 @@ function findClaudeCli() {
   return cliPathCache;
 }
 
+
+// ---------------------------------------------------------------------------
+// Copilot
+//
+// The reason this exists: Copilot at work is reached through GitHub Enterprise,
+// so signing in to github.com is not enough and the token has to be one the
+// enterprise issued.
+//
+// Credentials are never minted or stored here. The CLI takes GH_TOKEN, and the
+// token comes from `gh`, which the person signed in to themselves. That keeps
+// this on the supported path rather than the reverse-engineered one.
+
+let copilotPathCache;
+
+function findCopilotCli() {
+  if (copilotPathCache !== undefined) return copilotPathCache;
+  try {
+    const { execFileSync } = require("child_process");
+    const fs = require("fs");
+    const out = execFileSync("/bin/zsh", ["-ilc", "command -v copilot"], {
+      encoding: "utf8", timeout: 8000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    const lines = String(out).split("\n").map((l) => l.trim()).filter(Boolean);
+    copilotPathCache = lines.reverse().find((l) => l.startsWith("/") && fs.existsSync(l)) || null;
+  } catch {
+    copilotPathCache = null;
+  }
+  return copilotPathCache;
+}
+
+/** The GitHub hosts `gh` is signed in to, enterprise ones first. */
+function ghHosts() {
+  try {
+    const { execFileSync } = require("child_process");
+    const out = execFileSync("/bin/zsh", ["-ilc", "gh auth status"], {
+      encoding: "utf8", timeout: 12000, stdio: ["ignore", "pipe", "pipe"],
+    });
+    const hosts = [...String(out).matchAll(/^([a-z0-9.-]+\.[a-z]{2,})$/gim)].map((m) => m[1]);
+    // An enterprise host is the one that matters at work, so it sorts first.
+    return [...new Set(hosts)].sort((a, b) => (a === "github.com" ? 1 : b === "github.com" ? -1 : 0));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * A token for a host, and whether Copilot will accept it.
+ *
+ * The distinction matters more than it looks. A classic PAT authenticates fine
+ * against the API and is refused by Copilot with "Classic PATs are not
+ * supported", which arrives as an exit code and an empty stream unless you go
+ * looking in the CLI's own log. Checking the prefix here turns that into
+ * something the window can explain.
+ */
+function ghToken(host) {
+  try {
+    const { execFileSync } = require("child_process");
+    const out = execFileSync("/bin/zsh", ["-ilc", `gh auth token --hostname ${host}`], {
+      encoding: "utf8", timeout: 12000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    const token = String(out).split("\n").map((l) => l.trim())
+      .filter(Boolean).reverse().find((l) => /^gh[a-z]_/.test(l));
+    if (!token) return { token: null, kind: "none" };
+    // Classic PATs start ghp_. Copilot takes OAuth tokens (gho_), the ones a
+    // web login produces, and fine-grained PATs (github_pat_).
+    const kind = token.startsWith("ghp_") ? "classic" : "supported";
+    return { token, kind };
+  } catch {
+    return { token: null, kind: "none" };
+  }
+}
+
+function streamViaCopilot({ cli, cwd, model, prompt, host, token }, emit) {
+  return new Promise((resolve) => {
+    const args = ["-p", prompt, "--allow-all-tools"];
+    if (model) args.push("--model", model);
+
+    const child = spawn(cli, args, {
+      cwd: cwd || undefined,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...(host ? { GH_HOST: host } : {}), ...(token ? { GH_TOKEN: token } : {}) },
+    });
+
+    let stderr = "";
+    let saidAnything = false;
+    child.stdout.setEncoding("utf8");
+    // Plain text rather than a stream of events: this CLI has no JSON output
+    // mode, so what it prints is the reply.
+    child.stdout.on("data", (chunk) => { saidAnything = true; emit({ type: "text", text: chunk }); });
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", (e) => { emit({ type: "error", message: String(e.message || e) }); resolve(); });
+    child.on("close", (code) => {
+      if (code !== 0 && !saidAnything) {
+        // It fails silently on a rejected token, so the likely cause is named
+        // rather than leaving an empty reply and an exit code nobody sees.
+        emit({
+          type: "error",
+          message: stderr.trim() ||
+            "Copilot exited without saying anything. The usual cause is the token: " +
+            "classic personal access tokens are refused. Run " +
+            `gh auth login --hostname ${host || "your-enterprise-host"} --web ` +
+            "to get one Copilot accepts, then try again.",
+        });
+      }
+      emit({ type: "done" });
+      resolve();
+    });
+  });
+}
+
 /**
  * What this machine can talk to.
  *
@@ -89,6 +199,21 @@ async function providers({ apiKey } = {}) {
     out.push({ id: "claude-cli", label: "Claude Code", ready: loggedIn, detail, path: cli });
   } else {
     out.push({ id: "claude-cli", label: "Claude Code", ready: false, detail: "not installed" });
+  }
+
+  const copilot = findCopilotCli();
+  if (copilot) {
+    const host = ghHosts()[0] || null;
+    const { kind } = host ? ghToken(host) : { kind: "none" };
+    const ready = kind === "supported";
+    const detail =
+      kind === "supported" ? `signed in to ${host}`
+      : kind === "classic" ? `${host} uses a classic token, which Copilot refuses`
+      : host ? `signed in to ${host}, no token available`
+      : "gh is not signed in";
+    out.push({ id: "copilot", label: "GitHub Copilot", ready, detail, host, tokenKind: kind });
+  } else {
+    out.push({ id: "copilot", label: "GitHub Copilot", ready: false, detail: "not installed" });
   }
 
   out.push({
@@ -314,6 +439,29 @@ async function send({ provider, apiKey, model, system, messages, cwd }, emit) {
     return;
   }
 
+  if (provider === "copilot") {
+    const cli = findCopilotCli();
+    if (!cli) {
+      emit({ type: "error", message: "The Copilot CLI is not installed." });
+      emit({ type: "done" });
+      return;
+    }
+    const host = ghHosts()[0] || null;
+    const { token, kind } = host ? ghToken(host) : { token: null, kind: "none" };
+    if (kind === "classic") {
+      emit({
+        type: "error",
+        message: `Copilot refuses classic personal access tokens, and that is what gh holds for ${host}. ` +
+          `Run: gh auth login --hostname ${host} --web`,
+      });
+      emit({ type: "done" });
+      return;
+    }
+    const prompt = messages.map((m) => (m.role === "user" ? m.content : `Assistant: ${m.content}`)).join("\n\n");
+    await streamViaCopilot({ cli, cwd, model, prompt, host, token }, emit);
+    return;
+  }
+
   const cli = findClaudeCli();
   if (!cli) {
     emit({ type: "error", message: "Claude Code is not installed, and no API key is saved." });
@@ -327,4 +475,4 @@ async function send({ provider, apiKey, model, system, messages, cwd }, emit) {
   await streamViaCli({ cli, cwd, model, system, prompt }, emit);
 }
 
-module.exports = { providers, send, DEFAULT_MODEL, findClaudeCli, sseReader, mapAnthropicEvent };
+module.exports = { providers, send, DEFAULT_MODEL, findClaudeCli, findCopilotCli, ghHosts, sseReader, mapAnthropicEvent };
