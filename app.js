@@ -7183,6 +7183,7 @@ const STARTERS = [
 const currentSession = () => state.sessions.find((x) => x.id === state.sessionId) || null;
 
 async function openSession(id) {
+  resetHistory();
   state.sessionId = id;
   state.messages = id ? await window.delphi.messages.list(id) : [];
   render();
@@ -7266,6 +7267,7 @@ async function runCommand(command) {
   }
 
   state.termDraft = "";
+  resetHistory();
   state.termLines.push({ kind: "cmd", text });
   state.termBusy = true;
   render();
@@ -7372,6 +7374,8 @@ function renderTerminal(wrap) {
   };
   box.onkeydown = (e) => {
     if (e.key === "Escape") { e.stopPropagation(); box.blur(); return; }
+    const ran = state.termLines.filter((l) => l.kind === "cmd").map((l) => l.text).reverse();
+    if (!state.termBusy && recallHistory(e, box, ran, (text) => { state.termDraft = text; })) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       // While something runs, Enter feeds it a line rather than starting a
@@ -7411,6 +7415,67 @@ function renderTerminal(wrap) {
     if (folder) box.focus();
   });
 }
+
+// ---------------------------------------------------------------------------
+// Recalling what you typed
+//
+// Up walks back through what you sent, Down walks forward, and coming back past
+// the newest restores whatever you were part way through writing. That last part
+// is the one people notice when it is missing: without it, pressing Up once
+// destroys an unsent message.
+//
+// Only from the first line, so Up still moves the caret inside a reply being
+// composed over several lines, which is what it does in every other text box.
+
+let histIndex = -1;      // -1 is "not browsing"
+let histSaved = "";      // the draft that was in progress when browsing started
+
+/** Resets the walk. Called whenever the composer's contents come from elsewhere. */
+function resetHistory() {
+  histIndex = -1;
+  histSaved = "";
+}
+
+/**
+ * Handles Up and Down in a composer.
+ *
+ * Returns true when it took the key, so the caller can leave it alone otherwise.
+ * `entries` is newest first. `apply` is given the text to show.
+ */
+function recallHistory(e, box, entries, apply) {
+  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return false;
+  if (!entries.length) return false;
+
+  const caret = box.selectionStart;
+  const before = box.value.slice(0, caret);
+  const onFirstLine = !before.includes("\n");
+  const onLastLine = !box.value.slice(caret).includes("\n");
+
+  if (e.key === "ArrowUp") {
+    if (!onFirstLine) return false;
+    if (histIndex === -1) histSaved = box.value;
+    if (histIndex >= entries.length - 1) return false;
+    histIndex += 1;
+  } else {
+    if (!onLastLine || histIndex === -1) return false;
+    histIndex -= 1;
+  }
+
+  const text = histIndex === -1 ? histSaved : entries[histIndex];
+  e.preventDefault();
+  apply(text);
+  box.value = text;
+  // Caret to the end, which is where you want it when the point is to edit and
+  // send again rather than to read.
+  requestAnimationFrame(() => {
+    box.focus();
+    box.setSelectionRange(text.length, text.length);
+    box.style.height = "auto";
+    box.style.height = `${Math.min(box.scrollHeight, 160)}px`;
+  });
+  return true;
+}
+
 function renderChat(root) {
   const project = currentProject();
   if (!project) return;
@@ -7483,8 +7548,11 @@ function renderChat(root) {
         // The agent's turn is markdown, rendered with the same renderer the
         // memory notes use rather than a second one that would drift from it.
         const body = el("div", { className: "gmsg ai" });
-        body.append(renderMarkdown(m.content || ""));
+        body.append(renderMarkdown(m.id === streamingMessageId ? streamShown : (m.content || "")));
         stream.append(body);
+        // The one still arriving is handed to the stream, so it can grow this
+        // node rather than asking for a repaint per token.
+        if (m.id === streamingMessageId) adoptStreamNode(body);
       }
     }
   }
@@ -7504,6 +7572,9 @@ function renderChat(root) {
     // Enter sends, Shift+Enter breaks the line. Escape is swallowed rather than
     // hiding the whole window, which is what it does everywhere else.
     if (e.key === "Escape") { e.stopPropagation(); box.blur(); return; }
+    // Newest first, which is the order Up walks.
+    const sent = state.messages.filter((m) => m.role === "user").map((m) => m.content).reverse();
+    if (recallHistory(e, box, sent, (text) => { state.draft = text; })) return;
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   };
   comp.append(box);
@@ -7668,6 +7739,7 @@ async function sendMessage() {
   }
 
   state.draft = "";
+  resetHistory();
   await window.delphi.messages.append({ sessionId, role: "user", content: text });
 
   // The first thing said names the session, so the list reads as a set of
@@ -7727,9 +7799,84 @@ async function sendMessage() {
 // drawn.
 
 let streamingMessageId = null;
-let streamBuffer = "";
+let streamBuffer = "";      // everything received so far
+let streamShown = "";       // everything put on screen so far
 let streamUsage = { input: 0, output: 0 };
-let streamPaint = null;
+let streamTimer = null;
+let streamNode = null;      // the message element being grown
+let streamDone = false;     // the stream has ended, the drain may not have
+
+/**
+ * Registers the element a reply is being written into.
+ *
+ * Held so the stream can update that one node instead of asking the whole window
+ * to repaint. That was the real cause of the choppiness: every token ran
+ * render(), which rebuilds the rail, the sidebar, the tabs and the entire content
+ * pane. The text was arriving smoothly and the window could not keep up with
+ * drawing it.
+ */
+function adoptStreamNode(node) {
+  streamNode = node;
+}
+
+/**
+ * Puts a little more of the reply on screen, once per frame.
+ *
+ * The buffer does not empty in one go even when it could. A model reply arrives
+ * in bursts, several hundred characters at a time, and writing each burst whole
+ * is what makes it read as lurching rather than as typing. Releasing a share of
+ * what is waiting spreads a burst over a few frames while still draining fast
+ * when a lot is queued, so it never falls behind.
+ */
+function drainStream() {
+  streamTimer = null;
+  if (!streamNode) return;
+
+  const waiting = streamBuffer.length - streamShown.length;
+  if (waiting > 0) {
+    // A proportion, with a floor so short bursts still move, and a ceiling so a
+    // very large one does not arrive as a single jump.
+    const take = Math.max(3, Math.min(220, Math.ceil(waiting / 5)));
+    streamShown = streamBuffer.slice(0, streamShown.length + take);
+
+    streamNode.textContent = "";
+    streamNode.append(renderMarkdown(streamShown));
+
+    // Kept at the bottom only if it was already there, so reading back through a
+    // long reply is not fought by the reply still arriving.
+    const stream = streamNode.closest(".gstream");
+    if (stream && stream.scrollHeight - stream.scrollTop - stream.clientHeight < 120) {
+      stream.scrollTop = stream.scrollHeight;
+    }
+  }
+
+  if (streamBuffer.length > streamShown.length) {
+    streamTimer = requestAnimationFrame(drainStream);
+  } else if (streamDone) {
+    finishStream();
+  }
+}
+
+async function finishStream() {
+  const id = streamingMessageId;
+  if (!id) return;
+  streamingMessageId = null;
+  streamNode = null;
+  streamDone = false;
+  state.streaming = false;
+
+  if (streamBuffer) await window.delphi.messages.update(id, { content: streamBuffer });
+  if (streamUsage.input || streamUsage.output) {
+    await window.delphi.sessions.addUsage(state.sessionId, streamUsage);
+  }
+  streamBuffer = "";
+  streamShown = "";
+  streamUsage = { input: 0, output: 0 };
+
+  state.messages = await window.delphi.messages.list(state.sessionId);
+  state.sessions = await window.delphi.sessions.list(state.projectId);
+  render();
+}
 
 window.delphi.onAiEvent(async (event) => {
   if (!streamingMessageId || event.sessionId !== state.sessionId) return;
@@ -7738,15 +7885,7 @@ window.delphi.onAiEvent(async (event) => {
     streamBuffer += event.text;
     const row = state.messages.find((m) => m.id === streamingMessageId);
     if (row) row.content = streamBuffer;
-    // Painted on a frame rather than per token. A fast reply arrives faster than
-    // the screen refreshes, and re-rendering per token makes the whole window
-    // stutter for no visible gain.
-    if (!streamPaint) {
-      streamPaint = requestAnimationFrame(() => {
-        streamPaint = null;
-        if (state.view === "chat") render();
-      });
-    }
+    if (!streamTimer) streamTimer = requestAnimationFrame(drainStream);
     return;
   }
 
@@ -7761,18 +7900,10 @@ window.delphi.onAiEvent(async (event) => {
   }
 
   if (event.type === "done") {
-    const id = streamingMessageId;
-    streamingMessageId = null;
-    state.streaming = false;
-    if (streamBuffer) await window.delphi.messages.update(id, { content: streamBuffer });
-    if (streamUsage.input || streamUsage.output) {
-      await window.delphi.sessions.addUsage(state.sessionId, streamUsage);
-    }
-    streamBuffer = "";
-    streamUsage = { input: 0, output: 0 };
-    state.messages = await window.delphi.messages.list(state.sessionId);
-    state.sessions = await window.delphi.sessions.list(state.projectId);
-    render();
+    // The stream is over, the drain may not be. Letting it finish is what stops
+    // the last few words being replaced by the final render before they appear.
+    streamDone = true;
+    if (!streamTimer && streamBuffer.length <= streamShown.length) await finishStream();
   }
 });
 
