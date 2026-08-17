@@ -52,6 +52,12 @@ contextBridge.exposeInMainWorld("delphi", {
     export: () => call("vault:export"),
     reveal: () => call("vault:reveal"),
   },
+  ai: {
+    providers: () => call("ai:providers"),
+    hasKey: () => call("ai:hasKey"),
+    setKey: (key) => call("ai:setKey", key),
+    send: (payload) => call("ai:send", payload),
+  },
   sessions: {
     list: (projectId) => call("sessions:list", projectId),
     get: (id) => call("sessions:get", id),
@@ -116,6 +122,11 @@ contextBridge.exposeInMainWorld("delphi", {
   onMode: (fn) => ipcRenderer.on("mode", (_e, payload) => fn(payload)),
   onAlertsChanged: (fn) => ipcRenderer.on("alerts-changed", fn),
   onFocusTask: (fn) => ipcRenderer.on("focus-task", (_e, payload) => fn(payload)),
+  // A reply arrives a piece at a time, because the renderer cannot make the
+  // request itself. Register this once, at module scope: none of the listeners
+  // in this file can be removed, so one added inside a render would stack up
+  // another copy on every repaint.
+  onAiEvent: (fn) => ipcRenderer.on("ai-event", (_e, payload) => fn(payload)),
   // The application menu cannot touch the page directly, so every item that acts
   // on what is displayed arrives here as one message.
   onMenu: (fn) => ipcRenderer.on("menu", (_e, payload) => fn(payload)),

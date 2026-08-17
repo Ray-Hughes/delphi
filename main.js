@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage, nativeTheme, Notification, dialog } = require("electron");
+const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage, nativeTheme, Notification, dialog, safeStorage } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
@@ -13,6 +13,7 @@ const db = require("./db");
 const vault = require("./vault");
 const oracle = require("./oracle");
 const embeddings = require("./embeddings");
+const ai = require("./ai");
 
 const isMac = process.platform === "darwin";
 const SETTINGS_PATH = paths.SETTINGS_PATH;
@@ -934,6 +935,78 @@ handle("fs:folderExists", (folder) => {
 
 handle("fs:reveal", (target) => {
   if (target && fs.existsSync(target)) shell.showItemInFolder(target);
+});
+
+
+// ---------------------------------------------------------------------------
+// The model
+//
+// The renderer cannot reach a network at all: its CSP is default-src 'self'
+// with no connect-src. So the request is made here and the reply is pushed back
+// a piece at a time on "ai-event", which is the only way a streaming reply can
+// cross the boundary.
+
+/**
+ * Where the API key lives.
+ *
+ * Encrypted with the OS key rather than written into settings.json, which is a
+ * plain file sitting next to the database. safeStorage uses the Keychain on a
+ * Mac, so the key is no more readable than any other Keychain item.
+ */
+const KEY_FILE = () => path.join(paths.DATA_DIR, "anthropic.key");
+
+function readApiKey() {
+  try {
+    if (!fs.existsSync(KEY_FILE())) return null;
+    const blob = fs.readFileSync(KEY_FILE());
+    if (!safeStorage.isEncryptionAvailable()) return null;
+    return safeStorage.decryptString(blob) || null;
+  } catch {
+    return null;
+  }
+}
+
+handle("ai:providers", async () => ai.providers({ apiKey: readApiKey() }));
+handle("ai:hasKey", () => Boolean(readApiKey()));
+
+handle("ai:setKey", (key) => {
+  paths.ensureDataDir();
+  if (!key) {
+    if (fs.existsSync(KEY_FILE())) fs.unlinkSync(KEY_FILE());
+    return { saved: false };
+  }
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("This machine cannot encrypt secrets, so the key was not saved");
+  }
+  fs.writeFileSync(KEY_FILE(), safeStorage.encryptString(String(key)), { mode: 0o600 });
+  return { saved: true };
+});
+
+// Only one turn at a time. A second send while one is running would interleave
+// two replies into the same transcript with no way to tell them apart.
+let sending = false;
+
+handle("ai:send", async ({ sessionId, provider, model, system, messages, cwd }) => {
+  if (sending) throw new Error("A reply is already streaming");
+  sending = true;
+
+  const emit = (event) => {
+    // The window can be closed mid-stream, and sending to a disposed frame
+    // throws rather than being ignored.
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send("ai-event", { sessionId, ...event });
+    }
+  };
+
+  try {
+    await ai.send(
+      { provider, apiKey: readApiKey(), model, system, messages, cwd },
+      emit
+    );
+  } finally {
+    sending = false;
+  }
+  return { ok: true };
 });
 
 handle("sessions:list", (projectId) => db.listSessions(projectId));

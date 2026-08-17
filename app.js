@@ -6395,8 +6395,96 @@ async function sendMessage() {
 
   state.messages = await window.delphi.messages.list(sessionId);
   state.sessions = await window.delphi.sessions.list(state.projectId);
+
+  // The assistant's row is created empty and grown as the reply arrives, so an
+  // interrupted stream leaves what it managed to say rather than nothing.
+  const reply = await window.delphi.messages.append({ sessionId, role: "assistant", content: "" });
+  state.messages.push(reply);
+  streamingMessageId = reply.id;
+  state.streaming = true;
   render();
+
+  const project = currentProject();
+  const open = currentSession();
+  try {
+    await window.delphi.ai.send({
+      sessionId,
+      provider: open && open.provider ? open.provider : "claude-cli",
+      model: open && open.model ? open.model : null,
+      system: project && project.path
+        ? `You are helping with the project "${project.name}", whose files are at ${project.path}.`
+        : null,
+      messages: state.messages
+        .filter((m) => m.id !== reply.id && !m.error)
+        .map((m) => ({ role: m.role, content: m.content })),
+      cwd: project ? project.path : null,
+    });
+  } catch (error) {
+    await window.delphi.messages.update(reply.id, { error: String(error.message || error) });
+    state.streaming = false;
+    streamingMessageId = null;
+    state.messages = await window.delphi.messages.list(sessionId);
+    render();
+  }
 }
+
+// ---------------------------------------------------------------------------
+// The reply, arriving
+//
+// Registered once, at module scope. The bridge offers no way to remove a
+// listener, so registering inside a renderer would add another copy on every
+// repaint and each token would be handled as many times as the view had been
+// drawn.
+
+let streamingMessageId = null;
+let streamBuffer = "";
+let streamUsage = { input: 0, output: 0 };
+let streamPaint = null;
+
+window.delphi.onAiEvent(async (event) => {
+  if (!streamingMessageId || event.sessionId !== state.sessionId) return;
+
+  if (event.type === "text") {
+    streamBuffer += event.text;
+    const row = state.messages.find((m) => m.id === streamingMessageId);
+    if (row) row.content = streamBuffer;
+    // Painted on a frame rather than per token. A fast reply arrives faster than
+    // the screen refreshes, and re-rendering per token makes the whole window
+    // stutter for no visible gain.
+    if (!streamPaint) {
+      streamPaint = requestAnimationFrame(() => {
+        streamPaint = null;
+        if (state.view === "chat") render();
+      });
+    }
+    return;
+  }
+
+  if (event.type === "usage") {
+    streamUsage = { input: event.input || 0, output: event.output || streamUsage.output };
+    return;
+  }
+
+  if (event.type === "error") {
+    await window.delphi.messages.update(streamingMessageId, { error: event.message });
+    return;
+  }
+
+  if (event.type === "done") {
+    const id = streamingMessageId;
+    streamingMessageId = null;
+    state.streaming = false;
+    if (streamBuffer) await window.delphi.messages.update(id, { content: streamBuffer });
+    if (streamUsage.input || streamUsage.output) {
+      await window.delphi.sessions.addUsage(state.sessionId, streamUsage);
+    }
+    streamBuffer = "";
+    streamUsage = { input: 0, output: 0 };
+    state.messages = await window.delphi.messages.list(state.sessionId);
+    state.sessions = await window.delphi.sessions.list(state.projectId);
+    render();
+  }
+});
 
 /**
  * The parent folder a new project should be offered first.
