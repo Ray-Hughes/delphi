@@ -175,8 +175,15 @@ A claim is a lease, not an assignment. It lasts thirty minutes, and when it laps
 task returns to the pool for someone else. That is deliberate: an agent that dies
 holding a task should not take it with it.
 
+There is one pool, shared by every project. `queue_next(project: "key")` narrows it to
+one project's share of that pool, which is what you want whenever you can only work on
+one of them, most often because you are running in that project's checkout. Left out,
+you get whatever is at the top, whichever project it belongs to. A queued task with no
+project is only ever offered to an unnarrowed call.
+
 ```
 queue_next()                      claim the next one, and get its brief
+queue_next(project: "key")        the same, but only from that project
 add_comment(task_id, body)        what you found, tried, decided
 queue_extend(task_id, minutes)    still working, give me longer
 queue_complete(task_id, summary)  finished, with what happened

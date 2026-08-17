@@ -204,6 +204,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue, status);
 
+-- The same pool, sliced by project. The claim is one UPDATE with a subselect, so
+-- a queue read narrowed to a project is on the hot path of every agent asking for
+-- work, and project_id leads because it is the equality that removes the most
+-- rows once more than one project is using the pool.
+CREATE INDEX IF NOT EXISTS idx_tasks_queue_project ON tasks(project_id, queue, status);
+
 -- Organizers: the optional epic shell.
 --
 -- A project is the initiative and an organizer is a piece of it big enough to

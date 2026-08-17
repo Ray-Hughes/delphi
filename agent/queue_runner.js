@@ -28,6 +28,12 @@ const os = require("os");
 
 const DEFAULTS = {
   queue: process.env.DELPHI_QUEUE || "ready",
+  // Empty means the whole pool, which is what this did before there was a way to
+  // say otherwise. It matters more here than anywhere else: there is one --cwd
+  // for every task this runner claims, so a runner pointed at one checkout and
+  // left on the whole pool will sooner or later be handed another project's work
+  // and try to do it in the wrong repository.
+  project: process.env.DELPHI_PROJECT || "",
   actor: process.env.DELPHI_ACTOR || "runner",
   // "claude -p" is Claude Code's headless form. It is only a default: anything
   // that takes a prompt as its last argument and prints its answer works.
@@ -54,6 +60,7 @@ Delphi queue runner: claims queued tasks and spawns a headless agent for each.
 
   --dry-run              Show what would happen, claim nothing, spawn nothing
   --queue NAME           Which pool to pull from (default: ${DEFAULTS.queue})
+  --project KEY|ID       Only claim work from this project (default: any project)
   --actor NAME           How this runner's writes are attributed (default: ${DEFAULTS.actor})
   --agent "CMD"          Headless agent command (default: ${DEFAULTS.agent})
                          A literal {} is replaced by the brief; otherwise the
@@ -89,6 +96,7 @@ function parseArgs(argv) {
       case "--allow-unguarded": o.allowUnguarded = true; break;
       case "--verbose": o.verbose = true; break;
       case "--queue": o.queue = need(i, flag); i++; break;
+      case "--project": o.project = need(i, flag); i++; break;
       case "--actor": o.actor = need(i, flag); i++; break;
       case "--agent": o.agent = need(i, flag); i++; break;
       case "--cwd": o.cwd = path.resolve(need(i, flag)); i++; break;
@@ -111,6 +119,22 @@ function parseArgs(argv) {
   if (!o.lease) o.lease = Math.ceil(o.timeout / 60) + 5;
   if (o.lease * 60 <= o.timeout) throw new Error("--lease must be longer than --timeout, or the claim lapses mid task");
   return o;
+}
+
+/**
+ * The project filter in the shape the queue tools take, or nothing at all.
+ *
+ * A bare number is read as an id and anything else as a key, because both are
+ * things someone actually has to hand: list_projects prints the id, and the key
+ * is what a project is called everywhere else. When no project was asked for
+ * this contributes no keys at all, so the server sees exactly the call it saw
+ * before the flag existed.
+ */
+function projectFilter(options) {
+  if (!options.project) return {};
+  return /^\d+$/.test(options.project)
+    ? { project_id: Number(options.project) }
+    : { project: options.project };
 }
 
 // --- logging ----------------------------------------------------------------
@@ -498,7 +522,7 @@ async function main() {
   const server = openServer(options);
   await server.start();
 
-  log(`queue '${options.queue}' as '${options.actor}', agent '${binary}', timeout ${options.timeout}s, lease ${options.lease}m`);
+  log(`queue '${options.queue}'${options.project ? ` in project '${options.project}'` : ", every project"} as '${options.actor}', agent '${binary}', timeout ${options.timeout}s, lease ${options.lease}m`);
   log(`agent runs in ${options.cwd}`);
   log(`guard.py ${guard.installed ? `installed via ${guard.file}` : "NOT installed"}`);
 
@@ -536,7 +560,7 @@ async function main() {
     started++;
     let claim;
     try {
-      claim = await server.call("queue_next", { queue: options.queue, minutes: options.lease });
+      claim = await server.call("queue_next", { queue: options.queue, minutes: options.lease, ...projectFilter(options) });
     } catch (error) {
       started--;
       throw error;
@@ -660,7 +684,7 @@ async function main() {
  * with a runner is point it at a real queue to see what it thinks.
  */
 async function dryRun(server, options, argv, binary) {
-  const status = await server.call("queue_status", { queue: options.queue });
+  const status = await server.call("queue_status", { queue: options.queue, ...projectFilter(options) });
   const waiting = status.waiting || [];
   const inFlight = status.in_flight || [];
 
@@ -670,7 +694,7 @@ async function dryRun(server, options, argv, binary) {
     log(`  held  ${task.id} by ${task.claimed_by} until ${task.claim_expires}: ${task.title}`);
   }
   if (!waiting.length) {
-    log(`Nothing in the '${options.queue}' queue. The runner would poll every ${options.idle}s, backing off to ${options.maxIdle}s.`);
+    log(`Nothing in the '${options.queue}' queue${options.project ? ` for project '${options.project}'` : ""}. The runner would poll every ${options.idle}s, backing off to ${options.maxIdle}s.`);
     return;
   }
 

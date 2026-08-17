@@ -12,8 +12,11 @@ const call = async (channel, ...args) => {
 contextBridge.exposeInMainWorld("delphi", {
   projects: {
     list: () => call("projects:list"),
+    archived: () => call("projects:archived"),
     create: (payload) => call("projects:create", payload),
     update: (id, fields) => call("projects:update", id, fields),
+    remove: (id, opts) => call("projects:delete", id, opts),
+    contents: (id) => call("projects:contents", id),
   },
   tasks: {
     list: (opts) => call("tasks:list", opts),
@@ -22,9 +25,9 @@ contextBridge.exposeInMainWorld("delphi", {
     remove: (id) => call("tasks:delete", id),
     detail: (id) => call("tasks:detail", id),
     queue: (id, queue) => call("tasks:queue", id, queue),
-    queueState: (queue) => call("queue:state", queue),
+    queueState: (queue, projectId) => call("queue:state", queue, projectId),
     queueRelease: (id, note) => call("queue:release", id, note),
-    queueReclaim: (queue) => call("queue:reclaim", queue),
+    queueReclaim: (queue, projectId) => call("queue:reclaim", queue, projectId),
     comment: (id, body, author) => call("tasks:comment", id, body, author),
     uncomment: (id) => call("tasks:uncomment", id),
   },

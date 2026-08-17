@@ -605,7 +605,12 @@ function ensureOrganizer({ key, projectId, name, summary }, args, report, write)
 }
 
 function ensureProject({ key, name, summary, url }, args, report, write) {
-  const projectKey = args.projectPrefix + slug(key);
+  // Run through db's own normaliser as well as slug(), because --project-prefix
+  // is whatever was typed on the command line and createProject stores the
+  // normalised form. A prefix with an underscore in it would otherwise be looked
+  // up in one shape and written in another, so every run after the first would
+  // find nothing and then collide on the key it had already created.
+  const projectKey = db.slugKey(args.projectPrefix + slug(key));
   const existing = db.projectByKey(projectKey);
 
   if (!existing) {

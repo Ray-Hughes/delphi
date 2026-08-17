@@ -11,6 +11,9 @@ const state = {
   taskFilter: null,    // null | doing | blocked | overdue | done
   theme: "system",     // system | light | dark
   noteView: "formatted", // formatted | raw
+  // Mirrored from settings.json so motionOff can answer without a round trip.
+  // The CSS half of the same choice is the data-motion attribute on the root.
+  animations: true,
   // Which single note is open for editing. Deliberately not persisted and
   // deliberately not noteView: editing one note says nothing about how you want
   // to read the rest of them.
@@ -52,8 +55,21 @@ const today = () => new Date().toISOString().slice(0, 10);
 const isOverdue = (t) => t.due && t.status !== "done" && t.due < today();
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
-const prefersReducedMotion = () =>
-  window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+// The system half of the motion question, read once and then kept current by a
+// listener rather than queried at each call site. motionOff is called inside an
+// animation frame loop, and matchMedia there is a style read per frame.
+const motionQuery = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+let reducedMotionNow = motionQuery ? motionQuery.matches : false;
+motionQuery?.addEventListener("change", (e) => { reducedMotionNow = e.matches; });
+
+/**
+ * Whether motion should be suppressed, for the JavaScript that cannot be reached
+ * by the blanket CSS rules in index.html.
+ *
+ * The setting and the system preference are independent off switches: turning
+ * the setting on does not override someone's reduced motion preference.
+ */
+const motionOff = () => state.animations === false || reducedMotionNow;
 
 /**
  * The small celebration when a task is ticked off.
@@ -68,7 +84,7 @@ const prefersReducedMotion = () =>
  * exactly the same frame reads as one shape rather than as a burst.
  */
 function celebrateDone(row) {
-  if (prefersReducedMotion()) return;
+  if (motionOff()) return;
   row.classList.add("celebrate");
   const directions = [[-24, -18], [-2, -28], [22, -20], [-22, 14], [20, 16], [3, 24]];
   for (const [dx, dy] of directions) {
@@ -196,6 +212,20 @@ function applyTheme(theme) {
   state.theme = choice;
   if (choice === "system") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", choice);
+}
+
+/**
+ * Applies the animation choice.
+ *
+ * Off is the attribute, on is its absence, so the stylesheet needs one selector
+ * and the ordinary case carries no marker. This is only the app's own switch: a
+ * system reduced motion preference is answered by its own rule and is not
+ * overridden by turning this on.
+ */
+function applyMotion(on) {
+  state.animations = on !== false;
+  if (state.animations) document.documentElement.removeAttribute("data-motion");
+  else document.documentElement.setAttribute("data-motion", "off");
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +530,7 @@ function renderSidebar() {
   box.textContent = "";
 
   const allOpen = state.projects.reduce((n, p) => n + p.open_count, 0);
-  box.append(projectRow({ id: null, name: "All work", colour: "#8d97a9", open_count: allOpen }));
+  box.append(projectRow({ id: null, name: "All work", colour: "var(--ink-faint)", open_count: allOpen }));
 
   for (const p of state.projects) box.append(projectRow(p));
 }
@@ -511,7 +541,7 @@ function projectRow(p) {
     tabIndex: 0,
     role: "button",
   });
-  row.append(el("span", { className: "dot", style: `background:${p.colour || "#8d97a9"}` }));
+  row.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }));
   row.append(el("span", { className: "proj-name", textContent: p.name, title: p.summary || p.name }));
   if (p.open_count) row.append(el("span", { className: "count", textContent: String(p.open_count) }));
 
@@ -521,7 +551,29 @@ function projectRow(p) {
     navigate({ projectId: p.id, view: p.id ? "overview" : "new", query: "" });
   };
   row.onclick = go;
-  row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+  // Only the row itself. The actions button inside it is a real button and its
+  // keydown bubbles here: unguarded, Enter on it would open the menu and navigate
+  // away from under it in one keypress, and Space would do only the navigating,
+  // because the preventDefault below cancels the button's own activation.
+  row.onkeydown = (e) => {
+    if (e.target !== row) return;
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
+  };
+
+  // All work is a heading pretending to be a row: there is no project behind it
+  // to rename, recolour or delete, so it gets no menu and no button.
+  if (p.id) {
+    const more = el("button", { className: "proj-more", textContent: "⋯", title: "Project actions" });
+    more.setAttribute("aria-label", `Actions for ${p.name}`);
+    more.onclick = (e) => {
+      e.stopPropagation();
+      const box = more.getBoundingClientRect();
+      projectMenu(p, box.left - 40, box.bottom + 4);
+    };
+    row.append(more);
+    row.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
+  }
+
   return row;
 }
 
@@ -532,9 +584,12 @@ function renderTabs() {
   const tabs = state.query
     ? [["oracle", "Oracle", state.oracleHits.length], ["tasks", "Matches", state.tasks.length + state.notes.length]]
     : state.projectId
+    // "project" rather than "settings", because the All view's own Settings tab
+    // already owns that key and the two would fall through to each other.
     ? [["overview", "Overview"], ["tasks", "Tasks", state.tasks.length],
+       ["queue", "Queue"],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
-       ["activity", "Activity"]]
+       ["activity", "Activity"], ["project", "Settings"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
        ["graph", "Mind map"],
@@ -573,7 +628,7 @@ function render() {
   const valid = state.query
     ? ["oracle", "tasks"]
     : state.projectId
-    ? ["overview", "tasks", "notes", "links", "activity"]
+    ? ["overview", "tasks", "queue", "notes", "links", "activity", "project"]
     : ["new", "tasks", "queue", "graph", "reminders", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
@@ -619,6 +674,7 @@ function render() {
     reminders: renderReminders,
     history: renderHistory,
     activity: renderActivity,
+    project: renderProjectSettings,
     settings: renderSettings,
   })[state.view];
 
@@ -872,51 +928,485 @@ async function renderOverview(root) {
   right.append(linkCard.card);
 
   // --- project settings ----------------------------------------------------
+  // The editor itself moved to its own tab. It used to be a form at the bottom of
+  // this column, which is a strange place to keep the only way to rename or
+  // archive a project, and it left nowhere to put anything larger.
   const setCard = card("Project settings");
-  const kv = el("dl", { className: "kv" });
-
-  const nameInput = el("input", { className: "field", value: project.name });
-  nameInput.onblur = async () => {
-    if (nameInput.value.trim() && nameInput.value !== project.name) {
-      await window.delphi.projects.update(project.id, { name: nameInput.value.trim() });
-      refresh();
-    }
-  };
-  kv.append(el("dt", { textContent: "Name" }), el("dd", {}, nameInput));
-
-  const sumInput = el("input", { className: "field", value: project.summary || "" , placeholder: "One line: what this project is" });
-  sumInput.onblur = async () => {
-    if (sumInput.value !== (project.summary || "")) {
-      await window.delphi.projects.update(project.id, { summary: sumInput.value.trim() });
-      refresh();
-    }
-  };
-  kv.append(el("dt", { textContent: "Summary" }), el("dd", {}, sumInput));
-
-  const statusSel = el("select", { className: "field" });
-  for (const s of ["active", "paused", "blocked", "done", "archived"]) {
-    statusSel.append(el("option", { value: s, textContent: s, selected: s === project.status }));
-  }
-  statusSel.onchange = async () => {
-    await window.delphi.projects.update(project.id, { status: statusSel.value });
-    if (statusSel.value === "archived") { state.projectId = null; state.view = "tasks"; }
-    refresh();
-  };
-  kv.append(el("dt", { textContent: "Status" }), el("dd", {}, statusSel));
-
-  const colour = el("input", { type: "color", className: "field", value: project.colour || "#8d97a9", style: "height:34px; padding:2px" });
-  colour.onchange = async () => {
-    await window.delphi.projects.update(project.id, { colour: colour.value });
-    refresh();
-  };
-  kv.append(el("dt", { textContent: "Colour" }), el("dd", {}, colour));
-  kv.append(el("dt", { textContent: "Key" }), el("dd", {}, el("span", { className: "mono", textContent: project.key })));
-
-  setCard.body.append(kv);
+  setCard.body.append(el("div", { className: "row" },
+    el("div", { className: "grow hint",
+      textContent: "Name, summary, colour, status, how tasks are laid out, and deleting the project." }),
+    (() => {
+      const b = el("button", { className: "btn sm", textContent: "Open" });
+      b.onclick = () => navigate({ view: "project" });
+      return b;
+    })()));
   right.append(setCard.card);
 
   cols.append(left, right);
   root.append(cols);
+}
+
+// ---------------------------------------------------------------------------
+// Project settings
+//
+// Everything that is true of the project rather than of anything in it, in one
+// place. Before this there were two unconnected surfaces: a form at the bottom of
+// the Overview's right column, and the layout picker inside the Tasks tab, which
+// writes a column on the same row and never mentioned the other.
+//
+// Built as .setting sections rather than a dl of labels, because most of these
+// choices need a sentence to be safe to make: what archiving does, why the key
+// cannot change, and what a delete takes with it.
+// ---------------------------------------------------------------------------
+
+const PROJECT_STATUSES = ["active", "paused", "blocked", "done", "archived"];
+
+// The colours a project can be given without opening the picker. Free hex is
+// still allowed, and the Settings pane still offers the full picker: this is the
+// short list the sidebar menu shows, and the same list a new project is dealt
+// from, so the two cannot drift into two different ideas of what a project looks
+// like. Six, because that is one row of swatches at the width of a menu.
+const PROJECT_COLOURS = ["#4a63d8", "#e0803a", "#2f8757", "#a86fd1", "#c9546b", "#3fa7a1"];
+
+// What a project's status is called when it is being offered rather than listed.
+// The select in Settings shows the bare word because the label above it says what
+// the word is about; a menu item has to carry that context itself.
+const PROJECT_STATUS_VERB = {
+  active: "Mark active",
+  paused: "Mark paused",
+  blocked: "Mark blocked",
+  done: "Mark done",
+};
+
+// Set by the archive gesture and cleared by the settings pane that honours it.
+// Archiving sends you to Settings, and the archive is the last section of a long
+// page: arriving at the top of it is arriving somewhere that looks unrelated to
+// what you just did. One shot, because scrolling there on every later visit to
+// Settings would be the opposite problem.
+let revealArchived = false;
+
+/**
+ * Archives a project, having agreed it first. Answers true if it went ahead.
+ *
+ * Shared by the Settings pane and the sidebar menu because the two used to be
+ * one gesture written once: the warning, the write and the move afterwards are
+ * all part of the same promise, and a second copy of it in the menu is a second
+ * copy that can be reworded without the first one noticing.
+ *
+ * Where it lands depends on where the archiving happened. Archiving the project
+ * you are looking at has to move you, since the pane underneath is about to be
+ * describing a project no list will admit exists, and Settings is where it went.
+ * Archiving some other project from the sidebar moves nothing: being yanked out
+ * of the project you were working in is a worse surprise than the row quietly
+ * leaving the list you were not reading.
+ */
+async function archiveProject(project) {
+  const leaving = state.projectId === project.id;
+  const ok = confirm(
+    `Archive “${project.name}”?\n\n` +
+    "It leaves the sidebar and every list, and nothing in it is deleted: the tasks, notes, links and epics all stay exactly as they are.\n\n" +
+    (leaving
+      ? "You will land on Settings, under All work, where archived projects are listed with a button to bring each one back.\n\n"
+      : "Archived projects are listed under Settings, in All work, with a button to bring each one back.\n\n") +
+    "If what you want is for it to be gone rather than out of the way, delete it instead. That can be reversed from History."
+  );
+  if (!ok) return false;
+
+  await window.delphi.projects.update(project.id, { status: "archived" });
+  if (leaving) {
+    state.projectId = null;
+    state.view = "settings";
+    revealArchived = true;
+  }
+  await refresh();
+  return true;
+}
+
+/** A heading, a sentence saying what the choice means, then the control. */
+function settingSection(heading, explanation, ...controls) {
+  const box = el("div", { className: "setting" });
+  box.append(el("h3", { textContent: heading }));
+  box.append(el("p", { textContent: explanation }));
+  controls.filter(Boolean).forEach((c) => box.append(c));
+  return box;
+}
+
+function renderProjectSettings(root) {
+  const project = currentProject();
+  if (!project) return;
+
+  // Every handler re-reads the project rather than closing over this one. The
+  // node lives as long as the pane does and refresh() replaces the row underneath
+  // it, so a comparison against the captured copy is against a stale value: the
+  // second edit in a sitting was the one that silently did nothing.
+  const save = async (fields, msg) => {
+    const live = currentProject();
+    if (!live) return;
+    try {
+      await window.delphi.projects.update(live.id, fields);
+    } catch (error) {
+      // Only failures say anything. A success repaints this pane, so a "Saved"
+      // written here would be discarded in the same frame; the new name in the
+      // sidebar and the title is the confirmation, and it is a better one.
+      if (msg) { msg.className = "err-msg"; msg.textContent = error.message; }
+      return;
+    }
+    await refresh();
+  };
+
+  // Enter commits. The old form saved on blur alone, so pressing Enter appeared
+  // to do nothing and hiding the window with the field still focused lost the
+  // rename outright.
+  const commitOnEnter = (input) => {
+    input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); input.blur(); } };
+    return input;
+  };
+
+  // --- name ----------------------------------------------------------------
+  const nameMsg = el("span", { className: "hint" });
+  const nameInput = commitOnEnter(el("input", { className: "field", value: project.name }));
+  nameInput.onblur = () => {
+    const live = currentProject();
+    const value = nameInput.value.trim();
+    if (!value) { nameInput.value = live ? live.name : ""; return; }
+    if (!live || value === live.name) return;
+    save({ name: value }, nameMsg);
+  };
+  root.append(settingSection("Name",
+    "What this project is called everywhere it appears: the sidebar, the title, and any task that belongs to it.",
+    el("div", { className: "row" }, nameInput), nameMsg));
+
+  // --- summary -------------------------------------------------------------
+  const sumMsg = el("span", { className: "hint" });
+  const sumInput = commitOnEnter(el("input", {
+    className: "field",
+    value: project.summary || "",
+    placeholder: "One line: what this project is",
+  }));
+  sumInput.onblur = () => {
+    const live = currentProject();
+    if (!live || sumInput.value.trim() === (live.summary || "")) return;
+    save({ summary: sumInput.value.trim() }, sumMsg);
+  };
+  root.append(settingSection("Summary",
+    "One line, shown under the title and as the tooltip on the sidebar row. Leave it empty if the name says enough.",
+    el("div", { className: "row" }, sumInput), sumMsg));
+
+  // --- key -----------------------------------------------------------------
+  root.append(settingSection("Key",
+    "The short slug this project is known by outside the window: to the agent tools, to the markdown vault, and to anything that imported work into it. It is fixed once the project exists, because everything already pointing at it would be pointing at nothing.",
+    el("div", { className: "row" }, el("span", { className: "mono", textContent: project.key }))));
+
+  // --- colour --------------------------------------------------------------
+  const colourMsg = el("span", { className: "hint" });
+  const colour = el("input", {
+    type: "color", className: "field field-colour", value: project.colour || "#8d97a9",
+  });
+  // Chromium fires change on a colour input over and over while the picker is
+  // being dragged, not once when it is put away. Saving on each one wrote a row
+  // into the project's history for every shade passed through on the way to the
+  // one wanted, and repainted this pane under the open picker while doing it, so
+  // the write waits for the dragging to stop.
+  let colourTimer;
+  const commitColour = () => {
+    const live = currentProject();
+    // The timer can outlive the pane that started it. Without this, settling on a
+    // colour and immediately switching projects paints the wrong one.
+    if (!live || live.id !== project.id) return;
+    if (colour.value === (live.colour || "")) return;
+    save({ colour: colour.value }, colourMsg);
+  };
+  const queueColour = () => {
+    clearTimeout(colourTimer);
+    colourTimer = setTimeout(commitColour, 600);
+  };
+  colour.oninput = queueColour;
+  colour.onchange = queueColour;
+  root.append(settingSection("Colour",
+    "The dot beside this project in the sidebar, and the flash of colour on its tasks wherever they appear next to another project's.",
+    el("div", { className: "row" }, colour, colourMsg)));
+
+  // --- status --------------------------------------------------------------
+  const statusMsg = el("span", { className: "hint" });
+  const statusSel = el("select", { className: "field" });
+  for (const s of PROJECT_STATUSES) {
+    statusSel.append(el("option", { value: s, textContent: s, selected: s === project.status }));
+  }
+  statusSel.onchange = async () => {
+    const live = currentProject();
+    if (!live) return;
+    const value = statusSel.value;
+    // Archiving takes the project out of every list, this pane included, so the
+    // move away happens inside archiveProject rather than leaving the pane
+    // rendering a project the next refresh will not know about. The select is put
+    // back by hand when the warning is declined, because a select that has already
+    // repainted itself is showing a status nothing was ever told about.
+    if (value === "archived") {
+      const done = await archiveProject(live);
+      if (!done) statusSel.value = live.status;
+      return;
+    }
+    save({ status: value }, statusMsg);
+  };
+  root.append(settingSection("Status",
+    "Where this project stands. The first four are labels and change nothing else. Archived is the exception: it hides the project everywhere, out of the way rather than gone. Archived projects are listed under Settings in All work, and restoring one from there puts it back as it was.",
+    el("div", { className: "row" }, statusSel, statusMsg)));
+
+  // --- task view -----------------------------------------------------------
+  const viewSel = el("select", { className: "field" });
+  const TASK_VIEW_LABELS = {
+    list: "List, one column top to bottom",
+    table: "Table, a row per task",
+    columns: "Columns, one per status, side by side",
+    board: "Board, one column per status, drag to move",
+    calendar: "Calendar, tasks on the day they are due",
+  };
+  for (const [id, label] of Object.entries(TASK_VIEW_LABELS)) {
+    viewSel.append(el("option", { value: id, textContent: label, selected: id === taskViewMode() }));
+  }
+  viewSel.onchange = () => setTaskViewMode(viewSel.value);
+  root.append(settingSection("How tasks are laid out",
+    "Remembered on the project rather than as a global preference, because a project with four tasks and one with forty want different answers. The picker above the task list writes the same choice.",
+    el("div", { className: "row" }, viewSel)));
+
+  // --- danger zone ---------------------------------------------------------
+  const del = el("button", { className: "btn danger", textContent: "Delete this project…" });
+  const delMsg = el("span", { className: "hint" });
+  del.onclick = async () => {
+    const live = currentProject();
+    if (!live) return;
+    await destroyProject(live, (error) => {
+      delMsg.className = "err-msg";
+      delMsg.textContent = error.message;
+    });
+  };
+  root.append(settingSection("Delete this project",
+    "Removes the project and, unless you say otherwise, hands its tasks back to All work. Everything it holds is copied first, so the whole thing can be put back from History afterwards.",
+    el("div", { className: "row" }, del, delMsg)));
+}
+
+/**
+ * Deletes a project, having agreed it first. Answers true if it went ahead.
+ *
+ * Shared by the Settings pane and the sidebar menu, for the same reason
+ * archiveProject is: the counting, the agreement and the sentence said afterwards
+ * are one gesture, and the second copy of it is the one that would quietly stop
+ * offering the choice about the tasks.
+ *
+ * Where it lands is decided the same way too. Only the project on screen forces a
+ * move; deleting some other project from the sidebar leaves you where you were.
+ *
+ * onError is passed in because the two callers have different places to put a
+ * failure: the pane has a message line under its button, and a menu that has
+ * already closed has nowhere at all.
+ */
+async function destroyProject(project, onError = (error) => alert(error.message)) {
+  // Counted when the delete is asked for rather than when the pane was drawn. An
+  // agent adds tasks while a settings pane sits open, and a confirmation quoting
+  // numbers from ten minutes ago is worse than one quoting none.
+  const counts = await window.delphi.projects.contents(project.id);
+  const choice = await confirmDestroy({ project, counts });
+  if (!choice) return false;
+  try {
+    const r = await window.delphi.projects.remove(project.id, { tasks: choice.tasks });
+    if (state.projectId === project.id) {
+      state.projectId = null;
+      state.view = "new";
+    }
+    await refresh();
+    // Said after the move, on the view that is now on screen, because the pane
+    // that raised it has been replaced by then.
+    alert(`“${r.name}” is gone. Reverse it from History if that was wrong.`);
+    return true;
+  } catch (error) {
+    onError(error);
+    return false;
+  }
+}
+
+/**
+ * Agrees to a project delete, in proportion to what is being lost.
+ *
+ * confirm() is enough for an epic, which loses a shell. This loses a body of
+ * work, so it says what is in it rather than asking in the abstract, makes the
+ * fate of the tasks an explicit choice rather than a surprise, and asks for the
+ * key to be typed: the point is to make it impossible to do by reflex, and the
+ * key is short, immutable and printed a few lines above on the same pane.
+ *
+ * Escape is captured on the document exactly the way askText captures it. The
+ * window-level handler treats Escape as "hide the window", so without this the
+ * whole app disappears rather than the dialog.
+ */
+function confirmDestroy({ project, counts }) {
+  return new Promise((resolve) => {
+    const parts = [
+      [counts.tasks, "task", "tasks"],
+      [counts.notes, "note", "notes"],
+      [counts.links, "link", "links"],
+      [counts.organizers, "epic", "epics"],
+      [counts.repos, "repository", "repositories"],
+    ].filter(([n]) => n > 0).map(([n, one, many]) => plural(n, one, many));
+
+    const holds = parts.length
+      ? `It holds ${parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`}.`
+      : "It is empty.";
+
+    const overlay = el("div", { className: "overlay" });
+    const box = el("div", { className: "ask" });
+
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKey, true);
+      overlay.remove();
+      resolve(result);
+    };
+
+    box.append(el("h3", { textContent: `Delete “${project.name}”?` }));
+    box.append(el("p", { textContent: holds }));
+
+    // What happens to the tasks, spelled out under each option rather than left
+    // to be discovered afterwards. Keeping them is the default because it is the
+    // one that loses nothing, and because it is what the schema does anyway.
+    let mode = "keep";
+    const choices = el("div", { className: "destroy-choices" });
+    if (counts.tasks) {
+      for (const [value, label, detail] of [
+        ["keep", "Keep the tasks",
+         "They move to All work with no project, and stay in search, in the queue and on their reminders."],
+        // Subtasks that were moved into another project still go with their
+        // parent, because the cascade follows parent_id rather than project_id.
+        // Said out loud here: it is the only part of the loss that lands outside
+        // the project being deleted, so it is the part nobody expects.
+        ["delete", "Delete the tasks too",
+         "The work goes with the project, along with its comments, its history and any reminders set on it." +
+         (counts.subtasks_elsewhere
+           ? ` This includes ${plural(counts.subtasks_elsewhere, "subtask", "subtasks")} now filed under another project.`
+           : "")],
+      ]) {
+        const id = `destroy-${value}`;
+        const radio = el("input", { type: "radio", name: "destroy-tasks", id, value, checked: value === mode });
+        radio.onchange = () => { if (radio.checked) mode = value; };
+        const row = el("label", { className: "destroy-choice", htmlFor: id },
+          radio,
+          el("span", {},
+            el("span", { className: "destroy-choice-label", textContent: label }),
+            el("span", { className: "hint", textContent: detail })));
+        choices.append(row);
+      }
+      box.append(choices);
+    }
+
+    const ok = el("button", { className: "btn danger", textContent: "Delete", type: "button", disabled: true });
+    const input = el("input", {
+      className: "field", type: "text", placeholder: project.key, spellcheck: false,
+    });
+    input.oninput = () => { ok.disabled = input.value.trim() !== project.key; };
+    box.append(el("p", { className: "hint" },
+      "Type the project key ", el("span", { className: "mono", textContent: project.key }), " to confirm."));
+    box.append(input);
+
+    const cancel = el("button", { className: "btn", textContent: "Cancel", type: "button" });
+    cancel.onclick = () => finish(null);
+    ok.onclick = () => { if (!ok.disabled) finish({ tasks: mode }); };
+
+    const onKey = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(null);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!ok.disabled) finish({ tasks: mode });
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+
+    const actions = el("div", { className: "ask-actions" });
+    actions.append(cancel, ok);
+    box.append(actions);
+
+    overlay.append(box);
+    overlay.onclick = (event) => { if (event.target === overlay) finish(null); };
+    document.body.append(overlay);
+    input.focus();
+  });
+}
+
+/**
+ * The menu a sidebar project row offers, from right click and from its ⋯ button.
+ *
+ * The project row was the last row type in the app with no menu on it, so every
+ * change to a project meant selecting it first and then finding the Settings tab,
+ * including the changes that are one word long. The short ones live here and the
+ * ones that need a sentence of explanation stay on the pane, which is what
+ * Settings is for and why this ends with a way into it.
+ *
+ * Everything acts on the project the menu was opened over, not on the selected
+ * one. Renaming a project you are not in is the ordinary case from a sidebar, and
+ * a menu that quietly retargeted itself at whatever is on screen would be the
+ * worst kind of wrong.
+ */
+function projectMenu(p, x, y) {
+  const set = async (fields) => {
+    try {
+      await window.delphi.projects.update(p.id, fields);
+    } catch (error) {
+      // No message line to write into: the menu is gone by the time this runs.
+      alert(error.message);
+      return;
+    }
+    await refresh();
+  };
+
+  const rename = async () => {
+    const name = await askText({
+      title: "Rename project",
+      label: "What this project is called everywhere it appears. The key it is known by outside the window does not change.",
+      value: p.name,
+      confirmLabel: "Rename",
+    });
+    if (!name || name.trim() === p.name) return;
+    await set({ name: name.trim() });
+  };
+
+  const describe = async () => {
+    const summary = await askText({
+      title: "Describe project",
+      label: "One line: what this project is. Leave it empty to clear it.",
+      value: p.summary || "",
+      confirmLabel: "Save",
+      allowEmpty: true,
+    });
+    if (summary === null) return;
+    if (summary.trim() === (p.summary || "")) return;
+    await set({ summary: summary.trim() || null });
+  };
+
+  // The status the project already has is left out rather than shown ticked,
+  // because a menu item that does nothing is indistinguishable from one that
+  // failed. Archived is not among them: it is not another label, it takes the
+  // project out of every list, so it goes below the line with its own warning.
+  const statuses = PROJECT_STATUSES
+    .filter((s) => s !== "archived" && s !== p.status)
+    .map((s) => ({ label: PROJECT_STATUS_VERB[s], run: () => set({ status: s }) }));
+
+  rowMenu(x, y, [
+    { label: "Rename", run: rename },
+    { label: p.summary ? "Edit the summary" : "Add a summary", run: describe },
+    "-",
+    { node: projectSwatchRow(p.colour, async (colour) => { closeRowMenu(); await set({ colour }); }) },
+    "-",
+    ...statuses,
+    "-",
+    // The field is cleared by hand the way the row's own click does it: navigate
+    // drops the query from the state and the box goes on showing what was typed.
+    { label: "Settings", run: () => { $("search").value = ""; return navigate({ projectId: p.id, view: "project", query: "" }); } },
+    { label: "Archive…", run: () => archiveProject(p) },
+    { label: "Delete the project…", danger: true, run: () => destroyProject(p) },
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1457,7 +1947,6 @@ async function renderMindMap(root) {
     adjacency.get(l.b).add(l.a);
   }
 
-  const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   let hover = null;
   let named = null;   // what the readout is currently saying, so it is not rewritten every frame
 
@@ -1682,7 +2171,10 @@ async function renderMindMap(root) {
     if (!canvas.isConnected) { teardown(); return; }
     frame = requestAnimationFrame(tick);
 
-    if (!still) {
+    // Asked per frame rather than hoisted out of the loop, because the answer can
+    // change while the graph is on screen and a graph drawn before the change
+    // would otherwise keep moving until the view was rendered again.
+    if (!motionOff()) {
       // Only one node is magnetic, and it is the one already under the pointer.
       // Making everything flee the cursor is fun for a second and then makes the
       // graph impossible to click.
@@ -2252,6 +2744,24 @@ const colourClass = (t) => (hasColour(t) ? ` tinted c-${t.colour}` : "");
 const colourLabel = (name) => TASK_COLOUR_NAMES.get(name) || "";
 
 /**
+ * Which project a task belongs to, said the way the sidebar says it.
+ *
+ * Only ever shown in the cross-project lists, where the project name used to be
+ * one more piece of faint grey text among the ref and the counts and so read as
+ * a label rather than as an owner. The colour is what the sidebar trained the
+ * eye on, so reusing the same dot makes the row match up with the list on the
+ * left without anyone having to read it. Falls back to the faint ink when a
+ * project has no colour set, because an undefined background paints a black
+ * circle, which looks like a deliberate colour choice.
+ */
+function projectOwner(t) {
+  const owner = el("span", { className: "t-owner" });
+  owner.append(el("span", { className: "dot", style: `background:${t.project_colour || "var(--ink-faint)"}` }));
+  owner.append(el("span", { textContent: t.project_name }));
+  return owner;
+}
+
+/**
  * The palette, as a row of swatches.
  *
  * Used both inside the task sheet and inside the right click menu, so a colour
@@ -2279,6 +2789,33 @@ function swatchRow(current, onPick) {
   clear.setAttribute("aria-pressed", String(!current));
   clear.onclick = (e) => { e.stopPropagation(); onPick(null); };
   row.append(clear);
+  return row;
+}
+
+/**
+ * The same row of swatches, for a project.
+ *
+ * Projects store a raw hex rather than one of the palette names tasks use, so
+ * the colour cannot arrive through a c-* class and is written straight onto the
+ * custom property .swatch already paints itself from. There is no clearing
+ * swatch: a project with no colour still draws a dot, in a grey nobody chose,
+ * and offering that as a seventh option would be offering a colour that looks
+ * like a mistake. The full picker in Settings remains the way to any other hue.
+ */
+function projectSwatchRow(current, onPick) {
+  const row = el("div", { className: "swatches", role: "group" });
+  row.setAttribute("aria-label", "Project colour");
+  for (const hex of PROJECT_COLOURS) {
+    const on = (current || "").toLowerCase() === hex;
+    const b = el("button", {
+      className: "swatch" + (on ? " on" : ""),
+      type: "button", title: hex, style: `--task-colour:${hex}`,
+    });
+    b.setAttribute("aria-label", `Colour ${hex}`);
+    b.setAttribute("aria-pressed", String(on));
+    b.onclick = (e) => { e.stopPropagation(); onPick(hex); };
+    row.append(b);
+  }
   return row;
 }
 
@@ -2763,7 +3300,7 @@ function taskTableRow(t) {
   const name = el("div", { className: "tcell tcell-name" });
   name.append(el("span", { className: "trow-title", textContent: t.title }));
   const under = el("span", { className: "trow-sub" });
-  if (!state.projectId && t.project_name) under.append(el("span", { textContent: t.project_name }));
+  if (!state.projectId && t.project_name) under.append(projectOwner(t));
   if (t.ref) under.append(el("span", { className: "t-ref", textContent: t.ref }));
   if (t.subtask_count) under.append(el("span", { textContent: `${t.subtask_done}/${t.subtask_count}` }));
   if (t.comment_count) under.append(el("span", { textContent: `${t.comment_count} ✦` }));
@@ -3439,7 +3976,7 @@ function taskRow(t) {
     // Long enough to see it, short enough not to be in the way of ticking off
     // the next one. Skipped entirely when animations are turned off, since
     // there would be nothing to wait for.
-    setTimeout(refresh, prefersReducedMotion() ? 0 : 640);
+    setTimeout(refresh, motionOff() ? 0 : 640);
   };
   check.onclick = toggle;
   check.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
@@ -3451,7 +3988,7 @@ function taskRow(t) {
 
   // A second line only when there is something worth putting on it.
   const sub = el("div", { className: "t-sub" });
-  if (!state.projectId && t.project_name) sub.append(el("span", { textContent: t.project_name }));
+  if (!state.projectId && t.project_name) sub.append(projectOwner(t));
   if (t.ref) sub.append(el("span", { className: "t-ref", textContent: t.ref }));
   if (t.subtask_count) sub.append(el("span", { textContent: `${t.subtask_done}/${t.subtask_count}` }));
   if (t.comment_count) sub.append(el("span", { textContent: `${t.comment_count} ✦` }));
@@ -3922,9 +4459,18 @@ async function renderHistory(root) {
     const b = el("button", { className: "btn", textContent: text });
     b.onclick = async () => {
       try {
-        const done = await window.delphi.audit.undoLast(n);
-        msg.className = "ok-msg";
-        msg.textContent = done ? `Reversed ${plural(done, "change", "changes")}.` : "Nothing left to undo.";
+        const { undone, stopped } = await window.delphi.audit.undoLast(n);
+        // Reported together, because a run that stopped part way did do
+        // something and saying only why it stopped reads as though it did not.
+        if (stopped) {
+          msg.className = "err-msg";
+          msg.textContent = undone
+            ? `Reversed ${plural(undone, "change", "changes")}, then stopped: ${stopped}`
+            : stopped;
+        } else {
+          msg.className = "ok-msg";
+          msg.textContent = undone ? `Reversed ${plural(undone, "change", "changes")}.` : "Nothing left to undo.";
+        }
       } catch (e) { msg.className = "err-msg"; msg.textContent = e.message; }
       refresh();
     };
@@ -3947,8 +4493,14 @@ async function renderHistory(root) {
       el("div", { textContent: `${e.entity} ${e.summary}` }));
     if (e.label) what.append(el("div", { className: "lbl", textContent: e.label.slice(0, 120) }));
     row.append(what);
-    if (e.undone) row.append(el("span", { className: "chip", textContent: "undone" }));
-    else {
+    if (e.undone) {
+      row.append(el("span", { className: "chip", textContent: "undone" }));
+    } else if (e.action === "delete" && !e.restorable) {
+      // The same honesty the project Activity tab has always had. This list used
+      // to offer an undo button on every row, including deletes with no stored
+      // copy, where pressing it can only produce an error.
+      row.append(el("span", { className: "chip", textContent: "not recoverable" }));
+    } else {
       const b = el("button", { className: "btn sm", textContent: "undo" });
       b.onclick = async () => {
         try { await window.delphi.audit.undo(e.id); } catch (err) { alert(err.message); }
@@ -4406,6 +4958,11 @@ function remindersSettings(settings) {
 // Reading the queue sweeps it first. claimNext already treats an expired lease
 // as unclaimed, so a stale claim on screen is a claim that does not exist, and
 // showing one would be a picture of a queue nobody would actually be handed.
+//
+// There is one pool, and a project narrows it rather than owning one of its own.
+// The tab appears in both places for that reason: in All work it is the whole
+// pool, in a project it is that project's share of the same pool. A queued task
+// with no project belongs to no project's slice and shows only in All work.
 // ---------------------------------------------------------------------------
 
 const QUEUE_NAME = "ready";
@@ -4441,14 +4998,18 @@ function queueRow(t, extra) {
 }
 
 async function renderQueue(root) {
-  const state_ = await window.delphi.tasks.queueState(QUEUE_NAME);
+  const project = currentProject();
+  const state_ = await window.delphi.tasks.queueState(QUEUE_NAME, state.projectId);
 
   const bar = el("div", { className: "oracle-bar" });
-  bar.append(el("div", { className: "hint grow", textContent:
-    `The '${QUEUE_NAME}' pool. An agent calls queue_next to take the top of Waiting, and holds a lease it has to finish or renew before it lapses.` }));
+  bar.append(el("div", { className: "hint grow", textContent: project
+    ? `${project.name}'s share of the '${QUEUE_NAME}' pool. An agent calls queue_next with this project to take the top of Waiting, and holds a lease it has to finish or renew before it lapses.`
+    : `The whole '${QUEUE_NAME}' pool, every project. An agent calls queue_next to take the top of Waiting, and holds a lease it has to finish or renew before it lapses.` }));
   const sweep = el("button", { className: "btn sm", textContent: "Sweep" });
-  sweep.title = "Put any expired claim back in the pool now";
-  sweep.onclick = async () => { await window.delphi.tasks.queueReclaim(QUEUE_NAME); render(); };
+  sweep.title = project
+    ? "Put any expired claim in this project back in the pool now"
+    : "Put any expired claim back in the pool now";
+  sweep.onclick = async () => { await window.delphi.tasks.queueReclaim(QUEUE_NAME, state.projectId); render(); };
   bar.append(sweep);
   root.append(bar);
 
@@ -4464,12 +5025,19 @@ async function renderQueue(root) {
 
   const waiting = queueSection("Waiting", "Highest priority first, oldest first within it", state_.waiting);
   if (!state_.waiting.length) {
-    waiting.append(el("div", { className: "hint pad", textContent:
-      "Nothing queued. Send a task here from its right click menu, or from the task itself." }));
+    waiting.append(el("div", { className: "hint pad", textContent: project
+      ? `Nothing from ${project.name} is queued. Send a task here from its right click menu.`
+      : "Nothing queued. Send a task here from its right click menu." }));
   }
   for (const t of state_.waiting) {
+    // Which project a piece of work belongs to is the thing the global view is
+    // missing, and it is what tells you whether the agent about to take it is
+    // sitting in the right checkout.
+    const owner = !project && t.project_name;
     waiting.append(queueRow(t, [
       t.priority === "high" ? el("span", { className: "pill high", textContent: "high" }) : null,
+      owner ? el("span", { className: "dot", style: `background:${t.project_colour || "var(--ink-faint)"}` }) : null,
+      owner ? el("span", { className: "cell-text", textContent: t.project_name }) : null,
       t.ref ? el("span", { className: "t-ref", textContent: t.ref }) : null,
     ]));
   }
@@ -4477,7 +5045,9 @@ async function renderQueue(root) {
 
   const held = queueSection("In flight", "Claimed, with a lease running", state_.claimed);
   if (!state_.claimed.length) {
-    held.append(el("div", { className: "hint pad", textContent: "No agent is holding anything." }));
+    held.append(el("div", { className: "hint pad", textContent: project
+      ? "No agent is holding anything in this project."
+      : "No agent is holding anything." }));
   }
   for (const t of state_.claimed) {
     const lease = leaseLeft(t.claim_expires);
@@ -4496,9 +5066,17 @@ async function renderQueue(root) {
   }
   root.append(held);
 
-  const done = queueSection("Finished", "Left the pool in the last week", state_.finished || []);
+  // Not "left the pool", which is what this used to say and was never true.
+  // Finishing a task nulls its queue, so nothing records that a done task was
+  // ever queued and this list cannot be narrowed to the pool. It is every task
+  // finished in the last week, said plainly.
+  const done = queueSection("Finished", project
+    ? "Finished in this project in the last week, queued or not"
+    : "Finished anywhere in the last week, queued or not", state_.finished || []);
   if (!(state_.finished || []).length) {
-    done.append(el("div", { className: "hint pad", textContent: "Nothing has come out of the queue this week." }));
+    done.append(el("div", { className: "hint pad", textContent: project
+      ? "Nothing in this project has been finished this week."
+      : "Nothing has been finished this week." }));
   }
   for (const t of state_.finished || []) {
     done.append(queueRow(t, [
@@ -4564,6 +5142,37 @@ async function renderSettings(root) {
   }
   appearance.append(themes);
   root.append(appearance);
+
+  // --- animation -----------------------------------------------------------
+  const motion = el("div", { className: "setting" });
+  motion.append(el("h3", { textContent: "Animation" }));
+  motion.append(el("p", {
+    textContent: "Covers the celebration when a task is ticked off, the bar that slides in when several are selected, the fade behind a dialog and every hover transition. Turning it off also removes the short pause before a completed task leaves the list. If your system is already set to reduce motion, that wins either way and this cannot switch it back on.",
+  }));
+  const motionRow = el("div", { className: "row" });
+  const motionBox = el("input", { type: "checkbox", checked: settings.animations !== false, id: "animations" });
+  const motionLbl = el("label", { htmlFor: "animations", textContent: "Animate the interface" });
+  const motionMsg = el("span", { className: "hint" });
+  motionBox.onchange = async () => {
+    // Applied before the write, and not sent with anything else: the panelMode
+    // branch of settings:set returns early when panel mode changes, so a batched
+    // call would be dropped without an error.
+    applyMotion(motionBox.checked);
+    try {
+      const updated = await window.delphi.settings.set({ animations: motionBox.checked });
+      Object.assign(settings, updated);
+      motionMsg.className = "ok-msg";
+      motionMsg.textContent = "Saved";
+    } catch (e) {
+      motionMsg.className = "err-msg";
+      motionMsg.textContent = e.message;
+      motionBox.checked = !motionBox.checked;
+      applyMotion(motionBox.checked);
+    }
+  };
+  motionRow.append(motionBox, motionLbl, motionMsg);
+  motion.append(motionRow);
+  root.append(motion);
 
   // --- shortcut ------------------------------------------------------------
   const shortcut = el("div", { className: "setting" });
@@ -4743,6 +5352,80 @@ async function renderSettings(root) {
   mouse.append(el("p", { style: "margin-bottom:0",
     textContent: "A global shortcut can only be a keyboard combination, so a mouse button cannot be bound here directly. Do it the other way round: in your mouse software, map the side button to send the combination above. The panel cannot tell the difference. Logitech Options, SteerMouse and Razer Synapse all do this." }));
   root.append(mouse);
+
+  // --- archived projects ---------------------------------------------------
+  // Drawn even when the archive is empty. A heading that only appears once
+  // something is hidden cannot be found by the person hunting for where their
+  // project went, and that is the single moment anyone wants this section.
+  const arch = el("div", { className: "setting" });
+  arch.append(el("h3", { textContent: "Archived projects" }));
+  arch.append(el("p", {
+    textContent: "Archiving takes a project out of the sidebar and out of every list without deleting any of it, and this is the only place archived projects can be reached from. Restoring brings one back with everything it holds, marked active: nothing records whether it was paused or blocked before it was archived.",
+  }));
+
+  let archived = [];
+  let archivedError = null;
+  try {
+    archived = await window.delphi.projects.archived();
+  } catch (e) {
+    // Reported in place rather than allowed to throw. The rest of this page has
+    // nothing to do with the archive, and losing every other setting because one
+    // query failed is a worse outcome than one section saying why it is empty.
+    archivedError = e.message;
+  }
+
+  if (archivedError) {
+    arch.append(el("p", { className: "err-msg", style: "margin:0", textContent: archivedError }));
+  } else if (!archived.length) {
+    arch.append(el("p", { className: "hint", style: "margin:0",
+      textContent: "Nothing is archived. A project is archived from the Settings tab inside it, or from the menu on its sidebar row." }));
+  } else {
+    const box = el("div", { className: "list-box" });
+    for (const p of archived) {
+      const row = el("div", { className: "list-row" });
+      row.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }));
+
+      // What it still holds, so restoring is a decision rather than a guess. An
+      // archived project that turns out to be empty is one you can leave alone.
+      const parts = [
+        p.total_count ? plural(p.total_count, "task", "tasks") : null,
+        p.open_count ? `${p.open_count} still open` : null,
+        p.note_count ? plural(p.note_count, "note", "notes") : null,
+      ].filter(Boolean);
+      row.append(el("div", { className: "grow" },
+        el("div", { textContent: p.name }),
+        el("span", { className: "hint", textContent: parts.length ? parts.join(", ") : "Empty" })));
+
+      const msg = el("span", { className: "hint" });
+      const restore = el("button", { className: "btn sm", textContent: "Restore" });
+      restore.onclick = async () => {
+        restore.disabled = true;
+        try {
+          await window.delphi.projects.update(p.id, { status: "active" });
+        } catch (e) {
+          msg.className = "err-msg";
+          msg.textContent = e.message;
+          restore.disabled = false;
+          return;
+        }
+        // Nothing says "Saved". The row leaves this list and the project appears
+        // in the sidebar in the same frame, which is a better confirmation than
+        // any text this pane could show a moment before being replaced.
+        await refresh();
+      };
+      row.append(msg, restore);
+      box.append(row);
+    }
+    arch.append(box);
+  }
+  root.append(arch);
+
+  // Next frame rather than now: the section has just been appended and the pane
+  // is still growing, so a scroll measured here lands short.
+  if (revealArchived) {
+    revealArchived = false;
+    requestAnimationFrame(() => arch.scrollIntoView({ block: "start" }));
+  }
 
   // --- data ----------------------------------------------------------------
   const data = el("div", { className: "setting" });
@@ -5416,12 +6099,11 @@ async function createProject() {
   if (!name) return null;
 
   const key = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  const palette = ["#4a63d8", "#e0803a", "#2f8757", "#a86fd1", "#c9546b", "#3fa7a1"];
   try {
     const created = await window.delphi.projects.create({
       key: key || `p${Date.now()}`,
       name,
-      colour: palette[state.projects.length % palette.length],
+      colour: PROJECT_COLOURS[state.projects.length % PROJECT_COLOURS.length],
     });
     state.projectId = created.id;
     state.view = "overview";
@@ -5576,14 +6258,17 @@ window.delphi.onMenu(async ({ action, view, theme }) => {
       return;
     }
 
-    case "undo-last":
+    case "undo-last": {
       try {
-        await window.delphi.audit.undoLast(1);
+        const { undone, stopped } = await window.delphi.audit.undoLast(1);
+        if (stopped) alert(stopped);
+        else if (!undone) alert("Nothing to undo.");
       } catch (error) {
         alert(`Nothing to undo: ${error.message}`);
       }
       await refresh();
       return;
+    }
 
     case "view": {
       // What's new and History are the All view's tabs; Memory only exists inside
@@ -5619,9 +6304,11 @@ async function boot() {
   try {
     const settings = await window.delphi.settings.get();
     applyTheme(settings.theme);
+    applyMotion(settings.animations !== false);
     if (["formatted", "raw"].includes(settings.noteView)) state.noteView = settings.noteView;
   } catch {
     applyTheme("system");
+    applyMotion(true);
   }
   refresh();
 }

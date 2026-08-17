@@ -238,6 +238,40 @@ function sql(query, params = []) {
   return DATABASE.query(statement.endsWith(";") ? statement : statement + ";");
 }
 
+/**
+ * Turns whatever a caller said about a project into an id, or null for all of them.
+ *
+ * A key is accepted as well as an id because list_projects hands back both, and
+ * an agent that has been told which project it works on has been told the key.
+ * An unknown key is an error rather than a quiet fall back to no filter: silently
+ * widening the scope would hand an agent another project's work, which is the
+ * one mistake a project filter exists to prevent.
+ *
+ * An id is checked the same way, and used not to. It went through untouched, so
+ * a wrong or stale number narrowed the filter to nothing instead of widening it,
+ * and the failure was silent in the other direction: queue_runner reads a
+ * bare-digits --project as an id, so a runner started with the wrong one polled
+ * forever saying "Nothing waiting in the ready queue" while the work sat there.
+ * A non-numeric one was worse still, because literal() renders NaN as NULL and
+ * "project_id = NULL" is never true, so the filter matched nothing and the
+ * message said "for project NaN".
+ */
+function resolveProjectId(a) {
+  if (a.project_id !== undefined && a.project_id !== null) {
+    const id = Number(a.project_id);
+    if (!Number.isInteger(id)) {
+      throw new Error(`project_id must be a whole number, got '${a.project_id}'. Call list_projects to see them.`);
+    }
+    const row = sql("SELECT id FROM projects WHERE id = :p1", [id])[0];
+    if (!row) throw new Error(`No project with the id ${id}. Call list_projects to see them.`);
+    return row.id;
+  }
+  if (!a.project) return null;
+  const row = sql("SELECT id FROM projects WHERE key = :p1", [String(a.project)])[0];
+  if (!row) throw new Error(`No project with the key '${a.project}'. Call list_projects to see them.`);
+  return row.id;
+}
+
 const audit = (action, entity, entityId, summary, label) =>
   sql(
     `INSERT INTO audit (action, entity, entity_id, summary, label)
@@ -273,6 +307,12 @@ const TOOLS = {
       },
     },
     run: (a) => {
+      // Twin of db.js createProject. These rules, the slug, the clash check and
+      // the sort_order below, exist in both files and have to be changed in both.
+      // Requiring db.js is not an option here for the same reason paths.js is
+      // duplicated above: it ends up inside app.asar, and the Node an editor
+      // launched this with may have no node:sqlite either way.
+      //
       // The slug is the one column with a uniqueness constraint, so it is
       // normalised here rather than trusting the caller to pass a clean one.
       const key = String(a.key).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -403,20 +443,29 @@ const TOOLS = {
 
   queue_next: {
     description:
-      "Claim the next piece of work from the queue and get everything needed to do it. Call this when you are ready to work rather than waiting to be given something. Returns null when the queue is empty, which means there is nothing to do and you should stop rather than invent work.",
+      "Claim the next piece of work from the queue and get everything needed to do it. Call this when you are ready to work rather than waiting to be given something. Returns null when the queue is empty, which means there is nothing to do and you should stop rather than invent work. Pass project_id or project when you are only able to work on one project, for example because you are running in that project's checkout: without it you will be handed whatever is at the top of the pool, whichever project it belongs to.",
     schema: {
       type: "object",
       properties: {
         queue: { type: "string", description: "Which pool. Defaults to ready." },
         minutes: { type: "number", description: "How long to hold it before the claim lapses. Defaults to 30." },
+        project_id: { type: "number", description: "Only take work from this project. Leave it out to take from any." },
+        project: { type: "string", description: "The same thing by project key, if that is what you have." },
       },
     },
     run: (a) => {
       const queue = a.queue || "ready";
       const minutes = a.minutes || 30;
+      const projectId = resolveProjectId(a);
       // One statement, because two with a gap between them is exactly where two
       // agents both win. An expired claim counts as unclaimed, so a task held by
       // an agent that died comes back on its own.
+      //
+      // This statement has a twin: db.js claimNext is the same claim for the
+      // app. They cannot share code, because this file has to run under a plain
+      // Node with no better-sqlite3 and cannot read inside app.asar, so any
+      // change to how a task is chosen has to be made in both or the app and the
+      // agents will disagree about what is claimable.
       const claimed = sql(
         `UPDATE tasks
             SET claimed_by = :p1,
@@ -430,13 +479,21 @@ const TOOLS = {
                -- is being waited on, and an agent given it can only hand it back.
                AND status NOT IN ('done', 'blocked')
                AND (claimed_by IS NULL OR claim_expires < datetime('now'))
+               ${projectId == null ? "" : "AND project_id = :p4"}
              ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
              LIMIT 1)
           RETURNING *`,
-        [ACTOR, minutes, queue]
+        [ACTOR, minutes, queue, projectId]
       )[0];
 
-      if (!claimed) return { claimed: null, message: `Nothing waiting in the ${queue} queue.` };
+      if (!claimed) {
+        return {
+          claimed: null,
+          message: projectId == null
+            ? `Nothing waiting in the ${queue} queue.`
+            : `Nothing waiting in the ${queue} queue for project ${projectId}.`,
+        };
+      }
 
       // Only when the claim moved it. Nothing but todo is claimable, so this is
       // always a real transition rather than a repeat of the current status.
@@ -554,25 +611,36 @@ const TOOLS = {
     description: "What is waiting in the queue and what other agents are already holding. Read it before claiming if you want to know whether it is worth starting.",
     schema: {
       type: "object",
-      properties: { queue: { type: "string" } },
+      properties: {
+        queue: { type: "string" },
+        project_id: { type: "number", description: "Only count work in this project. Leave it out for the whole pool." },
+        project: { type: "string", description: "The same thing by project key." },
+      },
     },
     run: (a) => {
       const queue = a.queue || "ready";
+      const projectId = resolveProjectId(a);
+      const mine = projectId == null ? "" : "AND project_id = :p2";
       return {
         queue,
+        project_id: projectId,
+        // project_id comes back on every row, because a status read against the
+        // whole pool is exactly where you need to know whose work it is.
         waiting: sql(
-          `SELECT id, title, priority FROM tasks
+          `SELECT id, title, priority, project_id FROM tasks
             WHERE queue = :p1 AND status NOT IN ('done', 'blocked')
               AND (claimed_by IS NULL OR claim_expires < datetime('now'))
+              ${mine}
             ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id`,
-          [queue]
+          [queue, projectId]
         ),
         in_flight: sql(
-          `SELECT id, title, claimed_by, claim_expires FROM tasks
+          `SELECT id, title, project_id, claimed_by, claim_expires FROM tasks
             WHERE queue = :p1 AND status != 'done'
               AND claimed_by IS NOT NULL AND claim_expires >= datetime('now')
+              ${mine}
             ORDER BY claim_expires`,
-          [queue]
+          [queue, projectId]
         ),
       };
     },

@@ -75,7 +75,13 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
   const vault = vaultPath.replace(/^~(?=$|\/)/, os.homedir());
   fs.mkdirSync(vault, { recursive: true });
 
-  const projects = db.listProjects();
+  // Archived projects are written too. listProjects hides them, and the sweep at
+  // the end removes every .md this pass did not write, so leaving them out meant
+  // the first export after archiving deleted the project's notes from disk. The
+  // rows survive in the database, but Settings tells the reader that archiving
+  // deletes nothing and that restoring brings a project back with everything it
+  // holds, and the copy they actually read in their editor was gone.
+  const projects = [...db.listProjects(), ...db.listArchivedProjects()];
   const written = new Set();
   let notes = 0;
 

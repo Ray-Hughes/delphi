@@ -46,6 +46,11 @@ let settings = {
   // for someone without asking. See agent/directives.js for how it reaches them.
   scratchpadMode: false,
   scratchpadProjectId: null,   // null means "no default, pick a project"
+  // On by default because the celebration is the confirmation that a task was
+  // completed, and the row leaves straight afterwards. The system reduced motion
+  // preference already suppresses all of it for the people who need that, so
+  // this is a second, independent off switch rather than the only one.
+  animations: true,
 };
 let schedulerTimer = null;
 let vaultTimer = null;
@@ -785,8 +790,19 @@ const handle = (channel, fn) =>
   });
 
 handle("projects:list", () => db.listProjects());
+// Its own channel rather than a flag on projects:list, because every caller of
+// that one wants the working set and would have to opt out of the archive.
+handle("projects:archived", () => db.listArchivedProjects());
 handle("projects:create", (payload) => db.createProject(payload));
 handle("projects:update", (id, fields) => db.updateProject(id, fields));
+handle("projects:contents", (id) => db.projectContents(id));
+// The vault mirrors notes per project, so a deleted project leaves a folder of
+// files describing something that no longer exists until the mirror is rebuilt.
+handle("projects:delete", (id, opts) => {
+  const r = db.deleteProject(id, opts);
+  scheduleVaultExport();
+  return r;
+});
 
 handle("tasks:list", (opts) => db.listTasks(opts));
 handle("tasks:create", (payload) => { const r = db.createTask(payload); scheduleVaultExport(); return r; });
@@ -794,9 +810,11 @@ handle("tasks:update", (id, fields) => { const r = db.updateTask(id, fields); sc
 handle("tasks:delete", (id) => { const r = db.deleteTask(id); scheduleVaultExport(); return r; });
 handle("tasks:detail", (id) => db.taskDetail(id));
 handle("tasks:queue", (id, queue) => { const r = db.setQueue(id, queue); scheduleVaultExport(); return r; });
-handle("queue:state", (queue) => db.queueState(queue));
+// projectId is optional in both, and leaving it out is the whole pool. The
+// global Queue tab passes nothing; a project's Queue tab passes its id.
+handle("queue:state", (queue, projectId) => db.queueState(queue, projectId ?? null));
 handle("queue:release", (id, note) => { const r = db.releaseClaim(id, { agent: "you", note }); scheduleVaultExport(); return r; });
-handle("queue:reclaim", (queue) => db.reclaimExpired(queue || null));
+handle("queue:reclaim", (queue, projectId) => db.reclaimExpired(queue || null, projectId ?? null));
 handle("tasks:comment", (taskId, body, author) => {
   const r = db.createComment({ taskId, body, author });
   scheduleVaultExport();
@@ -904,6 +922,8 @@ handle("settings:set", (fields) => {
   }
 
   if (fields.scratchpadMode !== undefined) settings.scratchpadMode = fields.scratchpadMode === true;
+
+  if (fields.animations !== undefined) settings.animations = fields.animations !== false;
 
   // Checked against the projects that exist, because this id is handed to agents
   // as the place to write. A stale id would send them at a project that is not

@@ -83,6 +83,9 @@ const all = (sql, params = {}) => open().prepare(sql).all(params);
 const one = (sql, params = {}) => open().prepare(sql).get(params);
 const run = (sql, params = {}) => open().prepare(sql).run(params);
 
+// Audit summaries are read by people, so they say "1 task" rather than "1 tasks".
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
 // ---------------------------------------------------------------------------
 // Audit
 //
@@ -122,7 +125,15 @@ function describeUpdate(entity, before, after) {
     if (key === "updated_at" || key === "completed_at") continue;
     if (String(before[key] ?? "") === String(after[key] ?? "")) continue;
     if (key === "status") {
-      changes.push(after[key] === "done" ? "marked done" : `status ${before[key]} to ${after[key]}`);
+      // A project's status carries archiving, which is the app's put-this-away
+      // gesture rather than a label. "status active to archived" is the truth but
+      // it reads like every other field change, and this is the entry someone
+      // scanning the list is most likely to have come for.
+      if (entity === "project" && after[key] === "archived") changes.push("archived");
+      else if (entity === "project" && before[key] === "archived") changes.push("brought back from the archive");
+      else changes.push(after[key] === "done" ? "marked done" : `status ${before[key]} to ${after[key]}`);
+    } else if (key === "task_view") {
+      changes.push(`laid out as ${after[key]}`);
     } else if (key === "project_id") {
       changes.push("moved project");
     } else if (key === "organizer_id") {
@@ -163,25 +174,151 @@ function projectActivity(projectId, limit = 200) {
 
 function listAudit(limit = 100) {
   return all(
-    `SELECT id, at, action, entity, entity_id, summary, label, undone, undone_at
+    // restorable is the same column projectActivity computes, and for the same
+    // reason: a delete with no stored copy cannot be put back, and the global
+    // list used to offer an undo button on those rows anyway.
+    `SELECT id, at, action, entity, entity_id, summary, label, undone, undone_at,
+            CASE WHEN before_json IS NULL THEN 0 ELSE 1 END AS restorable
      FROM audit ORDER BY id DESC LIMIT :limit`,
     { limit }
   );
 }
 
+/**
+ * What a delete carried away, in the order it has to come back.
+ *
+ * Each entry is a key in the stored blob and the table its rows belong to.
+ * Parents before children, or the foreign key has nothing to point at: an
+ * organizer before the tasks filed under it, a task before its comments and
+ * reminders, the project itself before any of them.
+ */
+const RESTORE_ORDER = {
+  task: [["__subtasks", "tasks"], ["__comments", "comments"], ["__events", "status_events"]],
+  project: [
+    ["__organizers", "organizers"],
+    ["__tasks", "tasks"],
+    ["__comments", "comments"],
+    ["__events", "status_events"],
+    ["__alerts", "alerts"],
+    ["__notes", "notes"],
+    ["__links", "links"],
+    ["__repos", "repos"],
+  ],
+};
+
+/**
+ * Puts a set of stored rows back.
+ *
+ * OR IGNORE because a restore has to survive a row that is somehow already
+ * there. On its own that turns a half finished restore into a silent success,
+ * since an id SQLite has handed to something else since the delete is skipped
+ * without a word, so the count is checked when the caller asks for strict.
+ *
+ * Only a project restore asks. A project that comes back missing a third of its
+ * work, reported as a success, is worse than one that did not come back at all,
+ * and undo()'s transaction unwinds it. A task restore stays tolerant because it
+ * used to be: SQLite reuses a freed comment rowid as soon as anything else
+ * writes a comment, so a strict task restore refuses to bring back a task whose
+ * own row is perfectly fine over a single clashing comment.
+ */
+function restoreRows(table, rows, strict = false) {
+  let inserted = 0;
+  for (const row of rows) {
+    const cols = Object.keys(row);
+    const r = run(
+      `INSERT OR IGNORE INTO ${table} (${cols.join(", ")}) VALUES (${cols.map((c) => ":" + c).join(", ")})`,
+      row
+    );
+    inserted += Number(r.changes);
+  }
+  if (strict && inserted !== rows.length) {
+    throw new Error(
+      `Could not put back ${rows.length - inserted} of ${rows.length} rows in ${table}, ` +
+      "so nothing was restored"
+    );
+  }
+}
+
+/**
+ * Gives orphaned tasks their project back.
+ *
+ * Deleting a project with the tasks kept does not delete them: tasks.project_id
+ * is ON DELETE SET NULL, so they are sitting in All work with no home and, since
+ * organizers did cascade, no epic either. Both are restored from the stored copy.
+ *
+ * A task that no longer matches is left alone rather than treated as a failure.
+ * It has either been deleted since, with its own audit row to reverse, or moved
+ * into another project on purpose, and dragging it back out of one would be a
+ * worse answer than leaving it.
+ */
+function reattachTasks(projectId, rows) {
+  for (const row of rows) {
+    run(
+      `UPDATE tasks SET project_id = :projectId, organizer_id = :organizerId
+       WHERE id = :id AND project_id IS NULL`,
+      { projectId, organizerId: row.organizer_id ?? null, id: row.id }
+    );
+  }
+}
+
 // Reverses one entry. Deliberately does not itself write an audit row: an undo
 // that appears in the log as another change makes the list confusing and invites
 // undoing an undo. The entry is marked undone instead, so the history stays
-// truthful about what happened.
+// truthful about what happened. Undoing the creation of a project is the one
+// exception, and applyUndo says why.
 function undo(auditId) {
   const entry = one("SELECT * FROM audit WHERE id = :id", { id: auditId });
   if (!entry) throw new Error("No such audit entry");
   if (entry.undone) throw new Error("That change has already been undone");
 
+  // One transaction over the whole reversal. A restore is many statements and a
+  // failure part way through used to leave a project back but empty, which is
+  // worse than the delete it was trying to reverse and reported as success.
+  const conn = open();
+  conn.exec("BEGIN");
+  try {
+    applyUndo(entry);
+    run("UPDATE audit SET undone = 1, undone_at = datetime('now') WHERE id = :id", { id: auditId });
+    conn.exec("COMMIT");
+  } catch (error) {
+    conn.exec("ROLLBACK");
+    throw error;
+  }
+  return listAudit(100);
+}
+
+function applyUndo(entry) {
   const table = TABLES[entry.entity];
   const before = entry.before_json ? JSON.parse(entry.before_json) : null;
 
   if (entry.action === "create") {
+    // A project is the one create whose reversal is a cascading delete rather
+    // than the removal of one row: notes, links, organizers and repos all go
+    // with it and tasks are orphaned. The agent path writes project creates with
+    // no before_json, so undoing one used to destroy all of that with nothing
+    // kept. Refused outright when the project has since been filled, and routed
+    // through the project delete when it has not, which is the one place undo
+    // writes an audit row of its own: without it the removal leaves no copy at all.
+    if (entry.entity === "project") {
+      // Already gone, so the creation has been reversed some other way and there
+      // is nothing left to take. Returning marks the entry undone, which is what
+      // the plain DELETE that used to sit here did. Throwing instead left the
+      // entry pending for good, and undoLast stops at the first entry it cannot
+      // reverse, so one of these blocked everything older than it.
+      if (!getProject(entry.entity_id)) return;
+      const held = projectContents(entry.entity_id);
+      const total = held ? held.tasks + held.notes + held.links + held.organizers + held.repos : 0;
+      if (total) {
+        throw new Error(
+          "This project holds work now, so undoing its creation would take all of it. " +
+          "Delete it from the project's Settings tab instead, which says what will go and can be reversed."
+        );
+      }
+      // The untransacted body: undo() has already opened a transaction around
+      // this, and SQLite will not nest a second one.
+      deleteProjectRows(entry.entity_id, { tasks: "delete" });
+      return;
+    }
     run(`DELETE FROM ${table} WHERE id = :id`, { id: entry.entity_id });
   } else if (entry.action === "update") {
     if (!before) throw new Error("That change has no recorded previous state");
@@ -201,33 +338,45 @@ function undo(auditId) {
       `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${cols.map((c) => ":" + c).join(", ")})`,
       before
     );
-    // The parent first, then everything that pointed at it, or the foreign keys
-    // have nothing to point at.
-    for (const [key, rows] of [["__subtasks", "tasks"], ["__comments", "comments"], ["__events", "status_events"]]
-           .map(([k, t]) => [t, carried[k] || []])) {
-      for (const row of rows) {
-        const rowCols = Object.keys(row);
-        run(
-          `INSERT OR IGNORE INTO ${key} (${rowCols.join(", ")}) VALUES (${rowCols.map((c) => ":" + c).join(", ")})`,
-          row
-        );
+    for (const [key, subTable] of RESTORE_ORDER[entry.entity] || []) {
+      const rows = carried[key] || [];
+      if (!rows.length) continue;
+      // Tasks the delete only orphaned are still in the database. They want their
+      // project back, not a second copy of themselves.
+      if (subTable === "tasks" && entry.entity === "project" && carried.__tasks_mode === "keep") {
+        reattachTasks(entry.entity_id, rows);
+        continue;
       }
+      restoreRows(subTable, rows, entry.entity === "project");
     }
   }
-
-  run("UPDATE audit SET undone = 1, undone_at = datetime('now') WHERE id = :id", { id: auditId });
-  return listAudit(100);
 }
 
+/**
+ * Reverses the newest changes, and stops at the first one it cannot.
+ *
+ * Newest first, so a sequence of changes to the same row unwinds in the right
+ * order rather than leaving an older state on top. Stopping rather than throwing
+ * matters because the earlier entries have already been applied by then: a throw
+ * left the caller believing nothing had happened when several changes had.
+ */
 function undoLast(count = 1) {
   const pending = all(
     "SELECT id FROM audit WHERE undone = 0 ORDER BY id DESC LIMIT :count",
     { count }
   );
-  // Newest first, so a sequence of changes to the same row unwinds in the right
-  // order rather than leaving an older state on top.
-  for (const row of pending) undo(row.id);
-  return pending.length;
+  let undone = 0;
+  let stopped = null;
+  for (const row of pending) {
+    try {
+      undo(row.id);
+      undone += 1;
+    } catch (error) {
+      stopped = String(error.message || error);
+      break;
+    }
+  }
+  return { undone, stopped };
 }
 
 // Projects, each carrying its own open/total counts so the sidebar can show
@@ -248,6 +397,32 @@ const TASK_VIEWS = ["list", "table", "columns", "board", "calendar"];
  */
 const TASK_COLOURS = ["blue", "teal", "green", "amber", "orange", "red", "purple", "slate"];
 
+/**
+ * The states a project can be in.
+ *
+ * This one does have a CHECK behind it in schema.sql, unlike TASK_VIEWS. It is
+ * still listed here because the constraint only ever arrives at a caller as
+ * "CHECK constraint failed: projects", which names neither the column nor the
+ * answers it would have accepted.
+ */
+const PROJECT_STATUSES = ["active", "paused", "blocked", "done", "archived"];
+
+/**
+ * Normalises a project key.
+ *
+ * key is the only column in the table with a uniqueness constraint and the only
+ * one anything outside this window points at, so it is cleaned here rather than
+ * trusted to arrive clean from four different callers.
+ *
+ * agent/mcp_server.js keeps its own copy of this and of the sort_order rule in
+ * createProject below. It has to: it runs under whatever Node an editor launched
+ * it with, which may have no node:sqlite, and this file ends up inside app.asar
+ * where a plain Node process cannot read it. The two are twins and have to be
+ * edited together, so add_project carries a comment pointing back here.
+ */
+const slugKey = (key) =>
+  String(key ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
 function listProjects() {
   return all(`
     SELECT p.*,
@@ -260,18 +435,64 @@ function listProjects() {
   `);
 }
 
+/**
+ * The projects listProjects deliberately hides.
+ *
+ * Archiving is the soft removal: the row and everything hanging off it stay
+ * exactly where they were, and only the WHERE clause above pretends otherwise.
+ * But the renderer learns about projects through that one call and nothing else,
+ * so archiving used to be a one way door that no part of the window could open.
+ * This is the other side of it.
+ *
+ * Carries the same three counts, because the question asked of an archived
+ * project is whether it still holds anything worth having back. Ordered by name
+ * rather than sort_order, which is a statement about a sidebar these are not in.
+ */
+function listArchivedProjects() {
+  return all(`
+    SELECT p.*,
+           (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status != 'done') AS open_count,
+           (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS total_count,
+           (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id) AS note_count
+    FROM projects p
+    WHERE p.status = 'archived'
+    ORDER BY p.name
+  `);
+}
+
 function getProject(id) {
   return one("SELECT * FROM projects WHERE id = :id", { id });
 }
 
 function createProject({ key, name, summary = null, colour = "#7c8698" }) {
-  const order = one("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM projects").n;
+  const slug = slugKey(key);
+  if (!slug) throw new Error("A project key needs at least one letter or digit");
+
+  // Checked before the insert rather than left to the UNIQUE constraint, which
+  // reaches the window as "UNIQUE constraint failed: projects.key" and says
+  // neither which project already holds the key nor that a key is what went
+  // wrong. The agent path has always pre-checked; this path had not.
+  const clash = projectByKey(slug);
+  if (clash) {
+    throw new Error(`A project with the key ${slug} already exists (${clash.name})`);
+  }
+
+  // Above General, which is pinned at 99 as the catch-all, so a new project does
+  // not sort below the place work goes when it has nowhere else to be. This is
+  // the rule the agent path already used, and the reason two projects made the
+  // same week ended up either side of General depending on which one made them.
+  const order = one(
+    "SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM projects WHERE sort_order < 99"
+  ).n;
   const r = run(
     `INSERT INTO projects (key, name, summary, colour, sort_order)
      VALUES (:key, :name, :summary, :colour, :sort_order)`,
-    { key, name, summary, colour, sort_order: order }
+    { key: slug, name, summary, colour, sort_order: order }
   );
-  return getProject(Number(r.lastInsertRowid));
+  const created = getProject(Number(r.lastInsertRowid));
+  record({ action: "create", entity: "project", entityId: created.id,
+           summary: "created", label: created.name, after: created });
+  return created;
 }
 
 function updateProject(id, fields) {
@@ -279,14 +500,198 @@ function updateProject(id, fields) {
   if (fields.task_view !== undefined && !TASK_VIEWS.includes(fields.task_view)) {
     throw new Error(`task_view must be one of ${TASK_VIEWS.join(", ")}`);
   }
+  // status has a CHECK in the schema, but hitting it produces a message naming
+  // the table and nothing else, which is the failure the task_view check above
+  // exists to avoid. Stated here so both bad values fail the same readable way.
+  if (fields.status !== undefined && !PROJECT_STATUSES.includes(fields.status)) {
+    throw new Error(`status must be one of ${PROJECT_STATUSES.join(", ")}`);
+  }
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getProject(id);
+  const before = rowOf("project", id);
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
   run(`UPDATE projects SET ${assignments}, updated_at = datetime('now') WHERE id = :id`, {
     ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
     id,
   });
-  return getProject(id);
+  const after = getProject(id);
+
+  // Nothing was recorded here until now, which left the audit trail exactly
+  // inverted: archiving, the app's own put-this-away gesture, happened with no
+  // entry and no way back, while the agent's create was the one project change
+  // offering an undo button.
+  //
+  // A write that changed nothing is left out rather than filed as "no visible
+  // change". Both the colour picker and the status select re-send the value they
+  // are already showing, and a history of entries that did nothing is a history
+  // nobody reads.
+  if (before) {
+    const summary = describeUpdate("project", before, after);
+    if (summary !== "no visible change") {
+      record({ action: "update", entity: "project", entityId: id, summary,
+               label: after.name, before, after });
+    }
+  }
+  return after;
+}
+
+/**
+ * What a project holds, so a caller can say what it is about to destroy.
+ *
+ * listProjects carries open_count, total_count and note_count, which is what the
+ * sidebar needs and not what a confirmation needs: nobody agrees to lose "three
+ * things" without being told which three.
+ *
+ * subtasks_elsewhere is the work that only the "delete the tasks too" answer
+ * takes: subtasks of this project's tasks that were moved into another project
+ * and go anyway, because tasks.parent_id is ON DELETE CASCADE. It is counted
+ * apart from tasks so the confirmation can name it, since it is the one part of
+ * the loss that lands outside the project the person is looking at.
+ */
+function projectContents(id) {
+  return one(
+    `WITH RECURSIVE doomed(id) AS (
+       SELECT id FROM tasks WHERE project_id = :id
+       UNION
+       SELECT t.id FROM tasks t JOIN doomed d ON t.parent_id = d.id
+     )
+     SELECT
+       (SELECT COUNT(*) FROM tasks      WHERE project_id = :id) AS tasks,
+       (SELECT COUNT(*) FROM notes      WHERE project_id = :id) AS notes,
+       (SELECT COUNT(*) FROM links      WHERE project_id = :id) AS links,
+       (SELECT COUNT(*) FROM organizers WHERE project_id = :id) AS organizers,
+       (SELECT COUNT(*) FROM repos      WHERE project_id = :id) AS repos,
+       (SELECT COUNT(*) FROM tasks
+         WHERE id IN (SELECT id FROM doomed)
+           AND (project_id IS NULL OR project_id != :id)) AS subtasks_elsewhere`,
+    { id }
+  );
+}
+
+/**
+ * Deletes a project, keeping enough to put the whole thing back.
+ *
+ * The cascade in the schema is the wrong way round for this. notes, links,
+ * organizers and repos are ON DELETE CASCADE while tasks is ON DELETE SET NULL,
+ * so an unguarded DELETE destroys everything the project remembered and leaves
+ * the work behind as orphans in All work. That is exactly backwards from what
+ * anyone deleting a project expects, so the whole subtree is copied first, the
+ * same way deleteTask copies its own.
+ *
+ * The tasks option is the one real choice: "keep" lets the SET NULL stand and
+ * the work survives in All work, "delete" takes it with the project. Both are
+ * reversible, and which one was taken is stored alongside the rows because undo
+ * has to put them back differently: kept tasks are still there and want their
+ * project back, deleted ones have to be inserted again.
+ *
+ * Organizers and repos ride inside this blob rather than being audited in their
+ * own right. The audit entity column has a CHECK that cannot be widened on a
+ * database that already exists, which is the dead end deleteOrganizer documents.
+ *
+ * The whole thing runs in one transaction. The snapshot, both deletes and the
+ * audit row have to land together or not at all: a throw from record(), whose
+ * summary is NOT NULL and whose before blob can be large, used to leave the
+ * project already deleted with no stored copy anywhere, which is the one failure
+ * that cannot be recovered from.
+ */
+function deleteProject(id, options = {}) {
+  const conn = open();
+  conn.exec("BEGIN");
+  try {
+    const result = deleteProjectRows(id, options);
+    conn.exec("COMMIT");
+    return result;
+  } catch (error) {
+    conn.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+// The body of the above, without the transaction. undo() already holds one when
+// it reverses a project creation, and SQLite has no nested BEGIN, so that path
+// calls this directly rather than opening a second one.
+function deleteProjectRows(id, { tasks = "keep" } = {}) {
+  if (tasks !== "keep" && tasks !== "delete") {
+    throw new Error('tasks must be either "keep" or "delete"');
+  }
+  const before = rowOf("project", id);
+  if (!before) throw new Error("No such project");
+
+  // Parents ahead of their children, because tasks.parent_id points at another
+  // task and a child restored first has nothing to point at. Roots come first,
+  // and among the rest a child always has the higher id, having been created
+  // after the task it hangs off.
+  //
+  // Taking the tasks means taking more than the project's own rows. tasks.parent_id
+  // is ON DELETE CASCADE, and "Move to <project>" sets project_id on a single
+  // task, so a subtask can legitimately sit in another project and still goes
+  // when its parent goes. Walking the closure first is what makes the count
+  // honest, the stored copy complete and the delete something undo can reverse.
+  // Keeping the tasks does not reach them: SET NULL only touches rows that
+  // actually carry this project_id.
+  const taskRows = tasks === "delete"
+    ? all(
+        `WITH RECURSIVE doomed(id) AS (
+           SELECT id FROM tasks WHERE project_id = :id
+           UNION
+           SELECT t.id FROM tasks t JOIN doomed d ON t.parent_id = d.id
+         )
+         SELECT * FROM tasks WHERE id IN (SELECT id FROM doomed)
+         ORDER BY parent_id IS NULL DESC, id`,
+        { id }
+      )
+    : all(
+        "SELECT * FROM tasks WHERE project_id = :id ORDER BY parent_id IS NULL DESC, id",
+        { id }
+      );
+  const taskIds = taskRows.map((t) => t.id);
+  const placeholders = taskIds.map((_, i) => `:id${i}`).join(", ");
+  const params = Object.fromEntries(taskIds.map((v, i) => [`id${i}`, v]));
+  const forTasks = (sql) => (taskIds.length ? all(sql, params) : []);
+
+  before.__tasks_mode = tasks;
+  before.__organizers = all("SELECT * FROM organizers WHERE project_id = :id", { id });
+  before.__tasks = taskRows;
+  // Only worth copying when the tasks themselves are going. Kept tasks keep
+  // their own comments, history and reminders, and storing a second copy would
+  // give undo two ways to disagree about them.
+  if (tasks === "delete") {
+    before.__comments = forTasks(`SELECT * FROM comments WHERE task_id IN (${placeholders})`);
+    before.__events = forTasks(`SELECT * FROM status_events WHERE task_id IN (${placeholders})`);
+    before.__alerts = forTasks(`SELECT * FROM alerts WHERE task_id IN (${placeholders})`);
+  }
+  before.__notes = all("SELECT * FROM notes WHERE project_id = :id", { id });
+  before.__links = all("SELECT * FROM links WHERE project_id = :id", { id });
+  before.__repos = all("SELECT * FROM repos WHERE project_id = :id", { id });
+
+  // By id rather than by project_id, so the rows deleted are exactly the rows
+  // copied above. Deleting by project_id would let the cascade reach subtasks
+  // living elsewhere that the snapshot never saw.
+  if (tasks === "delete" && taskIds.length) {
+    run(`DELETE FROM tasks WHERE id IN (${placeholders})`, params);
+  }
+  run("DELETE FROM projects WHERE id = :id", { id });
+
+  const counts = {
+    tasks: taskRows.length,
+    notes: before.__notes.length,
+    links: before.__links.length,
+    organizers: before.__organizers.length,
+    repos: before.__repos.length,
+  };
+  record({
+    action: "delete",
+    entity: "project",
+    entityId: id,
+    summary: tasks === "delete"
+      ? `deleted with ${plural(counts.tasks, "task", "tasks")}`
+      : counts.tasks
+      ? `deleted, ${plural(counts.tasks, "task", "tasks")} kept in All work`
+      : "deleted",
+    label: before.name,
+    before,
+  });
+  return { ok: true, name: before.name, tasksMode: tasks, counts };
 }
 
 /**
@@ -530,35 +935,62 @@ function setQueue(id, queue) {
   return after;
 }
 
-/** What is waiting, and what is being worked on, in one pool. */
-function queueState(queue = "ready") {
+/**
+ * What is waiting, and what is being worked on, in one pool.
+ *
+ * The project is optional, and omitting it means the whole pool, which is what
+ * the All view asks for. Passing one narrows to that project's share of the same
+ * pool: the name still means what it always meant, and the project is a slice
+ * through it rather than a second queue. A task with no project is therefore in
+ * no project's queue and is only ever visible in the global view, which is the
+ * honest reading of a filter on a column that is allowed to be NULL.
+ */
+function queueState(queue = "ready", projectId = null) {
   // Swept first, so what this reports is what an agent would actually be handed
   // rather than a picture that includes leases nobody is holding any more.
-  const reclaimed = reclaimExpired(queue);
+  const reclaimed = reclaimExpired(queue, projectId);
+  const mine = projectId == null ? "" : "AND t.project_id = :projectId";
+  const params = projectId == null ? { queue } : { queue, projectId };
   return {
     queue,
+    projectId,
     reclaimed,
     waiting: all(
-      `SELECT id, title, priority, project_id, ref FROM tasks
-       WHERE queue = :queue AND status NOT IN ('done', 'blocked')
-         AND (claimed_by IS NULL OR claim_expires < datetime('now'))
-       ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id`,
-      { queue }
+      // The project is joined in rather than looked up by the renderer, because
+      // the global view needs a name for a project the renderer may not be
+      // holding: its list hides archived projects, and a queued task can belong
+      // to one.
+      `SELECT t.id, t.title, t.priority, t.project_id, t.ref,
+              p.name AS project_name, p.colour AS project_colour
+       FROM tasks t
+       LEFT JOIN projects p ON p.id = t.project_id
+       WHERE t.queue = :queue AND t.status NOT IN ('done', 'blocked')
+         AND (t.claimed_by IS NULL OR t.claim_expires < datetime('now'))
+         ${mine}
+       ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, t.id`,
+      params
     ),
     claimed: all(
-      `SELECT id, title, claimed_by, claim_expires FROM tasks
-       WHERE queue = :queue AND status != 'done'
-         AND claimed_by IS NOT NULL AND claim_expires >= datetime('now')
-       ORDER BY claim_expires`,
-      { queue }
+      `SELECT t.id, t.title, t.claimed_by, t.claim_expires FROM tasks t
+       WHERE t.queue = :queue AND t.status != 'done'
+         AND t.claimed_by IS NOT NULL AND t.claim_expires >= datetime('now')
+         ${mine}
+       ORDER BY t.claim_expires`,
+      params
     ),
     // Recently finished, so the view can show work leaving the pool rather than
-    // only what is still in it.
+    // only what is still in it. Not filtered by the pool, and it cannot be:
+    // finishing a task nulls its queue, so a done task carries no memory of
+    // having been queued and there is nothing left to match on. The project can
+    // be filtered, because project_id survives. The view says which of the two
+    // it is showing rather than claiming this is the pool's own history.
     finished: all(
-      `SELECT id, title, assignee, completed_at FROM tasks
-       WHERE status = 'done' AND completed_at IS NOT NULL
-         AND completed_at > datetime('now', '-7 days')
-       ORDER BY completed_at DESC LIMIT 20`
+      `SELECT t.id, t.title, t.assignee, t.completed_at FROM tasks t
+       WHERE t.status = 'done' AND t.completed_at IS NOT NULL
+         AND t.completed_at > datetime('now', '-7 days')
+         ${mine}
+       ORDER BY t.completed_at DESC LIMIT 20`,
+      projectId == null ? {} : { projectId }
     ),
   };
 }
@@ -570,8 +1002,14 @@ function queueState(queue = "ready") {
  * gap between them is exactly where two agents both win. An expired lease counts
  * as unclaimed, which is what makes a dead agent's task come back on its own
  * rather than needing a sweeper.
+ *
+ * This statement has a twin: agent/mcp_server.js queue_next runs the same claim
+ * inline. The two cannot share code, because that server must run under a plain
+ * Node with no better-sqlite3 and cannot read inside app.asar, so any change to
+ * how a task is chosen has to be made in both or the app and the agents will
+ * disagree about what is claimable.
  */
-function claimNext({ queue = "ready", agent, minutes = LEASE_MINUTES }) {
+function claimNext({ queue = "ready", agent, minutes = LEASE_MINUTES, projectId = null }) {
   if (!agent) throw new Error("A claim needs to say who is claiming");
   const claimed = one(
     `UPDATE tasks
@@ -587,11 +1025,12 @@ function claimNext({ queue = "ready", agent, minutes = LEASE_MINUTES }) {
            -- discovers it is blocked and hands it straight back.
            AND status NOT IN ('done', 'blocked')
            AND (claimed_by IS NULL OR claim_expires < datetime('now'))
+           ${projectId == null ? "" : "AND project_id = :projectId"}
          ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
          LIMIT 1
       )
       RETURNING *`,
-    { queue, agent, minutes }
+    projectId == null ? { queue, agent, minutes } : { queue, agent, minutes, projectId }
   );
   if (!claimed) return null;
 
@@ -645,14 +1084,18 @@ const nowStamp = () => one("SELECT datetime('now') AS n").n;
  * status moved with nobody moving it. Called on a schedule and before the queue
  * is shown, so what is on screen is what an agent would actually be handed.
  */
-function reclaimExpired(queue = null) {
+function reclaimExpired(queue = null, projectId = null) {
+  const params = {};
+  if (queue) params.queue = queue;
+  if (projectId != null) params.projectId = projectId;
   const stale = all(
     `SELECT * FROM tasks
       WHERE claimed_by IS NOT NULL AND claim_expires IS NOT NULL
         AND claim_expires < datetime('now')
         AND status != 'done'
-        ${queue ? "AND queue = :queue" : ""}`,
-    queue ? { queue } : {}
+        ${queue ? "AND queue = :queue" : ""}
+        ${projectId == null ? "" : "AND project_id = :projectId"}`,
+    params
   );
   for (const task of stale) {
     const before = { ...task };
@@ -1143,10 +1586,14 @@ module.exports = {
   // The graph builder works against the connection directly, so it is exposed
   // rather than every graph query being proxied through this module.
   handle: open,
-  listProjects, getProject, createProject, updateProject,
+  listProjects, listArchivedProjects, getProject, createProject, updateProject, deleteProject,
+  projectContents,
   listTasks, createTask, updateTask,
   listOrganizers, getOrganizer, createOrganizer, updateOrganizer, deleteOrganizer,
-  projectByKey, taskByExternalKey, createExternalTask,
+  // Exported because createProject now normalises the key it is given, so anyone
+  // looking a project up by a key they built themselves has to look it up in the
+  // same shape it was stored in or they will miss it and try to create it again.
+  projectByKey, slugKey, taskByExternalKey, createExternalTask,
   organizerByExternalKey, createExternalOrganizer,
   commentByExternalKey, createExternalComment, updateExternalComment, deleteTask,
   taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
