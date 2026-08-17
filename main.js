@@ -874,13 +874,77 @@ handle("repos:list", (projectId) => db.listRepos(projectId));
 //
 // Parented to the window so macOS attaches it as a sheet rather than floating a
 // separate dialog that can end up behind the app.
-handle("dialog:pickFolder", async (title) => {
+handle("dialog:pickFolder", async (title, options = {}) => {
   const result = await dialog.showOpenDialog(win, {
     title: title || "Choose a folder",
+    // Opens where the work already is rather than at the root of the disk. The
+    // caller passes the parent of the last project it knows about, so the second
+    // project lands beside the first without anyone navigating there again.
+    defaultPath: options.defaultPath || app.getPath("home"),
+    buttonLabel: options.buttonLabel || undefined,
     properties: ["openDirectory", "createDirectory"],
   });
   return result.canceled || !result.filePaths.length ? null : result.filePaths[0];
 });
+
+/**
+ * Makes the folder for a project that was named rather than picked.
+ *
+ * Two ways to start a project: point at a folder that exists, or type a name and
+ * have one made. This is the second. The parent is chosen in the picker, so the
+ * only thing invented here is the last path segment.
+ *
+ * An existing folder is not an error. Someone who types the name of a folder
+ * that is already there almost always means "use that one", and refusing would
+ * send them to Finder to check what is inside it.
+ */
+handle("fs:createFolder", async (parent, name) => {
+  if (!parent || !name) throw new Error("A folder needs a parent and a name");
+
+  // Anything that could climb out of the parent is rejected rather than
+  // sanitised. Silently turning "../etc" into "etc" makes a folder somewhere the
+  // person did not ask for, which is worse than telling them the name is no good.
+  const clean = String(name).trim();
+  if (!clean || clean === "." || clean === ".." || /[\\/]/.test(clean)) {
+    throw new Error("A folder name cannot be empty or contain a slash");
+  }
+
+  const target = path.join(parent, clean);
+  const resolvedParent = path.resolve(parent);
+  if (!path.resolve(target).startsWith(resolvedParent + path.sep)) {
+    throw new Error("That name would put the folder outside the folder you chose");
+  }
+
+  const existed = fs.existsSync(target);
+  if (existed && !fs.statSync(target).isDirectory()) {
+    throw new Error(`${clean} already exists here and is a file`);
+  }
+  if (!existed) fs.mkdirSync(target, { recursive: true });
+  return { path: target, existed };
+});
+
+/** Whether a project's folder is still where it said it was. */
+handle("fs:folderExists", (folder) => {
+  try {
+    return Boolean(folder) && fs.existsSync(folder) && fs.statSync(folder).isDirectory();
+  } catch {
+    return false;
+  }
+});
+
+handle("fs:reveal", (target) => {
+  if (target && fs.existsSync(target)) shell.showItemInFolder(target);
+});
+
+handle("sessions:list", (projectId) => db.listSessions(projectId));
+handle("sessions:get", (id) => db.getSession(id));
+handle("sessions:create", (payload) => db.createSession(payload));
+handle("sessions:update", (id, fields) => db.updateSession(id, fields));
+handle("sessions:delete", (id) => db.deleteSession(id));
+handle("messages:list", (sessionId) => db.listMessages(sessionId));
+handle("messages:append", (payload) => db.appendMessage(payload));
+handle("messages:update", (id, fields) => db.updateMessage(id, fields));
+handle("sessions:addUsage", (id, usage) => db.addSessionUsage(id, usage));
 
 handle("repos:create", (payload) => db.createRepo(payload));
 handle("repos:setPrimary", (id) => db.setPrimaryRepo(id));

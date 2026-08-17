@@ -8,6 +8,17 @@ const state = {
   // Set by the dashboard tiles, so a tile is a way into the list rather than a
   // number you then have to go and find yourself. Cleared whenever the list is
   // reached by any other route.
+  // The open session, and the messages in it. Held here rather than fetched by
+  // the chat renderer so a re-render, which happens on every alert tick, does
+  // not blank a conversation mid-read.
+  sessions: [],
+  sessionId: null,
+  messages: [],
+  // What is typed but not yet sent. render() rebuilds #content wholesale, so a
+  // draft that lived only in the textarea would be destroyed by an alert
+  // arriving while someone was still typing.
+  draft: "",
+  streaming: false,
   taskFilter: null,    // null | doing | blocked | overdue | done
   theme: "system",     // system | light | dark
   noteView: "formatted", // formatted | raw
@@ -413,6 +424,8 @@ async function refresh() {
     state.notes = notes;
     state.links = [];
     state.repos = [];
+    state.sessions = [];
+    state.sessionId = null;
     state.organizers = [];
 
     // Meaning-based ranking and the graph, in parallel with the literal match, so
@@ -443,11 +456,14 @@ async function refresh() {
       state.notes = await window.delphi.notes.list(state.projectId);
       state.links = await window.delphi.links.list(state.projectId);
       state.repos = await window.delphi.repos.list(state.projectId);
+      state.sessions = await window.delphi.sessions.list(state.projectId);
       state.organizers = await window.delphi.organizers.list(state.projectId);
     } else {
       state.notes = [];
       state.links = [];
       state.repos = [];
+      state.sessions = [];
+      state.sessionId = null;
       state.organizers = [];
     }
   }
@@ -482,6 +498,14 @@ function navigate(next) {
   // A filter belongs to the trip that set it. Any other move into the task list,
   // or out of it, drops the filter rather than leaving a list quietly narrowed.
   if (next.view !== undefined) state.taskFilter = null;
+  // A session belongs to one project, so moving to another has to let go of it.
+  // Without this the chat tab opens showing the previous project's conversation
+  // until something else happens to reload it.
+  if (next.projectId !== undefined && next.projectId !== state.projectId) {
+    state.sessionId = null;
+    state.messages = [];
+    state.draft = "";
+  }
   Object.assign(state, next);
   const to = position();
   if (samePosition(from, to)) return Promise.resolve();
@@ -526,6 +550,7 @@ function goBack() {
 }
 
 function renderSidebar() {
+  renderRail();
   const box = $("projects");
   box.textContent = "";
 
@@ -586,7 +611,8 @@ function renderTabs() {
     : state.projectId
     // "project" rather than "settings", because the All view's own Settings tab
     // already owns that key and the two would fall through to each other.
-    ? [["overview", "Overview"], ["tasks", "Tasks", state.tasks.length],
+    ? [["overview", "Overview"], ["chat", "Chat", state.sessions.length],
+       ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
        ["activity", "Activity"], ["project", "Settings"]]
@@ -628,7 +654,7 @@ function render() {
   const valid = state.query
     ? ["oracle", "tasks"]
     : state.projectId
-    ? ["overview", "tasks", "queue", "notes", "links", "activity", "project"]
+    ? ["overview", "chat", "tasks", "queue", "notes", "links", "activity", "project"]
     : ["new", "tasks", "queue", "graph", "reminders", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
@@ -666,6 +692,7 @@ function render() {
     new: renderWhatsNew,
     oracle: renderOracle,
     overview: renderOverview,
+    chat: renderChat,
     tasks: renderTasks,
     notes: renderNotes,
     links: renderLinks,
@@ -6090,19 +6117,358 @@ $("search").addEventListener("input", (e) => {
   }, 140);
 });
 
+
+// ---------------------------------------------------------------------------
+// Project rail
+//
+// The far-left column of project tiles, the way Slack and Granular both do it.
+// It is painted from renderSidebar so the rail and the sidebar list are built in
+// one pass and cannot end up disagreeing about which project is open.
+
+/** The letter shown when a project has no icon of its own. */
+const railLetter = (name) => {
+  const first = String(name || "?").trim()[0];
+  return (first || "?").toUpperCase();
+};
+
+function renderRail() {
+  const rail = $("rail");
+  if (!rail) return;
+  rail.textContent = "";
+
+  // "All work" keeps its place at the top. Everything downstream branches on a
+  // null id meaning "no project", so the rail has to offer that too or the view
+  // becomes unreachable once the rail is the way people move around.
+  const all = el("div", {
+    className: "rail-tile bare" + (state.projectId === null ? " on" : ""),
+    tabIndex: 0,
+    role: "button",
+    title: "All work",
+    textContent: "≣",
+  });
+  const goAll = () => navigate({ projectId: null, view: "new", query: "" });
+  all.onclick = goAll;
+  all.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); goAll(); } };
+  rail.append(all, el("div", { className: "rail-div" }));
+
+  for (const p of state.projects) {
+    const tile = el("div", {
+      className: "rail-tile" + (state.projectId === p.id ? " on" : ""),
+      tabIndex: 0,
+      role: "button",
+      title: p.path ? `${p.name}\n${p.path}` : p.name,
+    });
+    // An icon if one was chosen, the first letter otherwise. The letter is the
+    // reason a project never renders as an empty square.
+    tile.textContent = p.icon || railLetter(p.name);
+    if (p.colour && !p.icon) tile.style.color = p.colour;
+
+    const go = () => navigate({ projectId: p.id, view: "overview", query: "" });
+    tile.onclick = go;
+    tile.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    tile.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
+    rail.append(tile);
+
+    // A project bound to a folder that is no longer there is marked rather than
+    // left to fail later. Async on purpose: the rail must not wait on the disk.
+    if (p.path) {
+      window.delphi.fs.folderExists(p.path)
+        .then((there) => { if (!there) tile.classList.add("lost"); })
+        .catch(() => {});
+    }
+  }
+
+  const add = el("div", {
+    className: "rail-tile bare",
+    tabIndex: 0,
+    role: "button",
+    title: "New project",
+    textContent: "+",
+  });
+  add.onclick = createProject;
+  add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); createProject(); } };
+  rail.append(el("div", { className: "rail-sp" }), el("div", { className: "rail-div" }), add);
+}
+
+// ---------------------------------------------------------------------------
+// Chat
+//
+// A session is a conversation held against a project. The layout is Granular's:
+// a stream where only the person's turns are bubbles, a composer with no send
+// button, a row of model and permission chips, and a token meter.
+
+const AGENTS = [
+  ["boss", "Boss Agent"],
+  ["designer", "Designer"],
+  ["content", "Content creator"],
+  ["data", "Data analyst"],
+  ["assistant", "Personal assistant"],
+];
+
+const STARTERS = [
+  ["Design System", "Colors, type, spacing, defined once"],
+  ["Project Brain", "A living roadmap from your docs"],
+  ["Live Dashboard", "Your daily numbers on one page"],
+  ["Deep Research", "A sourced point of view"],
+];
+
+const currentSession = () => state.sessions.find((x) => x.id === state.sessionId) || null;
+
+async function openSession(id) {
+  state.sessionId = id;
+  state.messages = id ? await window.delphi.messages.list(id) : [];
+  render();
+}
+
+async function newSession() {
+  const project = currentProject();
+  if (!project) return;
+  const created = await window.delphi.sessions.create({
+    projectId: project.id,
+    agent: "boss",
+    provider: null,
+  });
+  state.sessions = await window.delphi.sessions.list(project.id);
+  await openSession(created.id);
+}
+
+function renderChat(root) {
+  const project = currentProject();
+  if (!project) return;
+
+  // Opening the tab lands on the most recent conversation rather than on
+  // nothing, which is what makes it feel like coming back to a session.
+  if (!state.sessionId && state.sessions.length) {
+    openSession(state.sessions[0].id);
+    return;
+  }
+
+  const wrap = el("div", { className: "chat" });
+
+  // --- sessions -----------------------------------------------------------
+  const list = el("div", { style: "padding:0 0 8px" });
+  const add = el("div", { className: "gnew", tabIndex: 0, role: "button" },
+    el("span", { textContent: "+" }), el("span", { textContent: "New session" }));
+  add.onclick = newSession;
+  add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); newSession(); } };
+  list.append(add);
+
+  for (const sn of state.sessions) {
+    const row = el("div", {
+      className: "gs" + (sn.id === state.sessionId ? " on" : ""),
+      tabIndex: 0,
+      role: "button",
+    });
+    row.append(
+      el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
+      el("span", { className: "nm", textContent: sn.title || "New session" })
+    );
+    if (sn.message_count) row.append(el("span", { className: "kbd", textContent: String(sn.message_count) }));
+    row.onclick = () => openSession(sn.id);
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSession(sn.id); } };
+    list.append(row);
+  }
+  wrap.append(list);
+
+  // --- stream -------------------------------------------------------------
+  const stream = el("div", { className: "gstream" });
+  if (!state.sessionId) {
+    stream.append(emptyState("No session yet", "Start one above to talk to an agent about this project."));
+  } else if (!state.messages.length) {
+    const empty = el("div", { className: "gempty" });
+    empty.append(
+      el("div", { className: "ge-k", textContent: "delphi agent" }),
+      el("div", { className: "ge-t", textContent: "Ask in plain English. The work runs against this project's folder." })
+    );
+    const cards = el("div", { className: "ge-cards" });
+    for (const [title, blurb] of STARTERS) {
+      const card = el("div", { className: "ge-card", tabIndex: 0, role: "button" },
+        el("b", { textContent: title }), el("span", { textContent: blurb }));
+      const use = () => { state.draft = title; render(); };
+      card.onclick = use;
+      card.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); use(); } };
+      cards.append(card);
+    }
+    empty.append(cards);
+    empty.append(el("div", { className: "ge-conn", textContent: project.path || "No folder linked yet" }));
+    stream.append(empty);
+  } else {
+    for (const m of state.messages) {
+      if (m.error) {
+        stream.append(el("div", { className: "gmsg err", textContent: m.error }));
+        continue;
+      }
+      if (m.role === "user") {
+        stream.append(el("div", { className: "gmsg you", textContent: m.content }));
+      } else {
+        // The agent's turn is markdown, rendered with the same renderer the
+        // memory notes use rather than a second one that would drift from it.
+        const body = el("div", { className: "gmsg ai" });
+        body.append(renderMarkdown(m.content || ""));
+        stream.append(body);
+      }
+    }
+  }
+  wrap.append(stream);
+
+  // --- composer -----------------------------------------------------------
+  const comp = el("div", { className: "gcomp" });
+  const box = el("textarea", {
+    rows: 1,
+    placeholder: "Ask for anything…",
+    value: state.draft,
+    spellcheck: false,
+  });
+  const grow = () => { box.style.height = "auto"; box.style.height = `${Math.min(box.scrollHeight, 160)}px`; };
+  box.oninput = () => { state.draft = box.value; grow(); };
+  box.onkeydown = (e) => {
+    // Enter sends, Shift+Enter breaks the line. Escape is swallowed rather than
+    // hiding the whole window, which is what it does everywhere else.
+    if (e.key === "Escape") { e.stopPropagation(); box.blur(); return; }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  };
+  comp.append(box);
+  wrap.append(comp);
+
+  // --- model row and meter ------------------------------------------------
+  const session = currentSession();
+  const model = el("div", { className: "gmodel" });
+  const conn = el("div", { className: "gconn", tabIndex: 0, role: "button", title: "Choose the agent" },
+    el("span", { className: "mk", textContent: "✦" }),
+    el("span", { textContent: session && session.provider ? session.provider : "Not connected" }),
+    el("span", { className: "cv", textContent: "▾" }));
+  conn.onclick = () => navigate({ view: "project" });
+  model.append(conn);
+  for (const [label, bordered] of [["Auto-allow", true], ["Auto", false], ["high", false]]) {
+    model.append(el("div", { className: "gpill" + (bordered ? " bd" : "") },
+      el("span", { className: bordered ? "" : "mono2", textContent: label })));
+  }
+  wrap.append(model);
+
+  const used = session ? (session.tokens_in || 0) + (session.tokens_out || 0) : 0;
+  const meter = el("div", { className: "gmeter" });
+  meter.append(el("span", { textContent: project.path ? project.name : `${project.name} (no folder)` }));
+  const right = el("div", { className: "ml" });
+  right.append(
+    el("span", { textContent: used ? `${(used / 1000).toFixed(1)}k tokens` : "0 tokens" }),
+    el("div", { className: "bar" }, el("span", { style: `width:${Math.min(100, used / 5000)}%` }))
+  );
+  meter.append(right);
+  wrap.append(meter);
+
+  root.append(wrap);
+
+  // Focus and caret restored after the rebuild, or typing into a chat while an
+  // alert ticks would move the cursor to the front of the draft.
+  if (state.draft || state.sessionId) {
+    requestAnimationFrame(() => {
+      grow();
+      if (document.activeElement !== box && state.draft) {
+        box.focus();
+        box.setSelectionRange(box.value.length, box.value.length);
+      }
+      stream.scrollTop = stream.scrollHeight;
+    });
+  }
+}
+
+async function sendMessage() {
+  const text = state.draft.trim();
+  if (!text || state.streaming) return;
+  let sessionId = state.sessionId;
+  if (!sessionId) {
+    await newSession();
+    sessionId = state.sessionId;
+    if (!sessionId) return;
+  }
+
+  state.draft = "";
+  await window.delphi.messages.append({ sessionId, role: "user", content: text });
+
+  // The first thing said names the session, so the list reads as a set of
+  // topics rather than a column of "New session".
+  const session = currentSession();
+  if (session && (!session.title || session.title === "New session")) {
+    const title = text.length > 48 ? `${text.slice(0, 45)}…` : text;
+    await window.delphi.sessions.update(sessionId, { title });
+  }
+
+  state.messages = await window.delphi.messages.list(sessionId);
+  state.sessions = await window.delphi.sessions.list(state.projectId);
+  render();
+}
+
+/**
+ * The parent folder a new project should be offered first.
+ *
+ * Wherever the last project was put. Someone who keeps their work in one place
+ * should not have to navigate there again for the second project, and someone
+ * who does not gets the same picker they would have got anyway.
+ */
+function lastProjectParent() {
+  for (let i = state.projects.length - 1; i >= 0; i--) {
+    const p = state.projects[i];
+    if (p.path) {
+      const cut = p.path.lastIndexOf("/");
+      if (cut > 0) return p.path.slice(0, cut);
+    }
+  }
+  return null;
+}
+
+/**
+ * Makes a project, which now means making or choosing a folder.
+ *
+ * Two ways in, because there are two situations. The work already exists in a
+ * folder, in which case pointing at it is the whole job. Or it does not exist
+ * yet, in which case a name is typed and the folder is made, and the only thing
+ * still to decide is where to put it.
+ */
 async function createProject() {
   const name = await askText({
     title: "New project",
-    label: "What is this project called? You can rename it later.",
+    label: "Name it and a folder will be made for it, or choose a folder that already exists.",
     placeholder: "Hearing transcripts",
+    confirmLabel: "Continue",
+    pickFolder: true,
   });
   if (!name) return null;
 
-  const key = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  // askText with pickFolder returns an absolute path when the folder button was
+  // used, and whatever was typed otherwise. A leading slash is the tell.
+  const picked = name.startsWith("/");
+  let folder = picked ? name.replace(/\/+$/, "") : null;
+  let label = picked ? folder.split("/").pop() : name;
+
+  if (!picked) {
+    const parent = await window.delphi.dialog.pickFolder(
+      `Where should the ${name} folder go?`,
+      { defaultPath: lastProjectParent(), buttonLabel: "Put it here" }
+    );
+    // Cancelling the location is cancelling the project. Making the folder
+    // somewhere arbitrary would be worse than doing nothing.
+    if (!parent) return null;
+    try {
+      const made = await window.delphi.fs.createFolder(parent, name);
+      folder = made.path;
+    } catch (error) {
+      await askText({
+        title: "That folder could not be made",
+        label: String(error.message || error),
+        value: "",
+        allowEmpty: true,
+        confirmLabel: "Close",
+      });
+      return null;
+    }
+  }
+
+  const key = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   try {
     const created = await window.delphi.projects.create({
       key: key || `p${Date.now()}`,
-      name,
+      name: label,
+      path: folder,
       colour: PROJECT_COLOURS[state.projects.length % PROJECT_COLOURS.length],
     });
     state.projectId = created.id;

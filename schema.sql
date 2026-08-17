@@ -16,6 +16,14 @@ CREATE TABLE IF NOT EXISTS projects (
   status      TEXT NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active', 'paused', 'blocked', 'done', 'archived')),
   colour      TEXT,                        -- accent for the sidebar dot
+  -- The folder on disk this project is. A project is a place, not just a label:
+  -- agents run in it, its files are the work. Nullable because every project
+  -- that existed before this column predates the idea, and a project without a
+  -- folder is still a perfectly good list of tasks.
+  path        TEXT,
+  -- What shows in the project rail. An emoji if one is chosen; null falls back
+  -- to the first letter of the name, which is why it can stay empty.
+  icon        TEXT,
   -- How this project's tasks are laid out: a flat list, one column per status
   -- side by side, or a board you can drag between. Per project rather than a
   -- setting, because two projects can reasonably want different answers.
@@ -247,3 +255,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_comments_external_key
   ON comments(external_key) WHERE external_key IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_organizers_external_key
   ON organizers(external_key) WHERE external_key IS NOT NULL;
+
+-- Sessions: a conversation with an agent, inside a project.
+--
+-- Granular's model, which this follows: you do not chat with the app, you open a
+-- session against a project and an agent works there. Several can run at once,
+-- which is why the session rather than the project holds the agent and model.
+CREATE TABLE IF NOT EXISTS sessions (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title       TEXT NOT NULL,
+  -- Which persona was chosen. Free text rather than a CHECK because the set of
+  -- personas is a product decision that will change, and a constraint here would
+  -- mean a migration every time one is added.
+  agent       TEXT,
+  provider    TEXT,                        -- anthropic | claude-cli | copilot
+  model       TEXT,
+  status      TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'done', 'archived')),
+  -- Running totals, kept on the session so the token meter does not have to add
+  -- up every message on every render.
+  tokens_in   INTEGER NOT NULL DEFAULT 0,
+  tokens_out  INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, updated_at DESC);
+
+-- Messages: the turns of a session, in order.
+--
+-- Stored rather than held in memory so a session survives a restart, which is
+-- the whole reason it is called a session and not a chat window.
+CREATE TABLE IF NOT EXISTS messages (
+  id          INTEGER PRIMARY KEY,
+  session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  role        TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+  content     TEXT NOT NULL,
+  -- Set once the turn is complete. A streaming reply is written as it arrives,
+  -- so a row can exist with content still growing and no token count yet.
+  tokens      INTEGER,
+  -- Non-null when a turn failed, so a broken reply reads as an error in place
+  -- rather than as an assistant that mysteriously said nothing.
+  error       TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);

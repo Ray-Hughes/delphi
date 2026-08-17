@@ -66,6 +66,10 @@ const LATER_COLUMNS = [
   ["comments", "external_key", "TEXT"],
   ["organizers", "external_key", "TEXT"],
   ["tasks", "colour", "TEXT"],
+  // A project is a folder now. Added here as well as in schema.sql because an
+  // existing database already has the table and never re-runs the CREATE.
+  ["projects", "path", "TEXT"],
+  ["projects", "icon", "TEXT"],
 ];
 
 function addLaterColumns(db) {
@@ -203,6 +207,11 @@ const RESTORE_ORDER = {
     ["__notes", "notes"],
     ["__links", "links"],
     ["__repos", "repos"],
+    // Sessions before their messages, same rule as everything above: the child
+    // has a foreign key pointing at the parent and nothing to point at if the
+    // parent is not back yet.
+    ["__sessions", "sessions"],
+    ["__messages", "messages"],
   ],
 };
 
@@ -464,7 +473,7 @@ function getProject(id) {
   return one("SELECT * FROM projects WHERE id = :id", { id });
 }
 
-function createProject({ key, name, summary = null, colour = "#7c8698" }) {
+function createProject({ key, name, summary = null, colour = "#7c8698", path = null, icon = null }) {
   const slug = slugKey(key);
   if (!slug) throw new Error("A project key needs at least one letter or digit");
 
@@ -485,9 +494,9 @@ function createProject({ key, name, summary = null, colour = "#7c8698" }) {
     "SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM projects WHERE sort_order < 99"
   ).n;
   const r = run(
-    `INSERT INTO projects (key, name, summary, colour, sort_order)
-     VALUES (:key, :name, :summary, :colour, :sort_order)`,
-    { key: slug, name, summary, colour, sort_order: order }
+    `INSERT INTO projects (key, name, summary, colour, path, icon, sort_order)
+     VALUES (:key, :name, :summary, :colour, :path, :icon, :sort_order)`,
+    { key: slug, name, summary, colour, path, icon, sort_order: order }
   );
   const created = getProject(Number(r.lastInsertRowid));
   record({ action: "create", entity: "project", entityId: created.id,
@@ -496,7 +505,7 @@ function createProject({ key, name, summary = null, colour = "#7c8698" }) {
 }
 
 function updateProject(id, fields) {
-  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view"];
+  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view", "path", "icon"];
   if (fields.task_view !== undefined && !TASK_VIEWS.includes(fields.task_view)) {
     throw new Error(`task_view must be one of ${TASK_VIEWS.join(", ")}`);
   }
@@ -663,6 +672,16 @@ function deleteProjectRows(id, { tasks = "keep" } = {}) {
   before.__notes = all("SELECT * FROM notes WHERE project_id = :id", { id });
   before.__links = all("SELECT * FROM links WHERE project_id = :id", { id });
   before.__repos = all("SELECT * FROM repos WHERE project_id = :id", { id });
+  // Sessions cascade from the project and messages cascade from the session, so
+  // without copying both here a deleted project takes every conversation with it
+  // and undo brings the project back empty.
+  before.__sessions = all("SELECT * FROM sessions WHERE project_id = :id", { id });
+  before.__messages = all(
+    `SELECT m.* FROM messages m
+      JOIN sessions s ON s.id = m.session_id
+     WHERE s.project_id = :id`,
+    { id }
+  );
 
   // By id rather than by project_id, so the rows deleted are exactly the rows
   // copied above. Deleting by project_id would let the cascade reach subtasks
@@ -678,6 +697,7 @@ function deleteProjectRows(id, { tasks = "keep" } = {}) {
     links: before.__links.length,
     organizers: before.__organizers.length,
     repos: before.__repos.length,
+    sessions: before.__sessions.length,
   };
   record({
     action: "delete",
@@ -1581,6 +1601,113 @@ function updateExternalComment(id, body) {
   return one("SELECT * FROM comments WHERE id = :id", { id });
 }
 
+
+// ---------------------------------------------------------------------------
+// Sessions
+//
+// A session is a conversation with an agent, held against a project. It is
+// stored rather than kept in memory because a session that does not survive a
+// restart is a chat window, and the whole point of calling it a session is that
+// you can come back to it.
+//
+// Messages are written as they arrive, including a partial assistant reply, so
+// a stream that is interrupted leaves what it managed to say rather than
+// nothing. That is why appendMessage and updateMessage are separate: one starts
+// a turn, the other grows it.
+
+function listSessions(projectId) {
+  return all(
+    `SELECT s.*,
+            (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
+            (SELECT m.content FROM messages m
+              WHERE m.session_id = s.id AND m.role = 'user'
+              ORDER BY m.id LIMIT 1) AS opener
+     FROM sessions s
+     WHERE s.project_id = :projectId AND s.status != 'archived'
+     ORDER BY s.updated_at DESC, s.id DESC`,
+    { projectId }
+  );
+}
+
+const getSession = (id) => one("SELECT * FROM sessions WHERE id = :id", { id });
+
+function createSession({ projectId, title = null, agent = null, provider = null, model = null }) {
+  if (!projectId) throw new Error("A session needs a project");
+  const r = run(
+    `INSERT INTO sessions (project_id, title, agent, provider, model)
+     VALUES (:projectId, :title, :agent, :provider, :model)`,
+    // Named for what it is until the first message can name it better. A blank
+    // title in the list is worse than a placeholder nobody minds replacing.
+    { projectId, title: title || "New session", agent, provider, model }
+  );
+  // Not audited. The audit table's entity CHECK admits task, note, project and
+  // link only, and a CHECK cannot be added to a database that already exists, so
+  // filing a session there would throw on every install but a brand new one.
+  // No loss: undo replays a stored "before" row, which is meaningless for a
+  // conversation, and a deleted session takes its messages with it either way.
+  return getSession(Number(r.lastInsertRowid));
+}
+
+function updateSession(id, fields) {
+  const allowed = ["title", "agent", "provider", "model", "status", "tokens_in", "tokens_out"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return getSession(id);
+  const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
+  run(`UPDATE sessions SET ${assignments}, updated_at = datetime('now') WHERE id = :id`, {
+    ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
+    id,
+  });
+  return getSession(id);
+}
+
+function deleteSession(id) {
+  const before = getSession(id);
+  if (!before) return null;
+  // Messages go with it through ON DELETE CASCADE. Not audited, for the reason
+  // given in createSession.
+  run("DELETE FROM sessions WHERE id = :id", { id });
+  return before;
+}
+
+const listMessages = (sessionId) =>
+  all("SELECT * FROM messages WHERE session_id = :sessionId ORDER BY id", { sessionId });
+
+function appendMessage({ sessionId, role, content = "", tokens = null, error = null }) {
+  if (!sessionId) throw new Error("A message needs a session");
+  const r = run(
+    `INSERT INTO messages (session_id, role, content, tokens, error)
+     VALUES (:sessionId, :role, :content, :tokens, :error)`,
+    { sessionId, role, content, tokens, error }
+  );
+  // Touched so the session list stays in most-recent order without the caller
+  // having to remember to do it.
+  run("UPDATE sessions SET updated_at = datetime('now') WHERE id = :id", { id: sessionId });
+  return one("SELECT * FROM messages WHERE id = :id", { id: Number(r.lastInsertRowid) });
+}
+
+function updateMessage(id, fields) {
+  const allowed = ["content", "tokens", "error"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return one("SELECT * FROM messages WHERE id = :id", { id });
+  const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
+  run(`UPDATE messages SET ${assignments} WHERE id = :id`, {
+    ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
+    id,
+  });
+  return one("SELECT * FROM messages WHERE id = :id", { id });
+}
+
+/** Adds a completed turn's usage to the session's running totals. */
+function addSessionUsage(id, { input = 0, output = 0 }) {
+  run(
+    `UPDATE sessions SET tokens_in = tokens_in + :input, tokens_out = tokens_out + :output,
+                         updated_at = datetime('now')
+     WHERE id = :id`,
+    { id, input, output }
+  );
+  return getSession(id);
+}
+
 module.exports = {
   DB_PATH,
   // The graph builder works against the connection directly, so it is exposed
@@ -1606,4 +1733,6 @@ module.exports = {
   dueAlerts, listAlerts, createAlert, updateAlert, deleteAlert,
   markFired, snoozeAlert, actOnAlert,
   listRepos, createRepo, setPrimaryRepo, deleteRepo,
+  listSessions, getSession, createSession, updateSession, deleteSession,
+  listMessages, appendMessage, updateMessage, addSessionUsage,
 };

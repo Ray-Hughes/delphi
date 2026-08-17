@@ -4,27 +4,55 @@
 <meta charset="utf-8" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
 <title>Delphi</title>
+<link rel="stylesheet" href="assets/fonts.css" />
 <style>
   /* Tokens ---------------------------------------------------------------
      Light is the base set; dark redefines the same names. Components only
      ever reference tokens, so neither theme can end up with one theme's ink
      on the other's ground. */
   :root {
-    --bg:        #f4f6f9;
-    --surface:   #ffffff;
-    --raised:    #eef1f6;
-    --line:      #dde2ea;
-    --line-soft: #e8ecf2;
+    /* Rad, the design language Granular is built with. The names below are the
+       ones every component in this app already uses, so redefining them here
+       restyles the whole window rather than only what has been rewritten. The
+       --rad-* originals are kept alongside for anything built against them
+       directly. */
+    --rad-bg:          #fafafa;
+    --rad-surface:     #ffffff;
+    --rad-edge:        #e8e8e9;
+    --rad-edge-strong: #d9d9db;
+    --rad-ink:         #1b1c1e;
+    --rad-ink-muted:   #5d5e61;
+    --rad-ink-faint:   #8a8b8e;
+    --rad-accent:      #ff5800;
+    --rad-accent-ink:  #c84400;
+    --rad-danger:      #d4183d;
+    --rad-success:     #1d8a4e;
 
-    --ink:       #171b23;
-    --ink-dim:   #5a6376;
-    --ink-faint: #8d97a9;
+    --bg:        var(--rad-bg);
+    --surface:   var(--rad-surface);
+    --raised:    #f2f2f3;
+    --line:      var(--rad-edge);
+    --line-soft: #f0f0f1;
 
-    --accent:      #4a63d8;
-    --accent-soft: #e6eaff;
-    --good:      #2f8757;
+    --ink:       var(--rad-ink);
+    --ink-dim:   var(--rad-ink-muted);
+    --ink-faint: var(--rad-ink-faint);
+
+    --accent:      var(--rad-accent);
+    --accent-ink:  var(--rad-accent-ink);
+    /* The orange at 8%, which is the tint Rad uses behind a selected row. A flat
+       pastel would fight the accent rather than belong to it. */
+    --accent-soft: #fff1e9;
+    --good:      var(--rad-success);
     --warn:      #a8700f;
-    --crit:      #c04a41;
+    --crit:      var(--rad-danger);
+
+    /* The gradient primary button, lifted whole: a fill, a border that darkens
+       down the edge, and a shadow tinted with the accent rather than with black. */
+    --btn-fg:           #fff;
+    --btn-fill:         linear-gradient(180deg, #ff6b1a 0%, #ff5800 46%, #e64f00 100%);
+    --btn-layer-border: linear-gradient(180deg, #ff8a3d 0%, #b83f00 100%);
+    --btn-layer-shadow: 0 .12073px .60363px rgba(255,88,0,.22), 0 1px 5px rgba(170,57,0,.42);
 
     /* Task colours. A label, not a status, so they sit apart from the semantic
        four above. Each is dark enough to read as text on --surface here and is
@@ -46,8 +74,9 @@
 
     --r-sm: 6px; --r: 10px; --r-lg: 14px;
 
-    --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
-    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --font:    'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    --display: 'Inter Tight', 'Inter', system-ui, sans-serif;
+    --mono:    'Sometype Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 
     --shadow: 0 1px 2px rgba(16, 20, 28, 0.05), 0 4px 16px rgba(16, 20, 28, 0.06);
   }
@@ -65,19 +94,28 @@
      ground and the amber and slate labels were nearly unreadable. */
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg:        #0f1217;
-      --surface:   #171b23;
-      --raised:    #1f242f;
-      --line:      #2a3040;
-      --line-soft: #222836;
+      --rad-bg:      #151618;
+      --rad-surface: #232426;
+      --rad-edge:    #2b2c2f;
+      --rad-ink:     #fafafb;
 
-      --ink:       #e6e9ef;
-      --ink-dim:   #98a1b2;
-      --ink-faint: #6a7385;
+      --bg:        #151618;
+      --surface:   #232426;
+      --raised:    #2b2c2f;
+      --line:      #3a3a3d;
+      --line-soft: #2b2c2f;
 
-      --accent:      #7c9bff;
-      --accent-soft: #1e2740;
-      --good:      #4fb477;
+      --ink:       #fafafb;
+      --ink-dim:   #acaeb1;
+      --ink-faint: #7f8083;
+
+      /* The accent does not shift between themes. It is the one fixed point in
+         Rad, and the lighter --accent-ink is what carries it on a dark ground
+         where the solid orange would vibrate against the text beside it. */
+      --accent:      #ff5800;
+      --accent-ink:  #ff8a4d;
+      --accent-soft: #2a1a11;
+      --good:      #96e3a6;
       --warn:      #e0a458;
       --crit:      #e2685f;
 
@@ -95,19 +133,28 @@
   }
 
   :root[data-theme="dark"] {
-    --bg:        #0f1217;
-    --surface:   #171b23;
-    --raised:    #1f242f;
-    --line:      #2a3040;
-    --line-soft: #222836;
+    --rad-bg:      #151618;
+    --rad-surface: #232426;
+    --rad-edge:    #2b2c2f;
+    --rad-ink:     #fafafb;
 
-    --ink:       #e6e9ef;
-    --ink-dim:   #98a1b2;
-    --ink-faint: #6a7385;
+    --bg:        #151618;
+    --surface:   #232426;
+    --raised:    #2b2c2f;
+    --line:      #3a3a3d;
+    --line-soft: #2b2c2f;
 
-    --accent:      #7c9bff;
-    --accent-soft: #1e2740;
-    --good:      #4fb477;
+    --ink:       #fafafb;
+    --ink-dim:   #acaeb1;
+    --ink-faint: #7f8083;
+
+    /* The accent does not shift between themes. It is the one fixed point in
+       Rad, and the lighter --accent-ink is what carries it on a dark ground
+       where the solid orange would vibrate against the text beside it. */
+    --accent:      #ff5800;
+    --accent-ink:  #ff8a4d;
+    --accent-soft: #2a1a11;
+    --good:      #96e3a6;
     --warn:      #e0a458;
     --crit:      #e2685f;
 
@@ -1901,6 +1948,253 @@
   .audit-when { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); flex: 0 0 128px; }
   .audit-what { flex: 1; min-width: 0; }
   .audit-what .lbl { color: var(--ink-dim); font-size: 12px; margin-top: 2px; }
+
+  /* ======================================================================
+     Granular
+     ----------------------------------------------------------------------
+     The project rail, the session sidebar and the chat, built to Granular's
+     own measurements rather than to something that merely resembles them.
+
+     Granular's app chrome is dark whatever the page around it is doing, and
+     these --c-* names are that console palette. They are still redefined for
+     light so the rest of this window does not end up with a dark slab bolted
+     to the side of it, but dark is the real one: it is what the design was
+     drawn against, and the accent was picked to sit on #151618.
+     ====================================================================== */
+  :root {
+    --c-bg:      #151618;
+    --c-surf:    #232426;
+    --c-edge:    #232426;   /* same value as the surface, used as every panel border */
+    --c-edge2:   #3a3a3d;
+    --c-ink:     #fafafb;
+    --c-mut:     #acaeb1;
+    --c-faint:   #7f8083;
+    --c-acc:     #ff5800;
+    --c-acc-ink: #ff8a4d;
+    --c-ok:      #96e3a6;
+  }
+  :root[data-theme="light"], :root:not([data-theme="dark"]) {
+    --c-bg:      #ffffff;
+    --c-surf:    #fafafa;
+    --c-edge:    #e8e8e9;
+    --c-edge2:   #d9d9db;
+    --c-ink:     #1b1c1e;
+    --c-mut:     #5d5e61;
+    --c-faint:   #8a8b8e;
+    --c-acc:     #ff5800;
+    --c-acc-ink: #c84400;
+    --c-ok:      #1d8a4e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --c-bg:      #151618;
+      --c-surf:    #232426;
+      --c-edge:    #232426;
+      --c-edge2:   #3a3a3d;
+      --c-ink:     #fafafb;
+      --c-mut:     #acaeb1;
+      --c-faint:   #7f8083;
+      --c-acc:     #ff5800;
+      --c-acc-ink: #ff8a4d;
+      --c-ok:      #96e3a6;
+    }
+  }
+  :root[data-theme="dark"] {
+    --c-bg:      #151618;
+    --c-surf:    #232426;
+    --c-edge:    #232426;
+    --c-edge2:   #3a3a3d;
+    --c-ink:     #fafafb;
+    --c-mut:     #acaeb1;
+    --c-faint:   #7f8083;
+    --c-acc:     #ff5800;
+    --c-acc-ink: #ff8a4d;
+    --c-ok:      #96e3a6;
+  }
+
+  /* Project rail ---------------------------------------------------------
+     Not .rail: .ts-rail already exists on the task sheet and the two would
+     read as a family they are not part of. */
+  .project-rail {
+    width: 48px; flex: 0 0 48px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+    padding: 12px 6px;
+    background: var(--surface);
+    border-right: 1px solid var(--line-soft);
+    /* The titlebar is a drag region and this sits under it. Without this a
+       click on a project tile moves the window instead of opening it. */
+    -webkit-app-region: no-drag;
+    overflow-y: auto; overflow-x: hidden;
+  }
+  .rail-tile {
+    position: relative; aspect-ratio: 1; width: 36px;
+    border-radius: 9px; border: 1px solid var(--c-edge2);
+    background: var(--c-surf);
+    display: grid; place-items: center;
+    font-family: var(--display);
+    font-size: 13px; font-weight: 600; color: var(--c-mut);
+    overflow: hidden; cursor: default;
+    -webkit-user-select: none; user-select: none;
+    transition: border-color 100ms ease, transform 100ms ease, color 100ms ease;
+  }
+  .rail-tile:hover { color: var(--c-ink); border-color: var(--c-faint); }
+  .rail-tile.on {
+    border-color: var(--c-acc); color: var(--c-ink);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.25), 0 8px 24px rgba(0,0,0,.35);
+  }
+  .rail-tile.bare { border-color: transparent; background: transparent; color: var(--c-faint); }
+  .rail-tile.bare:hover { color: var(--c-acc); }
+  .rail-sp { flex: 1 1 auto; }
+  .rail-div { height: 1px; width: 24px; margin: 0 auto; background: var(--line); flex: 0 0 auto; }
+  /* A tile whose folder has gone. Stated rather than silently working, because
+     a project that cannot find its own files will fail later and less clearly. */
+  .rail-tile.lost { border-style: dashed; border-color: var(--crit); color: var(--crit); }
+
+  /* Chat -----------------------------------------------------------------
+     Granular's measurements, kept as authored. The one deliberate departure
+     is that the composer is a real textarea rather than the marketing page's
+     static placeholder, so it grows with what is typed. */
+  .chat { display: flex; flex-direction: column; min-width: 0; height: 100%; }
+
+  .gstream {
+    flex: 1; min-height: 0; overflow: auto;
+    display: flex; flex-direction: column; justify-content: flex-start;
+    gap: 11px; padding: 12px 16px;
+  }
+  .gmsg { font-size: 12.5px; line-height: 1.55; max-width: 86%; }
+  /* Only the person gets a bubble. The agent is set as running text, which is
+     what makes a long reply readable instead of a wall inside a box. */
+  .gmsg.you {
+    align-self: flex-end;
+    background: var(--c-surf); border: 1px solid var(--c-edge2);
+    border-radius: 11px 11px 4px 11px; padding: 9px 13px; color: var(--c-ink);
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .gmsg.ai { align-self: stretch; max-width: 100%; color: var(--c-mut); }
+  .gmsg.ai b, .gmsg.ai strong { color: var(--c-ink); font-weight: 600; }
+  .gmsg.ai p { margin: 0 0 8px; }
+  .gmsg.ai > :last-child { margin-bottom: 0; }
+  .gmsg ul, .gmsg ol { margin: 4px 0 0; padding-left: 17px; }
+  .gmsg li { margin: 2px 0; }
+  .gmsg.ai pre {
+    background: var(--c-surf); border: 1px solid var(--c-edge2);
+    border-radius: 8px; padding: 8px 10px; overflow-x: auto; margin: 6px 0;
+  }
+  .gmsg.ai code { font-family: var(--mono); font-size: 11px; }
+  .gmsg.err { align-self: stretch; max-width: 100%; color: var(--crit); font-size: 11.5px; }
+
+  /* Empty state */
+  .gempty {
+    margin: auto; display: flex; flex-direction: column; align-items: center;
+    gap: 7px; text-align: center; padding: 8px 4px;
+  }
+  .gempty .ge-k {
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: .18em; color: var(--c-faint);
+    text-transform: uppercase;
+  }
+  .gempty .ge-t { font-size: 11px; line-height: 1.5; color: var(--c-mut); max-width: 230px; }
+  .gempty .ge-cards {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+    width: 100%; max-width: 264px; margin-top: 5px;
+  }
+  .gempty .ge-card {
+    border: 1px solid var(--c-edge2); background: var(--c-surf);
+    border-radius: 8px; padding: 7px 9px; text-align: left; cursor: default;
+    transition: border-color 100ms ease;
+  }
+  .gempty .ge-card:hover { border-color: var(--c-acc); }
+  .gempty .ge-card b { display: block; font-size: 10.5px; font-weight: 600; color: var(--c-ink); }
+  .gempty .ge-card span { display: block; margin-top: 2px; font-size: 9px; line-height: 1.35; color: var(--c-faint); }
+  .gempty .ge-conn { margin-top: 4px; font-size: 9px; color: var(--c-faint); }
+
+  /* Composer */
+  .gcomp {
+    margin: 10px 12px 0; display: flex; align-items: flex-end; gap: 8px;
+    border: 1px solid var(--c-edge2); border-radius: 8px; background: var(--c-surf);
+    padding: 8px 12px; min-height: 34px; flex: 0 0 auto;
+    transition: border-color 120ms ease;
+  }
+  .gcomp:focus-within { border-color: var(--c-acc); }
+  .gcomp textarea {
+    flex: 1; border: 0; background: transparent; outline: none; resize: none;
+    color: var(--c-ink); font-family: var(--font); font-size: 12px; line-height: 1.4;
+    max-height: 160px; padding: 0;
+  }
+  .gcomp textarea::placeholder { color: var(--c-faint); }
+
+  /* Model and permission row */
+  .gmodel {
+    position: relative; display: flex; align-items: center; flex-wrap: wrap;
+    gap: 4px; padding: 9px 11px 3px;
+  }
+  .gconn {
+    display: flex; align-items: center; gap: 5px;
+    border: 1px solid transparent; border-radius: 6px; padding: 3px 6px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .02em;
+    color: var(--c-mut); cursor: default;
+  }
+  .gconn:hover, .gconn.open { border-color: var(--c-edge2); background: var(--c-surf); color: var(--c-ink); }
+  .gconn .mk {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 14px; height: 14px; border-radius: 4px;
+    border: 1px solid rgba(0,0,0,.12); background: #fff; flex: 0 0 auto;
+    font-size: 9px; font-weight: 700; color: #d97757; font-family: var(--font);
+  }
+  .gconn .cv { font-size: 7px; color: var(--c-faint); opacity: .8; margin-left: 1px; }
+  .gpill {
+    display: flex; align-items: center; gap: 4px;
+    border: 1px solid transparent; border-radius: 6px; padding: 3px 6px;
+    font-size: 9.5px; color: var(--c-faint); cursor: default;
+  }
+  .gpill.bd { border-color: var(--c-edge); color: var(--c-mut); }
+  .gpill:hover { border-color: var(--c-edge2); color: var(--c-mut); }
+  .gpill .mono2 { font-family: var(--mono); }
+  .gpill .cv { font-size: 7px; color: var(--c-faint); }
+
+  /* Token meter */
+  .gmeter {
+    display: flex; align-items: center; gap: 8px; padding: 3px 12px 11px;
+    font-family: var(--mono); font-size: 9.5px; color: var(--c-faint);
+  }
+  .gmeter .ml { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .gmeter .bar {
+    position: relative; width: 28px; height: 4px; border-radius: 99px;
+    background: var(--c-edge2); overflow: hidden;
+  }
+  .gmeter .bar span { position: absolute; inset: 0; left: 0; background: rgba(255,88,0,.7); }
+
+  /* Session list in the sidebar */
+  .gs {
+    display: flex; align-items: center; gap: 7px;
+    border: 1px solid transparent; border-radius: 8px; padding: 7px 9px;
+    font-size: 12.5px; color: var(--c-mut); white-space: nowrap; cursor: default;
+  }
+  .gs:hover { color: var(--c-ink); }
+  .gs.on {
+    border-color: var(--c-edge2); background: var(--c-surf); color: var(--c-ink);
+    box-shadow: 0 1px 0 0 rgba(255,255,255,.05), 0 8px 22px rgba(0,0,0,.28);
+  }
+  .gs .sd { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--c-edge2); }
+  .gs .sd.live {
+    width: 9px; height: 9px; background: transparent;
+    border: 1.5px solid rgba(255,88,0,.28); border-top-color: var(--c-acc);
+    animation: gspin .7s linear infinite;
+  }
+  @keyframes gspin { to { transform: rotate(360deg); } }
+  .gs .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .gs .kbd { font-family: var(--mono); font-size: 10px; color: var(--c-faint); }
+  .gnew {
+    display: flex; align-items: center; gap: 8px; margin: 0 0 6px;
+    border: 1px solid var(--c-edge); border-radius: 8px; padding: 7px 10px;
+    color: var(--c-mut); font-size: 11.5px; cursor: default;
+  }
+  .gnew:hover { border-color: var(--c-acc); color: var(--c-ink); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .gs .sd.live { animation: none; background: var(--c-acc); border-color: transparent; }
+  }
+  :root[data-motion="off"] .gs .sd.live { animation: none; background: var(--c-acc); border-color: transparent; }
+
 </style>
 </head>
 <body>
@@ -1910,6 +2204,9 @@
   </header>
 
   <div class="body">
+    <!-- The project rail. Painted by renderRail() in the same pass as the
+         sidebar, so the two can never disagree about which project is open. -->
+    <nav class="project-rail" id="rail" aria-label="Projects"></nav>
     <nav class="sidebar">
       <div class="brand">
         <img class="mark" src="assets/mark-64.png" width="26" height="26" alt="" aria-hidden="true" />

@@ -52,8 +52,26 @@ contextBridge.exposeInMainWorld("delphi", {
     export: () => call("vault:export"),
     reveal: () => call("vault:reveal"),
   },
+  sessions: {
+    list: (projectId) => call("sessions:list", projectId),
+    get: (id) => call("sessions:get", id),
+    create: (payload) => call("sessions:create", payload),
+    update: (id, fields) => call("sessions:update", id, fields),
+    remove: (id) => call("sessions:delete", id),
+    addUsage: (id, usage) => call("sessions:addUsage", id, usage),
+  },
+  messages: {
+    list: (sessionId) => call("messages:list", sessionId),
+    append: (payload) => call("messages:append", payload),
+    update: (id, fields) => call("messages:update", id, fields),
+  },
+  fs: {
+    createFolder: (parent, name) => call("fs:createFolder", parent, name),
+    folderExists: (folder) => call("fs:folderExists", folder),
+    reveal: (target) => call("fs:reveal", target),
+  },
   dialog: {
-    pickFolder: (title) => call("dialog:pickFolder", title),
+    pickFolder: (title, options) => call("dialog:pickFolder", title, options),
   },
   alerts: {
     list: (opts) => call("alerts:list", opts),
