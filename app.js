@@ -1227,6 +1227,67 @@ function renderProjectSettings(root) {
     "What this project is called everywhere it appears: the sidebar, the title, and any task that belongs to it.",
     el("div", { className: "row" }, nameInput), nameMsg));
 
+  // --- folder --------------------------------------------------------------
+  // A project is a place now, so where that place is has to be visible and
+  // fixable here. It is the one setting that can be wrong without being empty:
+  // a folder that was moved or is on a volume that is not mounted still reads
+  // as linked, so the state is checked rather than assumed.
+  const folderMsg = el("span", { className: "hint" });
+  const folderRow = el("div", { className: "row" });
+
+  const paintFolder = async () => {
+    folderRow.textContent = "";
+    const live = currentProject();
+    if (!live) return;
+
+    if (!live.path) {
+      folderRow.append(el("span", { className: "hint", textContent: "No folder linked." }));
+      const link = el("button", { className: "btn primary", textContent: "Choose a folder" });
+      link.onclick = async () => { await linkFolder(live); };
+      folderRow.append(link);
+      return;
+    }
+
+    const shown = el("span", { className: "mono grow", textContent: live.path, title: live.path });
+    folderRow.append(shown);
+
+    const state_ = el("span", { className: "hint", textContent: "checking…" });
+    folderRow.append(state_);
+    window.delphi.fs.folderExists(live.path).then((there) => {
+      if (there) {
+        state_.className = "ok-msg";
+        state_.textContent = "found";
+      } else {
+        // Said plainly, because everything downstream will fail against it and
+        // the reason would otherwise surface as an unrelated error later.
+        state_.className = "err-msg";
+        state_.textContent = "missing";
+      }
+    }).catch(() => { state_.textContent = ""; });
+
+    const reveal = el("button", { className: "btn sm", textContent: "Reveal" });
+    reveal.onclick = () => window.delphi.fs.reveal(live.path);
+
+    const change = el("button", { className: "btn sm", textContent: "Change" });
+    change.onclick = async () => { await linkFolder(live); };
+
+    const clear = el("button", { className: "btn sm danger", textContent: "Unlink" });
+    clear.onclick = async () => {
+      // Unlinking forgets the path. It never touches the folder, which is worth
+      // saying on the button's own tooltip rather than leaving to be discovered.
+      await window.delphi.projects.update(live.id, { path: null });
+      await refresh();
+    };
+    clear.title = "Forget the path. The folder itself is left alone.";
+
+    folderRow.append(reveal, change, clear);
+  };
+  paintFolder();
+
+  root.append(settingSection("Folder",
+    "The folder on disk this project is. Agents run in it and the chat is told where it is. Unlinking forgets the path; it never deletes anything.",
+    folderRow, folderMsg));
+
   // --- summary -------------------------------------------------------------
   const sumMsg = el("span", { className: "hint" });
   const sumInput = commitOnEnter(el("input", {
@@ -6643,51 +6704,54 @@ function lastProjectParent() {
  * yet, in which case a name is typed and the folder is made, and the only thing
  * still to decide is where to put it.
  */
+/**
+ * Makes a project, which means choosing a folder.
+ *
+ * A project is a place, so the folder is not an optional extra to be filled in
+ * afterwards: it is the thing being created. The picker opens straight away
+ * rather than asking for a name first, because a name without a folder is a
+ * label for nothing.
+ *
+ * Naming still happens, but where it belongs. The picker is opened with
+ * createDirectory, so the native New Folder button is right there: someone
+ * starting something that does not exist yet makes the folder and names it in
+ * the same step, and the project takes that name. That is the only place a name
+ * is typed, and it is the only place one is needed.
+ */
 async function createProject() {
-  const name = await askText({
-    title: "New project",
-    label: "Name it and a folder will be made for it, or choose a folder that already exists.",
-    placeholder: "Hearing transcripts",
-    confirmLabel: "Continue",
-    pickFolder: true,
-  });
-  if (!name) return null;
+  const folder = await window.delphi.dialog.pickFolder(
+    "Choose a folder for the project, or make a new one",
+    { defaultPath: lastProjectParent(), buttonLabel: "Use this folder" }
+  );
+  if (!folder) return null;
 
-  // askText with pickFolder returns an absolute path when the folder button was
-  // used, and whatever was typed otherwise. A leading slash is the tell.
-  const picked = name.startsWith("/");
-  let folder = picked ? name.replace(/\/+$/, "") : null;
-  let label = picked ? folder.split("/").pop() : name;
+  const path = folder.replace(/\/+$/, "");
+  const label = path.split("/").pop() || path;
 
-  if (!picked) {
-    const parent = await window.delphi.dialog.pickFolder(
-      `Where should the ${name} folder go?`,
-      { defaultPath: lastProjectParent(), buttonLabel: "Put it here" }
-    );
-    // Cancelling the location is cancelling the project. Making the folder
-    // somewhere arbitrary would be worse than doing nothing.
-    if (!parent) return null;
-    try {
-      const made = await window.delphi.fs.createFolder(parent, name);
-      folder = made.path;
-    } catch (error) {
-      await askText({
-        title: "That folder could not be made",
-        label: String(error.message || error),
-        value: "",
-        allowEmpty: true,
-        confirmLabel: "Close",
-      });
-      return null;
-    }
+  // Two projects cannot share a folder. Opening the one that is already there is
+  // what the person meant anyway, and it beats a unique-key error naming a slug
+  // they never typed.
+  const already = state.projects.find((p) => p.path === path);
+  if (already) {
+    navigate({ projectId: already.id, view: "overview", query: "" });
+    return already;
   }
 
-  const key = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const base = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  // The folder name is the project name, so two folders of the same name in
+  // different places would collide on the slug. Suffixed rather than refused.
+  let key = base || `p${Date.now()}`;
+  if (state.projects.some((p) => p.key === key)) {
+    let n = 2;
+    while (state.projects.some((p) => p.key === `${base}-${n}`)) n += 1;
+    key = `${base}-${n}`;
+  }
+
   try {
     const created = await window.delphi.projects.create({
-      key: key || `p${Date.now()}`,
+      key,
       name: label,
-      path: folder,
+      path,
       colour: PROJECT_COLOURS[state.projects.length % PROJECT_COLOURS.length],
     });
     state.projectId = created.id;
@@ -6695,9 +6759,6 @@ async function createProject() {
     await refresh();
     return created;
   } catch (error) {
-    // The slug is unique, and two projects named closely enough can produce the
-    // same one. Saying so beats a button that appears to do nothing, which is
-    // exactly the failure this whole path just had.
     alert(`Could not create the project: ${error.message}`);
     return null;
   }
