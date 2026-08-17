@@ -779,7 +779,7 @@ function renderTabs() {
        ["activity", "Activity"]]
     : state.workspaceId
     ? [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
-       ["queue", "Queue"], ["activity", "Activity"]]
+       ["queue", "Queue"], ["graph", "Mind map"], ["activity", "Activity"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
        ["graph", "Mind map"],
@@ -820,7 +820,7 @@ function render() {
     : state.projectId
     ? ["overview", "chat", "tasks", "queue", "notes", "links", "activity", "project", "workspace"]
     : state.workspaceId
-    ? ["new", "tasks", "queue", "activity", "workspace"]
+    ? ["new", "tasks", "queue", "graph", "activity", "workspace"]
     : ["new", "tasks", "queue", "graph", "reminders", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
@@ -2196,6 +2196,27 @@ function fadeColour(colour, a) {
   return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${a})`;
 }
 
+
+/**
+ * Opens the map on the workspace you are in.
+ *
+ * Only when nothing else is selected, so it cannot pull the view back to the
+ * workspace every time the pane repaints while someone is exploring. The name is
+ * matched against the graph's own nodes rather than assumed to be there: a
+ * workspace nothing has written about yet has no node, and selecting a name that
+ * does not exist would leave the panel reporting an entity it cannot find.
+ */
+function focusWorkspaceNode() {
+  if (mindMap.selected || !state.workspaceId || !mindMap.data) return;
+  const workspace = state.workspaces.find((w) => w.id === state.workspaceId);
+  if (!workspace) return;
+
+  const wanted = [workspace.name, workspace.path.split("/").pop()]
+    .filter(Boolean).map((x) => x.toLowerCase());
+  const hit = (mindMap.data.nodes || []).find((n) => wanted.includes(String(n.name).toLowerCase()));
+  if (hit) mindMap.selected = hit.name;
+}
+
 async function renderMindMap(root) {
   if (!mindMap.data && !mindMap.error) {
     try {
@@ -2204,6 +2225,12 @@ async function renderMindMap(root) {
       mindMap.error = String(error.message || error);
     }
   }
+
+  // The graph is always the whole graph: a connection that leaves the workspace
+  // is the one worth seeing, and hiding it would make the map agree with the
+  // sidebar rather than tell you anything the sidebar cannot. What the workspace
+  // changes is where you start reading, so it opens on itself.
+  focusWorkspaceNode();
 
   const bar = el("div", { className: "oracle-bar" });
   bar.append(el("div", { className: "hint grow", textContent:
@@ -6667,7 +6694,7 @@ function renderRail() {
     if (!open) {
       tile.draggable = true;
       tile.ondragstart = (e) => {
-        dragging = w.id;
+        beginDrag(rail, w.id);
         tile.classList.add("dragging");
         e.dataTransfer.effectAllowed = "move";
         // Firefox refuses to start a drag unless something is on the transfer.
@@ -6698,7 +6725,7 @@ function renderRail() {
       if (dragging === null) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
-      shiftForDrop(rail, dropIndexAt(rail, e.clientY));
+      shiftForDrop(rail, dropIndexAt(e.clientY));
     };
     rail.ondragleave = (e) => {
       // Only when the pointer has actually left the rail, not when it crosses
@@ -6709,7 +6736,7 @@ function renderRail() {
     rail.ondrop = async (e) => {
       if (dragging === null) return;
       e.preventDefault();
-      const at = dropIndexAt(rail, e.clientY);
+      const at = dropIndexAt(e.clientY);
       const moved = dragging;
       endDrag(rail);
       await reorderWorkspaceTo(moved, at);
@@ -6749,49 +6776,77 @@ function renderRail() {
 
 
 
-// A tile is 36px square and the rail puts 8px between them, so a gap the size of
-// one tile is what has to open for the dragged one to fit.
+// A tile is 36px square with 8px between them, so one step is a whole slot.
 const RAIL_STEP = 44;
 
-/** The tiles that are not the one being dragged, in the order they appear. */
-const railOthers = (rail) =>
-  [...rail.querySelectorAll("[data-ws]")].filter((n) => Number(n.dataset.ws) !== dragging);
+// Measured once, when the drag starts. The tiles move while it is happening, so
+// reading their live positions to decide where the pointer is would be reading
+// the effect of the last decision: the gap chases the pointer and jitters.
+let dragBase = null;   // [{ id, mid }] in column order, unshifted
+let dragFrom = null;   // the dragged tile's index in that column
+
+function beginDrag(rail, id) {
+  dragging = id;
+  const tiles = [...rail.querySelectorAll("[data-ws]")];
+  dragBase = tiles.map((n) => {
+    const box = n.getBoundingClientRect();
+    return { id: Number(n.dataset.ws), mid: box.top + box.height / 2 };
+  });
+  dragFrom = dragBase.findIndex((t) => t.id === id);
+}
 
 /**
- * Where the dragged tile would land, as an index into the others.
+ * Where the dragged tile would land, as an index among the tiles that are not it.
  *
- * Measured against each tile's midpoint, so crossing halfway is what moves the
- * gap rather than reaching the far edge.
+ * Against the baseline midpoints, so crossing halfway past a tile is what moves
+ * the gap, and the answer does not depend on how far things have already slid.
  */
-function dropIndexAt(rail, y) {
-  const others = railOthers(rail);
+function dropIndexAt(y) {
+  if (!dragBase) return 0;
+  const others = dragBase.filter((t) => t.id !== dragging);
   for (let i = 0; i < others.length; i++) {
-    const box = others[i].getBoundingClientRect();
-    if (y < box.top + box.height / 2) return i;
+    if (y < others[i].mid) return i;
   }
   return others.length;
 }
 
 /**
- * Opens a gap at an index by moving everything below it down.
+ * Moves the tiles that the drop would displace, and only those.
  *
- * Passing null closes the gap. The transform is what animates, so the tiles
- * slide rather than jumping, and the dragged tile is left faded in place: two
- * things moving at once reads as a glitch rather than as a rearrangement.
+ * The dragged tile stays where it is, faded, still taking up its slot. That is
+ * the part the first attempt got wrong: it opened a gap at the target while the
+ * original slot was still occupied, so the column showed two gaps and something
+ * appeared to move the instant anything was picked up.
+ *
+ * Each tile is asked where it sits now and where it would sit afterwards, and
+ * moved by the difference. When the drop would not change the order, every
+ * difference is zero and nothing moves, which is the behaviour you actually want:
+ * the column is still until hovering somewhere that means something.
  */
 function shiftForDrop(rail, at) {
-  const others = railOthers(rail);
+  if (dragFrom === null) return;
+  const others = [...rail.querySelectorAll("[data-ws]")]
+    .filter((n) => Number(n.dataset.ws) !== dragging);
+
   others.forEach((node, i) => {
     node.classList.add("shifting");
-    node.style.transform = at !== null && i >= at ? `translateY(${RAIL_STEP}px)` : "";
+    if (at === null) { node.style.transform = ""; return; }
+    // Its slot now, and its slot after the move. Tiles before the dragged one
+    // keep their index; tiles after it sit one lower than their index suggests.
+    const now = i < dragFrom ? i : i + 1;
+    const next = i < at ? i : i + 1;
+    const delta = next - now;
+    node.style.transform = delta ? `translateY(${delta * RAIL_STEP}px)` : "";
   });
 }
 
 /** Puts everything back and forgets the drag. */
 function endDrag(rail) {
   dragging = null;
+  dragBase = null;
+  dragFrom = null;
   for (const node of rail.querySelectorAll("[data-ws]")) {
-    node.classList.remove("dragging", "shifting", "drop-before", "drop-after");
+    node.classList.remove("dragging", "shifting");
     node.style.transform = "";
   }
 }
@@ -6808,9 +6863,10 @@ async function reorderWorkspaceTo(movedId, index) {
   await refresh();
 }
 
-
 /** Opens a workspace, and lands on the project you were last in if it fits. */
 async function zoomInto(workspaceId) {
+  mindMap.selected = null;
+  mindMap.context = null;
   state.workspaceId = workspaceId;
   const inside = await window.delphi.workspaces.projects(workspaceId);
   state.wsProjects = inside;
@@ -6827,6 +6883,9 @@ async function zoomInto(workspaceId) {
 
 /** Back to the picker. */
 async function zoomOut() {
+  // So the map does not stay pinned to the workspace that was just left.
+  mindMap.selected = null;
+  mindMap.context = null;
   state.workspaceId = null;
   state.wsProjects = [];
   state.projectId = null;
