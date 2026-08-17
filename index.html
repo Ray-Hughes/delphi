@@ -2260,6 +2260,49 @@
   .rail-mark img { width: 26px; height: 26px; display: block; border-radius: 7px; }
   .rail-mark:hover { transform: translateY(-1px); }
   .rail-mark.on { border-color: var(--c-acc); box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+
+  /* Workspace picker rows in the sidebar. */
+  .ws-row {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: 8px 9px; border-radius: var(--r-sm);
+    border: 1px solid transparent; cursor: default;
+    transition: background 100ms ease, border-color 100ms ease;
+  }
+  .ws-row:hover, .ws-row:focus-visible { background: var(--raised); border-color: var(--line); }
+  .ws-ico {
+    width: 26px; height: 26px; flex: 0 0 26px; border-radius: 7px;
+    display: grid; place-items: center;
+    border: 1px solid var(--c-edge2); background: var(--c-surf);
+    font-family: var(--display); font-size: 12px; font-weight: 600; color: var(--ink-dim);
+  }
+  .ws-txt { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+  .ws-nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ws-p {
+    font-family: var(--mono); font-size: 9px; color: var(--ink-faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl; text-align: left;
+  }
+
+  /* Sessions, indented under the project they belong to. The rule on the left is
+     what makes the column read as one tree rather than two stacked lists. */
+  .gkids {
+    margin: 2px 0 4px 13px; padding-left: 10px;
+    border-left: 1px solid var(--line);
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .gs.sub { font-size: 12px; padding: 5px 8px; }
+  .gs .nm.dim { color: var(--ink-faint); }
+  .gs .dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; }
+
+  .row.wrap { flex-wrap: wrap; gap: var(--s2); align-items: center; }
+  .ws-chip { display: inline-flex; align-items: center; gap: 6px; cursor: default; }
+  .ws-chip.primary { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .ws-chip .hint { font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
+  .chip-x {
+    border: 0; background: transparent; color: inherit; opacity: .55;
+    padding: 0 0 0 2px; font-size: 13px; line-height: 1; cursor: default;
+  }
+  .chip-x:hover { opacity: 1; color: var(--crit); }
 </style>
 </head>
 <body>

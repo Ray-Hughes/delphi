@@ -302,3 +302,41 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+
+-- Workspaces: a folder on disk, as a thing in its own right.
+--
+-- The relationship to projects is many to many in both directions, which is why
+-- this is a table and not a column. One folder holds several separate pieces of
+-- work: caseflow carries SSNR, the Central Office address fix and the version
+-- drift checks. And one piece of work spans several folders: SSNR touches
+-- caseflow, caseflow-efolder, the MPI person update service and the veteran API.
+--
+-- projects.path was the first attempt and could only say one of those two
+-- things. It stays for now so nothing breaks mid-migration, but the join below
+-- is the answer.
+CREATE TABLE IF NOT EXISTS workspaces (
+  id          INTEGER PRIMARY KEY,
+  key         TEXT NOT NULL UNIQUE,
+  name        TEXT NOT NULL,
+  -- Unique because two rows pointing at one folder are two names for the same
+  -- place, and every question asked of a workspace would then have two answers.
+  path        TEXT NOT NULL UNIQUE,
+  icon        TEXT,
+  colour      TEXT,
+  sort_order  INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS project_workspaces (
+  project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  -- Where the work mainly lives, when it spans several. Used to pick a folder
+  -- for a session that did not name one.
+  is_primary   INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (project_id, workspace_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pw_workspace ON project_workspaces(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_pw_project   ON project_workspaces(project_id);

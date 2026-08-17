@@ -35,6 +35,15 @@ function open() {
   // file, so an older database would fail to open at all.
   addLaterColumns(db);
   db.exec(schema);
+  // Safe to call here: db is already assigned, so the helpers this goes through
+  // find the connection rather than recursing into open(). Guarded because a
+  // database that adopts nothing still works, and one that refuses to open does
+  // not.
+  try {
+    adoptProjectPaths();
+  } catch (error) {
+    console.error("could not adopt project paths into workspaces", error);
+  }
   return db;
 }
 
@@ -70,6 +79,9 @@ const LATER_COLUMNS = [
   // existing database already has the table and never re-runs the CREATE.
   ["projects", "path", "TEXT"],
   ["projects", "icon", "TEXT"],
+  // A session runs somewhere. A project spanning four repos cannot tell an
+  // agent which folder to work in without this.
+  ["sessions", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL"],
 ];
 
 function addLaterColumns(db) {
@@ -1708,6 +1720,129 @@ function addSessionUsage(id, { input = 0, output = 0 }) {
   return getSession(id);
 }
 
+
+// ---------------------------------------------------------------------------
+// Workspaces
+//
+// A folder, as a thing in its own right, joined to projects many to many. See
+// the comment above the table in schema.sql for why it has to be a join and not
+// a column.
+
+const listWorkspaces = () =>
+  all(`SELECT w.*,
+              (SELECT COUNT(*) FROM project_workspaces pw WHERE pw.workspace_id = w.id) AS project_count
+       FROM workspaces w ORDER BY w.sort_order, w.name`);
+
+const getWorkspace = (id) => one("SELECT * FROM workspaces WHERE id = :id", { id });
+const workspaceByPath = (path) => one("SELECT * FROM workspaces WHERE path = :path", { path });
+
+function createWorkspace({ name, path, icon = null, colour = null }) {
+  if (!path) throw new Error("A workspace needs a folder");
+  const clean = String(path).replace(/\/+$/, "");
+
+  // Choosing a folder that is already a workspace means opening it, not making a
+  // second one. Returned rather than thrown so the caller does not have to tell
+  // "already exists" apart from a real failure.
+  const already = workspaceByPath(clean);
+  if (already) return already;
+
+  const label = name || clean.split("/").pop() || clean;
+  const base = slugKey(label) || `w${Date.now()}`;
+  let key = base;
+  // Two folders of the same name in different places are ordinary, so the slug
+  // is suffixed rather than the second one refused.
+  let n = 2;
+  while (one("SELECT 1 AS x FROM workspaces WHERE key = :key", { key })) {
+    key = `${base}-${n}`;
+    n += 1;
+  }
+
+  const order = one("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM workspaces").n;
+  const r = run(
+    `INSERT INTO workspaces (key, name, path, icon, colour, sort_order)
+     VALUES (:key, :name, :path, :icon, :colour, :sort_order)`,
+    { key, name: label, path: clean, icon, colour, sort_order: order }
+  );
+  return getWorkspace(Number(r.lastInsertRowid));
+}
+
+function updateWorkspace(id, fields) {
+  const allowed = ["name", "path", "icon", "colour", "sort_order"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return getWorkspace(id);
+  const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
+  run(`UPDATE workspaces SET ${assignments}, updated_at = datetime('now') WHERE id = :id`, {
+    ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
+    id,
+  });
+  return getWorkspace(id);
+}
+
+function deleteWorkspace(id) {
+  const before = getWorkspace(id);
+  if (!before) return null;
+  // The join goes with it through ON DELETE CASCADE. The projects do not: work
+  // that spanned four folders still exists when one of them is forgotten, and
+  // the folder on disk is never touched.
+  run("DELETE FROM workspaces WHERE id = :id", { id });
+  return before;
+}
+
+/** The projects that touch a folder. */
+const projectsInWorkspace = (workspaceId) =>
+  all(`SELECT p.*, pw.is_primary,
+              (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status != 'done') AS open_count,
+              (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id) AS note_count
+       FROM projects p
+       JOIN project_workspaces pw ON pw.project_id = p.id
+       WHERE pw.workspace_id = :workspaceId AND p.status != 'archived'
+       ORDER BY p.sort_order, p.name`,
+    { workspaceId });
+
+/** The folders a project touches, primary first. */
+const workspacesForProject = (projectId) =>
+  all(`SELECT w.*, pw.is_primary
+       FROM workspaces w
+       JOIN project_workspaces pw ON pw.workspace_id = w.id
+       WHERE pw.project_id = :projectId
+       ORDER BY pw.is_primary DESC, w.name`,
+    { projectId });
+
+function linkProjectWorkspace(projectId, workspaceId, { primary = false } = {}) {
+  run(`INSERT OR IGNORE INTO project_workspaces (project_id, workspace_id, is_primary)
+       VALUES (:projectId, :workspaceId, :primary)`,
+      { projectId, workspaceId, primary: primary ? 1 : 0 });
+  if (primary) {
+    run("UPDATE project_workspaces SET is_primary = 0 WHERE project_id = :projectId", { projectId });
+    run(`UPDATE project_workspaces SET is_primary = 1
+         WHERE project_id = :projectId AND workspace_id = :workspaceId`, { projectId, workspaceId });
+  }
+  return workspacesForProject(projectId);
+}
+
+const unlinkProjectWorkspace = (projectId, workspaceId) => {
+  run(`DELETE FROM project_workspaces
+       WHERE project_id = :projectId AND workspace_id = :workspaceId`, { projectId, workspaceId });
+  return workspacesForProject(projectId);
+};
+
+/**
+ * Turns the old one folder per project column into workspaces.
+ *
+ * Runs once at open and is safe to repeat: createWorkspace returns the existing
+ * row for a path it already holds, and the link is INSERT OR IGNORE. projects.
+ * path is left in place rather than dropped, because SQLite cannot drop a column
+ * on an old database and a stale copy that nothing reads is harmless.
+ */
+function adoptProjectPaths() {
+  const withPath = all("SELECT id, name, path, icon FROM projects WHERE path IS NOT NULL AND path != ''");
+  for (const p of withPath) {
+    const w = createWorkspace({ name: p.path.split("/").pop(), path: p.path, icon: p.icon });
+    linkProjectWorkspace(p.id, w.id, { primary: true });
+  }
+  return withPath.length;
+}
+
 module.exports = {
   DB_PATH,
   // The graph builder works against the connection directly, so it is exposed
@@ -1733,6 +1868,9 @@ module.exports = {
   dueAlerts, listAlerts, createAlert, updateAlert, deleteAlert,
   markFired, snoozeAlert, actOnAlert,
   listRepos, createRepo, setPrimaryRepo, deleteRepo,
+  listWorkspaces, getWorkspace, workspaceByPath, createWorkspace, updateWorkspace, deleteWorkspace,
+  projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
+  adoptProjectPaths,
   listSessions, getSession, createSession, updateSession, deleteSession,
   listMessages, appendMessage, updateMessage, addSessionUsage,
 };

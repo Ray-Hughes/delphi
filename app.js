@@ -2,6 +2,15 @@
 
 const state = {
   projects: [],
+  // The folders, and which one is open. null is the picker: every workspace
+  // shown, nothing zoomed into.
+  workspaces: [],
+  workspaceId: null,
+  // The projects inside the open workspace. Separate from state.projects, which
+  // stays the whole set, because a project can belong to several folders and
+  // filtering the whole list on every render would ask the database the same
+  // question repeatedly.
+  wsProjects: [],
   projectId: null,     // null means the All view
   view: "new",         // new | overview | tasks | notes | links | history | settings
   showDone: false,
@@ -419,6 +428,10 @@ function ago(iso) {
 
 async function refresh() {
   state.projects = await window.delphi.projects.list();
+  state.workspaces = await window.delphi.workspaces.list();
+  state.wsProjects = state.workspaceId
+    ? await window.delphi.workspaces.projects(state.workspaceId)
+    : [];
   state.alerts = await loadAlerts();
 
   if (state.query) {
@@ -572,90 +585,114 @@ function renderSidebar() {
   box.textContent = "";
   if (foot) foot.textContent = "";
 
-  const project = currentProject();
+  const workspace = state.workspaces.find((w) => w.id === state.workspaceId) || null;
 
-  if (!project) {
-    const allOpen = state.projects.reduce((n, p) => n + p.open_count, 0);
+  // --- the picker ----------------------------------------------------------
+  if (!workspace) {
     box.append(el("div", { className: "pp-sec" },
-      el("span", { textContent: "Everything" }),
-      el("span", { className: "n", textContent: String(allOpen) })));
-    box.append(el("div", { className: "pp-empty",
-      textContent: state.projects.length
-        ? "Pick a project from the rail to see its sessions."
-        : "No projects yet. Use + on the rail to make one." }));
+      el("span", { textContent: "Workspaces" }),
+      el("span", { className: "n", textContent: String(state.workspaces.length) })));
+
+    if (!state.workspaces.length) {
+      box.append(el("div", { className: "pp-empty",
+        textContent: "None yet. Use + on the rail to add a folder." }));
+      return;
+    }
+
+    for (const w of state.workspaces) {
+      const row = el("div", { className: "ws-row", tabIndex: 0, role: "button", title: w.path });
+      row.append(el("span", { className: "ws-ico", textContent: w.icon || railLetter(w.name) }));
+      row.append(el("div", { className: "ws-txt" },
+        el("span", { className: "ws-nm", textContent: w.name }),
+        el("span", { className: "ws-p", textContent: w.path })));
+      if (w.project_count) {
+        row.append(el("span", { className: "count", textContent: String(w.project_count) }));
+      }
+      row.onclick = () => zoomInto(w.id);
+      row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); zoomInto(w.id); } };
+      row.oncontextmenu = (e) => { e.preventDefault(); workspaceMenu(w, e.clientX, e.clientY); };
+      box.append(row);
+    }
     return;
   }
 
+  // --- inside a workspace --------------------------------------------------
   const head = el("div", { className: "pp-head" });
   const name = el("div", { className: "nm" });
-  name.append(el("span", { className: "t", textContent: project.name, title: project.name }));
-  name.append(project.path
-    ? el("span", { className: "p", textContent: project.path, title: project.path })
-    : el("span", { className: "p none", textContent: "No folder linked" }));
+  name.append(el("span", { className: "t", textContent: workspace.name, title: workspace.name }));
+  name.append(el("span", { className: "p", textContent: workspace.path, title: workspace.path }));
   head.append(name);
   box.append(head);
 
   box.append(el("div", { className: "pp-sec" },
-    el("span", { textContent: "Sessions" }),
-    el("span", { className: "n", textContent: String(state.sessions.length) })));
+    el("span", { textContent: "Projects" }),
+    el("span", { className: "n", textContent: String(state.wsProjects.length) })));
 
-  const add = el("div", { className: "gnew", tabIndex: 0, role: "button" },
-    el("span", { textContent: "+" }), el("span", { textContent: "New session" }));
-  const start = async () => { await newSession(); navigate({ view: "chat" }); };
-  add.onclick = start;
-  add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); start(); } };
-  box.append(add);
+  const addProject = el("div", { className: "gnew", tabIndex: 0, role: "button" },
+    el("span", { textContent: "+" }), el("span", { textContent: "New project" }));
+  const make = () => createProject(workspace);
+  addProject.onclick = make;
+  addProject.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); make(); } };
+  box.append(addProject);
 
-  if (!state.sessions.length) {
+  if (!state.wsProjects.length) {
     box.append(el("div", { className: "pp-empty",
-      textContent: "None yet. Start one to talk to an agent about this project." }));
+      textContent: "No projects in this workspace yet." }));
   }
 
-  for (const sn of state.sessions) {
-    const row = el("div", {
-      className: "gs" + (sn.id === state.sessionId && state.view === "chat" ? " on" : ""),
-      tabIndex: 0,
-      role: "button",
-      title: sn.title || "New session",
-    });
-    row.append(
-      el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
-      el("span", { className: "nm", textContent: sn.title || "New session" })
-    );
-    if (sn.agent && AGENT_SHORT[sn.agent]) {
-      row.append(el("span", { className: "kbd", textContent: AGENT_SHORT[sn.agent] }));
-    }
-    const open = async () => {
-      // Opening a session is also opening the chat, or clicking one from another
-      // tab would change something nobody could see.
-      if (state.view !== "chat") { state.sessionId = sn.id; navigate({ view: "chat" }); return; }
-      await openSession(sn.id);
-    };
+  for (const p of state.wsProjects) {
+    const on = p.id === state.projectId;
+    const row = el("div", { className: "gs" + (on ? " on" : ""), tabIndex: 0, role: "button" });
+    row.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }));
+    row.append(el("span", { className: "nm", textContent: p.name }));
+    if (p.open_count) row.append(el("span", { className: "kbd", textContent: String(p.open_count) }));
+    const open = () => navigate({ projectId: p.id, view: "chat" });
     row.onclick = open;
     row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
-    row.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, e.clientX, e.clientY); };
+    row.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
     box.append(row);
+
+    // The open project's sessions sit under it, indented, so the column reads as
+    // one tree rather than as two lists that happen to be stacked.
+    if (!on) continue;
+    const kids = el("div", { className: "gkids" });
+    const addSession = el("div", { className: "gs sub", tabIndex: 0, role: "button" },
+      el("span", { className: "nm dim", textContent: "+ New session" }));
+    const start = async () => { await newSession(); navigate({ view: "chat" }); };
+    addSession.onclick = start;
+    addSession.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); start(); } };
+    kids.append(addSession);
+
+    for (const sn of state.sessions) {
+      const srow = el("div", {
+        className: "gs sub" + (sn.id === state.sessionId && state.view === "chat" ? " on" : ""),
+        tabIndex: 0, role: "button", title: sn.title || "New session",
+      });
+      srow.append(
+        el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
+        el("span", { className: "nm", textContent: sn.title || "New session" })
+      );
+      const openS = async () => {
+        if (state.view !== "chat") { state.sessionId = sn.id; navigate({ view: "chat" }); return; }
+        await openSession(sn.id);
+      };
+      srow.onclick = openS;
+      srow.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openS(); } };
+      srow.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, e.clientX, e.clientY); };
+      kids.append(srow);
+    }
+    box.append(kids);
   }
 
   if (foot) {
     const settings = el("button", {
       className: "btn wide" + (state.view === "project" ? " primary" : ""),
-      textContent: "Project settings",
+      textContent: state.projectId ? "Project settings" : "Workspace settings",
     });
     settings.onclick = () => navigate({ view: "project" });
+    settings.disabled = !state.projectId;
     foot.append(settings);
   }
-}
-
-/** Binds a project to a folder after the fact. */
-async function linkFolder(project) {
-  const folder = await window.delphi.dialog.pickFolder(
-    `Which folder is ${project.name}?`,
-    { defaultPath: lastProjectParent(), buttonLabel: "Link it" }
-  );
-  if (!folder) return;
-  await window.delphi.projects.update(project.id, { path: folder });
-  await refresh();
 }
 
 function sessionMenu(session, x, y) {
@@ -1227,66 +1264,69 @@ function renderProjectSettings(root) {
     "What this project is called everywhere it appears: the sidebar, the title, and any task that belongs to it.",
     el("div", { className: "row" }, nameInput), nameMsg));
 
-  // --- folder --------------------------------------------------------------
-  // A project is a place now, so where that place is has to be visible and
-  // fixable here. It is the one setting that can be wrong without being empty:
-  // a folder that was moved or is on a volume that is not mounted still reads
-  // as linked, so the state is checked rather than assumed.
-  const folderMsg = el("span", { className: "hint" });
-  const folderRow = el("div", { className: "row" });
+  // --- workspaces ----------------------------------------------------------
+  // A project is work, and work happens in folders: sometimes one, sometimes
+  // four. SSNR spans caseflow, caseflow-efolder, the MPI person update service
+  // and the veteran API, so this is a list rather than a field.
+  const wsRow = el("div", { className: "row wrap" });
 
-  const paintFolder = async () => {
-    folderRow.textContent = "";
+  const paintWorkspaces = async () => {
+    wsRow.textContent = "";
     const live = currentProject();
     if (!live) return;
+    const linked = await window.delphi.workspaces.forProject(live.id);
 
-    if (!live.path) {
-      folderRow.append(el("span", { className: "hint", textContent: "No folder linked." }));
-      const link = el("button", { className: "btn primary", textContent: "Choose a folder" });
-      link.onclick = async () => { await linkFolder(live); };
-      folderRow.append(link);
-      return;
+    if (!linked.length) {
+      wsRow.append(el("span", { className: "hint", textContent: "Not in any workspace yet." }));
     }
 
-    const shown = el("span", { className: "mono grow", textContent: live.path, title: live.path });
-    folderRow.append(shown);
+    for (const w of linked) {
+      const chip = el("span", { className: "chip ws-chip" + (w.is_primary ? " primary" : "") });
+      chip.append(el("span", { textContent: w.name, title: w.path }));
+      if (w.is_primary) chip.append(el("span", { className: "hint", textContent: "main" }));
 
-    const state_ = el("span", { className: "hint", textContent: "checking…" });
-    folderRow.append(state_);
-    window.delphi.fs.folderExists(live.path).then((there) => {
-      if (there) {
-        state_.className = "ok-msg";
-        state_.textContent = "found";
-      } else {
-        // Said plainly, because everything downstream will fail against it and
-        // the reason would otherwise surface as an unrelated error later.
-        state_.className = "err-msg";
-        state_.textContent = "missing";
-      }
-    }).catch(() => { state_.textContent = ""; });
+      // Left click promotes, so the folder a session defaults to can be changed
+      // without a menu. The x removes the link and never the folder.
+      chip.onclick = async () => {
+        await window.delphi.workspaces.link(live.id, w.id, { primary: true });
+        await paintWorkspaces();
+        await refresh();
+      };
+      chip.title = w.is_primary ? `${w.path}\nThe main folder for this project` : `${w.path}\nClick to make this the main folder`;
 
-    const reveal = el("button", { className: "btn sm", textContent: "Reveal" });
-    reveal.onclick = () => window.delphi.fs.reveal(live.path);
+      const drop = el("button", { className: "chip-x", textContent: "×", title: "Remove from this workspace" });
+      drop.onclick = async (e) => {
+        e.stopPropagation();
+        await window.delphi.workspaces.unlink(live.id, w.id);
+        await paintWorkspaces();
+        await refresh();
+      };
+      chip.append(drop);
+      wsRow.append(chip);
+    }
 
-    const change = el("button", { className: "btn sm", textContent: "Change" });
-    change.onclick = async () => { await linkFolder(live); };
-
-    const clear = el("button", { className: "btn sm danger", textContent: "Unlink" });
-    clear.onclick = async () => {
-      // Unlinking forgets the path. It never touches the folder, which is worth
-      // saying on the button's own tooltip rather than leaving to be discovered.
-      await window.delphi.projects.update(live.id, { path: null });
-      await refresh();
-    };
-    clear.title = "Forget the path. The folder itself is left alone.";
-
-    folderRow.append(reveal, change, clear);
+    const linkedIds = new Set(linked.map((w) => w.id));
+    const available = state.workspaces.filter((w) => !linkedIds.has(w.id));
+    if (available.length) {
+      const add = el("button", { className: "btn sm", textContent: "+ Add workspace" });
+      add.onclick = (e) => {
+        rowMenu(e.clientX, e.clientY, available.map((w) => ({
+          label: w.name,
+          run: async () => {
+            await window.delphi.workspaces.link(live.id, w.id, { primary: linked.length === 0 });
+            await paintWorkspaces();
+            await refresh();
+          },
+        })));
+      };
+      wsRow.append(add);
+    }
   };
-  paintFolder();
+  paintWorkspaces();
 
-  root.append(settingSection("Folder",
-    "The folder on disk this project is. Agents run in it and the chat is told where it is. Unlinking forgets the path; it never deletes anything.",
-    folderRow, folderMsg));
+  root.append(settingSection("Workspaces",
+    "The folders this project's work happens in. One project can span several, which is why this is a list: clicking a chip makes it the main folder, and the x removes the link without touching anything on disk.",
+    wsRow));
 
   // --- summary -------------------------------------------------------------
   const sumMsg = el("span", { className: "hint" });
@@ -6316,69 +6356,177 @@ const railLetter = (name) => {
   return (first || "?").toUpperCase();
 };
 
+/**
+ * The rail, which has two states.
+ *
+ * Zoomed out, it shows every workspace: the picker. Zoomed in, the chosen one
+ * has moved to the top under the mark and the rest are gone. That movement is
+ * the whole point of the interaction, so it is animated rather than swapped:
+ * the tile you clicked travels to where it is going, which is what tells you
+ * the others were put away rather than lost.
+ *
+ * Done with FLIP. The tiles are measured where they are, the rail is rebuilt in
+ * its new state, and each surviving tile is transformed back to where it was and
+ * released. That way the animation always matches the layout, however the layout
+ * was reached.
+ */
 function renderRail() {
   const rail = $("rail");
   if (!rail) return;
-  rail.textContent = "";
 
-  // The mark is the way back to everything. Everything downstream branches on a
-  // null id meaning "no project", so the rail has to offer that or the view
-  // becomes unreachable once the rail is how people move around.
-  const all = el("button", {
-    className: "rail-mark" + (state.projectId === null ? " on" : ""),
-    type: "button",
-    title: "All work",
-  });
-  all.append(el("img", { src: "assets/mark-64.png", width: 26, height: 26, alt: "Delphi" }));
-  const goAll = () => navigate({ projectId: null, view: "new", query: "" });
-  all.onclick = goAll;
-  all.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); goAll(); } };
-  rail.append(all, el("div", { className: "rail-div" }));
-
-  for (const p of state.projects) {
-    const tile = el("div", {
-      className: "rail-tile" + (state.projectId === p.id ? " on" : ""),
-      tabIndex: 0,
-      role: "button",
-      title: p.path ? `${p.name}\n${p.path}` : p.name,
-    });
-    // An icon if one was chosen, the first letter otherwise. The letter is the
-    // reason a project never renders as an empty square.
-    tile.textContent = p.icon || railLetter(p.name);
-    if (p.colour && !p.icon) tile.style.color = p.colour;
-
-    const go = () => navigate({ projectId: p.id, view: "overview", query: "" });
-    tile.onclick = go;
-    tile.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
-    tile.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
-    rail.append(tile);
-
-    // A project bound to a folder that is no longer there is marked rather than
-    // left to fail later. Async on purpose: the rail must not wait on the disk.
-    if (p.path) {
-      window.delphi.fs.folderExists(p.path)
-        .then((there) => { if (!there) tile.classList.add("lost"); })
-        .catch(() => {});
-    }
+  // Where every tile is now, before anything moves.
+  const before = new Map();
+  for (const node of rail.querySelectorAll("[data-ws]")) {
+    before.set(node.dataset.ws, node.getBoundingClientRect().top);
   }
 
-  // A drawn plus rather than the "+" character, which rendered as a stray glyph
-  // sitting in the column rather than as something you could press.
+  rail.textContent = "";
+
+  const home = el("button", {
+    className: "rail-mark" + (state.workspaceId === null && state.projectId === null ? " on" : ""),
+    type: "button",
+    title: "All workspaces",
+  });
+  home.append(el("img", { src: "assets/mark-64.png", width: 26, height: 26, alt: "Delphi" }));
+  home.onclick = () => zoomOut();
+  rail.append(home, el("div", { className: "rail-div" }));
+
+  const open = state.workspaces.find((w) => w.id === state.workspaceId) || null;
+  // Zoomed in shows only the one that is open, so the column reads as "you are
+  // here" rather than as a list with one item highlighted.
+  const shown = open ? [open] : state.workspaces;
+
+  for (const w of shown) {
+    const tile = el("div", {
+      className: "rail-tile" + (w.id === state.workspaceId ? " on" : ""),
+      tabIndex: 0,
+      role: "button",
+      title: open ? `${w.name}\n${w.path}\nClick to switch workspace` : `${w.name}\n${w.path}`,
+    });
+    tile.dataset.ws = String(w.id);
+    tile.textContent = w.icon || railLetter(w.name);
+    if (w.colour && !w.icon) tile.style.color = w.colour;
+
+    // Clicking the open one goes back to the picker, which is how you switch
+    // without a separate control taking up room in a 48px column.
+    const go = () => (w.id === state.workspaceId ? zoomOut() : zoomInto(w.id));
+    tile.onclick = go;
+    tile.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    tile.oncontextmenu = (e) => { e.preventDefault(); workspaceMenu(w, e.clientX, e.clientY); };
+    rail.append(tile);
+
+    window.delphi.fs.folderExists(w.path)
+      .then((there) => { if (!there) tile.classList.add("lost"); })
+      .catch(() => {});
+  }
+
   const add = el("div", {
     className: "rail-tile rail-add",
     tabIndex: 0,
     role: "button",
-    title: "New project",
+    title: "Add a workspace",
   });
   add.innerHTML =
-    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" ' +
-    'stroke-width="2" stroke-linecap="round" aria-hidden="true">' +
-    '<path d="M12 5v14M5 12h14"/></svg>';
-  add.onclick = createProject;
-  add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); createProject(); } };
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
+  add.onclick = addWorkspace;
+  add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); addWorkspace(); } };
   rail.append(el("div", { className: "rail-sp" }), el("div", { className: "rail-div" }), add);
+
+  // Second half of the FLIP: put each surviving tile back where it was, then let
+  // it travel. Skipped entirely when motion is off, in which case the layout
+  // simply changes, which is the correct behaviour rather than a lesser one.
+  if (motionOff()) return;
+  for (const node of rail.querySelectorAll("[data-ws]")) {
+    const was = before.get(node.dataset.ws);
+    if (was === undefined) continue;
+    const delta = was - node.getBoundingClientRect().top;
+    if (!delta) continue;
+    node.style.transform = `translateY(${delta}px)`;
+    node.style.transition = "none";
+    requestAnimationFrame(() => {
+      node.style.transition = "transform 260ms cubic-bezier(.2,.7,.3,1)";
+      node.style.transform = "";
+    });
+  }
 }
 
+/** Opens a workspace, and lands on the project you were last in if it fits. */
+async function zoomInto(workspaceId) {
+  state.workspaceId = workspaceId;
+  const inside = await window.delphi.workspaces.projects(workspaceId);
+  state.wsProjects = inside;
+  // Staying on a project that does not belong to this folder would show its
+  // sessions under a workspace they have nothing to do with.
+  if (!inside.some((p) => p.id === state.projectId)) {
+    state.projectId = inside.length === 1 ? inside[0].id : null;
+    state.sessionId = null;
+    state.messages = [];
+  }
+  state.view = state.projectId ? "chat" : "new";
+  await refresh();
+}
+
+/** Back to the picker. */
+async function zoomOut() {
+  state.workspaceId = null;
+  state.wsProjects = [];
+  state.projectId = null;
+  state.sessionId = null;
+  state.messages = [];
+  state.view = "new";
+  await refresh();
+}
+
+/** Adds a folder as a workspace. */
+async function addWorkspace() {
+  const folder = await window.delphi.dialog.pickFolder(
+    "Choose a folder, or make a new one",
+    { defaultPath: lastWorkspaceParent(), buttonLabel: "Use this folder" }
+  );
+  if (!folder) return;
+  const created = await window.delphi.workspaces.create({ path: folder });
+  await refresh();
+  await zoomInto(created.id);
+}
+
+/** Where the picker should open: beside the workspaces already known. */
+function lastWorkspaceParent() {
+  for (let i = state.workspaces.length - 1; i >= 0; i--) {
+    const cut = state.workspaces[i].path.lastIndexOf("/");
+    if (cut > 0) return state.workspaces[i].path.slice(0, cut);
+  }
+  return null;
+}
+
+function workspaceMenu(w, x, y) {
+  rowMenu(x, y, [
+    { label: "Reveal in Finder", run: async () => window.delphi.fs.reveal(w.path) },
+    {
+      label: "Rename",
+      run: async () => {
+        const name = await askText({
+          title: "Rename workspace", label: "What should this folder be called here?",
+          value: w.name, confirmLabel: "Rename",
+        });
+        if (!name) return;
+        await window.delphi.workspaces.update(w.id, { name });
+        await refresh();
+      },
+    },
+    "-",
+    {
+      label: "Remove from Delphi",
+      danger: true,
+      run: async () => {
+        // Says what it does not do, because "remove" next to a folder reads as
+        // deleting one.
+        await window.delphi.workspaces.remove(w.id);
+        if (state.workspaceId === w.id) await zoomOut(); else await refresh();
+      },
+    },
+  ]);
+}
 // ---------------------------------------------------------------------------
 // Chat
 //
@@ -6678,23 +6826,6 @@ window.delphi.onAiEvent(async (event) => {
   }
 });
 
-/**
- * The parent folder a new project should be offered first.
- *
- * Wherever the last project was put. Someone who keeps their work in one place
- * should not have to navigate there again for the second project, and someone
- * who does not gets the same picker they would have got anyway.
- */
-function lastProjectParent() {
-  for (let i = state.projects.length - 1; i >= 0; i--) {
-    const p = state.projects[i];
-    if (p.path) {
-      const cut = p.path.lastIndexOf("/");
-      if (cut > 0) return p.path.slice(0, cut);
-    }
-  }
-  return null;
-}
 
 /**
  * Makes a project, which now means making or choosing a folder.
@@ -6705,41 +6836,36 @@ function lastProjectParent() {
  * still to decide is where to put it.
  */
 /**
- * Makes a project, which means choosing a folder.
+ * Makes a project inside a workspace.
  *
- * A project is a place, so the folder is not an optional extra to be filled in
- * afterwards: it is the thing being created. The picker opens straight away
- * rather than asking for a name first, because a name without a folder is a
- * label for nothing.
- *
- * Naming still happens, but where it belongs. The picker is opened with
- * createDirectory, so the native New Folder button is right there: someone
- * starting something that does not exist yet makes the folder and names it in
- * the same step, and the project takes that name. That is the only place a name
- * is typed, and it is the only place one is needed.
+ * The folder question moved up a level: a workspace is a folder, and a project
+ * is a piece of work happening in one or more of them. So this asks for a name,
+ * which is the only thing a project is, and links it to the workspace it was
+ * started from. It can be linked to others afterwards, which is the whole point
+ * of the join: SSNR is one project across four repos, not four projects.
  */
-async function createProject() {
-  const folder = await window.delphi.dialog.pickFolder(
-    "Choose a folder for the project, or make a new one",
-    { defaultPath: lastProjectParent(), buttonLabel: "Use this folder" }
-  );
-  if (!folder) return null;
-
-  const path = folder.replace(/\/+$/, "");
-  const label = path.split("/").pop() || path;
-
-  // Two projects cannot share a folder. Opening the one that is already there is
-  // what the person meant anyway, and it beats a unique-key error naming a slug
-  // they never typed.
-  const already = state.projects.find((p) => p.path === path);
-  if (already) {
-    navigate({ projectId: already.id, view: "overview", query: "" });
-    return already;
+async function createProject(workspace) {
+  const ws = workspace || state.workspaces.find((w) => w.id === state.workspaceId);
+  // Reachable from the application menu, which does not know whether a workspace
+  // is open. Saying so beats a menu item that appears to do nothing.
+  if (!ws) {
+    await askText({
+      title: "Open a workspace first",
+      label: "A project lives in a workspace. Pick one from the rail, or add a folder with + first.",
+      value: "", allowEmpty: true, confirmLabel: "Close",
+    });
+    return null;
   }
 
-  const base = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  // The folder name is the project name, so two folders of the same name in
-  // different places would collide on the slug. Suffixed rather than refused.
+  const name = await askText({
+    title: `New project in ${ws.name}`,
+    label: "What is this piece of work called? It can span other workspaces later.",
+    placeholder: "SSNR / MPI Person Update",
+    confirmLabel: "Create",
+  });
+  if (!name) return null;
+
+  const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   let key = base || `p${Date.now()}`;
   if (state.projects.some((p) => p.key === key)) {
     let n = 2;
@@ -6750,12 +6876,12 @@ async function createProject() {
   try {
     const created = await window.delphi.projects.create({
       key,
-      name: label,
-      path,
+      name,
       colour: PROJECT_COLOURS[state.projects.length % PROJECT_COLOURS.length],
     });
+    await window.delphi.workspaces.link(created.id, ws.id, { primary: true });
     state.projectId = created.id;
-    state.view = "overview";
+    state.view = "chat";
     await refresh();
     return created;
   } catch (error) {
@@ -6763,7 +6889,6 @@ async function createProject() {
     return null;
   }
 }
-
 $("back").onclick = () => goBack();
 
 // The side buttons on a mouse, which people expect to mean back and forward.

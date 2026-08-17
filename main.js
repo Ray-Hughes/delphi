@@ -1009,6 +1009,15 @@ handle("ai:send", async ({ sessionId, provider, model, system, messages, cwd }) 
   return { ok: true };
 });
 
+handle("workspaces:list", () => db.listWorkspaces());
+handle("workspaces:create", (payload) => db.createWorkspace(payload));
+handle("workspaces:update", (id, fields) => db.updateWorkspace(id, fields));
+handle("workspaces:delete", (id) => db.deleteWorkspace(id));
+handle("workspaces:projects", (id) => db.projectsInWorkspace(id));
+handle("workspaces:forProject", (projectId) => db.workspacesForProject(projectId));
+handle("workspaces:link", (projectId, workspaceId, opts) => db.linkProjectWorkspace(projectId, workspaceId, opts));
+handle("workspaces:unlink", (projectId, workspaceId) => db.unlinkProjectWorkspace(projectId, workspaceId));
+
 handle("sessions:list", (projectId) => db.listSessions(projectId));
 handle("sessions:get", (id) => db.getSession(id));
 handle("sessions:create", (payload) => db.createSession(payload));

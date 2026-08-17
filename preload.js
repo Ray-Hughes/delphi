@@ -58,6 +58,16 @@ contextBridge.exposeInMainWorld("delphi", {
     setKey: (key) => call("ai:setKey", key),
     send: (payload) => call("ai:send", payload),
   },
+  workspaces: {
+    list: () => call("workspaces:list"),
+    create: (payload) => call("workspaces:create", payload),
+    update: (id, fields) => call("workspaces:update", id, fields),
+    remove: (id) => call("workspaces:delete", id),
+    projects: (id) => call("workspaces:projects", id),
+    forProject: (projectId) => call("workspaces:forProject", projectId),
+    link: (projectId, workspaceId, opts) => call("workspaces:link", projectId, workspaceId, opts),
+    unlink: (projectId, workspaceId) => call("workspaces:unlink", projectId, workspaceId),
+  },
   sessions: {
     list: (projectId) => call("sessions:list", projectId),
     get: (id) => call("sessions:get", id),
