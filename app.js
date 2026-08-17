@@ -670,13 +670,25 @@ function renderSidebar() {
       });
       srow.append(
         el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
-        el("span", { className: "nm", textContent: sn.title || "New session" })
+        el("span", { className: "nm", textContent: sn.title || "Session" })
       );
+
       const openS = async () => {
         if (state.view !== "chat") { state.sessionId = sn.id; navigate({ view: "chat" }); return; }
         await openSession(sn.id);
       };
+
+      // Both actions were on the right click menu only, which is a place nobody
+      // looks. They are on the row now; the menu keeps them too.
+      const rename = el("button", { className: "srow-btn", title: "Rename", textContent: "✎" });
+      rename.onclick = (e) => { e.stopPropagation(); renameSession(sn); };
+
+      const close = el("button", { className: "srow-btn close", title: "Close this session", textContent: "×" });
+      close.onclick = (e) => { e.stopPropagation(); closeSession(sn); };
+
+      srow.append(el("span", { className: "srow-acts" }, rename, close));
       srow.onclick = openS;
+      srow.ondblclick = (e) => { e.preventDefault(); renameSession(sn); };
       srow.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openS(); } };
       srow.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, e.clientX, e.clientY); };
       kids.append(srow);
@@ -695,29 +707,49 @@ function renderSidebar() {
   }
 }
 
+
+/** Renames a session. Shared by the row, the menu and the double click. */
+async function renameSession(session) {
+  const title = await askText({
+    title: "Rename session",
+    label: "What should this be called?",
+    value: session.title || "",
+    confirmLabel: "Rename",
+  });
+  if (!title) return;
+  await window.delphi.sessions.update(session.id, { title });
+  await refresh();
+}
+
+/**
+ * Closes a session, which deletes it and its messages.
+ *
+ * Asked for first when there is anything to lose. A session nobody spoke in is
+ * the one you made by mistake, and making someone confirm the removal of an
+ * empty box is the sort of prompt people learn to click through.
+ */
+async function closeSession(session) {
+  const spoken = (session.message_count || 0) > 0;
+  if (spoken) {
+    const ok = confirm(
+      `Close "${session.title || "this session"}"?\n\n` +
+      `Its ${session.message_count} message${session.message_count === 1 ? "" : "s"} go with it. ` +
+      "Nothing on disk is touched."
+    );
+    if (!ok) return;
+  }
+  await window.delphi.sessions.remove(session.id);
+  if (state.sessionId === session.id) {
+    state.sessionId = null;
+    state.messages = [];
+  }
+  await refresh();
+}
+
 function sessionMenu(session, x, y) {
   rowMenu(x, y, [
-    {
-      label: "Rename",
-      run: async () => {
-        const title = await askText({
-          title: "Rename session", label: "What should this be called?",
-          value: session.title || "", confirmLabel: "Rename",
-        });
-        if (!title) return;
-        await window.delphi.sessions.update(session.id, { title });
-        await refresh();
-      },
-    },
-    {
-      label: "Delete",
-      danger: true,
-      run: async () => {
-        await window.delphi.sessions.remove(session.id);
-        if (state.sessionId === session.id) { state.sessionId = null; state.messages = []; }
-        await refresh();
-      },
-    },
+    { label: "Rename", run: async () => renameSession(session) },
+    { label: "Close", danger: true, run: async () => closeSession(session) },
   ]);
 }
 

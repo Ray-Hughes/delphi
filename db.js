@@ -1643,14 +1643,33 @@ function listSessions(projectId) {
 
 const getSession = (id) => one("SELECT * FROM sessions WHERE id = :id", { id });
 
+/**
+ * The next unused "Session N" in a project.
+ *
+ * Numbered rather than all called the same thing, because a column of four rows
+ * reading "New session" tells you nothing about which is which. Taken from the
+ * highest number already used rather than from the count, so deleting Session 2
+ * does not make the next one collide with Session 3.
+ *
+ * A first message renames the session to what was asked, so this is what a
+ * session is called only until it has been used.
+ */
+function nextSessionName(projectId) {
+  const rows = all("SELECT title FROM sessions WHERE project_id = :projectId", { projectId });
+  let highest = 0;
+  for (const r of rows) {
+    const m = /^Session (\d+)$/.exec(String(r.title || "").trim());
+    if (m) highest = Math.max(highest, Number(m[1]));
+  }
+  return `Session ${highest + 1}`;
+}
+
 function createSession({ projectId, title = null, agent = null, provider = null, model = null, workspaceId = null }) {
   if (!projectId) throw new Error("A session needs a project");
   const r = run(
     `INSERT INTO sessions (project_id, workspace_id, title, agent, provider, model)
      VALUES (:projectId, :workspaceId, :title, :agent, :provider, :model)`,
-    // Named for what it is until the first message can name it better. A blank
-    // title in the list is worse than a placeholder nobody minds replacing.
-    { projectId, workspaceId, title: title || "New session", agent, provider, model }
+    { projectId, workspaceId, title: title || nextSessionName(projectId), agent, provider, model }
   );
   // Not audited. The audit table's entity CHECK admits task, note, project and
   // link only, and a CHECK cannot be added to a database that already exists, so

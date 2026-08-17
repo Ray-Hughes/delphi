@@ -2384,6 +2384,24 @@
   .setting-sub { margin-top: var(--s4); }
   .setting-sub h4 { margin: 0 0 3px; font-size: 13px; font-weight: 600; }
   .setting-sub p { margin: 0 0 var(--s3); }
+
+  /* Session row actions. Hidden until the row is wanted, so a column of
+     sessions is names rather than names plus buttons. */
+  .gs .srow-acts {
+    display: flex; align-items: center; gap: 1px; margin-left: auto;
+    opacity: 0; transition: opacity 90ms ease;
+  }
+  .gs:hover .srow-acts, .gs:focus-within .srow-acts { opacity: 1; }
+  @media (prefers-reduced-motion: reduce) { .gs .srow-acts { transition: none; } }
+  .srow-btn {
+    border: 0; background: transparent; color: var(--ink-faint);
+    width: 18px; height: 18px; padding: 0; border-radius: 4px;
+    display: grid; place-items: center; font-size: 12px; line-height: 1; cursor: default;
+  }
+  .srow-btn:hover { background: var(--raised); color: var(--ink); }
+  .srow-btn.close:hover { color: var(--crit); }
+  /* The name gives up its space to the buttons rather than pushing them out. */
+  .gs .nm { min-width: 0; }
 </style>
 </head>
 <body>
