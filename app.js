@@ -565,10 +565,7 @@ function goBack() {
   return true;
 }
 
-/** Short label for a persona, shown on the right of a session row. */
-const AGENT_SHORT = {
-  boss: "boss", designer: "design", content: "content", data: "data", assistant: "asst",
-};
+
 
 /**
  * The sidebar, which is now the open project's own panel.
@@ -7024,13 +7021,74 @@ function workspaceMenu(w, x, y) {
 // a stream where only the person's turns are bubbles, a composer with no send
 // button, a row of model and permission chips, and a token meter.
 
+// The personas, and what each one actually changes.
+//
+// A persona is a system prompt and nothing more. It is worth being plain about
+// that: it does not give an agent different abilities, it tells the same agent
+// what kind of help is wanted, which is the difference between a reply that
+// starts writing code and one that starts asking what the goal is.
 const AGENTS = [
-  ["boss", "Boss Agent"],
-  ["designer", "Designer"],
-  ["content", "Content creator"],
-  ["data", "Data analyst"],
-  ["assistant", "Personal assistant"],
+  {
+    id: "boss",
+    label: "Boss Agent",
+    blurb: "Plans the work and hands it out",
+    prompt:
+      "You coordinate work rather than doing all of it yourself. Start by making sure you " +
+      "understand what is actually being asked, and say what you would do before doing it. " +
+      "Break a large request into pieces, name which piece you are on, and say plainly when " +
+      "a piece is blocked or belongs to someone else. Prefer asking one sharp question over " +
+      "guessing at an ambiguous requirement.",
+  },
+  {
+    id: "builder",
+    label: "Builder",
+    blurb: "Writes and changes code",
+    prompt:
+      "You write and change code in this project. Match the surrounding style rather than " +
+      "importing your own. Explain why a change is the right one, not what the lines do. " +
+      "When something is risky or irreversible, say so before doing it. If you cannot verify " +
+      "a change, say that rather than implying it works.",
+  },
+  {
+    id: "designer",
+    label: "Designer",
+    blurb: "Interface, layout and visual detail",
+    prompt:
+      "You work on how things look and how they are used. Reason about hierarchy, spacing, " +
+      "contrast and state before reaching for colour. Respect the design tokens already in " +
+      "the project instead of introducing new values. Consider the empty, loading, error and " +
+      "too-much-content cases, which is where interfaces usually fail.",
+  },
+  {
+    id: "content",
+    label: "Content creator",
+    blurb: "Writing, docs and copy",
+    prompt:
+      "You write prose: documentation, copy, release notes, explanations. Write plainly, in " +
+      "the voice already used in this project. Lead with what the reader needs. Do not pad, " +
+      "and do not use em dashes or en dashes; plain hyphens only.",
+  },
+  {
+    id: "data",
+    label: "Data analyst",
+    blurb: "Queries, numbers and what they mean",
+    prompt:
+      "You work with data. State the question before the answer, show the query or the method " +
+      "you used, and give the numbers with enough context to judge them. Be explicit about " +
+      "what a figure does not tell us and where it could be misleading.",
+  },
+  {
+    id: "assistant",
+    label: "Personal assistant",
+    blurb: "Errands, summaries and tracking",
+    prompt:
+      "You handle the small things: summarising, drafting, chasing, keeping track. Be brief. " +
+      "Give the answer first and the detail underneath, and offer to do the next obvious step " +
+      "rather than describing how it could be done.",
+  },
 ];
+
+const agentById = (id) => AGENTS.find((a) => a.id === id) || AGENTS[0];
 
 const STARTERS = [
   ["Design System", "Colors, type, spacing, defined once"],
@@ -7071,6 +7129,8 @@ async function newSession() {
   if (!project) return;
   const created = await window.delphi.sessions.create({
     projectId: project.id,
+    // The Boss is the safe default: it plans and asks before it acts, which is
+    // the right first behaviour when nobody has chosen anything yet.
     agent: "boss",
     provider: null,
     // The folder it runs in, which is the workspace it was started from. A
@@ -7218,6 +7278,22 @@ function renderChat(root) {
   };
   model.append(tools);
 
+  const persona = agentById(session && session.agent);
+  const personaPill = el("div", {
+    className: "gpill bd", tabIndex: 0, role: "button", title: persona.blurb,
+  }, el("span", { textContent: persona.label }), el("span", { className: "cv", textContent: "▾" }));
+  personaPill.onclick = (e) => {
+    rowMenu(e.clientX, e.clientY, AGENTS.map((a) => ({
+      label: `${a.label}  ${a.blurb}`,
+      run: async () => {
+        if (!session) return;
+        await window.delphi.sessions.update(session.id, { agent: a.id });
+        await refresh();
+      },
+    })));
+  };
+  model.append(personaPill);
+
   const chosenModel = (session && session.model) || "Auto";
   const modelPill = el("div", {
     className: "gpill", tabIndex: 0, role: "button", title: "Which model answers",
@@ -7346,9 +7422,12 @@ async function sendMessage() {
       sessionId,
       provider: open && open.provider ? open.provider : "claude-cli",
       model: open && open.model ? open.model : null,
-      system: folder
-        ? `You are helping with the project "${project.name}", working in ${folder}.`
-        : `You are helping with the project "${project.name}". It has no folder linked, so do not assume a working directory.`,
+      system: [
+        agentById(open && open.agent).prompt,
+        folder
+          ? `You are helping with the project "${project.name}", working in ${folder}.`
+          : `You are helping with the project "${project.name}". It has no folder linked, so do not assume a working directory.`,
+      ].join("\n\n"),
       messages: state.messages
         .filter((m) => m.id !== reply.id && !m.error)
         .map((m) => ({ role: m.role, content: m.content })),
