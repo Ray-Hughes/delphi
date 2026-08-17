@@ -1792,7 +1792,7 @@
   .tl-dot.st-done { background: var(--good); }
   .tl-status { display: flex; gap: 7px; align-items: baseline; font-size: 13px; font-weight: 600; }
   .tl-when { display: flex; gap: 6px; align-items: center; font-size: 11px; }
-  .pad { padding: var(--s2) 0; }
+  .pad { padding: var(--s2) var(--s4); }
   .t-title[role="button"] { cursor: default; }
   .t-title[role="button"]:hover { color: var(--accent); }
 
@@ -2303,6 +2303,58 @@
     padding: 0 0 0 2px; font-size: 13px; line-height: 1; cursor: default;
   }
   .chip-x:hover { opacity: 1; color: var(--crit); }
+
+  /* Icon picker, in the workspace settings. */
+  .icon-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
+    gap: var(--s2); max-width: 420px;
+  }
+  .icon-opt {
+    aspect-ratio: 1; display: grid; place-items: center;
+    border: 1px solid var(--line); border-radius: var(--r-sm);
+    background: var(--surface); color: var(--ink-dim);
+    font-size: 17px; font-family: var(--display); cursor: default;
+    transition: border-color 100ms ease, background 100ms ease, transform 100ms ease;
+  }
+  .icon-opt:hover { border-color: var(--ink-faint); color: var(--ink); }
+  .icon-opt.on {
+    border-color: var(--accent); color: var(--accent);
+    background: var(--accent-soft); font-weight: 600;
+  }
+  .icon-opt:active { transform: scale(.94); }
+  @media (prefers-reduced-motion: reduce) { .icon-opt:active { transform: none; } }
+  :root[data-motion="off"] .icon-opt:active { transform: none; }
+
+  /* A rail tile is one letter or one glyph, which is not enough to tell two
+     workspaces apart at a glance. The name appears beside it on hover, rather
+     than through the native tooltip, which takes a second to arrive and is far
+     too slow for something you are scanning. */
+  .project-rail { overflow: visible; }
+  .rail-tile[data-name] { position: relative; }
+  .rail-tile[data-name]::after {
+    content: attr(data-name);
+    position: absolute; left: calc(100% + 8px); top: 50%;
+    transform: translateY(-50%) translateX(-4px);
+    padding: 5px 9px; border-radius: var(--r-sm);
+    background: var(--c-bg); color: var(--c-ink);
+    border: 1px solid var(--c-edge2);
+    box-shadow: 0 8px 24px rgba(0,0,0,.28);
+    font-family: var(--font); font-size: 11.5px; font-weight: 500;
+    white-space: nowrap; pointer-events: none; z-index: 40;
+    opacity: 0; transition: opacity 90ms ease, transform 90ms ease;
+  }
+  .rail-tile[data-name]:hover::after,
+  .rail-tile[data-name]:focus-visible::after {
+    opacity: 1; transform: translateY(-50%) translateX(0);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rail-tile[data-name]::after { transition: none; }
+  }
+
+  /* Being dragged into a new position. */
+  .rail-tile.dragging { opacity: .35; }
+  .rail-tile.drop-before { box-shadow: 0 -2px 0 0 var(--accent); }
+  .rail-tile.drop-after  { box-shadow: 0 2px 0 0 var(--accent); }
 </style>
 </head>
 <body>

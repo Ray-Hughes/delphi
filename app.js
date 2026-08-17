@@ -686,11 +686,11 @@ function renderSidebar() {
 
   if (foot) {
     const settings = el("button", {
-      className: "btn wide" + (state.view === "project" ? " primary" : ""),
+      className: "btn wide" + (["project", "workspace"].includes(state.view) ? " primary" : ""),
       textContent: state.projectId ? "Project settings" : "Workspace settings",
+      title: state.projectId ? "Settings for this project" : "Settings for this workspace",
     });
-    settings.onclick = () => navigate({ view: "project" });
-    settings.disabled = !state.projectId;
+    settings.onclick = () => navigate({ view: state.projectId ? "project" : "workspace" });
     foot.append(settings);
   }
 }
@@ -777,6 +777,9 @@ function renderTabs() {
        ["queue", "Queue"],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
        ["activity", "Activity"]]
+    : state.workspaceId
+    ? [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
+       ["queue", "Queue"], ["activity", "Activity"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
        ["graph", "Mind map"],
@@ -815,7 +818,9 @@ function render() {
   const valid = state.query
     ? ["oracle", "tasks"]
     : state.projectId
-    ? ["overview", "chat", "tasks", "queue", "notes", "links", "activity", "project"]
+    ? ["overview", "chat", "tasks", "queue", "notes", "links", "activity", "project", "workspace"]
+    : state.workspaceId
+    ? ["new", "tasks", "queue", "activity", "workspace"]
     : ["new", "tasks", "queue", "graph", "reminders", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
@@ -863,6 +868,7 @@ function render() {
     history: renderHistory,
     activity: renderActivity,
     project: renderProjectSettings,
+    workspace: renderWorkspaceSettings,
     settings: renderSettings,
   })[state.view];
 
@@ -1217,6 +1223,136 @@ function settingSection(heading, explanation, ...controls) {
   box.append(el("p", { textContent: explanation }));
   controls.filter(Boolean).forEach((c) => box.append(c));
   return box;
+}
+
+
+// A small set rather than a full emoji picker. These are the shapes a folder of
+// work actually is, and a short list you can scan beats a search box you have to
+// think of a word for.
+const WORKSPACE_ICONS = [
+  "◆", "●", "▲", "■", "★", "✦", "⬢", "◈",
+  "🗂", "📦", "🧭", "🛠", "⚙️", "🧪", "📊", "🔌",
+  "🚀", "🩺", "🏛", "📄", "🔐", "🌐", "🧩", "💾",
+];
+
+/**
+ * The workspace's own settings.
+ *
+ * Reached from the sidebar rather than from the row of tabs. Those tabs are
+ * views of the work; this is the folder's configuration, and it is the only
+ * place the letter on the rail tile can be replaced with something chosen.
+ */
+function renderWorkspaceSettings(root) {
+  const workspace = state.workspaces.find((w) => w.id === state.workspaceId);
+  if (!workspace) {
+    root.append(emptyState("No workspace open", "Pick one from the rail first."));
+    return;
+  }
+
+  const live = () => state.workspaces.find((w) => w.id === state.workspaceId) || workspace;
+
+  // --- name ----------------------------------------------------------------
+  const nameInput = el("input", { className: "field", value: workspace.name });
+  nameInput.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); nameInput.blur(); } };
+  nameInput.onblur = async () => {
+    const value = nameInput.value.trim();
+    const now = live();
+    if (!value) { nameInput.value = now.name; return; }
+    if (value === now.name) return;
+    await window.delphi.workspaces.update(now.id, { name: value });
+    await refresh();
+  };
+  root.append(settingSection("Name",
+    "What this folder is called here. The folder on disk keeps its own name; this is only what Delphi shows.",
+    el("div", { className: "row" }, nameInput)));
+
+  // --- icon ----------------------------------------------------------------
+  const grid = el("div", { className: "icon-grid" });
+  const paintIcons = () => {
+    grid.textContent = "";
+    const now = live();
+
+    // The letter is a choice too, not the absence of one, so it sits in the grid
+    // as the first option rather than being what you get by clearing something.
+    const letter = el("button", {
+      className: "icon-opt" + (now.icon ? "" : " on"),
+      type: "button",
+      title: "Use the first letter",
+      textContent: railLetter(now.name),
+    });
+    letter.onclick = async () => {
+      await window.delphi.workspaces.update(now.id, { icon: null });
+      await refresh();
+    };
+    grid.append(letter);
+
+    for (const icon of WORKSPACE_ICONS) {
+      const opt = el("button", {
+        className: "icon-opt" + (now.icon === icon ? " on" : ""),
+        type: "button",
+        textContent: icon,
+        title: icon,
+      });
+      opt.onclick = async () => {
+        await window.delphi.workspaces.update(now.id, { icon });
+        await refresh();
+      };
+      grid.append(opt);
+    }
+  };
+  paintIcons();
+  root.append(settingSection("Icon",
+    "What shows on the rail. Pick one, or keep the first letter of the name.",
+    grid));
+
+  // --- folder --------------------------------------------------------------
+  const folderRow = el("div", { className: "row" });
+  const now = live();
+  folderRow.append(el("span", { className: "mono grow", textContent: now.path, title: now.path }));
+  const there = el("span", { className: "hint", textContent: "checking…" });
+  folderRow.append(there);
+  window.delphi.fs.folderExists(now.path).then((ok) => {
+    there.className = ok ? "ok-msg" : "err-msg";
+    there.textContent = ok ? "found" : "missing";
+  }).catch(() => { there.textContent = ""; });
+  const reveal = el("button", { className: "btn sm", textContent: "Reveal" });
+  reveal.onclick = () => window.delphi.fs.reveal(now.path);
+  folderRow.append(reveal);
+  root.append(settingSection("Folder",
+    "Where this workspace is on disk. It is fixed: a workspace is its folder, so pointing it somewhere else would make it a different workspace.",
+    folderRow));
+
+  // --- projects ------------------------------------------------------------
+  const list = el("div", { className: "row wrap" });
+  if (!state.wsProjects.length) {
+    list.append(el("span", { className: "hint", textContent: "No projects here yet." }));
+  }
+  for (const p of state.wsProjects) {
+    const chip = el("span", { className: "chip", textContent: p.name, title: "Open this project" });
+    chip.onclick = () => navigate({ projectId: p.id, view: "chat" });
+    list.append(chip);
+  }
+  root.append(settingSection("Projects",
+    "The work happening in this folder. A project can also belong to other workspaces, which is set from the project's own settings.",
+    list));
+
+  // --- remove --------------------------------------------------------------
+  const danger = el("button", { className: "btn danger", textContent: "Remove this workspace" });
+  danger.onclick = async () => {
+    // Worth spelling out. "Remove" beside a folder reads as deleting one, and
+    // this deletes nothing on disk and keeps every project that used it.
+    const ok = confirm(
+      `Remove ${live().name} from Delphi?\n\n` +
+      "The folder on disk is not touched, and projects that also live in other " +
+      "workspaces keep working. Only the link from Delphi to this folder goes."
+    );
+    if (!ok) return;
+    await window.delphi.workspaces.remove(live().id);
+    await zoomOut();
+  };
+  root.append(settingSection("Remove",
+    "Forgets this folder. Nothing on disk is deleted and no project is deleted; only the workspace and its links go.",
+    el("div", { className: "row" }, danger)));
 }
 
 function renderProjectSettings(root) {
@@ -6370,6 +6506,10 @@ const railLetter = (name) => {
  * released. That way the animation always matches the layout, however the layout
  * was reached.
  */
+// Which workspace is being dragged, if any. Module scope rather than state,
+// because it lives and dies inside one gesture and nothing renders from it.
+let dragging = null;
+
 function renderRail() {
   const rail = $("rail");
   if (!rail) return;
@@ -6404,7 +6544,45 @@ function renderRail() {
       title: open ? `${w.name}\n${w.path}\nClick to switch workspace` : `${w.name}\n${w.path}`,
     });
     tile.dataset.ws = String(w.id);
+    tile.dataset.name = w.name;
     tile.textContent = w.icon || railLetter(w.name);
+
+    // Draggable only in the picker. Zoomed in there is one tile, and dragging it
+    // could only ever put it back where it was.
+    if (!open) {
+      tile.draggable = true;
+      tile.ondragstart = (e) => {
+        dragging = w.id;
+        tile.classList.add("dragging");
+        e.dataTransfer.effectAllowed = "move";
+        // Firefox refuses to start a drag without data set on the transfer.
+        e.dataTransfer.setData("text/plain", String(w.id));
+      };
+      tile.ondragend = () => {
+        dragging = null;
+        for (const n of rail.querySelectorAll("[data-ws]")) {
+          n.classList.remove("dragging", "drop-before", "drop-after");
+        }
+      };
+      tile.ondragover = (e) => {
+        if (dragging === null || dragging === w.id) return;
+        e.preventDefault();
+        // Which half the pointer is in decides which side of this tile the
+        // dragged one lands, so a drop near the top goes above and not below.
+        const box = tile.getBoundingClientRect();
+        const above = e.clientY < box.top + box.height / 2;
+        tile.classList.toggle("drop-before", above);
+        tile.classList.toggle("drop-after", !above);
+      };
+      tile.ondragleave = () => tile.classList.remove("drop-before", "drop-after");
+      tile.ondrop = async (e) => {
+        e.preventDefault();
+        const above = tile.classList.contains("drop-before");
+        tile.classList.remove("drop-before", "drop-after");
+        if (dragging === null || dragging === w.id) return;
+        await reorderWorkspaces(dragging, w.id, above);
+      };
+    }
     if (w.colour && !w.icon) tile.style.color = w.colour;
 
     // Clicking the open one goes back to the picker, which is how you switch
@@ -6449,6 +6627,25 @@ function renderRail() {
       node.style.transform = "";
     });
   }
+}
+
+
+/**
+ * Moves one workspace to sit either side of another.
+ *
+ * The whole column is renumbered rather than the moved row alone. Nudging one
+ * value works until two rows end up sharing an order, and then the sequence
+ * depends on whatever the database returns second, which is not stable.
+ */
+async function reorderWorkspaces(movedId, targetId, before) {
+  const order = state.workspaces.map((w) => w.id).filter((id) => id !== movedId);
+  const at = order.indexOf(targetId);
+  if (at === -1) return;
+  order.splice(before ? at : at + 1, 0, movedId);
+
+  await Promise.all(order.map((id, i) =>
+    window.delphi.workspaces.update(id, { sort_order: (i + 1) * 10 })));
+  await refresh();
 }
 
 /** Opens a workspace, and lands on the project you were last in if it fits. */
