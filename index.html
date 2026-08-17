@@ -2454,26 +2454,64 @@
   }
   .pane-kbd { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--c-faint); }
 
-  /* Terminal */
+  /* Terminal ------------------------------------------------------------
+     Dark in both themes, on purpose. A terminal is dark everywhere else on the
+     machine, and one that turns white with the rest of the interface stops
+     reading as a terminal at all, which is exactly what happened when these
+     used the theme tokens. So the colours here are fixed rather than tokens. */
+  .term {
+    --t-bg:     #0b0c0e;
+    --t-ink:    #e7e8ea;
+    --t-dim:    #8b8e95;
+    --t-where:  #6fa1ff;
+    --t-sigil:  #ff5800;
+    --t-err:    #e2685f;
+    --t-meta:   #96e3a6;
+
+    flex: 1; min-height: 0; display: flex; flex-direction: column;
+    margin: 10px 12px 12px; border-radius: var(--r);
+    background: var(--t-bg);
+    border: 1px solid #1c1e22;
+    overflow: hidden;
+    /* The scrollback is the whole surface, so clicking anywhere in the dark
+       lands in the prompt rather than doing nothing. */
+    cursor: text;
+  }
   .term-out {
-    flex: 1; min-height: 0; overflow: auto;
-    padding: 10px 14px; font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
-    background: var(--c-bg); color: var(--c-mut);
+    flex: 1; min-height: 0; overflow-y: auto;
+    padding: 12px 14px 14px;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+    color: var(--t-ink);
   }
-  .term-empty { padding: var(--s5) 0; color: var(--c-faint); display: flex; flex-direction: column; gap: 6px; }
-  .term-cmd { display: flex; gap: 7px; color: var(--c-ink); margin: 8px 0 2px; }
-  .term-cmd:first-child { margin-top: 0; }
-  .term-prompt { color: var(--c-acc); flex: 0 0 auto; }
-  .term-line {
-    margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
-    font: inherit; color: var(--c-mut);
+  .term-out::-webkit-scrollbar-thumb { background: #2a2d33; background-clip: content-box; }
+  .term-empty { color: var(--t-dim); display: flex; flex-direction: column; gap: 4px; padding-bottom: 10px; }
+
+  .term-cmd, .term-prompt-row { display: flex; align-items: flex-start; gap: 7px; margin-top: 9px; }
+  .term-cmd:first-child, .term-prompt-row:first-child { margin-top: 0; }
+  .term-where { color: var(--t-where); flex: 0 0 auto; }
+  .term-sigil { color: var(--t-sigil); flex: 0 0 auto; }
+  .term-typed { color: var(--t-ink); overflow-wrap: anywhere; }
+
+  .term-line { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: var(--t-dim); }
+  .term-line.err { color: var(--t-err); }
+  /* Exit codes and dropped-output notices: the app talking, not the command. */
+  .term-line.meta { color: var(--t-meta); font-size: 10.5px; opacity: .85; }
+
+  /* The prompt is the last line of the scrollback rather than a control below
+     it, so the caret sits exactly where the next output will appear. */
+  .term-input {
+    flex: 1; border: 0; background: transparent; outline: none; resize: none;
+    color: var(--t-ink); font: inherit; padding: 0; margin: 0;
+    caret-color: var(--t-sigil); overflow: hidden;
   }
-  .term-line.err { color: var(--crit); }
-  /* Exit codes and dropped-output notices, which are the app talking rather
-     than the command. */
-  .term-line.meta { color: var(--c-faint); font-size: 10.5px; padding-top: 2px; }
-  .term-comp textarea { font-family: var(--mono); font-size: 11.5px; }
-  .term-comp textarea:disabled { opacity: .5; }
+  .term-input:disabled { opacity: .45; }
+  .term-stop {
+    border: 1px solid #33363c; background: transparent; color: var(--t-dim);
+    font-family: var(--mono); font-size: 10px; padding: 1px 7px; border-radius: 4px;
+    cursor: default; flex: 0 0 auto;
+  }
+  .term-stop:hover { color: var(--t-err); border-color: var(--t-err); }
+
   .pane-tab .sd.live { width: 7px; height: 7px; }
 
   /* Repository state, under the sessions. */

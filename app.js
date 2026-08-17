@@ -7311,60 +7311,106 @@ window.delphi.onTermEvent((event) => {
   }
 });
 
+/** ~/va/caseflow rather than the whole path, which is what a shell shows. */
+function shortPath(folder) {
+  if (!folder) return "";
+  const home = "/Users/";
+  if (!folder.startsWith(home)) return folder;
+  const rest = folder.slice(home.length).split("/").slice(1).join("/");
+  return rest ? `~/${rest}` : "~";
+}
+
 function renderTerminal(wrap) {
   const folder = sessionFolder(currentSession());
+  const where = shortPath(folder);
 
+  // One dark surface holding the scrollback and the prompt, rather than an
+  // output box with a form field under it. A terminal is a single screen you
+  // type into, and the separation was the thing making it read as chat.
+  const screen = el("div", { className: "term" });
   const out = el("div", { className: "term-out" });
+
   if (!state.termLines.length) {
     out.append(el("div", { className: "term-empty" },
-      el("div", { textContent: folder ? `Commands run in ${folder}` : "No folder linked, so nothing can run here." }),
-      el("div", { className: "hint", textContent: "Real commands, real output. Anything that draws its own screen, like vim or top, will not work." })));
+      el("div", { textContent: folder
+        ? "Real commands, real output."
+        : "No folder linked to this workspace, so there is nothing to run in." }),
+      el("div", { textContent: "Anything that draws its own screen, like vim or top, will not work here." })));
   }
+
   for (const line of state.termLines) {
     if (line.kind === "cmd") {
       out.append(el("div", { className: "term-cmd" },
-        el("span", { className: "term-prompt", textContent: "$" }),
-        el("span", { textContent: line.text })));
+        el("span", { className: "term-where", textContent: where }),
+        el("span", { className: "term-sigil", textContent: "%" }),
+        el("span", { className: "term-typed", textContent: line.text })));
     } else {
       out.append(el("pre", { className: `term-line ${line.kind}`, textContent: line.text }));
     }
   }
-  wrap.append(out);
 
-  const bar = el("div", { className: "gcomp term-comp" });
+  // The prompt is the last line of the scrollback, not a separate control, so
+  // the caret sits where the next output will appear.
+  const prompt = el("div", { className: "term-prompt-row" });
+  prompt.append(
+    el("span", { className: "term-where", textContent: where }),
+    el("span", { className: "term-sigil", textContent: state.termBusy ? "…" : "%" })
+  );
+
   const box = el("textarea", {
+    className: "term-input",
     rows: 1,
-    placeholder: state.termBusy ? "Running…" : "Type a command",
+    placeholder: state.termBusy ? "" : "",
     value: state.termDraft,
     spellcheck: false,
     disabled: !folder,
   });
-  box.oninput = () => { state.termDraft = box.value; };
+  box.oninput = () => {
+    state.termDraft = box.value;
+    box.style.height = "auto";
+    box.style.height = `${box.scrollHeight}px`;
+  };
   box.onkeydown = (e) => {
     if (e.key === "Escape") { e.stopPropagation(); box.blur(); return; }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      // While something is running, Enter sends a line to it rather than
-      // starting a second command on top of the first.
-      if (state.termBusy) { window.delphi.term.write(termId(), `${box.value}\n`); box.value = ""; state.termDraft = ""; return; }
+      // While something runs, Enter feeds it a line rather than starting a
+      // second command on top of the first.
+      if (state.termBusy) {
+        window.delphi.term.write(termId(), `${box.value}\n`);
+        box.value = "";
+        state.termDraft = "";
+        return;
+      }
       runCommand(box.value);
     }
   };
-  bar.append(box);
+  prompt.append(box);
 
   if (state.termBusy) {
-    const stop = el("button", { className: "btn sm danger", textContent: "Stop" });
+    const stop = el("button", { className: "term-stop", textContent: "stop" });
+    stop.title = "Stop the running command";
     stop.onclick = () => window.delphi.term.stop(termId());
-    bar.append(stop);
+    prompt.append(stop);
   }
-  wrap.append(bar);
+
+  out.append(prompt);
+  screen.append(out);
+  screen.onmousedown = (e) => {
+    // Only when the click was on the surface itself. Selecting output text has
+    // to keep working, so a click that landed on a line is left alone.
+    if (e.target === screen || e.target === out) {
+      e.preventDefault();
+      box.focus();
+    }
+  };
+  wrap.append(screen);
 
   requestAnimationFrame(() => {
     out.scrollTop = out.scrollHeight;
-    if (folder && !state.termBusy) box.focus();
+    if (folder) box.focus();
   });
 }
-
 function renderChat(root) {
   const project = currentProject();
   if (!project) return;
