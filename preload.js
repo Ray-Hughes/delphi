@@ -58,6 +58,17 @@ contextBridge.exposeInMainWorld("delphi", {
     setKey: (key) => call("ai:setKey", key),
     send: (payload) => call("ai:send", payload),
   },
+  term: {
+    start: (payload) => call("term:start", payload),
+    write: (id, text) => call("term:write", id, text),
+    stop: (id) => call("term:stop", id),
+    sessions: () => call("term:sessions"),
+  },
+  git: {
+    status: (folder) => call("git:status", folder),
+    commit: (folder, message, opts) => call("git:commit", folder, message, opts),
+    log: (folder, limit) => call("git:log", folder, limit),
+  },
   workspaces: {
     list: () => call("workspaces:list"),
     create: (payload) => call("workspaces:create", payload),
@@ -132,11 +143,12 @@ contextBridge.exposeInMainWorld("delphi", {
   onMode: (fn) => ipcRenderer.on("mode", (_e, payload) => fn(payload)),
   onAlertsChanged: (fn) => ipcRenderer.on("alerts-changed", fn),
   onFocusTask: (fn) => ipcRenderer.on("focus-task", (_e, payload) => fn(payload)),
-  // A reply arrives a piece at a time, because the renderer cannot make the
-  // request itself. Register this once, at module scope: none of the listeners
-  // in this file can be removed, so one added inside a render would stack up
-  // another copy on every repaint.
+  // A reply and command output both arrive a piece at a time, because the
+  // renderer can neither make the request nor spawn the process. Register these
+  // once, at module scope: none of the listeners in this file can be removed, so
+  // one added inside a render would stack up another copy on every repaint.
   onAiEvent: (fn) => ipcRenderer.on("ai-event", (_e, payload) => fn(payload)),
+  onTermEvent: (fn) => ipcRenderer.on("term-event", (_e, payload) => fn(payload)),
   // The application menu cannot touch the page directly, so every item that acts
   // on what is displayed arrives here as one message.
   onMenu: (fn) => ipcRenderer.on("menu", (_e, payload) => fn(payload)),

@@ -25,6 +25,13 @@ const state = {
   // What this machine can talk to, asked once at boot. Probing spawns login
   // shells, which is far too slow to repeat on every render.
   providers: [],
+  // Which half of the pane is showing. Not a view of its own: the chat and the
+  // terminal are two faces of the same place, which is why Cmd+J flips between
+  // them rather than navigating anywhere.
+  pane: "chat",          // chat | terminal
+  termLines: [],         // what the running command has said
+  termBusy: false,
+  termDraft: "",
   messages: [],
   // What is typed but not yet sent. render() rebuilds #content wholesale, so a
   // draft that lived only in the textarea would be destroyed by an alert
@@ -693,6 +700,14 @@ function renderSidebar() {
     box.append(kids);
   }
 
+  // The repository, under the sessions. Painted async and appended when it
+  // answers, because asking git costs a spawn and the sidebar must not wait on
+  // it. A folder that is not a repository is the ordinary case here, not an
+  // error, so it simply says nothing.
+  const gitBox = el("div", { className: "gitfoot" });
+  box.append(gitBox);
+  paintGit(gitBox, workspace.path);
+
   if (foot) {
     const settings = el("button", {
       className: "btn wide" + (["project", "workspace"].includes(state.view) ? " primary" : ""),
@@ -741,6 +756,74 @@ async function closeSession(session) {
     state.messages = [];
   }
   await refresh();
+}
+
+
+/**
+ * The repository state for a workspace, under its sessions.
+ *
+ * Half of these folders are not repositories, so nothing is drawn at all in that
+ * case rather than an empty shell explaining its own emptiness.
+ */
+async function paintGit(box, folder) {
+  if (!folder) return;
+  let g;
+  try {
+    g = await window.delphi.git.status(folder);
+  } catch {
+    return;
+  }
+  if (!g || !g.repo) return;
+  box.textContent = "";
+
+  const head = el("div", { className: "gf-head" });
+  head.append(el("span", {
+    className: "gf-branch",
+    textContent: g.unborn ? "no commits yet" : g.detached ? "detached" : (g.branch || "unknown"),
+    title: g.upstream ? `tracking ${g.upstream}` : "no upstream set",
+  }));
+
+  // Unknown and zero are different answers. Without an upstream there is nothing
+  // to be ahead or behind of, and showing 0 would claim we had checked.
+  if (g.ahead === null || g.behind === null) {
+    head.append(el("span", { className: "gf-sync none", textContent: "no upstream" }));
+  } else {
+    head.append(el("span", { className: "gf-sync" + (g.ahead || g.behind ? " on" : "") },
+      el("span", { textContent: `↑${g.ahead}` }), el("span", { textContent: `↓${g.behind}` })));
+  }
+  box.append(head);
+
+  const row = el("div", { className: "gf-row" });
+  if (g.clean) {
+    row.append(el("span", { className: "hint", textContent: "nothing to commit" }));
+  } else {
+    row.append(el("span", { className: "gf-count", textContent: `${g.changed} uncommitted` }));
+    const commit = el("button", { className: "btn sm", textContent: "Commit" });
+    commit.onclick = async () => {
+      const message = await askText({
+        title: "Commit",
+        label: `${g.changed} file${g.changed === 1 ? "" : "s"} in ${folder.split("/").pop()}. Everything changed is staged.`,
+        placeholder: "What changed, and why",
+        confirmLabel: "Commit",
+      });
+      if (!message) return;
+      try {
+        const made = await window.delphi.git.commit(folder, message, { all: true });
+        await paintGit(box, folder);
+        state.termLines.push({ kind: "meta", text: `committed ${made.short} ${made.subject}` });
+      } catch (error) {
+        // Straight from git, which says useful things: nothing staged, no
+        // identity configured, a hook that refused.
+        await askText({
+          title: "That did not commit",
+          label: String(error.message || error),
+          value: "", allowEmpty: true, confirmLabel: "Close",
+        });
+      }
+    };
+    row.append(commit);
+  }
+  box.append(row);
 }
 
 function sessionMenu(session, x, y) {
@@ -7159,6 +7242,129 @@ function runningInLabel(session) {
   return folder ? folder.split("/").pop() : "this project";
 }
 
+
+// ---------------------------------------------------------------------------
+// Terminal
+//
+// Not a real terminal, and it says so. A true one needs a pty, which needs a
+// native module, and this app deliberately has none: the README's claim that
+// there is nothing to rebuild when Electron updates is the reason it keeps
+// working. So this runs commands and shows what they print. Anything that draws
+// its own screen, vim or top, will not work here.
+
+/** The id the running command is filed under, one per session. */
+const termId = () => `s${state.sessionId || 0}`;
+
+async function runCommand(command) {
+  const text = String(command || "").trim();
+  if (!text || state.termBusy) return;
+  const folder = sessionFolder(currentSession());
+  if (!folder) {
+    state.termLines.push({ kind: "err", text: "This project has no folder, so there is nowhere to run a command." });
+    render();
+    return;
+  }
+
+  state.termDraft = "";
+  state.termLines.push({ kind: "cmd", text });
+  state.termBusy = true;
+  render();
+
+  try {
+    await window.delphi.term.start({ id: termId(), cwd: folder, command: text });
+  } catch (error) {
+    state.termBusy = false;
+    state.termLines.push({ kind: "err", text: String(error.message || error) });
+    render();
+  }
+}
+
+// Registered once, at module scope, for the same reason the model stream is.
+let termPaint = null;
+window.delphi.onTermEvent((event) => {
+  if (event.id !== termId()) return;
+
+  if (event.type === "output") {
+    const last = state.termLines[state.termLines.length - 1];
+    // Appended to the previous chunk rather than pushed as a new line, because a
+    // stream arrives in arbitrary pieces and one write is not one line.
+    if (last && last.kind === "out") last.text += event.text;
+    else state.termLines.push({ kind: "out", text: event.text });
+  } else if (event.type === "error") {
+    state.termLines.push({ kind: "err", text: event.message });
+  } else if (event.type === "exit") {
+    state.termBusy = false;
+    const bits = [];
+    if (event.code !== 0) bits.push(`exit ${event.code}`);
+    if (event.signal) bits.push(event.signal);
+    if (event.dropped) bits.push(`${Math.round(event.dropped / 1024)}KB of output dropped`);
+    if (bits.length) state.termLines.push({ kind: "meta", text: bits.join(" · ") });
+  }
+
+  // On a frame, not per chunk. A build printing thousands of lines would
+  // otherwise re-render the window for each one.
+  if (!termPaint) {
+    termPaint = requestAnimationFrame(() => {
+      termPaint = null;
+      if (state.view === "chat" && state.pane === "terminal") render();
+    });
+  }
+});
+
+function renderTerminal(wrap) {
+  const folder = sessionFolder(currentSession());
+
+  const out = el("div", { className: "term-out" });
+  if (!state.termLines.length) {
+    out.append(el("div", { className: "term-empty" },
+      el("div", { textContent: folder ? `Commands run in ${folder}` : "No folder linked, so nothing can run here." }),
+      el("div", { className: "hint", textContent: "Real commands, real output. Anything that draws its own screen, like vim or top, will not work." })));
+  }
+  for (const line of state.termLines) {
+    if (line.kind === "cmd") {
+      out.append(el("div", { className: "term-cmd" },
+        el("span", { className: "term-prompt", textContent: "$" }),
+        el("span", { textContent: line.text })));
+    } else {
+      out.append(el("pre", { className: `term-line ${line.kind}`, textContent: line.text }));
+    }
+  }
+  wrap.append(out);
+
+  const bar = el("div", { className: "gcomp term-comp" });
+  const box = el("textarea", {
+    rows: 1,
+    placeholder: state.termBusy ? "Running…" : "Type a command",
+    value: state.termDraft,
+    spellcheck: false,
+    disabled: !folder,
+  });
+  box.oninput = () => { state.termDraft = box.value; };
+  box.onkeydown = (e) => {
+    if (e.key === "Escape") { e.stopPropagation(); box.blur(); return; }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      // While something is running, Enter sends a line to it rather than
+      // starting a second command on top of the first.
+      if (state.termBusy) { window.delphi.term.write(termId(), `${box.value}\n`); box.value = ""; state.termDraft = ""; return; }
+      runCommand(box.value);
+    }
+  };
+  bar.append(box);
+
+  if (state.termBusy) {
+    const stop = el("button", { className: "btn sm danger", textContent: "Stop" });
+    stop.onclick = () => window.delphi.term.stop(termId());
+    bar.append(stop);
+  }
+  wrap.append(bar);
+
+  requestAnimationFrame(() => {
+    out.scrollTop = out.scrollHeight;
+    if (folder && !state.termBusy) box.focus();
+  });
+}
+
 function renderChat(root) {
   const project = currentProject();
   if (!project) return;
@@ -7171,6 +7377,29 @@ function renderChat(root) {
   }
 
   const wrap = el("div", { className: "chat" });
+
+  // Two faces of one place, so this is a switch rather than navigation. Granular
+  // puts the same pair here and binds the same key.
+  const tabs = el("div", { className: "pane-tabs" });
+  for (const [id, label] of [["chat", "Chat"], ["terminal", "Terminal"]]) {
+    const t = el("div", {
+      className: "pane-tab" + (state.pane === id ? " on" : ""),
+      tabIndex: 0, role: "button",
+    }, el("span", { textContent: label }));
+    if (id === "terminal" && state.termBusy) t.append(el("span", { className: "sd live" }));
+    const go = () => { state.pane = id; render(); };
+    t.onclick = go;
+    t.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    tabs.append(t);
+  }
+  tabs.append(el("span", { className: "pane-kbd", textContent: "⌘J" }));
+  wrap.append(tabs);
+
+  if (state.pane === "terminal") {
+    renderTerminal(wrap);
+    root.append(wrap);
+    return;
+  }
 
   // --- stream -------------------------------------------------------------
   const stream = el("div", { className: "gstream" });
@@ -7600,6 +7829,13 @@ document.addEventListener("keydown", (e) => {
       return;
     }
     window.delphi.hide();
+  }
+  // Only where there are two panes to flip between.
+  if ((e.metaKey || e.ctrlKey) && e.key === "j" && state.view === "chat") {
+    e.preventDefault();
+    state.pane = state.pane === "chat" ? "terminal" : "chat";
+    render();
+    return;
   }
   if ((e.metaKey || e.ctrlKey) && e.key === "f") {
     e.preventDefault();

@@ -14,6 +14,8 @@ const vault = require("./vault");
 const oracle = require("./oracle");
 const embeddings = require("./embeddings");
 const ai = require("./ai");
+const terminal = require("./terminal");
+const git = require("./git");
 
 const isMac = process.platform === "darwin";
 const SETTINGS_PATH = paths.SETTINGS_PATH;
@@ -1008,6 +1010,33 @@ handle("ai:send", async ({ sessionId, provider, model, system, messages, cwd, au
   }
   return { ok: true };
 });
+
+
+// ---------------------------------------------------------------------------
+// Terminal
+//
+// Same shape as the model stream: the renderer cannot spawn a process, so the
+// command runs here and its output is pushed back a piece at a time.
+
+handle("term:start", ({ id, cwd, command }) => {
+  if (!cwd) throw new Error("This project has no folder, so there is nowhere to run a command");
+  return terminal.start({ id, cwd, command }, (event) => {
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send("term-event", { id, ...event });
+    }
+  });
+});
+
+handle("term:write", (id, text) => terminal.write(id, text));
+handle("term:stop", (id) => terminal.stop(id));
+handle("term:sessions", () => terminal.sessions());
+
+handle("git:status", (folder) => git.status(folder));
+handle("git:commit", (folder, message, opts) => git.commit(folder, message, opts));
+handle("git:log", (folder, limit) => git.log(folder, limit));
+
+// Anything still running belongs to a window that is going away.
+app.on("will-quit", () => { try { terminal.stopAll(); } catch {} });
 
 handle("workspaces:list", () => db.listWorkspaces());
 handle("workspaces:create", (payload) => db.createWorkspace(payload));
