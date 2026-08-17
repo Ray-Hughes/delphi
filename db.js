@@ -1643,14 +1643,14 @@ function listSessions(projectId) {
 
 const getSession = (id) => one("SELECT * FROM sessions WHERE id = :id", { id });
 
-function createSession({ projectId, title = null, agent = null, provider = null, model = null }) {
+function createSession({ projectId, title = null, agent = null, provider = null, model = null, workspaceId = null }) {
   if (!projectId) throw new Error("A session needs a project");
   const r = run(
-    `INSERT INTO sessions (project_id, title, agent, provider, model)
-     VALUES (:projectId, :title, :agent, :provider, :model)`,
+    `INSERT INTO sessions (project_id, workspace_id, title, agent, provider, model)
+     VALUES (:projectId, :workspaceId, :title, :agent, :provider, :model)`,
     // Named for what it is until the first message can name it better. A blank
     // title in the list is worse than a placeholder nobody minds replacing.
-    { projectId, title: title || "New session", agent, provider, model }
+    { projectId, workspaceId, title: title || "New session", agent, provider, model }
   );
   // Not audited. The audit table's entity CHECK admits task, note, project and
   // link only, and a CHECK cannot be added to a database that already exists, so
@@ -1661,7 +1661,7 @@ function createSession({ projectId, title = null, agent = null, provider = null,
 }
 
 function updateSession(id, fields) {
-  const allowed = ["title", "agent", "provider", "model", "status", "tokens_in", "tokens_out"];
+  const allowed = ["title", "agent", "provider", "model", "status", "tokens_in", "tokens_out", "workspace_id"];
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getSession(id);
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");

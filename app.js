@@ -6974,6 +6974,25 @@ async function openSession(id) {
   render();
 }
 
+
+/**
+ * The folder a session runs in.
+ *
+ * Recorded on the session, because a project spanning four repos has no single
+ * answer. Falls back to the workspace currently open, then to the project's old
+ * path column for sessions made before workspaces existed.
+ */
+function sessionFolder(session) {
+  if (session && session.workspace_id) {
+    const w = state.workspaces.find((x) => x.id === session.workspace_id);
+    if (w) return w.path;
+  }
+  const open = state.workspaces.find((w) => w.id === state.workspaceId);
+  if (open) return open.path;
+  const project = currentProject();
+  return project && project.path ? project.path : null;
+}
+
 async function newSession() {
   const project = currentProject();
   if (!project) return;
@@ -6981,6 +7000,11 @@ async function newSession() {
     projectId: project.id,
     agent: "boss",
     provider: null,
+    // The folder it runs in, which is the workspace it was started from. A
+    // project can span four repos, so this cannot be derived from the project
+    // afterwards: only the person starting the session knows which one they
+    // meant, and being in that workspace is them saying so.
+    workspaceId: state.workspaceId,
   });
   state.sessions = await window.delphi.sessions.list(project.id);
   await openSession(created.id);
@@ -7002,7 +7026,9 @@ function renderChat(root) {
   // --- stream -------------------------------------------------------------
   const stream = el("div", { className: "gstream" });
   if (!state.sessionId) {
-    stream.append(emptyState("No session yet", "Start one above to talk to an agent about this project."));
+    stream.append(emptyState(
+      "No session yet",
+      "Start one from the sidebar. It will belong to this project, and run in this workspace."));
   } else if (!state.messages.length) {
     const empty = el("div", { className: "gempty" });
     empty.append(
@@ -7085,7 +7111,11 @@ function renderChat(root) {
 
   const used = session ? (session.tokens_in || 0) + (session.tokens_out || 0) : 0;
   const meter = el("div", { className: "gmeter" });
-  meter.append(el("span", { textContent: project.path ? project.name : `${project.name} (no folder)` }));
+  const runningIn = sessionFolder(session);
+  meter.append(el("span", {
+    textContent: runningIn ? `${project.name} · ${runningIn.split("/").pop()}` : `${project.name} (no folder)`,
+    title: runningIn || "No folder linked, so an agent has no working directory",
+  }));
   const right = el("div", { className: "ml" });
   right.append(
     el("span", { textContent: used ? `${(used / 1000).toFixed(1)}k tokens` : "0 tokens" }),
@@ -7163,18 +7193,19 @@ async function sendMessage() {
 
   const project = currentProject();
   const open = currentSession();
+  const folder = sessionFolder(open);
   try {
     await window.delphi.ai.send({
       sessionId,
       provider: open && open.provider ? open.provider : "claude-cli",
       model: open && open.model ? open.model : null,
-      system: project && project.path
-        ? `You are helping with the project "${project.name}", whose files are at ${project.path}.`
-        : null,
+      system: folder
+        ? `You are helping with the project "${project.name}", working in ${folder}.`
+        : `You are helping with the project "${project.name}". It has no folder linked, so do not assume a working directory.`,
       messages: state.messages
         .filter((m) => m.id !== reply.id && !m.error)
         .map((m) => ({ role: m.role, content: m.content })),
-      cwd: project ? project.path : null,
+      cwd: folder,
     });
   } catch (error) {
     await window.delphi.messages.update(reply.id, { error: String(error.message || error) });
