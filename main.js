@@ -986,7 +986,7 @@ handle("ai:setKey", (key) => {
 // two replies into the same transcript with no way to tell them apart.
 let sending = false;
 
-handle("ai:send", async ({ sessionId, provider, model, system, messages, cwd }) => {
+handle("ai:send", async ({ sessionId, provider, model, system, messages, cwd, autoAllow }) => {
   if (sending) throw new Error("A reply is already streaming");
   sending = true;
 
@@ -1000,7 +1000,7 @@ handle("ai:send", async ({ sessionId, provider, model, system, messages, cwd }) 
 
   try {
     await ai.send(
-      { provider, apiKey: readApiKey(), model, system, messages, cwd },
+      { provider, apiKey: readApiKey(), model, system, messages, cwd, autoAllow },
       emit
     );
   } finally {

@@ -7042,6 +7042,22 @@ async function newSession() {
   await openSession(created.id);
 }
 
+
+// Aliases the CLI understands, plus the explicit ids. "Auto" means send nothing
+// and let the tool pick, which is what it does best.
+const MODELS = [
+  [null, "Auto"],
+  ["opus", "Opus"],
+  ["sonnet", "Sonnet"],
+  ["haiku", "Haiku"],
+];
+
+/** The folder a session runs in, named for a sentence. */
+function runningInLabel(session) {
+  const folder = sessionFolder(session);
+  return folder ? folder.split("/").pop() : "this project";
+}
+
 function renderChat(root) {
   const project = currentProject();
   if (!project) return;
@@ -7135,10 +7151,47 @@ function renderChat(root) {
     el("span", { className: "cv", textContent: "▾" }));
   conn.onclick = (e) => providerMenu(e.clientX, e.clientY);
   model.append(conn);
-  for (const [label, bordered] of [["Auto-allow", true], ["Auto", false], ["high", false]]) {
-    model.append(el("div", { className: "gpill" + (bordered ? " bd" : "") },
-      el("span", { className: bordered ? "" : "mono2", textContent: label })));
-  }
+  // Every chip does something. Two of the ones here before were decoration, and
+  // a control that looks live and is not is worse than no control.
+  const autoAllow = session && session.auto_allow === 1;
+  const tools = el("div", {
+    className: "gpill bd" + (autoAllow ? " hot" : ""),
+    tabIndex: 0, role: "button",
+    title: autoAllow
+      ? "The agent may read and write files in this folder without asking"
+      : "The agent can talk, but cannot touch files. Click to allow tools.",
+  }, el("span", { textContent: autoAllow ? "Auto-allow" : "Ask first" }));
+  tools.onclick = async () => {
+    if (!session) return;
+    // Turning it on is the dangerous direction, so that is the one that asks.
+    if (!autoAllow) {
+      const ok = confirm(
+        "Let the agent use tools without asking?\n\n" +
+        `It will be able to read and change files in ${runningInLabel(session)} on its own. ` +
+        "Turn this off again from the same chip."
+      );
+      if (!ok) return;
+    }
+    await window.delphi.sessions.update(session.id, { auto_allow: autoAllow ? 0 : 1 });
+    await refresh();
+  };
+  model.append(tools);
+
+  const chosenModel = (session && session.model) || "Auto";
+  const modelPill = el("div", {
+    className: "gpill", tabIndex: 0, role: "button", title: "Which model answers",
+  }, el("span", { className: "mono2", textContent: chosenModel }), el("span", { className: "cv", textContent: "▾" }));
+  modelPill.onclick = (e) => {
+    rowMenu(e.clientX, e.clientY, MODELS.map(([value, label]) => ({
+      label,
+      run: async () => {
+        if (!session) return;
+        await window.delphi.sessions.update(session.id, { model: value });
+        await refresh();
+      },
+    })));
+  };
+  model.append(modelPill);
   wrap.append(model);
 
   const used = session ? (session.tokens_in || 0) + (session.tokens_out || 0) : 0;
@@ -7201,6 +7254,27 @@ async function sendMessage() {
     if (!sessionId) return;
   }
 
+  // Checked before the turn is written, so a message is not left hanging with no
+  // reply and no reason. The error goes into the transcript rather than into an
+  // alert, because that is where the person is looking.
+  const ready = state.providers.filter((p) => p.ready);
+  if (!ready.length) {
+    state.draft = "";
+    await window.delphi.messages.append({ sessionId, role: "user", content: text });
+    const why = state.providers.length
+      ? state.providers.map((p) => `${p.label}: ${p.detail}`).join("\n")
+      : "Nothing was found on this machine.";
+    await window.delphi.messages.append({
+      sessionId, role: "assistant", content: "",
+      error: `No AI is configured, so there is nothing to answer.\n\n${why}\n\n` +
+             "Set one up in All Work, then Settings, then AI.",
+    });
+    state.messages = await window.delphi.messages.list(sessionId);
+    state.sessions = await window.delphi.sessions.list(state.projectId);
+    render();
+    return;
+  }
+
   state.draft = "";
   await window.delphi.messages.append({ sessionId, role: "user", content: text });
 
@@ -7238,6 +7312,7 @@ async function sendMessage() {
         .filter((m) => m.id !== reply.id && !m.error)
         .map((m) => ({ role: m.role, content: m.content })),
       cwd: folder,
+      autoAllow: open ? open.auto_allow === 1 : false,
     });
   } catch (error) {
     await window.delphi.messages.update(reply.id, { error: String(error.message || error) });
@@ -7550,6 +7625,13 @@ window.delphi.onFocusTask(({ projectId }) => {
  * are the behaviour the app had before these settings existed.
  */
 async function boot() {
+  // Asked once, here. Probing spawns login shells, so it cannot be done per
+  // render, and leaving it to the settings page meant the chat reported "not
+  // connected" until someone happened to open settings.
+  window.delphi.ai.providers()
+    .then((p) => { state.providers = p; if (state.view === "chat") render(); })
+    .catch(() => {});
+
   try {
     const settings = await window.delphi.settings.get();
     applyTheme(settings.theme);

@@ -2402,6 +2402,11 @@
   .srow-btn.close:hover { color: var(--crit); }
   /* The name gives up its space to the buttons rather than pushing them out. */
   .gs .nm { min-width: 0; }
+
+  /* A chip that is switched on, rather than merely available. */
+  .gpill.hot { border-color: var(--c-acc); color: var(--c-acc-ink); background: color-mix(in srgb, var(--c-acc) 10%, transparent); }
+  .gpill[role="button"]:hover { border-color: var(--c-edge2); color: var(--c-mut); }
+  .gpill.hot[role="button"]:hover { border-color: var(--c-acc); color: var(--c-acc-ink); }
 </style>
 </head>
 <body>

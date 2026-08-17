@@ -82,6 +82,10 @@ const LATER_COLUMNS = [
   // A session runs somewhere. A project spanning four repos cannot tell an
   // agent which folder to work in without this.
   ["sessions", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL"],
+  // Whether the agent may use tools without asking. Off by default, and
+  // deliberately per session: it is the difference between something that talks
+  // and something that edits your files.
+  ["sessions", "auto_allow", "INTEGER NOT NULL DEFAULT 0"],
 ];
 
 function addLaterColumns(db) {
@@ -1680,7 +1684,7 @@ function createSession({ projectId, title = null, agent = null, provider = null,
 }
 
 function updateSession(id, fields) {
-  const allowed = ["title", "agent", "provider", "model", "status", "tokens_in", "tokens_out", "workspace_id"];
+  const allowed = ["title", "agent", "provider", "model", "status", "tokens_in", "tokens_out", "workspace_id", "auto_allow"];
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getSession(id);
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");

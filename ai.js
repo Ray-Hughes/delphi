@@ -131,9 +131,11 @@ function ghToken(host) {
   }
 }
 
-function streamViaCopilot({ cli, cwd, model, prompt, host, token }, emit) {
+function streamViaCopilot({ cli, cwd, model, prompt, host, token, autoAllow }, emit) {
   return new Promise((resolve) => {
-    const args = ["-p", prompt, "--allow-all-tools"];
+    // Same rule as the Claude path: tools only when the session asks for them.
+    const args = ["-p", prompt];
+    if (autoAllow) args.push("--allow-all-tools");
     if (model) args.push("--model", model);
 
     const child = spawn(cli, args, {
@@ -358,7 +360,7 @@ function streamViaApi({ apiKey, model, system, messages }, emit) {
   });
 }
 
-function streamViaCli({ cli, cwd, model, system, prompt }, emit) {
+function streamViaCli({ cli, cwd, model, system, prompt, autoAllow }, emit) {
   return new Promise((resolve) => {
     const args = [
       "-p", prompt,
@@ -368,6 +370,12 @@ function streamViaCli({ cli, cwd, model, system, prompt }, emit) {
     ];
     if (model) args.push("--model", model);
     if (system) args.push("--append-system-prompt", system);
+
+    // Tools are off unless the session says otherwise. The difference is whether
+    // this can read and write files in the folder it is pointed at, so it is a
+    // decision someone has to make rather than a default they inherit.
+    if (autoAllow) args.push("--permission-mode", "bypassPermissions");
+    else args.push("--tools", "");
 
     // Never --bare. It refuses the Keychain credential outright and insists on
     // ANTHROPIC_API_KEY, so on a signed-in machine it fails with "Please run
@@ -422,7 +430,7 @@ function streamViaCli({ cli, cwd, model, system, prompt }, emit) {
  * single prompt rather than a transcript, so on that path the history is folded
  * into one string; it keeps its own context per invocation otherwise.
  */
-async function send({ provider, apiKey, model, system, messages, cwd }, emit) {
+async function send({ provider, apiKey, model, system, messages, cwd, autoAllow = false }, emit) {
   if (!messages || !messages.length) {
     emit({ type: "error", message: "Nothing to send" });
     emit({ type: "done" });
@@ -458,7 +466,7 @@ async function send({ provider, apiKey, model, system, messages, cwd }, emit) {
       return;
     }
     const prompt = messages.map((m) => (m.role === "user" ? m.content : `Assistant: ${m.content}`)).join("\n\n");
-    await streamViaCopilot({ cli, cwd, model, prompt, host, token }, emit);
+    await streamViaCopilot({ cli, cwd, model, prompt, host, token, autoAllow }, emit);
     return;
   }
 
@@ -472,7 +480,7 @@ async function send({ provider, apiKey, model, system, messages, cwd }, emit) {
   const prompt = messages
     .map((m) => (m.role === "user" ? m.content : `Assistant: ${m.content}`))
     .join("\n\n");
-  await streamViaCli({ cli, cwd, model, system, prompt }, emit);
+  await streamViaCli({ cli, cwd, model, system, prompt, autoAllow }, emit);
 }
 
 module.exports = { providers, send, DEFAULT_MODEL, findClaudeCli, findCopilotCli, ghHosts, sseReader, mapAnthropicEvent };
