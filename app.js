@@ -7476,6 +7476,33 @@ function recallHistory(e, box, entries, apply) {
   return true;
 }
 
+
+/**
+ * Shown between asking and the first word coming back.
+ *
+ * A model can take several seconds to start, and an empty element for that long
+ * reads as a question that went nowhere. After a few seconds it starts counting,
+ * because a wait you can see the length of is a wait rather than a hang.
+ */
+function thinkingIndicator() {
+  const box = el("div", { className: "thinking" });
+  const dots = el("span", { className: "thinking-dots" });
+  dots.append(el("i"), el("i"), el("i"));
+  const label = el("span", { className: "thinking-label", textContent: "Thinking" });
+  box.append(dots, label);
+
+  const started = Date.now();
+  const tick = setInterval(() => {
+    // Removed from the document the moment the first text lands, since the
+    // stream replaces the whole node, so this is how the timer learns to stop.
+    if (!box.isConnected) { clearInterval(tick); return; }
+    const seconds = Math.round((Date.now() - started) / 1000);
+    if (seconds >= 4) label.textContent = `Thinking, ${seconds}s`;
+  }, 1000);
+
+  return box;
+}
+
 function renderChat(root) {
   const project = currentProject();
   if (!project) return;
@@ -7548,11 +7575,18 @@ function renderChat(root) {
         // The agent's turn is markdown, rendered with the same renderer the
         // memory notes use rather than a second one that would drift from it.
         const body = el("div", { className: "gmsg ai" });
-        body.append(renderMarkdown(m.id === streamingMessageId ? streamShown : (m.content || "")));
+        const live = m.id === streamingMessageId;
+        if (live && !streamShown) {
+          // Nothing has come back yet. Without this the turn is an empty
+          // element, so the window looks like it did not hear the question.
+          body.append(thinkingIndicator());
+        } else {
+          body.append(renderMarkdown(live ? streamShown : (m.content || "")));
+        }
         stream.append(body);
         // The one still arriving is handed to the stream, so it can grow this
         // node rather than asking for a repaint per token.
-        if (m.id === streamingMessageId) adoptStreamNode(body);
+        if (live) adoptStreamNode(body);
       }
     }
   }
@@ -7562,7 +7596,7 @@ function renderChat(root) {
   const comp = el("div", { className: "gcomp" });
   const box = el("textarea", {
     rows: 1,
-    placeholder: "Ask for anything…",
+    placeholder: state.streaming ? "Waiting for a reply…" : "Ask for anything…",
     value: state.draft,
     spellcheck: false,
   });
