@@ -5506,6 +5506,121 @@ const partLabel = (p) =>
 async function renderSettings(root) {
   const settings = await window.delphi.settings.get();
 
+  // --- AI ------------------------------------------------------------------
+  // Three ways in, and they are not equivalent. A CLI login spends a
+  // subscription the person already pays for and this app never holds the
+  // credential. An API key bills separately and has to be stored. Both are
+  // offered rather than one being hidden, because which is right depends on what
+  // they already have.
+  const aiBox = el("div", { className: "setting" });
+  aiBox.append(el("h3", { textContent: "AI" }));
+  aiBox.append(el("p", {
+    textContent: "Which agent the chat talks to. Signing in through a command line tool uses the subscription you already pay for, and no credential is stored here. An API key is billed separately and is kept encrypted by the operating system.",
+  }));
+
+  const providerList = el("div", { className: "provider-list" });
+  aiBox.append(providerList);
+
+  const paintProviders = async () => {
+    providerList.textContent = "";
+    let providers = [];
+    try {
+      providers = await window.delphi.ai.providers();
+      state.providers = providers;
+    } catch (error) {
+      providerList.append(el("div", { className: "err-msg", textContent: String(error.message || error) }));
+      return;
+    }
+
+    for (const p of providers) {
+      const row = el("div", { className: "provider" });
+      row.append(el("span", { className: "pdot" + (p.ready ? " on" : "") }));
+      const text = el("div", { className: "grow" });
+      text.append(el("div", { className: "pname", textContent: p.label }));
+      text.append(el("div", { className: "hint", textContent: p.detail }));
+      row.append(text);
+
+      // Each unready provider says what would fix it, and gives the command
+      // rather than describing it. Signing in needs a terminal in every case, so
+      // the button copies the line instead of pretending it can do it here.
+      if (!p.ready) {
+        let fix = null;
+        if (p.id === "claude-cli") fix = "claude";
+        else if (p.id === "copilot" && p.host) fix = `gh auth login --hostname ${p.host} --web`;
+
+        if (fix) {
+          const copy = el("button", { className: "btn sm", textContent: "Copy command" });
+          copy.onclick = async () => {
+            await navigator.clipboard.writeText(fix);
+            copy.textContent = "Copied";
+            setTimeout(() => { copy.textContent = "Copy command"; }, 1400);
+          };
+          row.append(el("code", { className: "mono pfix", textContent: fix }), copy);
+        }
+      }
+      providerList.append(row);
+    }
+
+    const recheck = el("button", { className: "btn sm", textContent: "Check again" });
+    recheck.onclick = async () => { await paintProviders(); };
+    providerList.append(el("div", { className: "provider-foot" }, recheck));
+  };
+  await paintProviders();
+
+  // --- the key -------------------------------------------------------------
+  const keyMsg = el("span", { className: "hint" });
+  const keyRow = el("div", { className: "row" });
+  const keyField = el("input", {
+    className: "field grow",
+    type: "password",
+    placeholder: "sk-ant-...",
+    autocomplete: "off",
+    spellcheck: false,
+  });
+
+  const paintKey = async () => {
+    const has = await window.delphi.ai.hasKey();
+    keyField.placeholder = has ? "A key is saved" : "sk-ant-...";
+    keyField.value = "";
+    clearBtn.style.display = has ? "" : "none";
+  };
+
+  const saveBtn = el("button", { className: "btn primary", textContent: "Save key" });
+  saveBtn.onclick = async () => {
+    const value = keyField.value.trim();
+    if (!value) { keyMsg.className = "err-msg"; keyMsg.textContent = "Paste a key first."; return; }
+    try {
+      await window.delphi.ai.setKey(value);
+      keyMsg.className = "ok-msg";
+      keyMsg.textContent = "Saved, encrypted by the operating system.";
+      await paintKey();
+      await paintProviders();
+    } catch (error) {
+      keyMsg.className = "err-msg";
+      keyMsg.textContent = String(error.message || error);
+    }
+  };
+
+  const clearBtn = el("button", { className: "btn sm danger", textContent: "Remove" });
+  clearBtn.onclick = async () => {
+    await window.delphi.ai.setKey(null);
+    keyMsg.className = "hint";
+    keyMsg.textContent = "Key removed.";
+    await paintKey();
+    await paintProviders();
+  };
+
+  keyRow.append(keyField, saveBtn, clearBtn);
+  await paintKey();
+
+  aiBox.append(el("div", { className: "setting-sub" },
+    el("h4", { textContent: "Anthropic API key" }),
+    el("p", { className: "hint",
+      textContent: "Only needed if you would rather not use a command line login. It never leaves this machine and is written to the keychain, not to settings.json." }),
+    keyRow, keyMsg));
+
+  root.append(aiBox);
+
   // --- appearance ----------------------------------------------------------
   const appearance = el("div", { className: "setting" });
   appearance.append(el("h3", { textContent: "Appearance" }));
@@ -6555,33 +6670,10 @@ function renderRail() {
         dragging = w.id;
         tile.classList.add("dragging");
         e.dataTransfer.effectAllowed = "move";
-        // Firefox refuses to start a drag without data set on the transfer.
+        // Firefox refuses to start a drag unless something is on the transfer.
         e.dataTransfer.setData("text/plain", String(w.id));
       };
-      tile.ondragend = () => {
-        dragging = null;
-        for (const n of rail.querySelectorAll("[data-ws]")) {
-          n.classList.remove("dragging", "drop-before", "drop-after");
-        }
-      };
-      tile.ondragover = (e) => {
-        if (dragging === null || dragging === w.id) return;
-        e.preventDefault();
-        // Which half the pointer is in decides which side of this tile the
-        // dragged one lands, so a drop near the top goes above and not below.
-        const box = tile.getBoundingClientRect();
-        const above = e.clientY < box.top + box.height / 2;
-        tile.classList.toggle("drop-before", above);
-        tile.classList.toggle("drop-after", !above);
-      };
-      tile.ondragleave = () => tile.classList.remove("drop-before", "drop-after");
-      tile.ondrop = async (e) => {
-        e.preventDefault();
-        const above = tile.classList.contains("drop-before");
-        tile.classList.remove("drop-before", "drop-after");
-        if (dragging === null || dragging === w.id) return;
-        await reorderWorkspaces(dragging, w.id, above);
-      };
+      tile.ondragend = () => endDrag(rail);
     }
     if (w.colour && !w.icon) tile.style.color = w.colour;
 
@@ -6596,6 +6688,32 @@ function renderRail() {
     window.delphi.fs.folderExists(w.path)
       .then((there) => { if (!there) tile.classList.add("lost"); })
       .catch(() => {});
+  }
+
+  // The column reacts to the drag as a whole. Per-tile handlers could only draw
+  // a line on the tile under the pointer, which is not enough to see where the
+  // thing will land; the tiles move aside instead, which is.
+  if (!open && state.workspaces.length > 1) {
+    rail.ondragover = (e) => {
+      if (dragging === null) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      shiftForDrop(rail, dropIndexAt(rail, e.clientY));
+    };
+    rail.ondragleave = (e) => {
+      // Only when the pointer has actually left the rail, not when it crosses
+      // from one tile to the next inside it.
+      if (e.relatedTarget && rail.contains(e.relatedTarget)) return;
+      shiftForDrop(rail, null);
+    };
+    rail.ondrop = async (e) => {
+      if (dragging === null) return;
+      e.preventDefault();
+      const at = dropIndexAt(rail, e.clientY);
+      const moved = dragging;
+      endDrag(rail);
+      await reorderWorkspaceTo(moved, at);
+    };
   }
 
   const add = el("div", {
@@ -6630,23 +6748,66 @@ function renderRail() {
 }
 
 
-/**
- * Moves one workspace to sit either side of another.
- *
- * The whole column is renumbered rather than the moved row alone. Nudging one
- * value works until two rows end up sharing an order, and then the sequence
- * depends on whatever the database returns second, which is not stable.
- */
-async function reorderWorkspaces(movedId, targetId, before) {
-  const order = state.workspaces.map((w) => w.id).filter((id) => id !== movedId);
-  const at = order.indexOf(targetId);
-  if (at === -1) return;
-  order.splice(before ? at : at + 1, 0, movedId);
 
+// A tile is 36px square and the rail puts 8px between them, so a gap the size of
+// one tile is what has to open for the dragged one to fit.
+const RAIL_STEP = 44;
+
+/** The tiles that are not the one being dragged, in the order they appear. */
+const railOthers = (rail) =>
+  [...rail.querySelectorAll("[data-ws]")].filter((n) => Number(n.dataset.ws) !== dragging);
+
+/**
+ * Where the dragged tile would land, as an index into the others.
+ *
+ * Measured against each tile's midpoint, so crossing halfway is what moves the
+ * gap rather than reaching the far edge.
+ */
+function dropIndexAt(rail, y) {
+  const others = railOthers(rail);
+  for (let i = 0; i < others.length; i++) {
+    const box = others[i].getBoundingClientRect();
+    if (y < box.top + box.height / 2) return i;
+  }
+  return others.length;
+}
+
+/**
+ * Opens a gap at an index by moving everything below it down.
+ *
+ * Passing null closes the gap. The transform is what animates, so the tiles
+ * slide rather than jumping, and the dragged tile is left faded in place: two
+ * things moving at once reads as a glitch rather than as a rearrangement.
+ */
+function shiftForDrop(rail, at) {
+  const others = railOthers(rail);
+  others.forEach((node, i) => {
+    node.classList.add("shifting");
+    node.style.transform = at !== null && i >= at ? `translateY(${RAIL_STEP}px)` : "";
+  });
+}
+
+/** Puts everything back and forgets the drag. */
+function endDrag(rail) {
+  dragging = null;
+  for (const node of rail.querySelectorAll("[data-ws]")) {
+    node.classList.remove("dragging", "shifting", "drop-before", "drop-after");
+    node.style.transform = "";
+  }
+}
+
+/** Moves a workspace to a position in the column. */
+async function reorderWorkspaceTo(movedId, index) {
+  const order = state.workspaces.map((w) => w.id).filter((id) => id !== movedId);
+  order.splice(Math.max(0, Math.min(index, order.length)), 0, movedId);
+  // The whole column is renumbered rather than the moved row alone. Nudging one
+  // value works until two rows share an order, and then the sequence depends on
+  // whatever the database returns second.
   await Promise.all(order.map((id, i) =>
     window.delphi.workspaces.update(id, { sort_order: (i + 1) * 10 })));
   await refresh();
 }
+
 
 /** Opens a workspace, and lands on the project you were last in if it fits. */
 async function zoomInto(workspaceId) {

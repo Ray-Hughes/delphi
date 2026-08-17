@@ -2351,10 +2351,39 @@
     .rail-tile[data-name]::after { transition: none; }
   }
 
-  /* Being dragged into a new position. */
-  .rail-tile.dragging { opacity: .35; }
-  .rail-tile.drop-before { box-shadow: 0 -2px 0 0 var(--accent); }
-  .rail-tile.drop-after  { box-shadow: 0 2px 0 0 var(--accent); }
+  /* Being dragged into a new position.
+     The tile you are holding fades in place and the others move aside to open
+     the gap it would drop into, which is the only thing that actually shows
+     where it will land. */
+  .rail-tile.dragging { opacity: .3; }
+  .rail-tile.shifting { transition: transform 160ms cubic-bezier(.2,.7,.3,1); }
+  @media (prefers-reduced-motion: reduce) { .rail-tile.shifting { transition: none; } }
+  :root[data-motion="off"] .rail-tile.shifting { transition: none; }
+  /* The label would follow the tile as it slides, which is noise during a drag. */
+  .rail-tile.shifting::after, .rail-tile.dragging::after { opacity: 0 !important; }
+
+  /* AI providers, in settings. */
+  .provider-list { display: flex; flex-direction: column; gap: var(--s2); max-width: 70ch; }
+  .provider {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: var(--s3); border: 1px solid var(--line-soft);
+    border-radius: var(--r-sm); background: var(--surface);
+  }
+  .pdot {
+    width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px;
+    background: var(--ink-faint);
+  }
+  .pdot.on { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 18%, transparent); }
+  .pname { font-weight: 600; }
+  .pfix {
+    font-size: 11px; padding: 3px 7px; border-radius: 4px;
+    background: var(--raised); color: var(--ink-dim); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 34ch;
+  }
+  .provider-foot { display: flex; justify-content: flex-end; }
+  .setting-sub { margin-top: var(--s4); }
+  .setting-sub h4 { margin: 0 0 3px; font-size: 13px; font-weight: 600; }
+  .setting-sub p { margin: 0 0 var(--s3); }
 </style>
 </head>
 <body>
