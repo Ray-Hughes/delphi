@@ -37,6 +37,16 @@ contextBridge.exposeInMainWorld("delphi", {
     update: (id, fields) => call("notes:update", id, fields),
     remove: (id) => call("notes:delete", id),
   },
+  // The other agents. Turns come back on the same "ai-event" channel the built-in
+  // chat uses, because from the window's side they are the same thing.
+  harnesses: {
+    list: (force) => call("harness:list", force),
+    create: (payload) => call("harness:create", payload),
+    update: (id, fields) => call("harness:update", id, fields),
+    remove: (id) => call("harness:delete", id),
+    start: (payload) => call("harness:start", payload),
+    stop: (sessionId) => call("harness:stop", sessionId),
+  },
   pads: {
     list: (projectId) => call("pads:list", projectId),
     get: (id) => call("pads:get", id),

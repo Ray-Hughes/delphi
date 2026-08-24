@@ -43,6 +43,7 @@ module.exports = {
     "ai.js",
     "git.js",
     "terminal.js",
+    "harness.js",
     "schema.sql",
     "oracle.sql",
     "package.json",

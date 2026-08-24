@@ -21,6 +21,7 @@ process.env.DELPHI_DATA_DIR = dir;
 
 const db = require("../db");
 const pads = require("../pads");
+const harness = require("../harness");
 
 let failures = 0;
 let checks = 0;
@@ -175,6 +176,56 @@ section("deleting the pad");
 db.deleteScratchpad(pad.id);
 check("the work outlives the document",
       db.listTasks({ projectId: project.id, includeDone: true, includeSubtasks: true }).length, 4);
+
+// ---------------------------------------------------------------------------
+// The argv templates
+//
+// Here rather than in a file of its own because it is the same kind of thing:
+// rules with edge cases, exercised nowhere else except inside a spawned process
+// where the only symptom of getting them wrong is an agent that never answers.
+
+section("argv templates");
+
+const claude = harness.BUILTINS.find((h) => h.key === "claude-code");
+const codex = harness.BUILTINS.find((h) => h.key === "codex");
+
+check("drops an optional flag whose value is missing",
+      harness.expand(claude.args, { prompt: "hi" }).includes("--model"), false);
+check("keeps it when there is one",
+      harness.expand(claude.args, { prompt: "hi", model: "opus" }).join(" ").includes("--model opus"), true);
+check("a gate that is off leaves the group out",
+      harness.expand(claude.args, { prompt: "hi", autoAllow: false }).includes("bypassPermissions"), false);
+check("and the other branch is in",
+      harness.expand(claude.args, { prompt: "hi", autoAllow: false }).includes("--tools"), true);
+check("a gate that is on swaps them",
+      harness.expand(claude.args, { prompt: "hi", autoAllow: true }).includes("bypassPermissions"), true);
+check("a splice becomes several arguments",
+      harness.expand(claude.args, { prompt: "hi", mcpFlags: ["--mcp-config", "/tmp/x.json"] }).slice(-2),
+      ["--mcp-config", "/tmp/x.json"]);
+check("an empty splice becomes none",
+      harness.expand(claude.args, { prompt: "hi", mcpFlags: [] }).includes("{mcpFlags}"), false);
+
+// Position is load bearing for Codex: resume is a subcommand, so it has to land
+// straight after exec or the command line means something else.
+check("no resume, no subcommand", harness.expand(codex.args, { prompt: "hi" }).slice(0, 2), ["exec", "--json"]);
+check("resume sits where the subcommand goes",
+      harness.expand(codex.args, { prompt: "hi", resume: "abc" }).slice(0, 3), ["exec", "resume", "abc"]);
+check("the prompt is still last",
+      harness.expand(codex.args, { prompt: "hi", resume: "abc" }).slice(-1), ["hi"]);
+
+// A prompt is untrusted text. It has to arrive as one argument whatever is in it.
+const nasty = 'say "hi"; rm -rf / && echo $HOME `whoami`';
+check("a prompt with shell in it stays one argument",
+      harness.expand(claude.args, { prompt: nasty }).filter((a) => a === nasty).length, 1);
+
+check("the copilot config path is prefixed for that CLI",
+      harness.mcpFlags("flag:--additional-mcp-config|@", { dbPath: "/tmp/d.db", sessionId: 1, actor: "t" })
+        .flags[1].startsWith("@"), true);
+check("and is not for the others",
+      harness.mcpFlags("flag:--mcp-config", { dbPath: "/tmp/d.db", sessionId: 1, actor: "t" })
+        .flags[1].startsWith("@"), false);
+check("codex gets dotted overrides rather than a file",
+      harness.mcpFlags("codex-config", { dbPath: "/tmp/d.db", sessionId: 1, actor: "t" }).file, null);
 
 // ---------------------------------------------------------------------------
 

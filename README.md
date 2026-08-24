@@ -175,11 +175,39 @@ choose Delphi. **Windows**: press <kbd>Win</kbd>+<kbd>R</kbd>, run
 | Move between projects | Hover a task and use the **move to** menu |
 | Store a finding | The **Memory** tab, per project |
 | Read what an agent is working on | The **Pads** tab, per project |
+| Run Claude Code, Codex or Copilot | The **Chat** tab, then the agent's tab |
 | Read a note as prose | **Memory** tab, switch **Formatted** and **Raw markdown** |
 | Filter the task list | Click any count on a project's **Overview** |
 | Light or dark | **Settings**, then **Appearance**. System follows the Mac |
 | Undo a mistake | The **History** tab. Every change is reversible |
 | Dismiss | <kbd>Esc</kbd>, or click away |
+
+### Other agents, as tabs
+
+The **Chat** tab has a strip across the top: Delphi's own chat, then one tab for
+each coding agent installed on this machine, then a terminal. Claude Code,
+Codex, GitHub Copilot, and anything else you add.
+
+Each tab is a session. It runs in the project's folder, its turns are stored the
+way every other conversation is, and it is resumed by the agent's own session id
+rather than by replaying the transcript. Delphi never holds a credential for any
+of them: each signs in its own way and Delphi only runs the binary.
+
+The reason to run them here rather than in four terminal windows is that each
+one is handed Delphi's own MCP server on the way in, scoped to the project it is
+working on and named after the tab it is running as. So Codex can read the plan
+Claude wrote, file what it found, and every write it makes says Codex made it.
+The **Activity** tab becomes a log of which agent did what.
+
+They are configured in **Settings**, then **Agents**, where the command line for
+each is an editable row. These CLIs move fast, so when one renames a flag the fix
+is an edit there rather than waiting for a new version of Delphi. The same screen
+is how you add one that is not built in.
+
+What this is not: a terminal. Each agent runs in its headless mode, which is what
+lets Delphi see the individual tool calls and replies rather than a wall of
+bytes. The cost is that slash commands, permission prompts and full-screen
+interfaces are not available in a tab. For those, use a real terminal.
 
 ### Scratchpads, and the board read out of them
 

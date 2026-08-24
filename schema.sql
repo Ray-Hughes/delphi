@@ -282,6 +282,26 @@ CREATE TABLE IF NOT EXISTS sessions (
   model       TEXT,
   status      TEXT NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active', 'done', 'archived')),
+  -- Which harness runs this session, when one does. Null is the built-in chat,
+  -- which talks to a model directly rather than driving somebody else's CLI.
+  harness     TEXT,
+  -- The CLI's own id for this conversation, so a second turn resumes rather than
+  -- replaying the whole transcript as one prompt. That replay is what the built
+  -- in chat still does, and it is both expensive and lossy: the CLI keeps
+  -- context of its own that a folded transcript throws away.
+  native_id   TEXT,
+  -- The folder this session runs in, resolved once. A project can span four
+  -- repositories and a harness needs one answer.
+  cwd         TEXT,
+  -- Whether a turn is in flight. Separate from status, which is whether the
+  -- session is worth keeping: a failed turn does not archive a session, and an
+  -- archived session is not idle, it is over.
+  --
+  -- No CHECK, for the reason projects.task_view gives above: ALTER TABLE cannot
+  -- add one to a database that already exists, so the constraint would hold on a
+  -- fresh install and not on an old one. Validated in db.js instead.
+  run_state   TEXT NOT NULL DEFAULT 'idle',
+  last_run_at TEXT,
   -- Running totals, kept on the session so the token meter does not have to add
   -- up every message on every render.
   tokens_in   INTEGER NOT NULL DEFAULT 0,
@@ -413,3 +433,47 @@ CREATE TRIGGER IF NOT EXISTS pads_au AFTER UPDATE ON scratchpads BEGIN
 END;
 
 CREATE INDEX IF NOT EXISTS idx_tasks_pad ON tasks(pad_id);
+
+-- Harnesses: the other agents, as rows.
+--
+-- Claude Code, Codex, Copilot and whatever comes next are all the same shape: a
+-- binary, an argv that takes a prompt, and a way of printing what happened. So
+-- they are configuration rather than code, and adding one is a row.
+--
+-- That is the whole bet of this table. These CLIs move fast and rename flags
+-- between releases. If the argv lives in a source file, every rename is a new
+-- version of Delphi that somebody has to ship and everybody has to install. If
+-- it lives here, it is an edit in Settings.
+--
+-- The four built-in rows are seeded from harness.js on first open, with INSERT
+-- OR IGNORE, so an edit made here is never overwritten by the next launch.
+CREATE TABLE IF NOT EXISTS harnesses (
+  id         INTEGER PRIMARY KEY,
+  key        TEXT NOT NULL UNIQUE,
+  label      TEXT NOT NULL,
+  kind       TEXT NOT NULL DEFAULT 'builtin',   -- builtin | custom
+  -- A bare name is resolved through a login shell, because an app launched from
+  -- Finder does not inherit the PATH a version manager set up. An absolute path
+  -- is used as given.
+  command    TEXT,
+  -- The argv template, as JSON. See harness.js for the two rules: a nested list
+  -- is a group that drops out when a placeholder in it has no value, and
+  -- {mcpFlags} splices in however many arguments that harness needs to be told
+  -- about Delphi's own MCP server.
+  args_json  TEXT NOT NULL,
+  -- Which mapper reads its output: claude-stream-json, codex-json, copilot-json
+  -- or text.
+  parser     TEXT NOT NULL DEFAULT 'text',
+  -- flag:--mcp-config, codex-config, or none.
+  mcp_style  TEXT NOT NULL DEFAULT 'none',
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  -- What this row looked like when Delphi last seeded it. That is how a built-in
+  -- definition nobody has touched can be kept current while an edited one is
+  -- left alone. See db.js seedHarnesses: the alternative, never updating, means
+  -- a flag that turns out to be wrong stays wrong on every install that already
+  -- exists.
+  seeded_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);

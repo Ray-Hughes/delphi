@@ -16,6 +16,7 @@ const embeddings = require("./embeddings");
 const ai = require("./ai");
 const terminal = require("./terminal");
 const git = require("./git");
+const harness = require("./harness");
 
 const isMac = process.platform === "darwin";
 const SETTINGS_PATH = paths.SETTINGS_PATH;
@@ -588,6 +589,14 @@ app.whenReady().then(() => {
   // Before the database is opened for the first time, or the migration finds a
   // file already there and declines to do anything.
   if (app.isPackaged) paths.migrateLegacyDatabase();
+  // Before the window, so the harness strip has rows to draw on the first paint.
+  // Guarded because a database that has no registry is still a working tracker,
+  // and refusing to start over it would be a poor trade.
+  try {
+    db.seedHarnesses(harness.BUILTINS);
+  } catch (error) {
+    console.error("could not seed the harness registry", error);
+  }
   createWindow();
   createTray();
   refreshMenu();
@@ -1021,6 +1030,103 @@ handle("ai:send", async ({ sessionId, provider, model, system, messages, cwd, au
   return { ok: true };
 });
 
+
+// ---------------------------------------------------------------------------
+// Harnesses
+//
+// Somebody else's agent, run as a session. Same shape as ai:send, because from
+// the renderer's side it is the same thing: a turn goes out, events come back.
+// What differs is that this drives a CLI rather than calling a model, and that
+// the CLI is handed Delphi's own MCP server on the way in.
+
+handle("harness:list", (force) =>
+  harness.detect(db.listHarnesses(), { force: force === true }));
+handle("harness:create", (payload) => db.createHarness(payload));
+handle("harness:update", (id, fields) => db.updateHarness(id, fields));
+handle("harness:delete", (id) => db.deleteHarness(id));
+
+// One turn per session, not one turn overall. Two harnesses working two
+// sessions at once is the case this whole feature exists for; two turns in one
+// session would interleave into one transcript with no way to tell them apart.
+const turns = new Set();
+
+handle("harness:start", async ({ sessionId, prompt, system, autoAllow }) => {
+  if (turns.has(sessionId)) throw new Error("This session is already working");
+
+  const session = db.getSession(sessionId);
+  if (!session) throw new Error("No such session");
+  const row = db.getHarness(session.harness);
+  if (!row) throw new Error(`This session names a harness that no longer exists: ${session.harness}`);
+  if (!row.enabled) throw new Error(`${row.label} is turned off in Settings`);
+
+  const cwd = session.cwd || sessionFolder(session);
+  if (!cwd) throw new Error("This project has no folder, so there is nowhere for an agent to work");
+
+  turns.add(sessionId);
+  db.updateSession(sessionId, { run_state: "running", last_run_at: new Date().toISOString() });
+
+  const emit = (event) => {
+    // The CLI's own id for the conversation, kept so the next turn resumes
+    // rather than replaying the transcript as one prompt. Written as it arrives
+    // rather than at the end, because a turn that is interrupted has still
+    // started a conversation on the other side.
+    if (event.type === "session" && event.nativeId && event.nativeId !== session.native_id) {
+      db.updateSession(sessionId, { native_id: event.nativeId });
+    }
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send("ai-event", { sessionId, ...event });
+    }
+  };
+
+  let failed = false;
+  try {
+    await harness.start({
+      harness: { ...row, args: row.args_json },
+      sessionId,
+      cwd,
+      prompt,
+      system: system || null,
+      model: session.model || null,
+      resume: session.native_id || null,
+      autoAllow: autoAllow === true || session.auto_allow === 1,
+      dbPath: db.DB_PATH,
+      projectId: session.project_id,
+      // What the audit trail will say. This is the point of the whole
+      // arrangement: every row the agent writes is attributed to the tab it was
+      // written from, so History reads as a log of who did what.
+      actor: `${row.key}:${sessionId}`,
+    }, (event) => {
+      if (event.type === "error") failed = true;
+      emit(event);
+    });
+  } finally {
+    turns.delete(sessionId);
+    db.updateSession(sessionId, { run_state: failed ? "failed" : "idle" });
+  }
+  return { ok: true };
+});
+
+handle("harness:stop", (sessionId) => {
+  const stopped = harness.stop(sessionId);
+  if (stopped) db.updateSession(sessionId, { run_state: "idle" });
+  return { stopped };
+});
+
+/**
+ * Which folder a session runs in.
+ *
+ * A project can span four repositories, and a harness needs one answer. The
+ * session's own choice wins; then the workspace marked primary; then the
+ * project's own path, which is the older way of saying the same thing.
+ */
+function sessionFolder(session) {
+  if (session.cwd) return session.cwd;
+  const spaces = db.workspacesForProject(session.project_id) || [];
+  const primary = spaces.find((w) => w.is_primary) || spaces[0];
+  if (primary) return primary.path;
+  const project = db.getProject(session.project_id);
+  return project ? project.path : null;
+}
 
 // ---------------------------------------------------------------------------
 // Terminal

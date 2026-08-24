@@ -28,7 +28,15 @@ const state = {
   // Which half of the pane is showing. Not a view of its own: the chat and the
   // terminal are two faces of the same place, which is why Cmd+J flips between
   // them rather than navigating anywhere.
-  pane: "chat",          // chat | terminal
+  // Which face of the pane is showing. "chat" is Delphi's own, "terminal" is the
+  // command runner, and "h:<key>" is somebody else's agent running as a tab.
+  pane: "chat",          // chat | terminal | h:claude-code | h:codex | ...
+  // The registry, with whether each one is actually installed. Asked at boot for
+  // the same reason providers is: resolving a binary spawns a login shell.
+  harnesses: [],
+  // What the running turn has done, this turn only. Tool calls go into the
+  // message as they happen, so this is the live indicator rather than the record.
+  turnTool: null,
   termLines: [],         // what the running command has said
   termBusy: false,
   termDraft: "",
@@ -5079,6 +5087,168 @@ let openSheet = null;
  * length, and a write per character would fight the vault rebuild that follows
  * each change.
  */
+/**
+ * The editor for one harness definition.
+ *
+ * This is the escape hatch that makes the registry worth having. When Codex
+ * renames a flag between releases, or somebody wants Delphi to drive Aider or
+ * Goose or something written this afternoon, the answer is a row here rather
+ * than a version of Delphi.
+ *
+ * Deliberately plain. The argv is a JSON list and it is shown as one, because
+ * anything that hid it behind checkboxes could only express the flags somebody
+ * thought of in advance, which is the problem this is solving.
+ */
+/**
+ * An argv template, laid out to be read.
+ *
+ * One line per argument, with a group kept on its own line rather than exploded.
+ * JSON.stringify with an indent puts every element of every nested list on a
+ * line of its own, which turns a nine argument template into forty lines and
+ * hides the shape it has.
+ */
+function formatArgv(list) {
+  const lines = list.map((item) =>
+    `  ${Array.isArray(item) ? `[${item.map((t) => JSON.stringify(t)).join(", ")}]` : JSON.stringify(item)}`);
+  return `[\n${lines.join(",\n")}\n]`;
+}
+
+function openHarnessSheet(harness, done) {
+  if (openSheet) closeNoteSheet();
+
+  const overlay = el("div", { className: "overlay" });
+  const sheet = el("div", { className: "sheet", role: "dialog" });
+  sheet.setAttribute("aria-modal", "true");
+
+  const head = el("div", { className: "sheet-head" });
+  const label = el("input", { value: harness ? harness.label : "", placeholder: "Name, e.g. Aider" });
+  head.append(el("span", { className: "kind reference", textContent: harness ? harness.kind : "custom" }), label);
+  const status = el("span", { className: "hint" });
+  const close = el("button", { className: "icon-btn", title: "Close (Escape)" });
+  close.setAttribute("aria-label", "Close");
+  close.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" ' +
+    'stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+  head.append(status, close);
+  sheet.append(head);
+
+  const body = el("div", { className: "sheet-body hsheet" });
+
+  const field = (title, blurb, node) => {
+    body.append(el("label", { className: "hfield" },
+      el("b", { textContent: title }),
+      el("span", { className: "hint", textContent: blurb }),
+      node));
+    return node;
+  };
+
+  const command = field("Command",
+    "A bare name is looked up through a login shell, which is how a version manager's copy is found. An absolute path is used as given.",
+    el("input", { className: "field", value: harness ? (harness.command || "") : "", placeholder: "codex", spellcheck: false }));
+
+  const args = field("Arguments",
+    "A JSON list. A nested list is a group that drops out when a placeholder in it has no value, so an optional flag and its value stay together. " +
+    "{prompt} {model} {system} {resume} {cwd} are substituted, {mcpFlags} becomes however many arguments this agent needs to be told about Delphi's MCP server, " +
+    "and {if:autoAllow} or {ifnot:autoAllow} gate a group.",
+    el("textarea", {
+      className: "hargs", spellcheck: false,
+      value: harness ? formatArgv(JSON.parse(harness.args_json)) : '[\n  "-p", "{prompt}"\n]',
+    }));
+
+  const parser = field("Output",
+    "How its output is read. Anything that just prints an answer is text.",
+    el("select", { className: "btn sm" }));
+  for (const [value, text] of [
+    ["text", "Plain text"],
+    ["claude-stream-json", "Claude Code stream-json"],
+    ["codex-json", "Codex JSONL"],
+    ["copilot-json", "Copilot JSONL"],
+  ]) parser.append(el("option", { value, textContent: text, selected: harness && harness.parser === value }));
+
+  const mcp = field("Delphi's MCP server",
+    "How this agent is told about the tracker. Without it the tab still works, and the agent cannot see the pads, the board or anything else.",
+    el("select", { className: "btn sm" }));
+  for (const [value, text] of [
+    ["none", "Not connected"],
+    ["flag:--mcp-config", "A config file, via --mcp-config"],
+    ["flag:--additional-mcp-config|@", "A config file, via --additional-mcp-config @path"],
+    ["codex-config", "Codex style, via -c mcp_servers"],
+  ]) mcp.append(el("option", { value, textContent: text, selected: harness && harness.mcp_style === value }));
+
+  sheet.append(body);
+
+  const foot = el("div", { className: "sheet-foot" });
+  const save = el("button", { className: "btn primary", textContent: "Save" });
+  save.onclick = async () => {
+    try {
+      // Parsed here as well as in db.js, so the error lands next to the box it
+      // came from rather than as an exception from an IPC call.
+      JSON.parse(args.value);
+    } catch (error) {
+      status.textContent = `The arguments are not valid JSON: ${error.message}`;
+      return;
+    }
+    try {
+      if (harness) {
+        await window.delphi.harnesses.update(harness.id, {
+          label: label.value.trim() || harness.label,
+          command: command.value.trim(),
+          args_json: args.value,
+          parser: parser.value,
+          mcp_style: mcp.value,
+        });
+      } else {
+        await window.delphi.harnesses.create({
+          key: label.value.trim(),
+          label: label.value.trim(),
+          command: command.value.trim(),
+          args: JSON.parse(args.value),
+          parser: parser.value,
+          mcpStyle: mcp.value,
+        });
+      }
+    } catch (error) {
+      status.textContent = String(error.message || error);
+      return;
+    }
+    shut();
+    if (done) done();
+  };
+  foot.append(save);
+
+  if (harness && harness.kind === "custom") {
+    const remove = el("button", { className: "btn sm", textContent: "Delete" });
+    remove.onclick = async () => {
+      await window.delphi.harnesses.remove(harness.id);
+      shut();
+      if (done) done();
+    };
+    foot.append(remove);
+  }
+  // A built-in is never deleted, only turned off, so its definition can come
+  // back. Said here rather than left as a missing button.
+  if (harness && harness.kind === "builtin") {
+    foot.append(el("span", { className: "hint", textContent:
+      "A built-in agent is turned off rather than deleted. Leave it unedited and Delphi keeps its definition current." }));
+  }
+  sheet.append(foot);
+
+  const shut = () => {
+    overlay.remove();
+    openSheet = null;
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); shut(); } };
+  document.addEventListener("keydown", onKey);
+  close.onclick = shut;
+  overlay.onclick = (e) => { if (e.target === overlay) shut(); };
+
+  overlay.append(sheet);
+  document.body.append(overlay);
+  openSheet = { close: shut };
+  label.focus();
+}
+
 function openNoteSheet(note) {
   if (openSheet) closeNoteSheet();
 
@@ -6092,6 +6262,64 @@ async function renderSettings(root) {
     keyRow, keyMsg));
 
   root.append(aiBox);
+
+  // --- harnesses -----------------------------------------------------------
+  // The other agents, as rows you can edit. This is the difference between an
+  // app that integrates with three tools and one that is a layer above any of
+  // them: when a CLI renames a flag, the fix is here rather than in a release.
+  const harnessBox = el("div", { className: "setting" });
+  harnessBox.append(el("h3", { textContent: "Agents" }));
+  harnessBox.append(el("p", {
+    textContent: "The coding agents that can run as a tab inside a project. Each one runs in the project's folder with Delphi's own MCP server attached, so it can read the pads, file tasks, and be seen doing it in History. Delphi never holds their credentials: each signs in its own way and Delphi only runs the binary.",
+  }));
+
+  const harnessList = el("div", { className: "provider-list" });
+  harnessBox.append(harnessList);
+
+  const paintHarnesses = async (force = false) => {
+    harnessList.textContent = "";
+    harnessList.append(el("div", { className: "provider-probing" },
+      el("span", { className: "spinner" }),
+      el("span", { textContent: "Looking for the agents on this machine" })));
+    let rows = [];
+    try {
+      rows = await window.delphi.harnesses.list(force);
+      state.harnesses = rows;
+    } catch (error) {
+      harnessList.append(el("div", { className: "err-msg", textContent: String(error.message || error) }));
+      return;
+    }
+    harnessList.textContent = "";
+
+    for (const h of rows) {
+      const row = el("div", { className: "provider" });
+      row.append(el("span", { className: "pdot" + (h.ready && h.enabled ? " on" : "") }));
+      const text = el("div", { className: "grow" });
+      text.append(el("div", { className: "pname", textContent: h.label }));
+      text.append(el("div", { className: "hint", textContent: h.enabled ? (h.path || h.detail) : "turned off" }));
+      row.append(text);
+
+      const edit = el("button", { className: "btn sm", textContent: "Edit" });
+      edit.onclick = () => openHarnessSheet(h, () => paintHarnesses(true));
+      row.append(edit);
+
+      const toggle = el("button", { className: "btn sm", textContent: h.enabled ? "Turn off" : "Turn on" });
+      toggle.onclick = async () => {
+        await window.delphi.harnesses.update(h.id, { enabled: h.enabled ? 0 : 1 });
+        await paintHarnesses();
+      };
+      row.append(toggle);
+      harnessList.append(row);
+    }
+
+    const add = el("button", { className: "btn sm", textContent: "Add an agent" });
+    add.onclick = () => openHarnessSheet(null, () => paintHarnesses(true));
+    const recheck = el("button", { className: "btn sm", textContent: "Check again" });
+    recheck.onclick = async () => { await paintHarnesses(true); };
+    harnessList.append(el("div", { className: "provider-foot" }, add, recheck));
+  };
+  await paintHarnesses();
+  root.append(harnessBox);
 
   // --- appearance ----------------------------------------------------------
   const appearance = el("div", { className: "setting" });
@@ -7478,7 +7706,38 @@ async function openSession(id) {
   resetHistory();
   state.sessionId = id;
   state.messages = id ? await window.delphi.messages.list(id) : [];
+  // The strip follows the session, not the other way around. Picking a Codex
+  // conversation out of the sidebar has to land on the Codex tab, or the tab
+  // showing and the conversation showing disagree.
+  const session = state.sessions.find((x) => x.id === id);
+  if (state.pane !== "terminal") state.pane = session && session.harness ? `h:${session.harness}` : "chat";
   render();
+}
+
+/**
+ * Opens the tab for one harness, making its session if there is not one yet.
+ *
+ * A tab is a session, so switching to Codex means finding this project's most
+ * recent Codex conversation rather than starting a new one every time. That is
+ * what makes the strip feel like tabs instead of like a launcher.
+ */
+async function openHarness(key) {
+  const project = currentProject();
+  if (!project) return;
+  state.pane = `h:${key}`;
+  const existing = state.sessions.find((x) => x.harness === key);
+  if (existing) { await openSession(existing.id); return; }
+
+  const harness = state.harnesses.find((h) => h.key === key);
+  const created = await window.delphi.sessions.create({
+    projectId: project.id,
+    title: harness ? harness.label : key,
+    harness: key,
+    workspaceId: state.workspaceId,
+    cwd: sessionFolder({ workspace_id: state.workspaceId }),
+  });
+  state.sessions = await window.delphi.sessions.list(project.id);
+  await openSession(created.id);
 }
 
 
@@ -7789,7 +8048,11 @@ function thinkingIndicator() {
     // stream replaces the whole node, so this is how the timer learns to stop.
     if (!box.isConnected) { clearInterval(tick); return; }
     const seconds = Math.round((Date.now() - started) / 1000);
-    if (seconds >= 4) label.textContent = `Thinking, ${seconds}s`;
+    // What it is doing, when it has said. A harness that has been quiet for
+    // ninety seconds because it is running a test suite looks identical to one
+    // that has hung, and the tool name is the difference.
+    const doing = state.turnTool && state.turnTool !== "thinking" ? `Running ${state.turnTool}` : "Thinking";
+    label.textContent = seconds >= 4 ? `${doing}, ${seconds}s` : doing;
   }, 1000);
 
   return box;
@@ -7808,20 +8071,76 @@ function renderChat(root) {
 
   const wrap = el("div", { className: "chat" });
 
-  // Two faces of one place, so this is a switch rather than navigation. Granular
-  // puts the same pair here and binds the same key.
+  // Faces of one place, so this is a switch rather than navigation. Delphi's own
+  // chat, then one tab per agent that is actually installed, then the terminal.
+  //
+  // A tab is a session. Clicking Codex opens this project's Codex conversation,
+  // or starts one, and every one of them runs in the same folder with the same
+  // tracker wired in. That is the whole idea: the harnesses are the tabs, and
+  // Delphi is the thing above them.
   const tabs = el("div", { className: "pane-tabs" });
-  for (const [id, label] of [["chat", "Chat"], ["terminal", "Terminal"]]) {
+
+  const paneTab = (id, label, { busy = false, on = false, run = null } = {}) => {
     const t = el("div", {
       className: "pane-tab" + (state.pane === id ? " on" : ""),
       tabIndex: 0, role: "button",
     }, el("span", { textContent: label }));
-    if (id === "terminal" && state.termBusy) t.append(el("span", { className: "sd live" }));
-    const go = () => { state.pane = id; render(); };
+    if (busy) t.append(el("span", { className: "sd live" }));
+    if (run === "failed") t.append(el("span", { className: "sd bad", title: "The last turn failed" }));
+    const go = () => {
+      if (on) { on(); return; }
+      state.pane = id;
+      render();
+    };
     t.onclick = go;
     t.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
     tabs.append(t);
+    return t;
+  };
+
+  paneTab("chat", "Delphi", {
+    on: () => {
+      state.pane = "chat";
+      // Back to a conversation this tab owns, rather than leaving a Codex
+      // transcript on screen under Delphi's own name.
+      const own = state.sessions.find((x) => !x.harness);
+      if (own && own.id !== state.sessionId) { openSession(own.id); return; }
+      render();
+    },
+  });
+
+  for (const h of state.harnesses) {
+    if (!h.enabled || !h.ready) continue;
+    const session = state.sessions.find((x) => x.harness === h.key);
+    paneTab(`h:${h.key}`, h.label, {
+      // state.streaming as well as the stored state, because a turn in flight
+      // has not been written back to the row yet and the dot is the only thing
+      // saying the tab you are not looking at is working.
+      busy: Boolean(session && (session.run_state === "running" ||
+                                (state.streaming && session.id === state.sessionId))),
+      run: session ? session.run_state : null,
+      on: () => openHarness(h.key),
+    });
   }
+
+  paneTab("terminal", "Terminal", { busy: state.termBusy });
+
+  // The ones that are not installed, said once rather than as dead tabs. A tab
+  // that is always there and never works teaches people to stop reading the row.
+  const missing = state.harnesses.filter((h) => h.enabled && !h.ready);
+  if (missing.length) {
+    const note = el("span", {
+      className: "pane-miss",
+      textContent: `${missing.length} not installed`,
+      title: missing.map((h) => `${h.label}: ${h.detail}`).join("\n"),
+      tabIndex: 0, role: "button",
+    });
+    const go = () => goTo({ projectId: null, view: "settings" });
+    note.onclick = go;
+    note.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    tabs.append(note);
+  }
+
   tabs.append(el("span", { className: "pane-kbd", textContent: "⌘J" }));
   wrap.append(tabs);
 
@@ -7911,29 +8230,61 @@ function renderChat(root) {
   const model = el("div", { className: "gmodel" });
   // Named from what this machine can actually reach rather than from what the
   // session recorded, so a chip never claims a connection that is not there.
-  const ready = state.providers.filter((x) => x.ready);
-  const chosen = (session && session.provider && ready.find((x) => x.id === session.provider))
-    || ready[0] || null;
-  const conn = el("div", {
-    className: "gconn" + (chosen ? "" : " open"),
-    tabIndex: 0, role: "button",
-    title: chosen ? chosen.detail : "Nothing is connected yet. Click to choose.",
-  },
-    el("span", { className: "mk", textContent: chosen ? "✦" : "!" }),
-    el("span", { textContent: chosen ? chosen.label : "Not connected" }),
-    el("span", { className: "cv", textContent: "▾" }));
-  conn.onclick = (e) => providerMenu(e.clientX, e.clientY);
-  model.append(conn);
+  // A harness session does not use a provider: it drives a CLI of its own, and
+  // offering to switch it to an API key would be offering something that does
+  // nothing. The chip names the harness instead, and where it is running.
+  const harness = session && session.harness
+    ? state.harnesses.find((h) => h.key === session.harness) || null
+    : null;
+
+  if (harness) {
+    const conn = el("div", {
+      className: "gconn" + (harness.ready ? "" : " open"),
+      title: harness.ready
+        ? `${harness.path || harness.command}, resumed by session id`
+        : harness.detail,
+    },
+      el("span", { className: "mk", textContent: harness.ready ? "✦" : "!" }),
+      el("span", { textContent: harness.label }));
+    model.append(conn);
+  } else {
+    const ready = state.providers.filter((x) => x.ready);
+    const chosen = (session && session.provider && ready.find((x) => x.id === session.provider))
+      || ready[0] || null;
+    const conn = el("div", {
+      className: "gconn" + (chosen ? "" : " open"),
+      tabIndex: 0, role: "button",
+      title: chosen ? chosen.detail : "Nothing is connected yet. Click to choose.",
+    },
+      el("span", { className: "mk", textContent: chosen ? "✦" : "!" }),
+      el("span", { textContent: chosen ? chosen.label : "Not connected" }),
+      el("span", { className: "cv", textContent: "▾" }));
+    conn.onclick = (e) => providerMenu(e.clientX, e.clientY);
+    model.append(conn);
+  }
   // Every chip does something. Two of the ones here before were decoration, and
   // a control that looks live and is not is worse than no control.
   const autoAllow = session && session.auto_allow === 1;
+  // "Ask first" is the honest label for Delphi's own chat, where a refused tool
+  // comes back and can be allowed. A harness runs headless: there is nobody to
+  // ask, so the same switch is the difference between an agent that can only
+  // read and one that can change the folder. Saying "ask first" there would be
+  // promising a prompt that never arrives.
   const tools = el("div", {
     className: "gpill bd" + (autoAllow ? " hot" : ""),
     tabIndex: 0, role: "button",
-    title: autoAllow
+    title: harness
+      ? autoAllow
+        ? `${harness.label} may read and change files in this folder without asking`
+        : `${harness.label} can read this folder but not change it. There is no prompt in a tab: click to allow.`
+      : autoAllow
       ? "The agent may read and write files in this folder without asking"
       : "The agent can talk, but cannot touch files. Click to allow tools.",
-  }, el("span", { textContent: autoAllow ? "Auto-allow" : "Ask first" }));
+  }, el("span", {
+    textContent: harness
+      ? (autoAllow ? "Full access" : "Read only")
+      : (autoAllow ? "Auto-allow" : "Ask first"),
+  }));
   tools.onclick = async () => {
     if (!session) return;
     // Turning it on is the dangerous direction, so that is the one that asks.
@@ -7950,21 +8301,27 @@ function renderChat(root) {
   };
   model.append(tools);
 
+  // A persona is a system prompt, and only a harness whose template has a
+  // {system} placeholder can carry one. Offering the menu on the others would be
+  // offering a choice that changes nothing.
+  const takesPersona = !harness || /\{system\}/.test(String(harness.args_json || ""));
   const persona = agentById(session && session.agent);
-  const personaPill = el("div", {
+  const personaPill = takesPersona ? el("div", {
     className: "gpill bd", tabIndex: 0, role: "button", title: persona.blurb,
-  }, el("span", { textContent: persona.label }), el("span", { className: "cv", textContent: "▾" }));
-  personaPill.onclick = (e) => {
-    rowMenu(e.clientX, e.clientY, AGENTS.map((a) => ({
-      label: `${a.label}  ${a.blurb}`,
-      run: async () => {
-        if (!session) return;
-        await window.delphi.sessions.update(session.id, { agent: a.id });
-        await refresh();
-      },
-    })));
-  };
-  model.append(personaPill);
+  }, el("span", { textContent: persona.label }), el("span", { className: "cv", textContent: "▾" })) : null;
+  if (personaPill) {
+    personaPill.onclick = (e) => {
+      rowMenu(e.clientX, e.clientY, AGENTS.map((a) => ({
+        label: `${a.label}  ${a.blurb}`,
+        run: async () => {
+          if (!session) return;
+          await window.delphi.sessions.update(session.id, { agent: a.id });
+          await refresh();
+        },
+      })));
+    };
+    model.append(personaPill);
+  }
 
   const chosenModel = (session && session.model) || "Auto";
   const modelPill = el("div", {
@@ -8046,16 +8403,28 @@ async function sendMessage() {
   // Checked before the turn is written, so a message is not left hanging with no
   // reply and no reason. The error goes into the transcript rather than into an
   // alert, because that is where the person is looking.
-  const ready = state.providers.filter((p) => p.ready);
+  //
+  // A harness session is checked against the registry instead, since it does not
+  // use any of the providers: it drives a CLI of its own.
+  const harnessKey = (currentSession() || {}).harness || null;
+  const ready = harnessKey
+    ? state.harnesses.filter((h) => h.key === harnessKey && h.enabled && h.ready)
+    : state.providers.filter((p) => p.ready);
   if (!ready.length) {
     state.draft = "";
     await window.delphi.messages.append({ sessionId, role: "user", content: text });
-    const why = state.providers.length
+    const harness = harnessKey ? state.harnesses.find((h) => h.key === harnessKey) : null;
+    const why = harness
+      ? `${harness.label}: ${harness.enabled ? harness.detail : "turned off in Settings"}`
+      : state.providers.length
       ? state.providers.map((p) => `${p.label}: ${p.detail}`).join("\n")
       : "Nothing was found on this machine.";
     await window.delphi.messages.append({
       sessionId, role: "assistant", content: "",
-      error: `No AI is configured, so there is nothing to answer.\n\n${why}\n\n` +
+      error: (harness
+        ? `${harness.label} cannot run, so there is nothing to answer.`
+        : "No AI is configured, so there is nothing to answer.") +
+             `\n\n${why}\n\n` +
              "Set one up in All Work, then Settings, then AI.",
     });
     state.messages = await window.delphi.messages.list(sessionId);
@@ -8091,6 +8460,27 @@ async function sendMessage() {
   const open = currentSession();
   const folder = sessionFolder(open);
   try {
+    if (harnessKey) {
+      // Only the new turn goes over. The CLI keeps its own conversation and is
+      // resumed by id, which is both cheaper and better than folding the
+      // transcript into one prompt the way the built-in path has to.
+      //
+      // The persona goes with it on the first turn only, since it is a system
+      // prompt and a resumed conversation already has one. A harness whose
+      // template has no {system} placeholder drops it, which is why the pill is
+      // hidden for those.
+      await window.delphi.harnesses.start({
+        sessionId,
+        prompt: text,
+        system: open && open.native_id ? null : [
+          agentById(open && open.agent).prompt,
+          folder
+            ? `You are working on the project "${project.name}", in ${folder}. Delphi's MCP server is connected: keep your working document there with write_scratchpad, and its checkbox lines become tasks on the board.`
+            : `You are working on the project "${project.name}".`,
+        ].join("\n\n"),
+      });
+      return;
+    }
     await window.delphi.ai.send({
       sessionId,
       provider: open && open.provider ? open.provider : "claude-cli",
@@ -8220,12 +8610,39 @@ window.delphi.onAiEvent(async (event) => {
     return;
   }
 
+  // What it did, in the transcript, where it happened. Written into the message
+  // rather than kept beside it, because in a month the useful question is "what
+  // did Codex actually run", and an answer that only existed while the turn was
+  // live is no answer.
+  if (event.type === "tool") {
+    state.turnTool = event.name;
+    const detail = event.detail ? ` \`${String(event.detail).replace(/`/g, "")}\`` : "";
+    const gap = streamBuffer && !streamBuffer.endsWith("\n\n") ? "\n\n" : "";
+    streamBuffer += `${gap}> ▸ **${event.name}**${detail}\n\n`;
+    const row = state.messages.find((m) => m.id === streamingMessageId);
+    if (row) row.content = streamBuffer;
+    if (!streamTimer) streamTimer = requestAnimationFrame(drainStream);
+    return;
+  }
+
+  // Reasoning is shown while it happens and not kept. It is long, it is not the
+  // answer, and a transcript full of it is harder to read afterwards, not easier.
+  if (event.type === "thinking") {
+    state.turnTool = "thinking";
+    return;
+  }
+
+  // The CLI's own conversation id. Recorded by the main process; nothing here
+  // has to do anything with it beyond not treating it as an error.
+  if (event.type === "session") return;
+
   if (event.type === "error") {
     await window.delphi.messages.update(streamingMessageId, { error: event.message });
     return;
   }
 
   if (event.type === "done") {
+    state.turnTool = null;
     // The stream is over, the drain may not be. Letting it finish is what stops
     // the last few words being replaced by the final render before they appear.
     streamDone = true;
@@ -8489,6 +8906,12 @@ async function boot() {
   // connected" until someone happened to open settings.
   window.delphi.ai.providers()
     .then((p) => { state.providers = p; if (state.view === "chat") render(); })
+    .catch(() => {});
+  // Same reason, same once: resolving a binary through a login shell is far too
+  // slow to do on a render, and the strip needs to know which agents exist
+  // before it can draw a tab for each of them.
+  window.delphi.harnesses.list()
+    .then((h) => { state.harnesses = h; if (state.view === "chat") render(); })
     .catch(() => {});
 
   try {

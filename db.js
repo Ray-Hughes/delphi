@@ -94,6 +94,15 @@ const LATER_COLUMNS = [
   // because a task typed into the board is not derived from anything, and SET
   // NULL because deleting the working document must not delete the work.
   ["tasks", "pad_id", "INTEGER REFERENCES scratchpads(id) ON DELETE SET NULL"],
+  // A session can now be somebody else's agent rather than the built-in chat.
+  ["sessions", "harness", "TEXT"],
+  ["sessions", "native_id", "TEXT"],
+  ["sessions", "cwd", "TEXT"],
+  ["sessions", "run_state", "TEXT NOT NULL DEFAULT 'idle'"],
+  ["sessions", "last_run_at", "TEXT"],
+  // What this row looked like when Delphi last seeded it, so seedHarnesses can
+  // tell a definition nobody has touched from one somebody has edited.
+  ["harnesses", "seeded_json", "TEXT"],
 ];
 
 function addLaterColumns(db) {
@@ -2069,23 +2078,39 @@ function nextSessionName(projectId) {
   return `Session ${highest + 1}`;
 }
 
-function createSession({ projectId, title = null, agent = null, provider = null, model = null, workspaceId = null }) {
+function createSession({
+  projectId, title = null, agent = null, provider = null, model = null,
+  workspaceId = null, harness = null, cwd = null,
+}) {
   if (!projectId) throw new Error("A session needs a project");
   const r = run(
-    `INSERT INTO sessions (project_id, workspace_id, title, agent, provider, model)
-     VALUES (:projectId, :workspaceId, :title, :agent, :provider, :model)`,
-    { projectId, workspaceId, title: title || nextSessionName(projectId), agent, provider, model }
+    `INSERT INTO sessions (project_id, workspace_id, title, agent, provider, model, harness, cwd)
+     VALUES (:projectId, :workspaceId, :title, :agent, :provider, :model, :harness, :cwd)`,
+    {
+      projectId, workspaceId, title: title || nextSessionName(projectId),
+      agent, provider, model, harness, cwd,
+    }
   );
-  // Not audited. The audit table's entity CHECK admits task, note, project and
-  // link only, and a CHECK cannot be added to a database that already exists, so
-  // filing a session there would throw on every install but a brand new one.
-  // No loss: undo replays a stored "before" row, which is meaningless for a
-  // conversation, and a deleted session takes its messages with it either way.
+  // Not audited, even though the entity CHECK now admits 'session'. Undo replays
+  // a stored "before" row, which is meaningless for a conversation, and a
+  // deleted session takes its messages with it either way. What is worth
+  // auditing is what the session did, and every one of those writes comes back
+  // through the MCP server under the harness's own actor name.
   return getSession(Number(r.lastInsertRowid));
 }
 
+const RUN_STATES = ["idle", "running", "failed"];
+
 function updateSession(id, fields) {
-  const allowed = ["title", "agent", "provider", "model", "status", "tokens_in", "tokens_out", "workspace_id", "auto_allow"];
+  const allowed = ["title", "agent", "provider", "model", "status", "tokens_in", "tokens_out",
+                   "workspace_id", "auto_allow", "harness", "native_id", "cwd", "run_state",
+                   "last_run_at"];
+  // Validated here rather than by a CHECK, because ALTER TABLE could not have
+  // added the constraint to a database that already exists and one rule that
+  // holds on new installs only is worse than none.
+  if (fields.run_state != null && !RUN_STATES.includes(fields.run_state)) {
+    throw new Error(`run_state must be one of ${RUN_STATES.join(", ")}`);
+  }
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getSession(id);
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
@@ -2094,6 +2119,130 @@ function updateSession(id, fields) {
     id,
   });
   return getSession(id);
+}
+
+// ---------------------------------------------------------------------------
+// The harness registry
+//
+// Rows rather than code, so a flag that moves in the next Codex release is an
+// edit in Settings and not a release of this. harness.js holds the four built-in
+// definitions and the machinery that runs them; this holds the copies a person
+// can change.
+// ---------------------------------------------------------------------------
+
+const listHarnesses = ({ includeDisabled = true } = {}) =>
+  all(`SELECT * FROM harnesses ${includeDisabled ? "" : "WHERE enabled = 1"}
+       ORDER BY sort_order, id`);
+
+const getHarness = (key) => one("SELECT * FROM harnesses WHERE key = :key", { key });
+
+/**
+ * Puts the built-in harnesses in, and keeps the untouched ones current.
+ *
+ * The obvious version of this is INSERT OR IGNORE, and it is wrong in a way that
+ * only shows up later: these CLIs move, so a shipped definition will need fixing,
+ * and a row that is never updated means everybody who installed before the fix
+ * keeps the broken flag forever. The first version of the Copilot row passed its
+ * MCP config file without the @ prefix that CLI needs, and every existing
+ * database would have kept doing that.
+ *
+ * The other obvious version, overwriting on every launch, is worse: somebody who
+ * edited a command line had a reason, and silently reverting it is the failure
+ * this whole table exists to avoid.
+ *
+ * So each row remembers what it was last seeded with. If it still matches, it
+ * has not been touched and takes the new definition. If it does not, somebody
+ * changed it and it is left exactly as they left it.
+ */
+function seedHarnesses(definitions) {
+  definitions.forEach((h, i) => {
+    const seeded = JSON.stringify({
+      label: h.label, command: h.command || null, args: h.args,
+      parser: h.parser, mcp_style: h.mcp_style,
+    });
+    const existing = getHarness(h.key);
+    if (!existing) {
+      run(
+        `INSERT INTO harnesses (key, label, kind, command, args_json, parser, mcp_style, enabled, sort_order, seeded_json)
+         VALUES (:key, :label, 'builtin', :command, :args, :parser, :mcpStyle, :enabled, :sort, :seeded)`,
+        {
+          key: h.key, label: h.label, command: h.command || null,
+          args: JSON.stringify(h.args), parser: h.parser, mcpStyle: h.mcp_style,
+          enabled: h.enabled === undefined ? 1 : h.enabled, sort: (i + 1) * 10, seeded,
+        }
+      );
+      return;
+    }
+    if (existing.kind !== "builtin") return;
+    const current = JSON.stringify({
+      label: existing.label, command: existing.command, args: JSON.parse(existing.args_json),
+      parser: existing.parser, mcp_style: existing.mcp_style,
+    });
+    // A row with no snapshot predates this and is treated as untouched, which is
+    // true: there was no way to edit one before there was a settings panel.
+    const untouched = !existing.seeded_json || existing.seeded_json === current;
+    if (!untouched) return;
+    // enabled is deliberately not in the snapshot and not written here. Turning a
+    // harness off is a preference, not an edit to its definition, and it has to
+    // survive a definition that changes underneath it.
+    run(
+      `UPDATE harnesses SET label = :label, command = :command, args_json = :args,
+       parser = :parser, mcp_style = :mcpStyle, seeded_json = :seeded,
+       updated_at = datetime('now') WHERE id = :id`,
+      {
+        label: h.label, command: h.command || null, args: JSON.stringify(h.args),
+        parser: h.parser, mcpStyle: h.mcp_style, seeded, id: existing.id,
+      }
+    );
+  });
+  return listHarnesses();
+}
+
+const PARSERS = ["claude-stream-json", "codex-json", "copilot-json", "text"];
+
+function updateHarness(id, fields) {
+  const allowed = ["label", "command", "args_json", "parser", "mcp_style", "enabled", "sort_order"];
+  if (fields.parser != null && !PARSERS.includes(fields.parser)) {
+    throw new Error(`parser must be one of ${PARSERS.join(", ")}`);
+  }
+  // Rejected here rather than at spawn time. A malformed template fails inside a
+  // child process, where the only symptom is a harness that never answers.
+  if (fields.args_json != null) {
+    let parsed;
+    try { parsed = JSON.parse(fields.args_json); } catch { throw new Error("The argv template is not valid JSON"); }
+    if (!Array.isArray(parsed)) throw new Error("The argv template must be a list");
+  }
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return one("SELECT * FROM harnesses WHERE id = :id", { id });
+  run(`UPDATE harnesses SET ${sets.map((k) => `${k} = :${k}`).join(", ")},
+       updated_at = datetime('now') WHERE id = :id`,
+      { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id });
+  return one("SELECT * FROM harnesses WHERE id = :id", { id });
+}
+
+function createHarness({ key, label, command, args, parser = "text", mcpStyle = "none" }) {
+  const slug = slugKey(key || label);
+  if (!slug) throw new Error("A harness needs a key");
+  if (getHarness(slug)) throw new Error(`A harness with the key '${slug}' already exists`);
+  run(
+    `INSERT INTO harnesses (key, label, kind, command, args_json, parser, mcp_style, sort_order)
+     VALUES (:key, :label, 'custom', :command, :args, :parser, :mcpStyle,
+             (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM harnesses))`,
+    {
+      key: slug, label: label || slug, command: command || null,
+      args: JSON.stringify(args || ["-p", "{prompt}"]), parser, mcpStyle,
+    }
+  );
+  return getHarness(slug);
+}
+
+/** Built-ins are disabled rather than removed, so the definition can come back. */
+function deleteHarness(id) {
+  const row = one("SELECT * FROM harnesses WHERE id = :id", { id });
+  if (!row) return;
+  if (row.kind === "builtin") return updateHarness(id, { enabled: 0 });
+  run("DELETE FROM harnesses WHERE id = :id", { id });
+  return null;
 }
 
 function deleteSession(id) {
@@ -2298,5 +2447,6 @@ module.exports = {
   projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
   adoptProjectPaths,
   listSessions, getSession, createSession, updateSession, deleteSession,
+  listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness,
   listMessages, appendMessage, updateMessage, addSessionUsage,
 };

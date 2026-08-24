@@ -781,6 +781,23 @@
   }
   .t-pad:hover { border-color: var(--accent); color: var(--accent-ink); }
 
+  /* The harness editor.
+     Plain on purpose: the argv is a JSON list and is shown as one. Anything that
+     hid it behind checkboxes could only express the flags somebody thought of in
+     advance, which is the problem the registry exists to solve. */
+  .hsheet { display: flex; flex-direction: column; gap: var(--s4); padding: var(--s4); }
+  .hfield { display: flex; flex-direction: column; gap: 5px; }
+  .hfield > b { font-size: 12.5px; }
+  .hfield > .hint { max-width: 72ch; }
+  .hfield select { align-self: flex-start; }
+  .hargs {
+    min-height: 150px; resize: vertical; border: 1px solid var(--line);
+    border-radius: var(--r-sm); background: var(--bg); color: var(--ink);
+    padding: var(--s3); font-family: var(--mono); font-size: 12px; line-height: 1.6;
+    outline: none;
+  }
+  .hargs:focus { border-color: var(--accent); }
+
   /* Pads -------------------------------------------------------------------
      The working documents, and the board read out of them.
 
@@ -2596,6 +2613,20 @@
   .term-stop:hover { color: var(--t-err); border-color: var(--t-err); }
 
   .pane-tab .sd.live { width: 7px; height: 7px; }
+  /* A turn that failed. Not an alarm: the tab is still there and still works,
+     and this is only saying the last thing it tried did not. */
+  .pane-tab .sd.bad {
+    width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--crit);
+  }
+
+  /* The agents this machine does not have. Said once, at the end of the strip,
+     rather than as tabs that are always there and never work. */
+  .pane-miss {
+    font-size: 11px; color: var(--ink-faint); padding: 0 var(--s2);
+    align-self: center; white-space: nowrap;
+  }
+  .pane-miss:hover { color: var(--accent-ink); }
+
 
   /* Repository state, under the sessions. */
   .gitfoot { margin-top: var(--s4); padding-top: var(--s3); border-top: 1px solid var(--line-soft); }

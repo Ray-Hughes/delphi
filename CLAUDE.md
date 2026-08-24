@@ -34,6 +34,8 @@ loads all of them at startup, so a renderer change needs a restart, not a reload
 | `app.js` | Renderer. Talks to the main process through `window.delphi` only |
 | `index.html` | All styling. Design tokens at the top, components below |
 | `pads.js` | The scratchpad grammar. Pure text in, text out, no database and no dependencies |
+| `ai.js` | Talking to a model directly, for Delphi's own chat |
+| `harness.js` | Running somebody else's agent CLI as a session. Templates, parsers, MCP wiring |
 | `agent/mcp_server.js` | JSON-RPC 2.0 MCP server over stdio, no dependencies |
 | `schema.sql` | The store. Projects hold tasks, notes, pads and links |
 
@@ -69,6 +71,21 @@ board to pad, and a module-level `deriving` flag is what stops them calling each
 other forever. Two rules are load bearing and both are there to stop an agent
 losing work: a line that disappears never deletes its task, and an unticked box
 never drags a task out of `doing`. See the comments in `db.js` and `pads.js`.
+
+**A harness is a row, not a code path.** Claude Code, Codex and Copilot are
+seeded into the `harnesses` table from `harness.BUILTINS`, argv template and all,
+so a flag that moves in one of their releases is an edit in Settings rather than
+a release of this. `seedHarnesses` keeps an untouched built-in current and leaves
+an edited one alone, by remembering what it last seeded in `seeded_json`. The
+template language is two rules: a nested list is a group that drops out when a
+placeholder in it has no value, and `{mcpFlags}` splices. Both are tested.
+
+**Every harness Delphi launches gets Delphi's MCP server**, scoped to the
+project and named `<harness>:<sessionId>` in `DELPHI_ACTOR`. That attribution is
+the point: it is what makes History a log of which agent did what. The server is
+launched as `process.execPath` with `ELECTRON_RUN_AS_NODE=1`, because there is no
+guarantee of a `node` on PATH and Electron in that mode can read inside
+`app.asar`.
 
 **The renderer runs under a strict CSP**: `default-src 'self'; script-src 'self'`.
 No external scripts, no CDN, no `eval`. Build DOM nodes rather than assigning
