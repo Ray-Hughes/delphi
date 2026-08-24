@@ -193,6 +193,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
 CREATE TABLE IF NOT EXISTS alerts (
   id          INTEGER PRIMARY KEY,
   task_id     INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  -- A timer, rather than a reminder. Same table because they are the same
+  -- mechanism, and there is already one sweep firing due rows every minute; a
+  -- second scheduler would be a second thing to keep in step. kind is what keeps
+  -- them apart, so the Reminders tab does not fill with machine wakeups.
+  session_id  INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL DEFAULT 'reminder',   -- reminder | harvest
+  payload     TEXT,                               -- JSON, for what the wake is about
   fire_at     TEXT NOT NULL,           -- when it should next appear
   message     TEXT,                    -- overrides the task title if set
   status      TEXT NOT NULL DEFAULT 'pending'
@@ -476,4 +483,70 @@ CREATE TABLE IF NOT EXISTS harnesses (
   seeded_json TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Handoffs: one agent asking another to do something.
+--
+-- The thing this makes possible: from a Claude tab, "send this branch to Codex
+-- to review". Delphi finds or makes the Codex session, runs the request in it,
+-- keeps the reply, and wakes the agent that asked. Neither agent knows the other
+-- exists; they both know Delphi.
+--
+-- A row rather than a message queue, because the interesting states are not
+-- "sent" and "delivered". They are queued, running, ready to collect, and
+-- collected, and something has to hold the reply in between. An agent's turn
+-- ends long before the answer arrives, which is the whole difficulty: without
+-- somewhere durable to put it, the reply arrives to nobody.
+CREATE TABLE IF NOT EXISTS handoffs (
+  id              INTEGER PRIMARY KEY,
+  project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  -- Who asked. Null when a person asked from the window rather than an agent
+  -- asking from a tab, which is why there is nobody to wake in that case.
+  from_session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+  -- Who is being asked. The harness key is the request; the session is filled in
+  -- once one has been found or made, because "ask Codex" does not name a
+  -- conversation and should not have to.
+  to_harness      TEXT NOT NULL,
+  to_session_id   INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+  task_id         INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+  request         TEXT NOT NULL,
+  -- Branch, files, pad ids: whatever the sender thought the receiver would need.
+  -- JSON rather than columns, because the useful contents of this will change
+  -- and a column per idea would be a migration per idea.
+  context_json    TEXT,
+  status          TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (status IN ('queued','running','ready','harvested','failed','cancelled')),
+  reply           TEXT,
+  -- Whether the sender's own session should be woken with the reply when it
+  -- lands. On by default: an agent that asked for a review wants the review. Off
+  -- is for a handoff somebody fired and will read themselves.
+  wake            INTEGER NOT NULL DEFAULT 1,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  started_at      TEXT,
+  finished_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status, id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_project ON handoffs(project_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_handoffs_from ON handoffs(from_session_id, status);
+
+-- Locks: a lease on anything that is not a task.
+--
+-- tasks.claimed_by already leases a piece of work, and the semantics there are
+-- the right ones. This is the same idea for everything else two agents can
+-- collide over: a file, a migration, a branch, the dev server.
+--
+-- A lease and not a mutex, for the reason the task claim gives: an agent that
+-- takes a lock and then dies must not hold it forever. Everything here expires.
+CREATE TABLE IF NOT EXISTS locks (
+  id         INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  key        TEXT NOT NULL,
+  holder     TEXT NOT NULL,
+  note       TEXT,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  -- One holder per key per project. The acquire is a single statement that
+  -- relies on this: two agents asking at the same moment cannot both win.
+  UNIQUE (project_id, key)
 );

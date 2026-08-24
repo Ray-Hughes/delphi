@@ -798,6 +798,24 @@
   }
   .hargs:focus { border-color: var(--accent); }
 
+  /* Work one agent handed to another. */
+  .hoff { display: flex; gap: var(--s2); align-items: flex-start; padding: var(--s2) 0; }
+  .hoff + .hoff { border-top: 1px solid var(--line-soft); }
+  .hoff-s {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .05em; font-weight: 600;
+    padding: 2px 6px; border-radius: 4px; background: var(--raised); color: var(--ink-faint);
+    flex: 0 0 auto; margin-top: 2px; min-width: 64px; text-align: center;
+  }
+  .hoff-s.running { background: var(--accent-soft); color: var(--accent-ink); }
+  .hoff-s.ready { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good); }
+  .hoff-s.failed { background: color-mix(in srgb, var(--crit) 12%, transparent); color: var(--crit); }
+  .hoff-t { font-weight: 600; font-size: 12.5px; }
+  .hoff-r {
+    margin-top: 5px; padding: var(--s2); border-radius: var(--r-sm);
+    background: var(--raised); color: var(--ink-dim); font-size: 12px;
+    white-space: pre-wrap; max-height: 9em; overflow: hidden;
+  }
+
   /* Pads -------------------------------------------------------------------
      The working documents, and the board read out of them.
 

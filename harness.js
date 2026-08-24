@@ -38,6 +38,7 @@
 //   { type: "text",     text }              a piece of the reply
 //   { type: "thinking", text }              a piece of the reasoning, if it shows it
 //   { type: "tool",     name, detail }      it used a tool
+//   { type: "status",   text }              still going, and here is why it is quiet
 //   { type: "session",  nativeId }          the CLI's own id, kept for resume
 //   { type: "usage",    input, output }
 //   { type: "error",    message }
@@ -360,6 +361,20 @@ function claudeMapper(emit) {
     try { m = JSON.parse(line); } catch { return; }
     if (m.session_id) emit({ type: "session", nativeId: m.session_id });
 
+    // Why it has gone quiet. The API returns 529 under load and the CLI retries
+    // with a backoff that reaches half a minute, so a turn can sit silent for
+    // five minutes and then exit non-zero. Without this the window shows nothing
+    // at all for that whole time and the tab looks hung, which is the one thing
+    // it must not do: a person watching a blank pane cannot tell a busy agent
+    // from a broken one.
+    if (m.type === "system" && m.subtype === "api_retry") {
+      emit({
+        type: "status",
+        text: `${m.error || "the service"} is busy, retrying (${m.attempt || 1} of ${m.max_retries || "?"})`,
+      });
+      return;
+    }
+
     if (m.type === "stream_event" && m.event) {
       const e = m.event;
       if (e.type === "content_block_delta" && e.delta) {
@@ -426,7 +441,14 @@ function codexMapper(emit) {
       return;
     }
     if (m.type === "error") {
-      emit({ type: "error", message: m.message || "Codex reported an error" });
+      // A reconnect is not a failure. Codex reports each attempt on the same
+      // channel as a genuine error, and treating them alike marks a turn failed
+      // while it is still going and puts a red line in a transcript that then
+      // carries on perfectly well.
+      const message = String(m.message || "Codex reported an error");
+      emit(/^Reconnecting/i.test(message)
+        ? { type: "status", text: message.replace(/\s*\(.*$/, "") }
+        : { type: "error", message });
       return;
     }
 
@@ -559,11 +581,13 @@ function start(options, emit) {
     const mapper = MAPPERS[harness.parser];
     let stderr = "";
     let said = false;
+    let lastStatus = null;
 
     child.stdout.setEncoding("utf8");
     if (mapper) {
       const map = mapper((event) => {
         if (event.type === "text" || event.type === "tool") said = true;
+        if (event.type === "status") lastStatus = event.text;
         emit(event);
       });
       child.stdout.on("data", lineReader(map));
@@ -591,9 +615,15 @@ function start(options, emit) {
       // is common enough, and reporting stderr on top of a good reply reads as
       // though the reply were wrong.
       if (code !== 0 && !said) {
+        // The last status, when there was one. "Exited with code 1" is true and
+        // useless; "the service was busy, it retried nine times and gave up" is
+        // the same event described so somebody can decide what to do about it.
         emit({
           type: "error",
-          message: stderr.trim() || `${harness.label} exited with code ${code} and said nothing.`,
+          message: stderr.trim() ||
+            (lastStatus
+              ? `${harness.label} gave up after retrying: ${lastStatus}.`
+              : `${harness.label} exited with code ${code} and said nothing.`),
         });
       }
       emit({ type: "done", code });

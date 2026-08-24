@@ -716,6 +716,11 @@ function checkForExternalWrites() {
     if (version !== lastSeenDbChange) {
       lastSeenDbChange = version;
       scheduleVaultExport();
+      // A handoff written by an agent arrives as an external write, since the
+      // MCP server is a different process. This is what turns "Claude asked
+      // Codex" into Codex actually starting, within seconds rather than at the
+      // next sweep.
+      dispatchHandoffs();
       if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
     }
   } catch (error) {
@@ -759,6 +764,11 @@ function startScheduler() {
   schedulerTimer = setInterval(() => {
     sweep();
     checkForExternalWrites();
+    // The backstop. Both of these are normally kicked the moment the write that
+    // created them lands, and this is what catches the one written by an MCP
+    // client while the app was closed.
+    dispatchHandoffs();
+    fireTimers();
   }, Math.max(15, settings.checkIntervalSeconds) * 1000);
   // Sweep shortly after launch so anything that came due while the app was closed
   // appears rather than waiting for the first interval.
@@ -1050,7 +1060,16 @@ handle("harness:delete", (id) => db.deleteHarness(id));
 // session would interleave into one transcript with no way to tell them apart.
 const turns = new Set();
 
-handle("harness:start", async ({ sessionId, prompt, system, autoAllow }) => {
+/**
+ * Runs one turn in a harness session.
+ *
+ * Two callers, and the difference between them is who owns the transcript. The
+ * window creates the message rows itself, so it can grow the reply on screen as
+ * it arrives; a handoff has no window involved, so this writes them. Hence
+ * `collect`: on that path the reply is accumulated and stored here, and the
+ * events still go to the window in case it happens to be looking.
+ */
+async function runTurn({ sessionId, prompt, system = null, autoAllow, collect = false }) {
   if (turns.has(sessionId)) throw new Error("This session is already working");
 
   const session = db.getSession(sessionId);
@@ -1065,27 +1084,21 @@ handle("harness:start", async ({ sessionId, prompt, system, autoAllow }) => {
   turns.add(sessionId);
   db.updateSession(sessionId, { run_state: "running", last_run_at: new Date().toISOString() });
 
-  const emit = (event) => {
-    // The CLI's own id for the conversation, kept so the next turn resumes
-    // rather than replaying the transcript as one prompt. Written as it arrives
-    // rather than at the end, because a turn that is interrupted has still
-    // started a conversation on the other side.
-    if (event.type === "session" && event.nativeId && event.nativeId !== session.native_id) {
-      db.updateSession(sessionId, { native_id: event.nativeId });
-    }
-    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
-      win.webContents.send("ai-event", { sessionId, ...event });
-    }
-  };
+  let text = "";
+  let failure = null;
+  let reply = null;
+  if (collect) {
+    db.appendMessage({ sessionId, role: "user", content: prompt });
+    reply = db.appendMessage({ sessionId, role: "assistant", content: "" });
+  }
 
-  let failed = false;
   try {
     await harness.start({
       harness: { ...row, args: row.args_json },
       sessionId,
       cwd,
       prompt,
-      system: system || null,
+      system,
       model: session.model || null,
       resume: session.native_id || null,
       autoAllow: autoAllow === true || session.auto_allow === 1,
@@ -1096,15 +1109,208 @@ handle("harness:start", async ({ sessionId, prompt, system, autoAllow }) => {
       // written from, so History reads as a log of who did what.
       actor: `${row.key}:${sessionId}`,
     }, (event) => {
-      if (event.type === "error") failed = true;
-      emit(event);
+      // The CLI's own id for the conversation, kept so the next turn resumes
+      // rather than replaying the transcript as one prompt. Written as it
+      // arrives rather than at the end, because a turn that is interrupted has
+      // still started a conversation on the other side.
+      if (event.type === "session" && event.nativeId && event.nativeId !== session.native_id) {
+        db.updateSession(sessionId, { native_id: event.nativeId });
+      }
+      if (event.type === "error") failure = event.message;
+      if (event.type === "text") text += event.text;
+      if (event.type === "tool" && collect) {
+        text += `${text && !text.endsWith("\n\n") ? "\n\n" : ""}> \u25b8 **${event.name}**\n\n`;
+      }
+      if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+        win.webContents.send("ai-event", { sessionId, ...event });
+      }
     });
   } finally {
     turns.delete(sessionId);
-    db.updateSession(sessionId, { run_state: failed ? "failed" : "idle" });
+    db.updateSession(sessionId, { run_state: failure ? "failed" : "idle" });
+    if (collect && reply) {
+      db.updateMessage(reply.id, failure ? { error: failure } : { content: text });
+    }
   }
-  return { ok: true };
+  return { text, failure };
+}
+
+handle("harness:start", ({ sessionId, prompt, system, autoAllow }) =>
+  runTurn({ sessionId, prompt, system, autoAllow }).then(() => ({ ok: true })));
+
+// ---------------------------------------------------------------------------
+// Handoffs
+//
+// An agent asking another agent. The MCP server can only write the row: it runs
+// in a separate process with no registry and no window, so it cannot spawn
+// anything. This is the half that reads those rows and runs them, and it is here
+// because this is where the harnesses already live.
+
+handle("handoffs:list", (opts) => db.listHandoffs(opts || {}));
+handle("handoffs:create", (payload) => {
+  const created = db.createHandoff(payload);
+  // Straight away rather than at the next sweep. A minute of nothing happening
+  // is how a feature like this gets a reputation for not working.
+  setTimeout(dispatchHandoffs, 50);
+  return created;
 });
+handle("handoffs:cancel", (id) => db.updateHandoff(id, { status: "cancelled" }));
+handle("locks:list", (projectId) => db.listLocks(projectId ?? null));
+handle("locks:release", (projectId, key, holder) => db.releaseLock({ projectId, key, holder }));
+
+// One dispatch at a time. Two overlapping passes would both see the same queued
+// row and run it twice, and "twice" here means two agents doing the same work in
+// the same folder.
+let dispatching = false;
+
+async function dispatchHandoffs() {
+  if (dispatching) return;
+  dispatching = true;
+  try {
+    for (const handoff of db.pendingHandoffs()) {
+      try {
+        await runHandoff(handoff);
+      } catch (error) {
+        db.updateHandoff(handoff.id, { status: "failed", reply: String(error.message || error) });
+      }
+    }
+  } finally {
+    dispatching = false;
+    if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
+  }
+  // The wake, straight after the work. Outside the guard so a wake that itself
+  // hands something off does not deadlock against the pass that is still
+  // holding it.
+  await fireTimers();
+}
+
+/**
+ * Runs one handoff, in the receiving agent's own session.
+ *
+ * Its own session rather than a throwaway, so "ask Codex" means the same Codex
+ * that has been working this project all week and knows what it looked at an
+ * hour ago. That continuity is most of the value: a reviewer with no memory of
+ * the codebase is a worse reviewer.
+ */
+// How many handoffs one project may finish in an hour before Delphi stops
+// running them by itself. Two agents that each wake the other are a loop that
+// spends money at machine speed with nobody watching, and a limit somebody has
+// to raise deliberately is the only thing that reliably stops it.
+const HANDOFF_LIMIT_PER_HOUR = 12;
+
+async function runHandoff(handoff) {
+  if (db.handoffsSince(handoff.project_id, 1) >= HANDOFF_LIMIT_PER_HOUR) {
+    db.updateHandoff(handoff.id, {
+      status: "failed",
+      reply:
+        `Delphi stopped this one. ${HANDOFF_LIMIT_PER_HOUR} handoffs have already finished in this ` +
+        `project in the last hour, which usually means two agents are handing work back and forth. ` +
+        `Nothing is lost: the request is on the handoff and can be run again.`,
+    });
+    return;
+  }
+  const target = db.getHarness(handoff.to_harness);
+  if (!target || !target.enabled) {
+    db.updateHandoff(handoff.id, {
+      status: "failed",
+      reply: `There is no agent called "${handoff.to_harness}" turned on here.`,
+    });
+    return;
+  }
+
+  let session = db.listSessions(handoff.project_id).find((x) => x.harness === handoff.to_harness);
+  if (!session) {
+    session = db.createSession({
+      projectId: handoff.project_id,
+      title: target.label,
+      harness: handoff.to_harness,
+    });
+  }
+  db.updateHandoff(handoff.id, { status: "running", to_session_id: session.id });
+
+  const from = handoff.from_session_id ? db.getSession(handoff.from_session_id) : null;
+  const context = handoff.context_json ? `\n\nContext:\n${handoff.context_json}` : "";
+  const task = handoff.task_id ? db.taskDetail(handoff.task_id) : null;
+  const asked = from ? (from.harness || "the Delphi chat") : "the person using Delphi";
+
+  const { text, failure } = await runTurn({
+    sessionId: session.id,
+    collect: true,
+    prompt:
+      `A request has been handed to you through Delphi by ${asked}.\n\n` +
+      `${handoff.request}${context}` +
+      (task ? `\n\nThis is about task ${task.task.id}: ${task.task.title}` : "") +
+      `\n\nAnswer it directly. Your reply goes straight back to whoever asked, ` +
+      `so write it for them rather than for a person reading a terminal.`,
+  });
+
+  db.updateHandoff(handoff.id, {
+    status: failure ? "failed" : "ready",
+    reply: failure || text,
+  });
+
+  // The wake. The sender's turn ended minutes ago, so the only way it learns the
+  // answer is to be given a turn of its own, which is what a timer is for. Due
+  // now rather than later: there is nothing to wait for, and the delay would
+  // only be there to look like waiting.
+  if (!failure && handoff.wake && handoff.from_session_id) {
+    db.createAlert({
+      sessionId: handoff.from_session_id,
+      kind: "harvest",
+      fireAt: new Date().toISOString().slice(0, 19).replace("T", " "),
+      payload: { handoffId: handoff.id },
+    });
+  }
+}
+
+/**
+ * Wakes a session that was waiting on something.
+ *
+ * Only when the session is idle. Interrupting a turn in flight with a second
+ * prompt would interleave two conversations, and the alert stays pending, so it
+ * fires again on the next sweep rather than being lost.
+ */
+async function fireTimers() {
+  for (const timer of db.dueTimers()) {
+    if (turns.has(timer.session_id)) continue;
+    let payload = {};
+    try { payload = JSON.parse(timer.payload || "{}"); } catch {}
+
+    if (timer.kind === "harvest" && payload.handoffId) {
+      const handoff = db.getHandoff(payload.handoffId);
+      if (!handoff || handoff.status !== "ready") { db.updateAlert(timer.id, { status: "done" }); continue; }
+      db.updateAlert(timer.id, { status: "done" });
+      db.updateHandoff(handoff.id, { status: "harvested" });
+      try {
+        await runTurn({
+          sessionId: timer.session_id,
+          collect: true,
+          prompt:
+            `${handoff.to_harness} has answered the request you handed over.\n\n` +
+            `You asked: ${handoff.request}\n\n` +
+            `It replied:\n${handoff.reply}\n\n` +
+            `Carry on from there.`,
+        });
+      } catch (error) {
+        console.error("could not wake a session with a handoff reply", error);
+      }
+      continue;
+    }
+
+    // A plain timer: something asked to be woken at a time, with a note.
+    db.updateAlert(timer.id, { status: "done" });
+    try {
+      await runTurn({
+        sessionId: timer.session_id,
+        collect: true,
+        prompt: timer.message || "The timer you set has come due.",
+      });
+    } catch (error) {
+      console.error("could not fire a timer", error);
+    }
+  }
+  if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
+}
 
 handle("harness:stop", (sessionId) => {
   const stopped = harness.stop(sessionId);

@@ -1005,6 +1005,209 @@ const TOOLS = {
     },
   },
 
+  handoff_send: {
+    description:
+      "Hand a piece of work to another agent. Use this when something is better done by a different tool, or by a second opinion: \"have Codex review this branch\", \"ask Claude to write the migration\".\n\n" +
+      "It returns immediately with a handoff id. Delphi runs the request in that agent's own session in this project, keeps the reply, and gives you a turn of your own with the answer when it lands. So do not wait, do not poll in a loop, and do not sleep: finish what you were doing and say you have handed it over. You will be woken.\n\n" +
+      "Call list_agents first if you are not sure which agents this machine has.",
+    schema: {
+      type: "object",
+      required: ["to", "request"],
+      properties: {
+        to: { type: "string", description: "The agent's key, e.g. codex, claude-code, copilot" },
+        request: { type: "string", description: "What you want done, written for them rather than for a log" },
+        project_id: { type: "number" },
+        project: { type: "string", description: "Project key, as an alternative to project_id" },
+        task_id: { type: "number", description: "The task this is about, if there is one" },
+        context: {
+          type: "object",
+          description: "Branch, files, pad ids: whatever they will need and cannot work out",
+        },
+        wake: {
+          type: "boolean",
+          description: "Whether you want a turn when the reply lands. True unless you are handing something over and leaving.",
+        },
+      },
+    },
+    run: (a) => {
+      const projectId = a.project_id ?? resolveProjectId(a);
+      if (projectId == null) throw new Error("A handoff needs a project. Pass project_id or project.");
+      const target = sql("SELECT key, label, enabled FROM harnesses WHERE key = :p1", [String(a.to)])[0];
+      if (!target) {
+        const known = sql("SELECT key FROM harnesses WHERE enabled = 1").map((r) => r.key).join(", ");
+        throw new Error(`No agent called '${a.to}'. This machine has: ${known || "none configured"}.`);
+      }
+      if (!target.enabled) throw new Error(`${target.label} is turned off in Delphi's settings.`);
+
+      sql(
+        `INSERT INTO handoffs (project_id, from_session_id, to_harness, task_id, request, context_json, wake)
+         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7)`,
+        [
+          projectId,
+          // Set by whatever launched this server. A handoff from a tab knows
+          // which tab it came from and can be woken; one from an editor's own
+          // MCP client does not, and simply has nobody to wake.
+          process.env.DELPHI_SESSION ? Number(process.env.DELPHI_SESSION) : null,
+          String(a.to), a.task_id ?? null, String(a.request),
+          a.context ? JSON.stringify(a.context) : null,
+          a.wake === false ? 0 : 1,
+        ]
+      );
+      const row = sql("SELECT * FROM handoffs WHERE id = last_insert_rowid()")[0];
+      audit("create", "handoff", row.id, `asked ${row.to_harness}`, row.request.slice(0, 80));
+      return {
+        ...row,
+        note: "Queued. Delphi will run it and wake you with the reply. Do not wait for it here.",
+      };
+    },
+  },
+
+  handoff_status: {
+    description:
+      "What has been handed to and from you, and where each one got to. Use this when you have come back to a session and want to know whether an answer arrived while you were away.",
+    schema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "One handoff, in full, including the reply" },
+        project_id: { type: "number" },
+        project: { type: "string" },
+      },
+    },
+    run: (a) => {
+      if (a.id != null) {
+        const row = sql("SELECT * FROM handoffs WHERE id = :p1", [Number(a.id)])[0];
+        if (!row) throw new Error("No such handoff");
+        return row;
+      }
+      const projectId = a.project_id ?? resolveProjectId(a);
+      const session = process.env.DELPHI_SESSION ? Number(process.env.DELPHI_SESSION) : null;
+      return sql(
+        `SELECT id, from_session_id, to_harness, status, request, reply, created_at, finished_at
+         FROM handoffs
+         WHERE ${projectId != null ? "project_id = :p1" : "1 = :p1"}
+         ORDER BY id DESC LIMIT 25`,
+        [projectId != null ? projectId : 1]
+      ).map((h) => ({ ...h, mine: session != null && h.from_session_id === session }));
+    },
+  },
+
+  list_agents: {
+    description:
+      "The other agents Delphi can hand work to on this machine, and whether each is turned on. Call this before handoff_send if you are guessing at a name.",
+    schema: { type: "object", properties: {} },
+    run: () => sql("SELECT key, label, enabled FROM harnesses ORDER BY sort_order, id"),
+  },
+
+  lock_acquire: {
+    description:
+      "Take a lease on something, so another agent working the same project does not touch it at the same time. Use it for a file two of you are editing, a migration, a branch, a dev server.\n\n" +
+      "A lease, not a lock: it expires, because an agent that takes one and dies must not hold it forever. Extend it by calling again with the same key and holder. Check the answer: held false means somebody else has it and says who.",
+    schema: {
+      type: "object",
+      required: ["key"],
+      properties: {
+        key: { type: "string", description: "What is being held, e.g. db/schema.sql or migration" },
+        project_id: { type: "number" },
+        project: { type: "string" },
+        note: { type: "string", description: "What you are doing with it, for whoever finds it held" },
+        minutes: { type: "number", description: "How long you need it. 15 by default." },
+      },
+    },
+    run: (a) => {
+      const projectId = a.project_id ?? resolveProjectId(a);
+      if (projectId == null) throw new Error("A lock needs a project. Pass project_id or project.");
+      const minutes = Math.max(1, Number(a.minutes) || 15);
+      // Two statements, both leaning on the unique index, so two agents asking at
+      // the same moment cannot both win. Twin of db.js acquireLock.
+      sql(
+        `INSERT INTO locks (project_id, key, holder, note, expires_at)
+         VALUES (:p1, :p2, :p3, :p4, datetime('now', :p5))
+         ON CONFLICT (project_id, key) DO UPDATE SET
+           holder = excluded.holder, note = excluded.note, expires_at = excluded.expires_at,
+           created_at = datetime('now')
+         WHERE locks.expires_at <= datetime('now') OR locks.holder = excluded.holder`,
+        [projectId, String(a.key), ACTOR, a.note ?? null, `+${minutes} minutes`]
+      );
+      const row = sql("SELECT * FROM locks WHERE project_id = :p1 AND key = :p2",
+                      [projectId, String(a.key)])[0];
+      return {
+        held: row.holder === ACTOR,
+        holder: row.holder,
+        expires_at: row.expires_at,
+        note: row.holder === ACTOR
+          ? "Yours until it expires. Call lock_release when you are done."
+          : `${row.holder} has this until ${row.expires_at}. Work on something else, or wait.`,
+      };
+    },
+  },
+
+  lock_release: {
+    description: "Give back a lease you took. Do this as soon as you are done rather than letting it expire.",
+    schema: {
+      type: "object",
+      required: ["key"],
+      properties: {
+        key: { type: "string" },
+        project_id: { type: "number" },
+        project: { type: "string" },
+      },
+    },
+    run: (a) => {
+      const projectId = a.project_id ?? resolveProjectId(a);
+      sql("DELETE FROM locks WHERE project_id = :p1 AND key = :p2 AND holder = :p3",
+          [projectId, String(a.key), ACTOR]);
+      return { released: true };
+    },
+  },
+
+  lock_status: {
+    description: "What is currently held in a project, and by whom. Expired leases are cleared rather than reported.",
+    schema: {
+      type: "object",
+      properties: { project_id: { type: "number" }, project: { type: "string" } },
+    },
+    run: (a) => {
+      const projectId = a.project_id ?? resolveProjectId(a);
+      sql("DELETE FROM locks WHERE expires_at <= datetime('now')");
+      return sql(
+        `SELECT key, holder, note, expires_at FROM locks
+         ${projectId != null ? "WHERE project_id = :p1" : ""} ORDER BY key`,
+        projectId != null ? [projectId] : []
+      );
+    },
+  },
+
+  timer_set: {
+    description:
+      "Ask to be given a turn later. Use this instead of waiting: for a build you have started, a deploy, anything that finishes on its own clock.\n\n" +
+      "Only works from inside a Delphi agent tab, because there has to be a session to wake. Waiting in a loop instead burns tokens for no reason and stops the moment your turn ends.",
+    schema: {
+      type: "object",
+      required: ["minutes", "message"],
+      properties: {
+        minutes: { type: "number", description: "How long from now" },
+        message: { type: "string", description: "What to tell you when you wake, in enough detail to carry on" },
+      },
+    },
+    run: (a) => {
+      const session = process.env.DELPHI_SESSION ? Number(process.env.DELPHI_SESSION) : null;
+      if (!session) {
+        throw new Error(
+          "There is no session to wake: this server was not launched by a Delphi agent tab. " +
+          "Ask the person to run you as a tab in Delphi if you need this."
+        );
+      }
+      const minutes = Math.max(1, Number(a.minutes) || 1);
+      sql(
+        `INSERT INTO alerts (session_id, kind, fire_at, message)
+         VALUES (:p1, 'timer', datetime('now', :p2), :p3)`,
+        [session, `+${minutes} minutes`, String(a.message)]
+      );
+      const row = sql("SELECT id, fire_at FROM alerts WHERE id = last_insert_rowid()")[0];
+      return { ...row, note: "Set. Finish your turn: you will be given another one when it fires." };
+    },
+  },
+
   search: {
     description:
       "Search tasks and memory notes. Check here before searching a repository: a previous session may have already worked out the answer.",

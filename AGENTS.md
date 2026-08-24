@@ -21,6 +21,13 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `write_scratchpad` | Write the working document. Checkbox lines in it become tasks |
 | `append_scratchpad` | Add to the end of a pad without reading it first |
 | `patch_scratchpad` | Replace one section, found by its heading |
+| `list_agents` | The other agents on this machine that work can be handed to |
+| `handoff_send` | Hand a piece of work to another agent. You are woken with the reply |
+| `handoff_status` | What has been handed to and from you, and the replies |
+| `lock_acquire` | Take a lease on a file, a branch, a migration, so two agents do not collide |
+| `lock_release` | Give one back |
+| `lock_status` | What is held in a project, and by whom |
+| `timer_set` | Ask to be given a turn later, instead of waiting in a loop |
 | `search` | Text matching across tasks and notes |
 | `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
 | `oracle_entities` | What the graph knows about, most referenced first |
@@ -212,6 +219,32 @@ re-reads the descriptions. Wording lives in `agent/directives.js`.
 
 It deliberately does not cover files that have to be files to work: scripts an
 agent executes, generated documents, anything a command needs a path for.
+
+## Working alongside other agents
+
+Delphi can run Claude Code, Codex and Copilot as tabs in the same project, and
+they all speak to this same server. Three tools exist because of that.
+
+`handoff_send` gives a piece of work to another agent: "have Codex review this
+branch". It returns immediately with an id. Delphi runs the request in that
+agent's own session, keeps the reply, and gives you a fresh turn with the answer
+when it lands. So hand it over and finish your turn. Do not poll, do not sleep,
+do not wait in a loop: your turn ending is the normal and expected thing, and you
+will be woken.
+
+`timer_set` is the same idea for anything else that finishes on its own clock: a
+build, a deploy, a long test run. Start it, set a timer, end your turn. It only
+works from inside a Delphi tab, because there has to be a session to wake.
+
+`lock_acquire` is a lease on something two of you could collide over: a file, a
+branch, a migration, the dev server. It expires, because an agent that takes one
+and dies must not hold it forever, and you extend it by asking again. Check the
+answer before you carry on: `held: false` means somebody else has it and says
+who and until when.
+
+Delphi stops running handoffs by itself after twelve finish in one project in an
+hour. Two agents that each wake the other are a loop that spends money at machine
+speed with nobody watching, and the limit is the thing that notices.
 
 ## Taking work from the queue
 

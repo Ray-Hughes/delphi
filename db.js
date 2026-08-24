@@ -103,6 +103,13 @@ const LATER_COLUMNS = [
   // What this row looked like when Delphi last seeded it, so seedHarnesses can
   // tell a definition nobody has touched from one somebody has edited.
   ["harnesses", "seeded_json", "TEXT"],
+  // Alerts grew a second job. A reminder is a person being nudged about a task;
+  // a timer is a session being woken about something that finished while it was
+  // not running. Same table because they are the same mechanism, and there is
+  // already one sweep that fires due rows every minute.
+  ["alerts", "session_id", "INTEGER REFERENCES sessions(id) ON DELETE CASCADE"],
+  ["alerts", "kind", "TEXT NOT NULL DEFAULT 'reminder'"],
+  ["alerts", "payload", "TEXT"],
 ];
 
 function addLaterColumns(db) {
@@ -1798,8 +1805,30 @@ function dueAlerts() {
     JOIN tasks t ON t.id = a.task_id
     LEFT JOIN projects p ON p.id = t.project_id
     WHERE a.status IN ('pending', 'snoozed')
+      AND a.kind = 'reminder'
       AND a.fire_at <= datetime('now')
       AND t.status != 'done'
+    ORDER BY a.fire_at
+  `);
+}
+
+/**
+ * Timers that are due: a session being woken rather than a person nudged.
+ *
+ * A separate query rather than a flag on the one above, because the join
+ * differs. A reminder is about a task and is pointless once the task is done; a
+ * timer is about a session and usually has no task at all, so the inner join
+ * that makes the reminder query correct would silently drop every one of these.
+ */
+function dueTimers() {
+  return all(`
+    SELECT a.*, s.project_id, s.harness, s.title AS session_title
+    FROM alerts a
+    JOIN sessions s ON s.id = a.session_id
+    WHERE a.status IN ('pending', 'snoozed')
+      AND a.kind != 'reminder'
+      AND a.fire_at <= datetime('now')
+      AND s.status = 'active'
     ORDER BY a.fire_at
   `);
 }
@@ -1825,15 +1854,24 @@ function listAlerts({ includeFinished = true, taskId = null } = {}) {
   `, taskId ? { taskId } : {});
 }
 
-function createAlert({ taskId, fireAt, message = null, repeatEveryMinutes = null }) {
+function createAlert({ taskId = null, fireAt, message = null, repeatEveryMinutes = null,
+                      sessionId = null, kind = "reminder", payload = null }) {
   const r = run(
-    `INSERT INTO alerts (task_id, fire_at, message, repeat_every_minutes)
-     VALUES (:taskId, :fireAt, :message, :repeatEveryMinutes)`,
-    { taskId, fireAt, message, repeatEveryMinutes }
+    `INSERT INTO alerts (task_id, fire_at, message, repeat_every_minutes, session_id, kind, payload)
+     VALUES (:taskId, :fireAt, :message, :repeatEveryMinutes, :sessionId, :kind, :payload)`,
+    {
+      taskId, fireAt, message, repeatEveryMinutes, sessionId, kind,
+      payload: payload && typeof payload === "object" ? JSON.stringify(payload) : payload,
+    }
   );
   const created = one("SELECT * FROM alerts WHERE id = :id", { id: Number(r.lastInsertRowid) });
-  record({ action: "create", entity: "task", entityId: taskId,
-           summary: `reminder set for ${fireAt}`, label: message || null, after: created });
+  // A reminder is a thing somebody set and may want to undo. A timer is
+  // plumbing: one is written every time an agent waits on another, and putting
+  // those in History would bury the changes worth reading.
+  if (kind === "reminder") {
+    record({ action: "create", entity: "task", entityId: taskId,
+             summary: `reminder set for ${fireAt}`, label: message || null, after: created });
+  }
   return created;
 }
 
@@ -2245,6 +2283,155 @@ function deleteHarness(id) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Handoffs
+//
+// One agent asking another. The row outlives the turn that created it, which is
+// the point: the sender's turn ends in seconds and the answer arrives in
+// minutes, so there has to be somewhere durable for it to arrive.
+// ---------------------------------------------------------------------------
+
+const getHandoff = (id) => one("SELECT * FROM handoffs WHERE id = :id", { id });
+
+const listHandoffs = ({ projectId = null, sessionId = null, status = null, limit = 50 } = {}) => {
+  const where = [];
+  if (projectId != null) where.push("h.project_id = :projectId");
+  if (sessionId != null) where.push("(h.from_session_id = :sessionId OR h.to_session_id = :sessionId)");
+  if (status) where.push("h.status = :status");
+  return all(
+    `SELECT h.*, t.title AS task_title,
+            f.title AS from_title, f.harness AS from_harness,
+            r.title AS to_title
+     FROM handoffs h
+     LEFT JOIN tasks t ON t.id = h.task_id
+     LEFT JOIN sessions f ON f.id = h.from_session_id
+     LEFT JOIN sessions r ON r.id = h.to_session_id
+     ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+     ORDER BY h.id DESC LIMIT :limit`,
+    { projectId, sessionId, status, limit }
+  );
+};
+
+function createHandoff({ projectId, fromSessionId = null, toHarness, request, taskId = null, context = null, wake = true }) {
+  if (!projectId) throw new Error("A handoff needs a project");
+  if (!toHarness) throw new Error("A handoff needs somebody to hand to");
+  if (!request || !String(request).trim()) throw new Error("A handoff needs a request");
+  const r = run(
+    `INSERT INTO handoffs (project_id, from_session_id, to_harness, task_id, request, context_json, wake)
+     VALUES (:projectId, :fromSessionId, :toHarness, :taskId, :request, :context, :wake)`,
+    {
+      projectId, fromSessionId, toHarness: String(toHarness), taskId,
+      request: String(request),
+      context: context ? JSON.stringify(context) : null,
+      wake: wake ? 1 : 0,
+    }
+  );
+  const created = getHandoff(Number(r.lastInsertRowid));
+  record({ action: "create", entity: "handoff", entityId: created.id,
+           summary: `asked ${created.to_harness}`, label: created.request.slice(0, 80), after: created });
+  return created;
+}
+
+/**
+ * Moves a handoff along.
+ *
+ * Every transition goes through here so the timestamps cannot drift from the
+ * status they describe, which is the same reason status_events is written by
+ * updateTask rather than by its callers.
+ */
+function updateHandoff(id, fields) {
+  const before = getHandoff(id);
+  if (!before) throw new Error("No such handoff");
+  const allowed = ["status", "reply", "to_session_id", "wake"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return before;
+  const stamps =
+    fields.status === "running" ? ", started_at = datetime('now')"
+    : ["ready", "failed", "cancelled"].includes(fields.status) ? ", finished_at = datetime('now')"
+    : "";
+  run(`UPDATE handoffs SET ${sets.map((k) => `${k} = :${k}`).join(", ")}${stamps} WHERE id = :id`,
+      { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id });
+  const after = getHandoff(id);
+  if (before.status !== after.status) {
+    record({ action: "update", entity: "handoff", entityId: id,
+             summary: `${before.status} to ${after.status}`, label: after.request.slice(0, 80),
+             before, after });
+  }
+  return after;
+}
+
+/** Everything queued, oldest first, for whatever is going to run them. */
+const pendingHandoffs = () =>
+  all("SELECT * FROM handoffs WHERE status = 'queued' ORDER BY id");
+
+/**
+ * How many handoffs this project has finished in the last hour.
+ *
+ * The circuit breaker. Two agents can hand work to each other, and each reply
+ * wakes the other with a turn of its own, so a polite pair saying "thanks, one
+ * more thing" is a loop that spends real money at machine speed with nobody
+ * watching. Counting completions rather than tracking a chain depth, because the
+ * MCP server writes these rows from a separate process and any depth it was
+ * asked to carry would be a number an agent could get wrong.
+ */
+const handoffsSince = (projectId, hours = 1) =>
+  one(
+    `SELECT COUNT(*) AS n FROM handoffs
+     WHERE project_id = :projectId AND finished_at IS NOT NULL
+       AND finished_at > datetime('now', :window)`,
+    { projectId, window: `-${hours} hours` }
+  ).n;
+
+// ---------------------------------------------------------------------------
+// Locks
+//
+// The task claim, generalised. A lease and not a mutex: an agent that takes one
+// and dies must not hold it forever, so everything here expires and the acquire
+// is allowed to take over anything that has.
+// ---------------------------------------------------------------------------
+
+const LOCK_MINUTES = 15;
+
+/**
+ * Takes a lock, or reports who has it.
+ *
+ * One statement for the insert and one for the takeover, both relying on the
+ * unique index, so two agents asking at the same moment cannot both win. The
+ * read afterwards says who actually holds it, which is the answer either way.
+ */
+function acquireLock({ projectId, key, holder, note = null, minutes = LOCK_MINUTES }) {
+  if (!projectId || !key || !holder) throw new Error("A lock needs a project, a key and a holder");
+  run(
+    `INSERT INTO locks (project_id, key, holder, note, expires_at)
+     VALUES (:projectId, :key, :holder, :note, datetime('now', :window))
+     ON CONFLICT (project_id, key) DO UPDATE SET
+       holder = excluded.holder, note = excluded.note, expires_at = excluded.expires_at,
+       created_at = datetime('now')
+     WHERE locks.expires_at <= datetime('now') OR locks.holder = excluded.holder`,
+    { projectId, key: String(key), holder, note, window: `+${Math.max(1, minutes)} minutes` }
+  );
+  const row = one("SELECT * FROM locks WHERE project_id = :projectId AND key = :key",
+                  { projectId, key: String(key) });
+  return { held: row.holder === holder, lock: row };
+}
+
+function releaseLock({ projectId, key, holder }) {
+  const r = run(
+    "DELETE FROM locks WHERE project_id = :projectId AND key = :key AND holder = :holder",
+    { projectId, key: String(key), holder }
+  );
+  return { released: Number(r.changes) > 0 };
+}
+
+/** What is held right now. Expired rows are swept rather than reported. */
+function listLocks(projectId = null) {
+  run("DELETE FROM locks WHERE expires_at <= datetime('now')");
+  return all(
+    `SELECT * FROM locks ${projectId != null ? "WHERE project_id = :projectId" : ""} ORDER BY key`,
+    { projectId }
+  );
+}
+
 function deleteSession(id) {
   const before = getSession(id);
   if (!before) return null;
@@ -2440,7 +2627,7 @@ module.exports = {
   search, stats,
   listAudit, projectActivity, undo, undoLast,
   recentItems,
-  dueAlerts, listAlerts, createAlert, updateAlert, deleteAlert,
+  dueAlerts, dueTimers, listAlerts, createAlert, updateAlert, deleteAlert,
   markFired, snoozeAlert, actOnAlert,
   listRepos, createRepo, setPrimaryRepo, deleteRepo,
   listWorkspaces, getWorkspace, workspaceByPath, createWorkspace, updateWorkspace, deleteWorkspace,
@@ -2448,5 +2635,7 @@ module.exports = {
   adoptProjectPaths,
   listSessions, getSession, createSession, updateSession, deleteSession,
   listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness,
+  listHandoffs, getHandoff, createHandoff, updateHandoff, pendingHandoffs, handoffsSince,
+  acquireLock, releaseLock, listLocks,
   listMessages, appendMessage, updateMessage, addSessionUsage,
 };

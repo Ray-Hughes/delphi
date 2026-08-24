@@ -47,6 +47,16 @@ contextBridge.exposeInMainWorld("delphi", {
     start: (payload) => call("harness:start", payload),
     stop: (sessionId) => call("harness:stop", sessionId),
   },
+  // One agent asking another, and the leases that stop two of them colliding.
+  handoffs: {
+    list: (opts) => call("handoffs:list", opts),
+    create: (payload) => call("handoffs:create", payload),
+    cancel: (id) => call("handoffs:cancel", id),
+  },
+  locks: {
+    list: (projectId) => call("locks:list", projectId),
+    release: (projectId, key, holder) => call("locks:release", projectId, key, holder),
+  },
   pads: {
     list: (projectId) => call("pads:list", projectId),
     get: (id) => call("pads:get", id),

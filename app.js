@@ -37,6 +37,10 @@ const state = {
   // What the running turn has done, this turn only. Tool calls go into the
   // message as they happen, so this is the live indicator rather than the record.
   turnTool: null,
+  // Why it has gone quiet, when it has said. An API retrying under load is the
+  // usual answer, and five silent minutes with no explanation is the worst thing
+  // a tab can do.
+  turnStatus: null,
   termLines: [],         // what the running command has said
   termBusy: false,
   termDraft: "",
@@ -1302,6 +1306,46 @@ async function renderOverview(root) {
     linkCard.card.append(flush);
   }
   right.append(linkCard.card);
+
+  // --- handoffs ------------------------------------------------------------
+  // Work one agent has handed to another. Here rather than on its own tab
+  // because it is not a place you go, it is a thing you notice: most of the time
+  // there is nothing in it, and when there is, it is either running or waiting
+  // for somebody to read the answer.
+  const handoffs = await window.delphi.handoffs.list({ projectId: project.id, limit: 8 })
+    .catch(() => []);
+  if (handoffs.length) {
+    const hCard = card("Between agents");
+    for (const h of handoffs) {
+      const row = el("div", { className: "hoff" });
+      row.append(el("span", { className: `hoff-s ${h.status}`, textContent: h.status }));
+      const body = el("div", { className: "grow" });
+      body.append(el("div", { className: "hoff-t",
+        textContent: `${h.from_harness || "you"} → ${h.to_harness}` }));
+      body.append(el("div", { className: "hint", textContent: h.request.slice(0, 120) }));
+      // The reply is the point of the row, so it is shown rather than hidden
+      // behind a click. Trimmed, because some of them are an essay.
+      if (h.reply && (h.status === "ready" || h.status === "harvested" || h.status === "failed")) {
+        body.append(el("div", { className: "hoff-r", textContent: h.reply.slice(0, 400) }));
+      }
+      row.append(body);
+      if (h.to_session_id) {
+        const open = el("button", { className: "btn sm", textContent: "Open" });
+        open.onclick = async () => {
+          await goTo({ projectId: project.id, view: "chat" });
+          await openSession(h.to_session_id);
+        };
+        row.append(open);
+      }
+      if (h.status === "queued" || h.status === "running") {
+        const stop = el("button", { className: "btn sm", textContent: "Cancel" });
+        stop.onclick = async () => { await window.delphi.handoffs.cancel(h.id); refresh(); };
+        row.append(stop);
+      }
+      hCard.body.append(row);
+    }
+    right.append(hCard.card);
+  }
 
   // --- project settings ----------------------------------------------------
   // The editor itself moved to its own tab. It used to be a form at the bottom of
@@ -8051,6 +8095,7 @@ function thinkingIndicator() {
     // What it is doing, when it has said. A harness that has been quiet for
     // ninety seconds because it is running a test suite looks identical to one
     // that has hung, and the tool name is the difference.
+    if (state.turnStatus) { label.textContent = `${state.turnStatus}, ${seconds}s`; return; }
     const doing = state.turnTool && state.turnTool !== "thinking" ? `Running ${state.turnTool}` : "Thinking";
     label.textContent = seconds >= 4 ? `${doing}, ${seconds}s` : doing;
   }, 1000);
@@ -8632,6 +8677,13 @@ window.delphi.onAiEvent(async (event) => {
     return;
   }
 
+  // Why it has gone quiet. Not kept either, for the same reason, but it is the
+  // difference between a tab that looks busy and one that looks broken.
+  if (event.type === "status") {
+    state.turnStatus = event.text;
+    return;
+  }
+
   // The CLI's own conversation id. Recorded by the main process; nothing here
   // has to do anything with it beyond not treating it as an error.
   if (event.type === "session") return;
@@ -8643,6 +8695,7 @@ window.delphi.onAiEvent(async (event) => {
 
   if (event.type === "done") {
     state.turnTool = null;
+    state.turnStatus = null;
     // The stream is over, the drain may not be. Letting it finish is what stops
     // the last few words being replaced by the final render before they appear.
     streamDone = true;
