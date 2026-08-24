@@ -10,6 +10,7 @@ const { DatabaseSync } = require("node:sqlite");
 const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
+const pads = require("./pads");
 
 // Beside the source when run from a checkout, in the per-user data directory when
 // run from an installer. See paths.js: the packaged source directory is a
@@ -35,6 +36,9 @@ function open() {
   // file, so an older database would fail to open at all.
   addLaterColumns(db);
   db.exec(schema);
+  // After the schema, because on a fresh database the table it rebuilds has just
+  // been created with the right constraint and there is nothing to do.
+  widenAuditEntities(db);
   // Safe to call here: db is already assigned, so the helpers this goes through
   // find the connection rather than recursing into open(). Guarded because a
   // database that adopts nothing still works, and one that refuses to open does
@@ -86,6 +90,10 @@ const LATER_COLUMNS = [
   // deliberately per session: it is the difference between something that talks
   // and something that edits your files.
   ["sessions", "auto_allow", "INTEGER NOT NULL DEFAULT 0"],
+  // The pad this task was read out of, when it was read out of one. Nullable
+  // because a task typed into the board is not derived from anything, and SET
+  // NULL because deleting the working document must not delete the work.
+  ["tasks", "pad_id", "INTEGER REFERENCES scratchpads(id) ON DELETE SET NULL"],
 ];
 
 function addLaterColumns(db) {
@@ -97,6 +105,57 @@ function addLaterColumns(db) {
     if (columns.some((c) => c.name === column)) continue;
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
+}
+
+/**
+ * Widens the CHECK on audit.entity, once.
+ *
+ * The audit table names the kinds of thing that can be written, and scratchpads
+ * are a new one. A CHECK constraint cannot be altered, so the only way to change
+ * it is the twelve step rebuild SQLite documents: make the new table, copy, drop
+ * the old, rename, put the indexes back.
+ *
+ * This is the first thing in the file more structural than an added column, and
+ * it is worth the risk rather than the alternative. The alternative was to file
+ * pad writes under 'note', which would make the History tab lie about what
+ * happened, in the one feature whose whole selling point is that it does not.
+ *
+ * Guarded on the stored SQL rather than a version number, so it is idempotent
+ * without a migrations table: if the constraint already names scratchpad, this
+ * has run.
+ */
+function widenAuditEntities(db) {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit'").get();
+  if (!row || !row.sql || row.sql.includes("'scratchpad'")) return;
+  // foreign_keys cannot be changed inside a transaction, hence the order. Nothing
+  // references audit, so this is belt and braces rather than load bearing.
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec(`
+    BEGIN;
+    CREATE TABLE audit_rebuilt (
+      id          INTEGER PRIMARY KEY,
+      at          TEXT NOT NULL DEFAULT (datetime('now')),
+      action      TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete')),
+      entity      TEXT NOT NULL CHECK (entity IN ('task', 'note', 'project', 'link',
+                                                  'scratchpad', 'session', 'handoff')),
+      entity_id   INTEGER,
+      summary     TEXT NOT NULL,
+      label       TEXT,
+      before_json TEXT,
+      after_json  TEXT,
+      undone      INTEGER NOT NULL DEFAULT 0,
+      undone_at   TEXT
+    );
+    INSERT INTO audit_rebuilt
+      (id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at)
+      SELECT id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at
+      FROM audit;
+    DROP TABLE audit;
+    ALTER TABLE audit_rebuilt RENAME TO audit;
+    CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
+    COMMIT;
+  `);
+  db.exec("PRAGMA foreign_keys = ON");
 }
 
 const all = (sql, params = {}) => open().prepare(sql).all(params);
@@ -115,7 +174,13 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 // not in the log.
 // ---------------------------------------------------------------------------
 
-const TABLES = { task: "tasks", note: "notes", project: "projects", link: "links" };
+const TABLES = {
+  task: "tasks", note: "notes", project: "projects", link: "links",
+  // Listed here and not only in the CHECK, because this is what makes a pad edit
+  // reversible. An agent that rewrites your plan badly should be one undo away
+  // from having not done that.
+  scratchpad: "scratchpads",
+};
 
 const rowOf = (entity, id) =>
   id == null ? null : one(`SELECT * FROM ${TABLES[entity]} WHERE id = :id`, { id });
@@ -158,6 +223,8 @@ function describeUpdate(entity, before, after) {
       changes.push("moved project");
     } else if (key === "organizer_id") {
       changes.push(after[key] == null ? "taken out of its epic" : "filed under an epic");
+    } else if (key === "body" && entity === "scratchpad") {
+      changes.push("wrote to the pad");
     } else if (key === "body" || key === "detail") {
       changes.push(`edited ${key}`);
     } else {
@@ -303,6 +370,11 @@ function undo(auditId) {
   conn.exec("BEGIN");
   try {
     applyUndo(entry);
+    // Putting a pad body back leaves the board reading from text that is no
+    // longer there, so the projection is taken again from the restored body.
+    // Inside the same transaction as the restore, for the reason writeScratchpad
+    // gives: half a sync is worse than none.
+    if (entry.entity === "scratchpad" && entry.action !== "delete") deriveInPlace(entry.entity_id);
     run("UPDATE audit SET undone = 1, undone_at = datetime('now') WHERE id = :id", { id: auditId });
     conn.exec("COMMIT");
   } catch (error) {
@@ -940,6 +1012,11 @@ function updateTask(id, fields, { actor = null } = {}) {
   record({ action: "update", entity: "task", entityId: id,
            summary: describeUpdate("task", before, after), label: after.title,
            before, after });
+  // The other half of the pad sync. After the audit row rather than before, so
+  // the log reads in the order things happened, and unconditional rather than
+  // gated on a flag the caller passes: ticking a task on the board has to tick
+  // the line in the document whichever screen the tick came from.
+  writeBackToPad(after, before);
   return after;
 }
 
@@ -1317,6 +1394,310 @@ function deleteNote(id) {
            summary: "deleted", label: before ? before.title : null, before });
 }
 
+// ---------------------------------------------------------------------------
+// Scratchpads, and the tasks derived from them
+//
+// The board is a projection of the pads. A checkbox line in a pad is a task row,
+// and the two are kept in step in both directions: writing the pad updates the
+// tasks, and updating a task rewrites its line.
+//
+// Two rules keep that from being destructive, and both were chosen against the
+// obvious alternative.
+//
+// A line that disappears does not delete its task. An agent tidying its own
+// notes, or replacing a plan wholesale, would otherwise be able to empty a
+// board. The task is left, and reads as dropped from the pad because nothing in
+// the pad anchors it any more.
+//
+// An unticked box does not force a task back to todo. See pads.statusFor: a
+// checkbox has two states and a task has four, so the pad owns "done or not"
+// and the board owns the rest.
+//
+// pads.js has the grammar and no database access. This has the rows and no
+// parsing. The split is what makes the grammar testable.
+// ---------------------------------------------------------------------------
+
+// Derivation writes tasks, and writing a task writes back to the pad. Without
+// this the first pad write would recurse until the stack gave out. Set for the
+// duration of a derivation, which is the only time a task update is already the
+// consequence of a pad the caller is holding.
+let deriving = false;
+
+const listScratchpads = (projectId) =>
+  all(
+    `SELECT * FROM scratchpads WHERE project_id = :projectId
+     ORDER BY pinned DESC, updated_at DESC`,
+    { projectId }
+  );
+
+const getScratchpad = (id) => one("SELECT * FROM scratchpads WHERE id = :id", { id });
+
+const scratchpadByKey = (projectId, key) =>
+  one("SELECT * FROM scratchpads WHERE project_id = :projectId AND key = :key", { projectId, key });
+
+/**
+ * A key that is unique within its project.
+ *
+ * An agent naming a pad "plan" in two projects is asking for two pads, not one,
+ * which is why the uniqueness is scoped. Within a project a collision is a
+ * different pad wanting the same name, and it gets a number.
+ */
+function padKey(projectId, title, key = null) {
+  const base = slugKey(key || title) || "pad";
+  let candidate = base;
+  let n = 2;
+  while (scratchpadByKey(projectId, candidate)) candidate = `${base}-${n++}`;
+  return candidate;
+}
+
+function createScratchpad({ projectId, title, body = "", key = null, author = null, sessionId = null, derivesTasks = true }) {
+  const r = run(
+    `INSERT INTO scratchpads (project_id, key, title, body, author, session_id, derives_tasks)
+     VALUES (:projectId, :key, :title, :body, :author, :sessionId, :derivesTasks)`,
+    {
+      projectId, key: padKey(projectId, title, key), title, body, author,
+      sessionId, derivesTasks: derivesTasks ? 1 : 0,
+    }
+  );
+  const created = getScratchpad(Number(r.lastInsertRowid));
+  record({ action: "create", entity: "scratchpad", entityId: created.id,
+           summary: "created", label: created.title, after: created });
+  return derive(created.id);
+}
+
+/**
+ * Replaces a pad's body, and re-reads the board from it.
+ *
+ * One transaction over the write and the derivation, so a pad and its tasks can
+ * never be half in step. That matters more here than anywhere else in this file:
+ * the failure would be silent, and the thing left behind would be a board that
+ * disagrees with the document everybody is reading.
+ */
+function writeScratchpad(id, fields = {}) {
+  const allowed = ["title", "body", "author", "pinned", "derives_tasks", "session_id"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return getScratchpad(id);
+  const before = rowOf("scratchpad", id);
+  if (!before) throw new Error("No such scratchpad");
+
+  const conn = open();
+  conn.exec("BEGIN");
+  try {
+    run(
+      `UPDATE scratchpads SET ${sets.map((k) => `${k} = :${k}`).join(", ")},
+       updated_at = datetime('now') WHERE id = :id`,
+      { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id }
+    );
+    deriveInPlace(id);
+    conn.exec("COMMIT");
+  } catch (error) {
+    conn.exec("ROLLBACK");
+    throw error;
+  }
+
+  const after = getScratchpad(id);
+  record({ action: "update", entity: "scratchpad", entityId: id,
+           summary: describeUpdate("scratchpad", before, after), label: after.title,
+           before, after });
+  return after;
+}
+
+/** Adds to the end of a pad. The common agent write, and it cannot lose anything. */
+function appendScratchpad(id, text) {
+  const pad = getScratchpad(id);
+  if (!pad) throw new Error("No such scratchpad");
+  const joiner = !pad.body || pad.body.endsWith("\n") ? "" : "\n";
+  return writeScratchpad(id, { body: `${pad.body}${joiner}${text}` });
+}
+
+/**
+ * Replaces one markdown section, found by its heading.
+ *
+ * Here so two agents working the same pad do not have to read, edit and write
+ * the whole document to change their own part of it, which is the write that
+ * loses the other one's work. The heading is matched on its text, at any level,
+ * and the section runs to the next heading of the same level or higher.
+ */
+function patchScratchpad(id, heading, text) {
+  const pad = getScratchpad(id);
+  if (!pad) throw new Error("No such scratchpad");
+  const lines = pad.body.split("\n");
+  const wanted = String(heading).trim().toLowerCase().replace(/^#+\s*/, "");
+
+  let start = -1;
+  let level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+    if (m && m[2].trim().toLowerCase() === wanted) { start = i; level = m[1].length; break; }
+  }
+  // A heading that is not there is added rather than refused. An agent asking to
+  // patch a section it has not written yet means to write it, and making that an
+  // error would only teach it to read the whole pad first.
+  if (start === -1) return appendScratchpad(id, `\n## ${heading}\n\n${text}\n`);
+
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    const m = /^(#{1,6})\s+/.exec(lines[i]);
+    if (m && m[1].length <= level) { end = i; break; }
+  }
+  const body = [...lines.slice(0, start + 1), "", text, "", ...lines.slice(end)].join("\n");
+  return writeScratchpad(id, { body });
+}
+
+function deleteScratchpad(id) {
+  const before = rowOf("scratchpad", id);
+  // The tasks outlive the pad, by the ON DELETE SET NULL on tasks.pad_id. Said
+  // out loud because the opposite is what people expect from a cascade, and the
+  // opposite is how a board gets emptied by a tidy-up.
+  run("DELETE FROM scratchpads WHERE id = :id", { id });
+  record({ action: "delete", entity: "scratchpad", entityId: id,
+           summary: "deleted", label: before ? before.title : null, before });
+}
+
+/**
+ * Reads a pad's checkbox lines into tasks, and anchors them.
+ *
+ * Runs inside whatever transaction the caller has open, which is why it does not
+ * start one. deriveInPlace is the half that touches rows; derive is the wrapper
+ * that returns the pad afterwards.
+ */
+function deriveInPlace(padId) {
+  const pad = getScratchpad(padId);
+  if (!pad || !pad.derives_tasks) return pad;
+
+  deriving = true;
+  try {
+    let body = pad.body;
+    // Re-parsed after every write, because anchoring a line changes its text and
+    // the entries hold the offsets they were parsed at.
+    let entries = pads.parse(body);
+    const idByEntry = new Map();
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const parentId = entry.parentIndex != null ? idByEntry.get(entry.parentIndex) ?? null : null;
+      let task = entry.taskId ? one("SELECT * FROM tasks WHERE id = :id", { id: entry.taskId }) : null;
+
+      // An anchor pointing at a task that has been deleted, or at one belonging
+      // to another pad, is stale text rather than an instruction. Dropped, and
+      // the line is treated as new.
+      if (task && task.pad_id !== pad.id) task = null;
+
+      if (!task) task = rebind(pad, entry, body);
+
+      if (task) {
+        const changes = {};
+        if (task.title !== entry.title && entry.title) changes.title = entry.title;
+        const status = pads.statusFor(entry.done, task.status);
+        if (status !== task.status) changes.status = status;
+        if (entry.assignee && entry.assignee !== task.assignee) changes.assignee = entry.assignee;
+        if (entry.priority && entry.priority !== task.priority) changes.priority = entry.priority;
+        if (parentId !== (task.parent_id ?? null)) changes.parent_id = parentId;
+        if (Object.keys(changes).length) task = updateTask(task.id, changes, { actor: pad.author });
+      } else {
+        task = createTask({
+          projectId: pad.project_id,
+          title: entry.title || "Untitled",
+          status: entry.done ? "done" : "todo",
+          priority: entry.priority || "med",
+          assignee: entry.assignee || null,
+          parentId,
+          actor: pad.author,
+        });
+      }
+
+      run("UPDATE tasks SET pad_id = :padId, external_key = :key WHERE id = :id",
+          { padId: pad.id, key: `pad:${pad.id}:${task.id}`, id: task.id });
+      idByEntry.set(entry.at, task.id);
+
+      if (entry.taskId !== task.id) {
+        body = pads.anchorLine(body, entry, task.id);
+        entries = pads.parse(body);
+      }
+    }
+
+    if (body !== pad.body) {
+      run("UPDATE scratchpads SET body = :body WHERE id = :id", { body, id: pad.id });
+    }
+  } finally {
+    deriving = false;
+  }
+  return getScratchpad(padId);
+}
+
+/**
+ * Finds the task an unanchored line used to be.
+ *
+ * The failure this exists for: an agent rewrites a pad from scratch and the
+ * anchors go with the old text. Without this, every line comes back as new work
+ * and the board doubles. With it, a line whose words exactly match a task this
+ * pad owns, and which nothing else in the pad currently claims, is recognised as
+ * that task again.
+ *
+ * Exact title match only. Fuzzy matching here would mean a plan that reworded
+ * two similar items could silently merge them, and a wrong merge is much harder
+ * to notice than a duplicate.
+ */
+function rebind(pad, entry, body) {
+  if (!entry.title) return null;
+  const claimed = pads.anchoredIds(body);
+  const candidates = all(
+    "SELECT * FROM tasks WHERE pad_id = :padId AND title = :title ORDER BY id",
+    { padId: pad.id, title: entry.title }
+  );
+  return candidates.find((t) => !claimed.has(t.id)) || null;
+}
+
+const derive = (padId) => deriveInPlace(padId);
+
+/**
+ * Rewrites a task's line in its pad.
+ *
+ * The other direction of the sync, called from updateTask. Silent when the task
+ * has no pad, when the pad has gone, or when we are already inside a derivation,
+ * which is the case that would otherwise loop.
+ */
+function writeBackToPad(task, before) {
+  if (deriving || !task || !task.pad_id) return;
+  const pad = getScratchpad(task.pad_id);
+  if (!pad || !pad.derives_tasks) return;
+  const entry = pads.parse(pad.body).find((e) => e.taskId === task.id);
+  if (!entry) return;
+
+  const fields = {};
+  if (!before || before.status !== task.status) fields.done = task.status === "done";
+  if (!before || before.title !== task.title) fields.title = task.title;
+  if (!before || before.assignee !== task.assignee) fields.assignee = task.assignee || null;
+  if (!before || before.priority !== task.priority) fields.priority = task.priority;
+  if (!Object.keys(fields).length) return;
+
+  const body = pads.writeLine(pad.body, entry, fields);
+  if (body === pad.body) return;
+  run("UPDATE scratchpads SET body = :body, updated_at = datetime('now') WHERE id = :id",
+      { body, id: pad.id });
+}
+
+/**
+ * A pad's lines, each with the task behind it, for the editor to render.
+ *
+ * Also names the tasks the pad no longer mentions, which is the honest way to
+ * show what a rewrite dropped: they are still on the board, and this is where
+ * someone would go looking for why.
+ */
+function scratchpadTasks(padId) {
+  const pad = getScratchpad(padId);
+  if (!pad) return { lines: [], dropped: [] };
+  const entries = pads.parse(pad.body);
+  const anchored = new Set(entries.map((e) => e.taskId).filter(Boolean));
+  const lines = entries.map((e) => ({
+    ...e,
+    task: e.taskId ? one("SELECT * FROM tasks WHERE id = :id", { id: e.taskId }) : null,
+  }));
+  const dropped = all("SELECT * FROM tasks WHERE pad_id = :padId ORDER BY id", { padId })
+    .filter((t) => !anchored.has(t.id));
+  return { lines, dropped };
+}
+
 function listLinks(projectId) {
   return all("SELECT * FROM links WHERE project_id = :projectId ORDER BY id", { projectId });
 }
@@ -1371,7 +1752,27 @@ function search(query) {
       { like }
     );
   }
-  return { tasks, notes };
+  // Pads join the same search, through their own index. A working document is
+  // often the only place a decision was written down before it became one, so
+  // leaving them out would make search quietly worse the more the agents use it.
+  let padHits = [];
+  try {
+    padHits = all(
+      `SELECT s.*, p.name AS project_name, p.colour AS project_colour
+       FROM pads_fts f JOIN scratchpads s ON s.id = f.rowid
+       LEFT JOIN projects p ON p.id = s.project_id
+       WHERE pads_fts MATCH :q ORDER BY rank LIMIT 50`,
+      { q: `${q}*` }
+    );
+  } catch {
+    padHits = all(
+      `SELECT s.*, p.name AS project_name, p.colour AS project_colour
+       FROM scratchpads s LEFT JOIN projects p ON p.id = s.project_id
+       WHERE s.title LIKE :like OR s.body LIKE :like LIMIT 50`,
+      { like }
+    );
+  }
+  return { tasks, notes, pads: padHits };
 }
 
 // ---------------------------------------------------------------------------
@@ -1884,6 +2285,8 @@ module.exports = {
   taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
   setQueue, queueState, claimNext, releaseClaim, completeClaim, extendClaim, reclaimExpired,
   listNotes, createNote, updateNote, deleteNote,
+  listScratchpads, getScratchpad, scratchpadByKey, createScratchpad, writeScratchpad,
+  appendScratchpad, patchScratchpad, deleteScratchpad, scratchpadTasks, derive,
   listLinks, createLink, deleteLink,
   search, stats,
   listAudit, projectActivity, undo, undoLast,

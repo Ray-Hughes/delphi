@@ -37,6 +37,17 @@ contextBridge.exposeInMainWorld("delphi", {
     update: (id, fields) => call("notes:update", id, fields),
     remove: (id) => call("notes:delete", id),
   },
+  pads: {
+    list: (projectId) => call("pads:list", projectId),
+    get: (id) => call("pads:get", id),
+    create: (payload) => call("pads:create", payload),
+    // write rather than update, because the body is the pad and replacing it is
+    // the normal edit. The name is the one the MCP tool uses too.
+    write: (id, fields) => call("pads:write", id, fields),
+    append: (id, text) => call("pads:append", id, text),
+    remove: (id) => call("pads:delete", id),
+    tasks: (id) => call("pads:tasks", id),
+  },
   links: {
     list: (projectId) => call("links:list", projectId),
     create: (payload) => call("links:create", payload),

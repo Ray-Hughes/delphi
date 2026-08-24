@@ -772,6 +772,89 @@
   .task:hover .t-actions, .task:focus-within .t-actions { opacity: 1; }
 
   /* Notes ---------------------------------------------------------------- */
+  /* The pad a task was read out of, on its row in the list. Quiet, because it is
+     provenance rather than status: the row is about the work, not about where the
+     words came from. */
+  .t-pad {
+    font-size: 10.5px; padding: 0 5px; border-radius: 4px;
+    border: 1px solid var(--line); color: var(--ink-faint);
+  }
+  .t-pad:hover { border-color: var(--accent); color: var(--accent-ink); }
+
+  /* Pads -------------------------------------------------------------------
+     The working documents, and the board read out of them.
+
+     Two columns because a pad is chosen and then read, the same shape the chat
+     uses for its sessions. The reading column is the one that matters, so the
+     list is kept narrow and quiet: it is a way back to the other pads, not a
+     thing to look at. */
+  .pad-wrap { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: var(--s4); align-items: start; }
+  @media (max-width: 900px) { .pad-wrap { grid-template-columns: 1fr; } }
+
+  .pad-list { display: flex; flex-direction: column; gap: 2px; }
+  .pad-row {
+    padding: var(--s2) var(--s3); border-radius: var(--r-sm); cursor: default;
+    border: 1px solid transparent;
+  }
+  .pad-row:hover { background: var(--raised); }
+  .pad-row.on { background: var(--accent-soft); border-color: var(--accent); }
+  .pad-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .pad-row-t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pad-row-m { font-size: 11.5px; color: var(--ink-faint); margin-top: 1px; }
+
+  .pad-pane { border: 1px solid var(--line-soft); border-radius: var(--r); background: var(--surface); min-width: 0; }
+  .pad-head {
+    display: flex; gap: var(--s2); align-items: center;
+    padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line-soft);
+  }
+  .pad-title {
+    flex: 1; min-width: 0; border: 1px solid transparent; background: transparent;
+    font-weight: 600; padding: 4px 6px; border-radius: var(--r-sm); outline: none;
+  }
+  .pad-title:hover { border-color: var(--line); }
+  .pad-title:focus { border-color: var(--accent); background: var(--bg); }
+  .pad-head .btn.on { border-color: var(--accent); color: var(--accent-ink); }
+
+  .pad-source {
+    display: block; width: 100%; box-sizing: border-box; min-height: 420px;
+    border: 0; outline: none; resize: vertical; background: transparent; color: var(--ink);
+    padding: var(--s4); font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
+  }
+
+  .pad-board { padding: var(--s3) var(--s4) var(--s4); }
+  .pad-prose { margin: var(--s2) 0; }
+
+  /* A checkbox line is rendered as the task it is, not as text with a box in
+     front of it. Hence the row treatment: it should read as something with a
+     state, sitting inside a document. */
+  .pad-line {
+    display: flex; align-items: baseline; gap: var(--s2);
+    padding: 5px var(--s2); border-radius: var(--r-sm); line-height: 1.5;
+  }
+  .pad-line:hover { background: var(--raised); }
+  .pad-line input[type="checkbox"] { position: relative; top: 2px; accent-color: var(--accent); }
+  .pad-line-t { flex: 1; min-width: 0; }
+  .pad-line.done .pad-line-t { color: var(--ink-faint); text-decoration: line-through; }
+  .pad-line-id { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+  .pad-line-id[role="button"]:hover { color: var(--accent-ink); }
+  .pad-line.d1 { padding-left: calc(var(--s2) + 22px); }
+  .pad-line.d2 { padding-left: calc(var(--s2) + 44px); }
+  .pad-line.d3 { padding-left: calc(var(--s2) + 66px); }
+  .pad-line.d4 { padding-left: calc(var(--s2) + 88px); }
+
+  .pad-line .chip {
+    font-size: 10.5px; padding: 1px 6px; border-radius: 4px;
+    background: var(--raised); color: var(--ink-dim); white-space: nowrap;
+  }
+  .pad-line .chip.hi { background: color-mix(in srgb, var(--crit) 12%, transparent); color: var(--crit); }
+  .pad-line .chip.st { background: var(--accent-soft); color: var(--accent-ink); }
+
+  .pad-dropped { margin-top: var(--s4); padding-top: var(--s3); border-top: 1px solid var(--line-soft); }
+  .pad-dropped-h { font-weight: 600; margin-bottom: 2px; }
+  .pad-drop { display: flex; gap: var(--s2); align-items: baseline; padding: 4px var(--s2); border-radius: var(--r-sm); }
+  .pad-drop:hover { background: var(--raised); }
+  .pad-drop-s { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-faint); min-width: 52px; }
+
   .note { border: 1px solid var(--line-soft); border-radius: var(--r); background: var(--surface); margin-bottom: var(--s3); }
   .note-head { display: flex; gap: var(--s2); align-items: center; padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line-soft); }
   .note-head input { flex: 1; border: 1px solid transparent; background: transparent; font-weight: 600; padding: 4px 6px; border-radius: var(--r-sm); outline: none; }

@@ -830,6 +830,16 @@ handle("notes:create", (payload) => { const r = db.createNote(payload); schedule
 handle("notes:update", (id, fields) => { const r = db.updateNote(id, fields); scheduleVaultExport(); return r; });
 handle("notes:delete", (id) => { const r = db.deleteNote(id); scheduleVaultExport(); return r; });
 
+// Pads go through the vault export like notes do: a working document is exactly
+// the kind of thing somebody wants to open in Obsidian or grep from a terminal.
+handle("pads:list", (projectId) => db.listScratchpads(projectId));
+handle("pads:get", (id) => db.getScratchpad(id));
+handle("pads:create", (payload) => { const r = db.createScratchpad(payload); scheduleVaultExport(); return r; });
+handle("pads:write", (id, fields) => { const r = db.writeScratchpad(id, fields); scheduleVaultExport(); return r; });
+handle("pads:append", (id, text) => { const r = db.appendScratchpad(id, text); scheduleVaultExport(); return r; });
+handle("pads:delete", (id) => { const r = db.deleteScratchpad(id); scheduleVaultExport(); return r; });
+handle("pads:tasks", (id) => db.scratchpadTasks(id));
+
 handle("links:list", (projectId) => db.listLinks(projectId));
 handle("links:create", (payload) => db.createLink(payload));
 handle("links:delete", (id) => db.deleteLink(id));

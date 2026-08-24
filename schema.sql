@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- rather than CASCADE: deleting the shell must never delete the work, or
   -- nobody can safely try epics and change their mind.
   organizer_id INTEGER REFERENCES organizers(id) ON DELETE SET NULL,
+  -- The scratchpad this task was read out of, when it was read out of one. The
+  -- board is a projection of the pads, and this is the link that makes the
+  -- projection go both ways. SET NULL rather than CASCADE for the reason the
+  -- organizer above gives: deleting the document must never delete the work.
+  pad_id       INTEGER REFERENCES scratchpads(id) ON DELETE SET NULL,
   -- Free text until there is a people table. An agent name goes here too, which
   -- is what lets the queue show who is holding a piece of work.
   assignee     TEXT,
@@ -165,7 +170,11 @@ CREATE TABLE IF NOT EXISTS audit (
   id          INTEGER PRIMARY KEY,
   at          TEXT NOT NULL DEFAULT (datetime('now')),
   action      TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete')),
-  entity      TEXT NOT NULL CHECK (entity IN ('task', 'note', 'project', 'link')),
+  -- Widened once, for scratchpads and the agent coordination rows. An existing
+  -- database cannot get this by ALTER TABLE, so db.js rebuilds the table when it
+  -- finds the narrower constraint. Adding a value here means adding it there too.
+  entity      TEXT NOT NULL CHECK (entity IN ('task', 'note', 'project', 'link',
+                                              'scratchpad', 'session', 'handoff')),
   entity_id   INTEGER,
   summary     TEXT NOT NULL,          -- human readable, e.g. "marked done"
   label       TEXT,                   -- what it was, so the list reads without a join
@@ -340,3 +349,67 @@ CREATE TABLE IF NOT EXISTS project_workspaces (
 
 CREATE INDEX IF NOT EXISTS idx_pw_workspace ON project_workspaces(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_pw_project   ON project_workspaces(project_id);
+
+-- Scratchpads: the working document an agent keeps while it thinks.
+--
+-- Every harness already keeps one, and until now it kept it somewhere Delphi
+-- could not see: a file in /tmp, a heading in its own context, a plan that dies
+-- with the session. A pad is that document, stored, so the next session and
+-- every other agent can read it.
+--
+-- Its own table rather than a kind of note, for two reasons. notes.kind carries
+-- a CHECK constraint and ALTER TABLE cannot extend one, which is the same trap
+-- projects.task_view documents above. And a pad is not a note: a note is
+-- something you decided and want to keep, a pad is something you are still
+-- working out, rewritten twenty times in an afternoon and read by whoever picks
+-- the work up next.
+--
+-- derives_tasks is what makes the board a projection of the pads rather than a
+-- second list somebody has to maintain. A checkbox line in the body is a task,
+-- and the pad line and the task row stay in step in both directions. Per pad
+-- rather than global, because a pad that is a design sketch full of unchecked
+-- options should not fill the board with work nobody agreed to.
+CREATE TABLE IF NOT EXISTS scratchpads (
+  id            INTEGER PRIMARY KEY,
+  project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  -- Short slug, so an agent can address a pad by name across sessions without
+  -- first having to look up an id it has no way of remembering.
+  key           TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  body          TEXT NOT NULL DEFAULT '',
+  -- Who wrote last. Free text for the same reason comments.author is: agents and
+  -- people both write here and neither is the special case.
+  author        TEXT,
+  -- The session this pad belongs to, when it is a session's own working
+  -- document rather than one the project keeps. SET NULL so ending a session
+  -- does not take its thinking with it.
+  session_id    INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+  pinned        INTEGER NOT NULL DEFAULT 0,
+  derives_tasks INTEGER NOT NULL DEFAULT 1,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  -- Two pads with one name in one project are two answers to "open the plan".
+  UNIQUE (project_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scratchpads_project ON scratchpads(project_id, pinned DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scratchpads_session ON scratchpads(session_id);
+
+-- Same arrangement as notes_fts, so search finds what an agent was working on
+-- and not only what it concluded.
+CREATE VIRTUAL TABLE IF NOT EXISTS pads_fts USING fts5(
+  title, body, content='scratchpads', content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS pads_ai AFTER INSERT ON scratchpads BEGIN
+  INSERT INTO pads_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS pads_ad AFTER DELETE ON scratchpads BEGIN
+  INSERT INTO pads_fts(pads_fts, rowid, title, body) VALUES ('delete', old.id, old.title, old.body);
+END;
+CREATE TRIGGER IF NOT EXISTS pads_au AFTER UPDATE ON scratchpads BEGIN
+  INSERT INTO pads_fts(pads_fts, rowid, title, body) VALUES ('delete', old.id, old.title, old.body);
+  INSERT INTO pads_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
+END;
+
+CREATE INDEX IF NOT EXISTS idx_tasks_pad ON tasks(pad_id);

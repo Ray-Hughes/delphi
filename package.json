@@ -12,6 +12,7 @@
   },
   "scripts": {
     "start": "electron .",
+    "test": "electron --no-sandbox tools/pad_test.js",
     "icons": "python3 tools/make_icons.py",
     "pack": "electron-builder --dir --config electron-builder.config.js",
     "dist": "electron-builder --config electron-builder.config.js",

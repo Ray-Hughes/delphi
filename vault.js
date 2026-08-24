@@ -84,6 +84,7 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
   const projects = [...db.listProjects(), ...db.listArchivedProjects()];
   const written = new Set();
   let notes = 0;
+  let pads = 0;
 
   const allTitles = [];
   for (const project of projects) {
@@ -118,6 +119,38 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
       notes++;
     }
 
+    // Pads go into their own folder rather than beside the notes. They are the
+    // working documents, rewritten constantly and often half-finished, and mixing
+    // them into the memory folder would make the thing you open in Obsidian
+    // mostly draft. Not linkified, because a plan quoting a note title verbatim
+    // is a quote, not a reference.
+    const projectPads = db.listScratchpads ? db.listScratchpads(project.id) : [];
+    if (projectPads.length) {
+      const padDir = path.join(dir, "pads");
+      fs.mkdirSync(padDir, { recursive: true });
+      for (const pad of projectPads) {
+        const file = path.join(padDir, `${slug(pad.key || pad.title)}.md`);
+        fs.writeFileSync(file, [
+          frontMatter({
+            title: pad.title,
+            project: project.name,
+            kind: "scratchpad",
+            author: pad.author || undefined,
+            created: pad.created_at,
+            updated: pad.updated_at,
+            id: `pad-${pad.id}`,
+          }),
+          "",
+          `# ${pad.title}`,
+          "",
+          pad.body || "",
+          "",
+        ].join("\n"));
+        written.add(path.resolve(file));
+        pads++;
+      }
+    }
+
     // An index per project, so the vault is navigable rather than a flat pile,
     // and so open work is visible next to the knowledge about it.
     const tasks = db.listTasks({ projectId: project.id });
@@ -136,6 +169,9 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
       "",
       ...projectNotes.map((n) => `- [[${n.title}]]${n.kind !== "note" ? ` - ${n.kind}` : ""}`),
       projectNotes.length ? "" : "_Nothing stored yet._\n",
+      projectPads.length ? "## Scratchpads\n" : "",
+      ...projectPads.map((p) => `- [pads/${slug(p.key || p.title)}](pads/${slug(p.key || p.title)}.md)${p.author ? ` - ${p.author}` : ""}`),
+      projectPads.length ? "" : "",
       "## Open tasks",
       "",
       ...tasks.map((t) => {
@@ -166,7 +202,7 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
   };
   sweep(vault);
 
-  return { vault, projects: projects.length, notes, removed };
+  return { vault, projects: projects.length, notes, pads, removed };
 }
 
 module.exports = { exportAll, DEFAULT_VAULT };

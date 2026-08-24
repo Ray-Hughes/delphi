@@ -174,11 +174,44 @@ choose Delphi. **Windows**: press <kbd>Win</kbd>+<kbd>R</kbd>, run
 | Change status | Hover a task and click **status** to cycle todo, doing, blocked, done |
 | Move between projects | Hover a task and use the **move to** menu |
 | Store a finding | The **Memory** tab, per project |
+| Read what an agent is working on | The **Pads** tab, per project |
 | Read a note as prose | **Memory** tab, switch **Formatted** and **Raw markdown** |
 | Filter the task list | Click any count on a project's **Overview** |
 | Light or dark | **Settings**, then **Appearance**. System follows the Mac |
 | Undo a mistake | The **History** tab. Every change is reversible |
 | Dismiss | <kbd>Esc</kbd>, or click away |
+
+### Scratchpads, and the board read out of them
+
+The **Pads** tab holds the working documents: the plan, what was tried, what it
+did, what is still open. Agents write here through the MCP server, so a plan
+survives the session that wrote it, and the next agent picks up where the last
+one stopped instead of starting again.
+
+The part that matters is that the task board is a projection of these. A
+checkbox line in a pad is a real task:
+
+```
+- [ ] wire the codex adapter @ray !high
+- [x] a finished one
+  - [ ] an indented line is a subtask of the one above
+```
+
+`@name` sets the assignee, `!high` the priority, indentation the parent. Tick a
+line and the task closes; close the task on the board and the line ticks. So
+nobody files anything twice, and the plan and the board cannot drift apart.
+
+Delphi writes an `<!--d:123-->` marker into each line it has filed. It is
+invisible when the markdown renders and it is what keeps a line and its task the
+same thing after somebody rewords one of them.
+
+Two rules keep this from being able to lose work. A line that disappears from a
+pad does not delete its task: it stays on the board, and the pad says how many it
+dropped. And an unticked box does not drag a task out of **doing** or
+**blocked**, because a checkbox has two states and a task has four.
+
+A pad that is a sketch rather than a plan can be switched to **Notes only**, and
+then nothing in it reaches the board.
 
 ### Memory notes
 

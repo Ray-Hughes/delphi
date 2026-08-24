@@ -33,6 +33,19 @@ const state = {
   termBusy: false,
   termDraft: "",
   messages: [],
+  // The scratchpads in the open project, and which one is being read. padDetail
+  // is the parsed form the main process hands back: one entry per checkbox line
+  // with the task behind it, plus the tasks the pad no longer mentions.
+  pads: [],
+  padId: null,
+  padDetail: null,
+  // Source rather than the projected view. Per session and not stored, unlike
+  // the memory toggle: reading a pad is the normal case and editing it is the
+  // errand you are on right now.
+  padRaw: false,
+  // Held here for the same reason draft is: render() rebuilds the pane
+  // wholesale, and a body being typed into a textarea would not survive it.
+  padDraft: null,
   // What is typed but not yet sent. render() rebuilds #content wholesale, so a
   // draft that lived only in the textarea would be destroyed by an alert
   // arriving while someone was still typing.
@@ -477,12 +490,23 @@ async function refresh() {
       : state.allTasks.filter((t) => t.status !== "done");
     if (state.projectId) {
       state.notes = await window.delphi.notes.list(state.projectId);
+      state.pads = await window.delphi.pads.list(state.projectId);
+      // Landing on the most recently written pad rather than on nothing, which is
+      // what makes opening the tab feel like picking the work back up.
+      if (!state.pads.some((p) => p.id === state.padId)) {
+        state.padId = state.pads.length ? state.pads[0].id : null;
+        state.padDraft = null;
+      }
+      state.padDetail = state.padId ? await window.delphi.pads.tasks(state.padId) : null;
       state.links = await window.delphi.links.list(state.projectId);
       state.repos = await window.delphi.repos.list(state.projectId);
       state.sessions = await window.delphi.sessions.list(state.projectId);
       state.organizers = await window.delphi.organizers.list(state.projectId);
     } else {
       state.notes = [];
+      state.pads = [];
+      state.padId = null;
+      state.padDetail = null;
       state.links = [];
       state.repos = [];
       state.sessions = [];
@@ -887,6 +911,7 @@ function renderTabs() {
     ? [["overview", "Overview"], ["chat", "Chat", state.sessions.length],
        ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
+       ["pads", "Pads", state.pads.length],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
        ["activity", "Activity"]]
     : state.workspaceId
@@ -930,7 +955,7 @@ function render() {
   const valid = state.query
     ? ["oracle", "tasks"]
     : state.projectId
-    ? ["overview", "chat", "tasks", "queue", "notes", "links", "activity", "project", "workspace"]
+    ? ["overview", "chat", "tasks", "queue", "pads", "notes", "links", "activity", "project", "workspace"]
     : state.workspaceId
     ? ["new", "tasks", "queue", "graph", "activity", "workspace"]
     : ["new", "tasks", "queue", "graph", "reminders", "history", "settings"];
@@ -972,6 +997,7 @@ function render() {
     overview: renderOverview,
     chat: renderChat,
     tasks: renderTasks,
+    pads: renderPads,
     notes: renderNotes,
     links: renderLinks,
     queue: renderQueue,
@@ -3396,6 +3422,27 @@ function colourMenu(x, y, task, onPick) {
  * Deliberately quieter than a row: in a narrow column there is no room for meta,
  * so it carries the title and only what changes a decision.
  */
+/**
+ * Where a task came from, when it came from a pad.
+ *
+ * The board is a projection of the pads, and this is the way back to the
+ * document being projected. It matters most for the task nobody remembers
+ * filing, because an agent wrote the line rather than a person typing it here.
+ */
+function padChip(t) {
+  const chip = el("span", { className: "t-pad", textContent: "pad", tabIndex: 0, role: "button" });
+  chip.title = "Read out of a scratchpad. Open it.";
+  const go = (e) => {
+    if (e) e.stopPropagation();
+    state.padId = t.pad_id;
+    state.padDraft = null;
+    goTo({ projectId: t.project_id || state.projectId, view: "pads" });
+  };
+  chip.onclick = go;
+  chip.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(e); } };
+  return chip;
+}
+
 function taskCard(t, { draggable = false, showDue = true } = {}) {
   const card = el("div", { className: "tcard" + (t.status === "done" ? " done" : "") + colourClass(t) });
   card.append(el("div", { className: "tcard-title", textContent: t.title }));
@@ -3408,6 +3455,7 @@ function taskCard(t, { draggable = false, showDue = true } = {}) {
   else if (showDue && t.due) foot.append(el("span", { className: "t-due", textContent: t.due }));
   if (t.subtask_count) foot.append(el("span", { className: "t-due", textContent: `${t.subtask_done}/${t.subtask_count}` }));
   if (t.ref) foot.append(el("span", { className: "t-ref", textContent: t.ref }));
+  if (t.pad_id) foot.append(padChip(t));
   if (t.assignee) {
     foot.append(el("span", {
       className: "avatar sm" + (isAgent(t.assignee) ? " agent" : ""),
@@ -4553,6 +4601,7 @@ function taskRow(t) {
   const sub = el("div", { className: "t-sub" });
   if (!state.projectId && t.project_name) sub.append(projectOwner(t));
   if (t.ref) sub.append(el("span", { className: "t-ref", textContent: t.ref }));
+  if (t.pad_id) sub.append(padChip(t));
   if (t.subtask_count) sub.append(el("span", { textContent: `${t.subtask_done}/${t.subtask_count}` }));
   if (t.comment_count) sub.append(el("span", { textContent: `${t.comment_count} ✦` }));
   if (sub.childNodes.length) body.append(sub);
@@ -4604,6 +4653,249 @@ function taskRow(t) {
 // ---------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Pads
+//
+// The working documents, and the board read out of them. A pad is markdown, and
+// every checkbox line in it is a real task: ticking one here closes the task,
+// closing the task rewrites the line.
+//
+// Which is why this is not just a markdown editor with a preview. The formatted
+// view renders each checkbox line as the task it is, with its id and its status,
+// so the projection is visible. Somebody reading a plan an agent wrote should be
+// able to see, without being told, that the plan is the board.
+// ---------------------------------------------------------------------------
+
+function renderPads(root) {
+  const project = currentProject();
+  if (!project) return;
+
+  const title = el("input", { className: "field", placeholder: "New pad title, then Enter" });
+  title.onkeydown = async (e) => {
+    if (e.key !== "Enter" || !title.value.trim()) return;
+    const pad = await window.delphi.pads.create({ projectId: state.projectId, title: title.value.trim(), author: "you" });
+    state.padId = pad.id;
+    state.padDraft = null;
+    title.value = "";
+    refresh();
+  };
+  root.append(el("div", { className: "add-row" }, title));
+
+  if (!state.pads.length) {
+    root.append(emptyState(
+      "No pads yet",
+      "A pad is the working document for a piece of work: the plan, what you tried, what it did. " +
+      "Agents write here through write_scratchpad, and every checkbox line becomes a task on the board."));
+    return;
+  }
+
+  const wrap = el("div", { className: "pad-wrap" });
+  wrap.append(padList(), padPane());
+  root.append(wrap);
+}
+
+function padList() {
+  const list = el("div", { className: "pad-list" });
+  for (const pad of state.pads) {
+    const row = el("div", {
+      className: "pad-row" + (pad.id === state.padId ? " on" : ""),
+      tabIndex: 0, role: "button",
+    });
+    row.append(el("div", { className: "pad-row-t", textContent: pad.title }));
+    const meta = [pad.author || "you"];
+    if (!pad.derives_tasks) meta.push("no tasks");
+    row.append(el("div", { className: "pad-row-m", textContent: meta.join(" · ") }));
+    const go = () => {
+      if (pad.id === state.padId) return;
+      state.padId = pad.id;
+      state.padDraft = null;
+      refresh();
+    };
+    row.onclick = go;
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    list.append(row);
+  }
+  return list;
+}
+
+function padPane() {
+  const pad = state.pads.find((p) => p.id === state.padId);
+  const pane = el("div", { className: "pad-pane" });
+  if (!pad) return pane;
+
+  // --- head ----------------------------------------------------------------
+  const head = el("div", { className: "pad-head" });
+  const name = el("input", { className: "pad-title", value: pad.title });
+  name.onblur = async () => {
+    if (name.value.trim() && name.value !== pad.title) {
+      await window.delphi.pads.write(pad.id, { title: name.value.trim() });
+      refresh();
+    }
+  };
+  head.append(name);
+
+  const seg = el("div", { className: "seg", role: "group" });
+  seg.setAttribute("aria-label", "Pad display");
+  for (const [raw, label] of [[false, "Board"], [true, "Markdown"]]) {
+    const button = el("button", { type: "button", textContent: label });
+    button.setAttribute("aria-pressed", String(state.padRaw === raw));
+    button.onclick = () => { if (state.padRaw !== raw) { state.padRaw = raw; state.padDraft = null; render(); } };
+    seg.append(button);
+  }
+  head.append(seg);
+
+  // Off means the pad is a sketch: options nobody has agreed to should not fill
+  // the board with work.
+  const derive = el("button", {
+    className: "btn sm" + (pad.derives_tasks ? " on" : ""),
+    textContent: pad.derives_tasks ? "Files tasks" : "Notes only",
+    title: "Whether checkbox lines in this pad become tasks",
+  });
+  derive.onclick = async () => {
+    await window.delphi.pads.write(pad.id, { derives_tasks: pad.derives_tasks ? 0 : 1 });
+    refresh();
+  };
+  head.append(derive);
+
+  const del = el("button", { className: "btn sm", textContent: "×", title: "Delete this pad. Its tasks stay." });
+  del.onclick = async () => {
+    if (!confirm(`Delete "${pad.title}"? The tasks it filed stay on the board.`)) return;
+    await window.delphi.pads.remove(pad.id);
+    state.padId = null;
+    state.padDraft = null;
+    refresh();
+  };
+  head.append(del);
+  pane.append(head);
+
+  // --- body ----------------------------------------------------------------
+  if (state.padRaw) {
+    const box = el("textarea", {
+      className: "pad-source",
+      value: state.padDraft != null ? state.padDraft : pad.body,
+      spellcheck: false,
+    });
+    box.oninput = () => { state.padDraft = box.value; };
+    // On blur rather than per keystroke. Every write re-reads the board from the
+    // pad, and doing that on each character would file a task for every prefix
+    // of a line somebody was still typing.
+    box.onblur = async () => {
+      if (state.padDraft == null || state.padDraft === pad.body) return;
+      const body = state.padDraft;
+      state.padDraft = null;
+      await window.delphi.pads.write(pad.id, { body, author: "you" });
+      refresh();
+    };
+    pane.append(box);
+    pane.append(el("div", { className: "hint", textContent:
+      "The <!--d:123--> markers are how a line and its task stay the same thing. Edit around them." }));
+    return pane;
+  }
+
+  pane.append(padBoard(pad));
+  return pane;
+}
+
+/**
+ * The pad as it reads, with its checkbox lines live.
+ *
+ * Prose is passed through the markdown renderer in runs, so a heading is still a
+ * heading. A checkbox line is not: it is rendered as its task, because that is
+ * what it is, and ticking it here goes through the same update the board uses.
+ */
+function padBoard(pad) {
+  const box = el("div", { className: "pad-board" });
+  const detail = state.padDetail && state.padDetail.padId !== undefined
+    ? state.padDetail
+    : state.padDetail || { lines: [], dropped: [] };
+
+  const byLine = new Map((detail.lines || []).map((l) => [l.index, l]));
+  const source = (pad.body || "").split("\n");
+  let prose = [];
+
+  const flush = () => {
+    const text = prose.join("\n").trim();
+    prose = [];
+    if (text) box.append(el("div", { className: "pad-prose" }, renderMarkdown(text)));
+  };
+
+  source.forEach((line, index) => {
+    const entry = byLine.get(index);
+    if (!entry) { prose.push(line); return; }
+    flush();
+    box.append(padLine(entry));
+  });
+  flush();
+
+  if (!source.join("").trim()) {
+    box.append(el("div", { className: "hint", textContent:
+      "Empty. Switch to Markdown and write the plan as checkbox lines." }));
+  }
+
+  if (detail.dropped && detail.dropped.length) {
+    // Named rather than hidden. A rewrite that dropped six lines is the moment
+    // somebody goes looking for where their tasks went, and this is the answer.
+    box.append(el("div", { className: "pad-dropped" },
+      el("div", { className: "pad-dropped-h", textContent:
+        `${plural(detail.dropped.length, "task", "tasks")} no longer in this pad` }),
+      el("div", { className: "hint", textContent:
+        "Still on the board. A pad that stops mentioning a task does not close it." }),
+      ...detail.dropped.map((t) => {
+        const row = el("div", { className: "pad-drop", tabIndex: 0, role: "button" },
+          el("span", { className: "pad-drop-s", textContent: t.status }),
+          el("span", { textContent: t.title }));
+        const go = () => goTo({ projectId: state.projectId, view: "tasks" });
+        row.onclick = go;
+        row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+        return row;
+      })));
+  }
+
+  return box;
+}
+
+function padLine(entry) {
+  const task = entry.task;
+  const row = el("div", {
+    className: "pad-line d" + Math.min(entry.depth, 4) + (entry.done ? " done" : ""),
+  });
+
+  const tick = el("input", { type: "checkbox", checked: entry.done });
+  tick.disabled = !task;
+  tick.onchange = async () => {
+    if (!task) return;
+    // Through the task, not through the pad. updateTask writes the line back, so
+    // there is one path that changes a status and one place that decides what a
+    // status change means.
+    await window.delphi.tasks.update(task.id, { status: tick.checked ? "done" : "todo" });
+    refresh();
+  };
+  row.append(tick);
+
+  row.append(el("span", { className: "pad-line-t", textContent: entry.title }));
+
+  if (entry.assignee) row.append(el("span", { className: "chip", textContent: `@${entry.assignee}` }));
+  if (entry.priority === "high") row.append(el("span", { className: "chip hi", textContent: "high" }));
+  // The board's word for it, when the board and the checkbox disagree. A task
+  // somebody moved to doing reads as doing here rather than as simply unticked.
+  if (task && task.status !== "todo" && task.status !== "done") {
+    row.append(el("span", { className: "chip st", textContent: task.status }));
+  }
+  if (task) {
+    const id = el("span", { className: "pad-line-id", textContent: `#${task.id}`, tabIndex: 0, role: "button" });
+    id.title = "Open on the board";
+    const go = () => goTo({ projectId: state.projectId, view: "tasks" });
+    id.onclick = go;
+    id.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    row.append(id);
+  } else {
+    row.append(el("span", { className: "pad-line-id", textContent: "not filed", title:
+      "This pad does not file tasks. Turn it on in the header." }));
+  }
+
+  return row;
+}
 
 function renderNotes(root) {
   const title = el("input", { className: "field", placeholder: "New memory note title, then Enter" });

@@ -16,6 +16,11 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `add_task` | Create a task |
 | `update_task` | Change status, priority, detail, or move between projects |
 | `add_note` | Store a decision, gotcha or reference against a project |
+| `list_scratchpads` | The working documents in a project. Call before writing one |
+| `read_scratchpad` | One pad in full: what the last session was in the middle of |
+| `write_scratchpad` | Write the working document. Checkbox lines in it become tasks |
+| `append_scratchpad` | Add to the end of a pad without reading it first |
+| `patch_scratchpad` | Replace one section, found by its heading |
 | `search` | Text matching across tasks and notes |
 | `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
 | `oracle_entities` | What the graph knows about, most referenced first |
@@ -121,6 +126,10 @@ During the work:
   and the reasoning behind it, a trap that cost time, why an obvious approach was
   rejected, an exact value that is hard to find again. Use `kind` of `decision`,
   `gotcha` or `reference` as appropriate.
+- Keep your working document in a scratchpad, through `write_scratchpad`, and write the
+  plan in it as checkbox lines. They become real tasks, so a plan in a pad is a plan on
+  the board. Do not also call `add_task` for work that is already in the pad: that files
+  it twice.
 
 Do not ask permission before recording any of this. Record it, then mention in one line
 what you recorded.
@@ -130,12 +139,54 @@ restatements of what the code already says plainly.
 
 ---
 
-## Using the tracker as the scratchpad
+## Scratchpads, and the board read out of them
+
+A scratchpad is the working document for a piece of work: the plan, what was
+tried, what it did, what is still open. Every agent already keeps one. Until
+these existed it kept it somewhere Delphi could not see, which meant it died
+with the session.
+
+`write_scratchpad` puts it in the tracker instead, and `list_scratchpads` is how
+you find the one that is already there rather than starting a second one beside
+it. `append_scratchpad` and `patch_scratchpad` are the safe writes when another
+agent may be working the same pad: neither can overwrite what the other added.
+
+The part worth understanding is that the board is a projection of the pads. A
+checkbox line is a task:
+
+```
+- [ ] wire the codex adapter @ray !high
+- [x] a finished one
+  - [ ] an indented line is a subtask of the one above
+```
+
+`@name` sets the assignee, `!high` the priority, indentation the parent. Ticking
+a line closes its task; closing the task rewrites the line. So the plan and the
+board cannot drift, and nobody has to file anything twice.
+
+Delphi marks each line it has filed with an `<!--d:123-->` comment. It is
+invisible when the markdown renders and it is how a line and its task stay the
+same thing across a rewording. Edit around them. If you drop them, lines are
+matched back to their tasks by exact text, which recovers most of it but not a
+line you reworded in the same pass.
+
+Two rules exist so this cannot lose work. A line that disappears from a pad does
+not delete its task; it stays on the board, and the pad shows what it dropped.
+And an unticked box does not drag a task out of `doing` or `blocked`: the pad
+owns done or not done, the board owns the rest.
+
+A pad can be turned off as a source with `derives_tasks: false`, for a sketch
+full of options nobody has agreed to yet.
+
+Notes are still notes. A pad is where you are thinking; a note is what you
+concluded, and `add_note` still owns those.
+
+### The scratchpad switch
 
 Settings has a switch called **Agent scratchpad**. Off by default. Turned on,
-every agent connected to this database is told to write its drafts, plans and
-working documents here as notes instead of to temporary files, and given a
-default project to put them in.
+every agent connected to this database is told to keep its plans and working
+documents here rather than in temporary files, and given a default project to
+put them in.
 
 The point is that the default is otherwise a temp directory, which is emptied
 between sessions and invisible to every other agent sharing this tracker. You
@@ -151,7 +202,7 @@ switch writes to all of them:
 | `tools/list` → tool descriptions | Whenever the model considers a tool | Where the behaviour comes from |
 | `tools/call` → result | While the agent is already working | Last chance to correct course |
 
-The middle one does the work. A directive sitting in `add_note`'s own description
+The middle one does the work. A directive sitting in `write_scratchpad`'s own description
 is read at the moment the model is deciding where to put something.
 
 Turning it on or off reaches agents that are already connected, within a few

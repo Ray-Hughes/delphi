@@ -34,6 +34,15 @@ module.exports = {
     "vault.js",
     "oracle.js",
     "embeddings.js",
+    // The pad grammar. Also in extraResources below, because the MCP server
+    // needs a copy it can read from outside the archive.
+    "pads.js",
+    // These three arrived after this list was last touched and were missing from
+    // it, which meant a packaged build had a main process requiring files that
+    // were not in the archive. Nothing catches that at build time.
+    "ai.js",
+    "git.js",
+    "terminal.js",
     "schema.sql",
     "oracle.sql",
     "package.json",
@@ -48,6 +57,10 @@ module.exports = {
   // that something other than Electron can actually run.
   extraResources: [
     { from: "agent/mcp_server.js", to: "agent/mcp_server.js" },
+    // The pad grammar, which the server requires. Out here rather than only in
+    // the asar because the server is a plain Node process and cannot read in
+    // there, and because one copy of these rules is the whole point.
+    { from: "pads.js", to: "pads.js" },
     { from: "agent/guard.py", to: "agent/guard.py" },
   ],
 

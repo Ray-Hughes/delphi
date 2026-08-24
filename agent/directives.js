@@ -81,26 +81,40 @@ function scratchpadInstructions(project) {
   return [
     "SCRATCHPAD MODE IS ON.",
     "",
-    "This tracker is the scratchpad for this session. Drafts, working documents,",
-    "research summaries, plans, analyses and intermediate output go into it as",
-    "notes, through add_note.",
+    "This tracker holds the scratchpad for this session. Your working document,",
+    "the plan, the findings, what you tried and what it did, goes into it through",
+    "write_scratchpad.",
     "",
-    "Do not write them to a temporary directory, a scratchpad folder, /tmp, or an",
+    "Do not write it to a temporary directory, a scratchpad folder, /tmp, or an",
     "untracked file beside the source. Those are invisible to the next session and",
-    "to every other agent sharing this tracker. A note is not.",
+    "to every other agent sharing this tracker. A pad is not.",
+    "",
+    "Call list_scratchpads first and add to the pad that already exists, rather",
+    "than starting a second one beside it. append_scratchpad and patch_scratchpad",
+    "are the safe writes when another agent may be working the same pad.",
     "",
     destination,
     "",
-    'Use kind "reference" for a document meant to be used, pasted or handed over,',
-    'and "note", "decision" or "gotcha" when it is knowledge rather than a',
-    "deliverable. Open the body with its provenance: when it was written, what it",
-    "was derived from, what is still unresolved or still a placeholder.",
+    "Write the plan as checkboxes, because they become real tasks on the board:",
     "",
-    "This is about prose and drafts, not about build output. Keep using real files",
+    "  - [ ] the thing to do @who !high",
+    "  - [x] the thing already done",
+    "    - [ ] an indented line is a subtask of the one above",
+    "",
+    "Ticking a line closes its task, and closing the task ticks the line. So do",
+    "not also call add_task for work that is already in the pad: that files it",
+    "twice. Delphi marks each filed line with an <!--d:123--> comment; edit around",
+    "those and leave them alone.",
+    "",
+    "Notes are a different thing and add_note still owns them: a decision and why,",
+    "a gotcha, a reference. Knowledge that outlives this piece of work. The pad is",
+    "where you are thinking; a note is what you concluded.",
+    "",
+    "This is about prose and plans, not about build output. Keep using real files",
     "for things that have to be files to work at all: scripts you are going to",
     "execute, generated documents, anything a command needs a path for.",
     "",
-    "Report back the note id and title, since there is no file path to hand over.",
+    "Report back the pad id and key, since there is no file path to hand over.",
   ].join("\n");
 }
 
@@ -111,9 +125,11 @@ function scratchpadToolNote(project) {
       `unless the draft plainly belongs to another project's work.`
     : `No default project is set, so pick the project that fits.`;
   return (
-    ` SCRATCHPAD MODE IS ON: this tracker is the scratchpad for this session. ` +
-    `Drafts, working documents and intermediate output belong here as notes, not in ` +
-    `a temp directory, a scratchpad folder or /tmp. ${where}`
+    ` SCRATCHPAD MODE IS ON: this tracker holds the scratchpad for this session. ` +
+    `Your plan and working document belong here, through write_scratchpad, not in ` +
+    `a temp directory, a scratchpad folder or /tmp. Checkbox lines in a pad become ` +
+    `tasks, so write the plan as checkboxes rather than calling add_task as well. ` +
+    `${where}`
   );
 }
 
@@ -121,9 +137,10 @@ function scratchpadToolNote(project) {
 function scratchpadReminder(project) {
   const where = project ? `"${project.name}" (project_id ${project.id})` : "the project that fits";
   return (
-    `[delphi] Scratchpad mode is on. Write drafts and working documents here with ` +
-    `add_note, against ${where}, rather than to a file in a temp directory. ` +
-    `Executable scripts and generated documents are the exception and stay as real files.`
+    `[delphi] Scratchpad mode is on. Keep your plan and working document here with ` +
+    `write_scratchpad, against ${where}, rather than in a file in a temp directory. ` +
+    `Checkbox lines become tasks, so the board follows the pad. Executable scripts ` +
+    `and generated documents are the exception and stay as real files.`
   );
 }
 

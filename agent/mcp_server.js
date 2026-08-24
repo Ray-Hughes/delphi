@@ -102,11 +102,15 @@ function scratchpadState() {
   return { on: true, project };
 }
 
-// Which tools carry the directive in their description. add_note is where a draft
-// is actually written, and list_projects is what the standing prompt tells agents
-// to call first, so it is where an agent is oriented before it has decided
-// anything. The rest would be noise.
-const SCRATCHPAD_TOOLS = new Set(["add_note", "list_projects"]);
+// Which tools carry the directive in their description. write_scratchpad is
+// where the working document is actually written, list_scratchpads is what the
+// directive tells agents to call first so they add to the existing pad, and
+// list_projects is where an agent is oriented before it has decided anything.
+//
+// add_note keeps it too, because an agent reaching for a note when it wants a pad
+// is the mistake this is guarding against, and the description is the last place
+// to catch it.
+const SCRATCHPAD_TOOLS = new Set(["write_scratchpad", "list_scratchpads", "add_note", "list_projects"]);
 const ACTOR = process.env.DELPHI_ACTOR || "agent";
 
 /**
@@ -272,12 +276,164 @@ function resolveProjectId(a) {
   return row.id;
 }
 
+// The pad grammar, shared with the app rather than copied.
+//
+// Everything else in this file that touches a row is a deliberate twin of db.js,
+// because requiring db.js would drag in node:sqlite. pads.js has no dependencies
+// at all: it is pure text in, text out. Two copies of a grammar this fiddly would
+// disagree within a month, and the disagreement would show up as duplicated tasks
+// in somebody's board rather than as an error anyone could read.
+//
+// Shipped beside this file by electron-builder's extraResources, for the same
+// reason the server itself is: a plain Node process cannot read inside app.asar.
+const pads = require("../pads");
+
 const audit = (action, entity, entityId, summary, label) =>
   sql(
     `INSERT INTO audit (action, entity, entity_id, summary, label)
      VALUES (:p1, :p2, :p3, :p4, :p5)`,
     [action, entity, entityId, `${summary} (by ${ACTOR})`, label]
   );
+
+// --- scratchpads -------------------------------------------------------------
+//
+// The row half of the pad tools. Twins of db.js the same way add_project is, and
+// for the same reason: node:sqlite is not available here. The grammar is not
+// duplicated, only the writes.
+
+/** A pad by id, or by project and key, which is how an agent addresses one. */
+function findPad(a) {
+  if (a.id != null) return sql("SELECT * FROM scratchpads WHERE id = :p1", [Number(a.id)])[0] || null;
+  if (!a.key) throw new Error("Pass either id, or project_id and key.");
+  const projectId = resolveProjectId(a);
+  if (projectId == null) throw new Error("Pass either id, or project_id and key.");
+  return sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
+             [projectId, String(a.key)])[0] || null;
+}
+
+/**
+ * The slug a pad is addressed by.
+ *
+ * Not made unique by appending a number, unlike db.js. Here a repeated key means
+ * an agent writing to the pad it wrote last time, which is the intended use, and
+ * silently giving it "plan-2" would leave it appending to a document nobody else
+ * reads.
+ */
+function padKeyFor(projectId, source) {
+  const key = String(source).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  if (!key) throw new Error("key must contain at least one alphanumeric character");
+  return key;
+}
+
+/** Twin of db.js patchScratchpad. Replaces a section, or adds it if it is new. */
+function patchSection(body, heading, text) {
+  const lines = String(body || "").split("\n");
+  const wanted = String(heading).trim().toLowerCase().replace(/^#+\s*/, "");
+  let start = -1;
+  let level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+    if (m && m[2].trim().toLowerCase() === wanted) { start = i; level = m[1].length; break; }
+  }
+  if (start === -1) {
+    const joiner = !body || body.endsWith("\n") ? "" : "\n";
+    return `${body}${joiner}\n## ${heading}\n\n${text}\n`;
+  }
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    const m = /^(#{1,6})\s+/.exec(lines[i]);
+    if (m && m[1].length <= level) { end = i; break; }
+  }
+  return [...lines.slice(0, start + 1), "", text, "", ...lines.slice(end)].join("\n");
+}
+
+/**
+ * Reads a pad's checkbox lines into tasks. Twin of db.js deriveInPlace.
+ *
+ * Returns what the caller should report back: the pad, and the tasks it now
+ * owns. An agent that has just written a plan wants to know which task ids it
+ * got, because those are what it will claim and close later.
+ */
+function derivePad(padId) {
+  const pad = sql("SELECT * FROM scratchpads WHERE id = :p1", [padId])[0];
+  if (!pad) throw new Error("No such scratchpad");
+  if (!pad.derives_tasks) return { ...pad, tasks: [] };
+
+  let body = pad.body;
+  let entries = pads.parse(body);
+  const idByEntry = new Map();
+  const filed = [];
+
+  for (const entry of entries.slice()) {
+    // Re-read each pass, because anchoring a line shifts nothing but rewrites it,
+    // and the entry we are holding was parsed from the text before that.
+    const current = pads.parse(body)[entry.at];
+    if (!current) continue;
+    const parentId = current.parentIndex != null ? idByEntry.get(current.parentIndex) ?? null : null;
+
+    let task = current.taskId
+      ? sql("SELECT * FROM tasks WHERE id = :p1", [current.taskId])[0]
+      : null;
+    if (task && task.pad_id !== pad.id) task = null;
+
+    if (!task) {
+      // An anchorless line that exactly matches a task this pad owns, and that no
+      // other line currently claims, is that task with its marker rewritten away.
+      // See pads.js: exact match only, because a wrong merge is harder to spot
+      // than a duplicate.
+      const claimed = [...pads.anchoredIds(body)];
+      const rows = sql(
+        `SELECT * FROM tasks WHERE pad_id = :p1 AND title = :p2
+         ${claimed.length ? `AND id NOT IN (${claimed.join(", ")})` : ""} ORDER BY id`,
+        [pad.id, current.title]
+      );
+      task = rows[0] || null;
+    }
+
+    if (task) {
+      const sets = [];
+      if (current.title && current.title !== task.title) sets.push(`title = ${literal(current.title)}`);
+      const status = pads.statusFor(current.done, task.status);
+      if (status !== task.status) {
+        sets.push(`status = ${literal(status)}`);
+        sets.push(status === "done" ? "completed_at = datetime('now')" : "completed_at = NULL");
+      }
+      if (current.assignee && current.assignee !== task.assignee) sets.push(`assignee = ${literal(current.assignee)}`);
+      if (current.priority && current.priority !== task.priority) sets.push(`priority = ${literal(current.priority)}`);
+      if (parentId !== (task.parent_id ?? null)) sets.push(`parent_id = ${literal(parentId)}`);
+      if (sets.length) {
+        sql(`UPDATE tasks SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = :p1`, [task.id]);
+        if (status !== task.status) {
+          sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
+              [task.id, status, ACTOR]);
+          audit("update", "task", task.id, `status ${task.status} to ${status}`, task.title);
+        }
+      }
+    } else {
+      sql(
+        `INSERT INTO tasks (project_id, title, status, priority, assignee, parent_id, pad_id, source, completed_at)
+         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, 'pad',
+                 CASE WHEN :p3 = 'done' THEN datetime('now') END)`,
+        [pad.project_id, current.title || "Untitled", current.done ? "done" : "todo",
+         current.priority || "med", current.assignee || null, parentId, pad.id]
+      );
+      task = sql("SELECT * FROM tasks WHERE id = last_insert_rowid()")[0];
+      sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
+          [task.id, task.status, ACTOR]);
+      audit("create", "task", task.id, "read out of a pad", task.title);
+    }
+
+    sql("UPDATE tasks SET pad_id = :p1, external_key = :p2 WHERE id = :p3",
+        [pad.id, `pad:${pad.id}:${task.id}`, task.id]);
+    idByEntry.set(current.at, task.id);
+    filed.push({ id: task.id, title: current.title, status: pads.statusFor(current.done, task.status) });
+
+    if (current.taskId !== task.id) body = pads.anchorLine(body, current, task.id);
+  }
+
+  if (body !== pad.body) sql("UPDATE scratchpads SET body = :p1 WHERE id = :p2", [body, pad.id]);
+  return { ...sql("SELECT * FROM scratchpads WHERE id = :p1", [pad.id])[0], tasks: filed };
+}
 
 // --- tools ------------------------------------------------------------------
 
@@ -710,6 +866,142 @@ const TOOLS = {
       const row = sql("SELECT id, title FROM notes ORDER BY id DESC LIMIT 1")[0];
       audit("create", "note", row.id, "created", row.title);
       return row;
+    },
+  },
+
+  list_scratchpads: {
+    description:
+      "List the scratchpads in a project: the working documents, with their keys. Call this before writing one, so you add to the existing plan rather than starting a second one beside it.",
+    schema: {
+      type: "object",
+      properties: {
+        project_id: { type: "number" },
+        project: { type: "string", description: "Project key, as an alternative to project_id" },
+      },
+    },
+    run: (a) => {
+      const projectId = a.project_id ?? (a.project ? resolveProjectId(a) : null);
+      return sql(
+        `SELECT id, project_id, key, title, author, derives_tasks, updated_at,
+                length(body) AS size
+         FROM scratchpads
+         ${projectId ? "WHERE project_id = :p1" : ""}
+         ORDER BY pinned DESC, updated_at DESC LIMIT 100`,
+        projectId ? [projectId] : []
+      );
+    },
+  },
+
+  read_scratchpad: {
+    description:
+      "Read a scratchpad in full, by id or by project and key. This is how you pick up what the last session, or another agent, was in the middle of.",
+    schema: {
+      type: "object",
+      properties: {
+        id: { type: "number" },
+        project_id: { type: "number" },
+        key: { type: "string" },
+      },
+    },
+    run: (a) => {
+      const pad = findPad(a);
+      if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
+      return pad;
+    },
+  },
+
+  write_scratchpad: {
+    description:
+      "Write a scratchpad: the working document for a piece of work. Plans, findings, handover notes, what you tried and what it did. Creates it if the key is new, replaces the body if it is not.\n\n" +
+      "Checkbox lines become real tasks on the board, kept in step in both directions:\n" +
+      "  - [ ] wire the codex adapter @ray !high\n" +
+      "  - [x] a finished one\n" +
+      "    - [ ] an indented one is a subtask\n" +
+      "So write the plan as checkboxes and the board follows. Do not also call add_task for the same work.\n\n" +
+      "Delphi adds an <!--d:123--> marker to each line it has filed. Leave those in place when you edit around them: they are how a line and its task stay the same thing. If you drop them, the lines are matched back up by their exact text.\n\n" +
+      "Prefer append_scratchpad or patch_scratchpad when you are adding to a pad another agent may also be writing.",
+    schema: {
+      type: "object",
+      required: ["title", "body"],
+      properties: {
+        project_id: { type: "number" },
+        project: { type: "string", description: "Project key, as an alternative to project_id" },
+        key: { type: "string", description: "Short slug to address this pad by later. Defaults to the title." },
+        title: { type: "string" },
+        body: { type: "string", description: "Markdown. Checkbox lines become tasks." },
+        derives_tasks: {
+          type: "boolean",
+          description: "False for a sketch full of options nobody has agreed to yet. Defaults to true.",
+        },
+      },
+    },
+    run: (a) => {
+      const projectId = a.project_id ?? resolveProjectId(a);
+      const key = padKeyFor(projectId, a.key || a.title);
+      const existing = sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
+                           [projectId, key])[0];
+      if (existing) {
+        sql(`UPDATE scratchpads SET title = :p1, body = :p2, author = :p3,
+             derives_tasks = :p4, updated_at = datetime('now') WHERE id = :p5`,
+            [a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : existing.derives_tasks, existing.id]);
+        audit("update", "scratchpad", existing.id, "wrote to the pad", a.title);
+        return derivePad(existing.id);
+      }
+      sql(`INSERT INTO scratchpads (project_id, key, title, body, author, derives_tasks)
+           VALUES (:p1, :p2, :p3, :p4, :p5, :p6)`,
+          [projectId, key, a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : 1]);
+      const row = sql("SELECT id FROM scratchpads WHERE project_id = :p1 AND key = :p2",
+                      [projectId, key])[0];
+      audit("create", "scratchpad", row.id, "created", a.title);
+      return derivePad(row.id);
+    },
+  },
+
+  append_scratchpad: {
+    description:
+      "Add to the end of a scratchpad without reading it first. The safe write when another agent may be working the same pad: it cannot overwrite what they added.",
+    schema: {
+      type: "object",
+      required: ["text"],
+      properties: {
+        id: { type: "number" },
+        project_id: { type: "number" },
+        key: { type: "string" },
+        text: { type: "string", description: "Markdown to add. Checkbox lines become tasks." },
+      },
+    },
+    run: (a) => {
+      const pad = findPad(a);
+      if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
+      const joiner = !pad.body || pad.body.endsWith("\n") ? "" : "\n";
+      sql("UPDATE scratchpads SET body = :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3",
+          [`${pad.body}${joiner}${a.text}`, ACTOR, pad.id]);
+      audit("update", "scratchpad", pad.id, "added to the pad", pad.title);
+      return derivePad(pad.id);
+    },
+  },
+
+  patch_scratchpad: {
+    description:
+      "Replace one section of a scratchpad, found by its markdown heading. Use this to update your own part of a shared pad without touching anyone else's. The section is added at the end if the heading is not there yet.",
+    schema: {
+      type: "object",
+      required: ["heading", "text"],
+      properties: {
+        id: { type: "number" },
+        project_id: { type: "number" },
+        key: { type: "string" },
+        heading: { type: "string", description: "The heading text, without the leading hashes" },
+        text: { type: "string", description: "What the section should now say" },
+      },
+    },
+    run: (a) => {
+      const pad = findPad(a);
+      if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
+      sql("UPDATE scratchpads SET body = :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3",
+          [patchSection(pad.body, a.heading, a.text), ACTOR, pad.id]);
+      audit("update", "scratchpad", pad.id, `rewrote "${a.heading}"`, pad.title);
+      return derivePad(pad.id);
     },
   },
 

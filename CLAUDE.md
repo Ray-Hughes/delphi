@@ -18,6 +18,7 @@ the code is worse than no comment.
 
 ```
 npm start          # electron .
+npm test           # the scratchpad sync, round tripped. No framework
 ```
 
 There is no build step and no bundler. `index.html`, `app.js`, `main.js` and
@@ -32,8 +33,9 @@ loads all of them at startup, so a renderer change needs a restart, not a reload
 | `preload.js` | The only bridge. Exposes `window.delphi` and unwraps `{ok, data}` so the renderer can await plain values |
 | `app.js` | Renderer. Talks to the main process through `window.delphi` only |
 | `index.html` | All styling. Design tokens at the top, components below |
+| `pads.js` | The scratchpad grammar. Pure text in, text out, no database and no dependencies |
 | `agent/mcp_server.js` | JSON-RPC 2.0 MCP server over stdio, no dependencies |
-| `schema.sql` | The store. Projects hold tasks, notes and links |
+| `schema.sql` | The store. Projects hold tasks, notes, pads and links |
 
 ## Things that will catch you out
 
@@ -51,14 +53,33 @@ breaks it halfway through.
 `delphi.db-wal`. Run `PRAGMA wal_checkpoint(TRUNCATE)` before committing
 `delphi.db`, or the committed copy will be missing recent rows.
 
+**`pads.js` is required by both the app and the MCP server.** It is the only
+file that is, and it works because it has no dependencies at all. Everything else
+the server needs it duplicates on purpose, since it runs under a plain Node with
+no `node:sqlite` and cannot read inside `app.asar`. The grammar is shared instead
+of copied because two copies of it would disagree within a month, and the
+disagreement would surface as duplicated tasks in somebody's board rather than as
+an error anyone could read. It is in `files` and in `extraResources` in
+`electron-builder.config.js` for that reason. Run `npm test` after touching it.
+
+**The board is a projection of the scratchpads.** A checkbox line in a pad is a
+task, anchored to it by an `<!--d:123-->` comment written into the line. The sync
+runs both ways: `db.deriveInPlace` reads pad to board, `db.writeBackToPad` writes
+board to pad, and a module-level `deriving` flag is what stops them calling each
+other forever. Two rules are load bearing and both are there to stop an agent
+losing work: a line that disappears never deletes its task, and an unticked box
+never drags a task out of `doing`. See the comments in `db.js` and `pads.js`.
+
 **The renderer runs under a strict CSP**: `default-src 'self'; script-src 'self'`.
 No external scripts, no CDN, no `eval`. Build DOM nodes rather than assigning
 `innerHTML` for anything that came from the database.
 
-**The audit table has a CHECK constraint** on `entity`: only `task`, `note`,
-`project` and `link`. Every write through the MCP server records an audit row
-attributed to `DELPHI_ACTOR`, which is what makes the History tab worth reading
-when more than one agent is working.
+**The audit table has a CHECK constraint** on `entity`: `task`, `note`,
+`project`, `link`, `scratchpad`, `session` and `handoff`. Adding to that list
+means editing `schema.sql` *and* `widenAuditEntities` in `db.js`, which rebuilds
+the table on an existing database because a CHECK cannot be altered. Every write
+through the MCP server records an audit row attributed to `DELPHI_ACTOR`, which
+is what makes the History tab worth reading when more than one agent is working.
 
 ## Theming
 
