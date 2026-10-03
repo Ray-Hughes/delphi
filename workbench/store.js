@@ -21,6 +21,10 @@ const CLOSED = ["finished", "discarded"];
 // are how someone finds old work again.
 const HIDE_AFTER_DAYS = 90;
 
+// How long a running entry whose runner cannot be checked (another machine,
+// or none recorded) still counts as running in a Workbench's folder.
+const UNSURE_RUN_MS = 12 * 60 * 60 * 1000;
+
 const LIVE_SQL = LIVE.map((s) => `'${s}'`).join(", ");
 
 const SELECT = `SELECT w.*, t.title AS task_title, t.status AS task_status, t.project_id AS project_id,
@@ -198,15 +202,40 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
    */
   function busyIn(wb) {
     const { pidAlive } = require("../sheet/store");
+    const fs = require("fs");
+    const nodePath = require("path");
     const host = require("os").hostname();
-    const root = String(wb.path);
-    const inside = (p) => { const q = String(p || ""); return q === root || q.startsWith(root + "/") || q.startsWith(root + "\\"); };
+    // Compared as real paths: a shell reports /var/... where the folder is
+    // /private/var/..., or adds a trailing slash, and both are the same place.
+    // A path that does not exist (a subfolder since deleted) is resolved
+    // through its nearest existing parent.
+    const realish = (p) => {
+      let head = nodePath.resolve(String(p || "/"));
+      const tail = [];
+      for (;;) {
+        try { return nodePath.join(fs.realpathSync.native(head), ...tail.reverse()); } catch {}
+        const up = nodePath.dirname(head);
+        if (up === head) return nodePath.resolve(String(p || "/"));
+        tail.push(nodePath.basename(head));
+        head = up;
+      }
+    };
+    const root = realish(wb.path);
+    const inside = (p) => { if (!p) return false; const q = realish(p); return q === root || q.startsWith(root + nodePath.sep); };
     const out = [];
-    for (const row of sql(`SELECT id, task_id, body, meta FROM comments WHERE kind = 'run' AND meta LIKE '%"state":"running"%'`, [])) {
+    for (const row of sql(`SELECT id, task_id, body, meta, created_at FROM comments WHERE kind = 'run' AND meta LIKE '%"state":"running"%'`, [])) {
       let meta = null;
       try { meta = JSON.parse(row.meta); } catch { continue; }
       if (!meta || meta.state !== "running" || !inside(meta.cwd)) continue;
-      if (meta.runner_host === host && meta.runner_pid && !pidAlive(Number(meta.runner_pid))) continue;
+      const here = meta.runner_host === host && meta.runner_pid;
+      if (here && !pidAlive(Number(meta.runner_pid))) continue;
+      // From another machine, or with no runner recorded: nothing here can
+      // tell whether it is still going, and nothing sweeps it as lost. It
+      // counts while it is recent, not for ever.
+      if (!here) {
+        const started = Date.parse(String(row.created_at || "").replace(" ", "T") + "Z");
+        if (!Number.isFinite(started) || Date.now() - started > UNSURE_RUN_MS) continue;
+      }
       out.push(`$ ${String(row.body).slice(0, 60)} (entry ${row.id})`);
     }
     const claim = sql(`SELECT claimed_by FROM tasks WHERE id = :p1 AND claimed_by IS NOT NULL
@@ -214,6 +243,7 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
     if (claim) out.push(`an agent (${claim.claimed_by}) holding task ${wb.task_id}`);
     return out;
   }
+
 
   /** Every repo that has ever had a Workbench, for housekeeping, which leaves every other repo alone. */
   function reposInUse() {

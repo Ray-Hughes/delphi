@@ -150,9 +150,12 @@ async function readyToMove(git, top, wb, busy) {
  * from where it was or still there whole, never half. The slow delete comes
  * later (emptyTrash), after the Workbench is recorded.
  */
-async function moveFolderAside(git, top, wb, ref) {
+async function moveFolderAside(git, top, wb, ref, done) {
+  // What housekeeping needs to finish the job if this process dies after
+  // the move: how to record it, what to check it against, what to delete.
+  const { trash: _t, ...manifest } = done;
   try {
-    return await keep.moveAside(git, { repo: top, folder: wb.path, id: wb.id });
+    return await keep.moveAside(git, { repo: top, folder: wb.path, id: wb.id, manifest: { ...manifest, task_id: wb.task_id } });
   } catch (error) {
     throw refusal(`Could not move the folder aside (${error.code || error.message}), so it is still there, whole. A copy is kept as ${ref} all the same.`,
       "GIT", { ref, details: { ref } });
@@ -254,7 +257,7 @@ async function discardFolder(wb, { git = defaultGit, confirm = null, busy = [] }
   if (plan.blocked) throw refusal(plan.blocked.message, plan.blocked.code);
   if (plan.notKept.length && confirm !== plan.confirm) throw ignoredRefusal(plan.look, "discard");
   if (!plan.folderGone) await readyToMove(git, plan.top, wb, busy);
-  const since = Date.now();
+  const since = keep.volumeNow(wb.path);
   const snap = await keep.snapshot(git, {
     repo: plan.top, folder: plan.folderGone ? null : wb.path, branch: wb.branch, ref: plan.ref,
     keep: plan.look ? plan.look.report.keep : [], hidden: plan.hidden, expect: plan.look ? plan.look.st.untracked : [],
@@ -263,24 +266,39 @@ async function discardFolder(wb, { git = defaultGit, confirm = null, busy = [] }
   if (!snap.ok) throw refusal(`Could not keep a copy of the folder first: ${snap.reason} Nothing was thrown away.`, "NO_COPY");
   const recover = snap.ref === plan.ref ? plan.recover
     : await keep.recoverFor(git, { ref: snap.ref, repo: plan.top, folder: wb.path, branch: wb.branch, id: wb.id, until: plan.until, notKept: plan.notKept });
-  let trash = null;
-  if (!plan.folderGone) trash = await moveFolderAside(git, plan.top, wb, snap.ref);
-  else await git.forgetRegistration(plan.top, wb.path);
-  let branchDeleted = false;
-  if (!plan.branchPushed && snap.tip) {
-    const holder = (await git.branchState(plan.top, wb.branch)).checkedOutAt;
-    if (!holder) branchDeleted = (await git.deleteBranch(plan.top, wb.branch, snap.tip)).ok;
-  }
-  return {
-    discarded: true, branchDeleted, keptRemote: plan.remote, branch: wb.branch,
+  // The branch goes only after the Discard is recorded (afterRecord): until
+  // then the branch is one of the two ways back to the work.
+  // Held by another folder means someone else is on it; this folder holding
+  // it is expected, since it has not moved yet.
+  const held = !plan.branchPushed && snap.tip ? (await git.branchState(plan.top, wb.branch)).checkedOutAt : null;
+  const holder = held && !git.samePath(held, wb.path) ? held : null;
+  const branchToDelete = !plan.branchPushed && snap.tip && !holder ? { branch: wb.branch, tip: snap.tip } : null;
+  const done = {
+    mode: "discard", discarded: true, branchDeleted: Boolean(branchToDelete), branchToDelete, keptRemote: plan.remote, branch: wb.branch,
     ref: snap.ref, sha: snap.sha, until: plan.until, recover,
     unsaved: plan.unsaved.length, files: plan.unsaved.slice(0, 5),
     commits: plan.commits.length, detached: plan.detached.length,
     ignored: plan.ignored.reduce((n, g) => n + g.count, 0),
     notKept: plan.notKept.map((n) => n.path),
     // For emptyTrash, once the Discard is recorded.
-    trash, top: plan.top, tree: snap.sha, since, copy: setupMod.copyList(wb.copy_files ?? setupMod.DEFAULT_COPY),
+    trash: null, top: plan.top, tree: snap.sha, since, copy: setupMod.copyList(wb.copy_files ?? setupMod.DEFAULT_COPY),
   };
+  if (!plan.folderGone) done.trash = await moveFolderAside(git, plan.top, wb, snap.ref, done);
+  else await git.forgetRegistration(plan.top, wb.path);
+  return done;
+}
+
+/**
+ * What comes after a Discard is recorded and before its folder is emptied:
+ * deleting the branch, if it never reached a remote, and only if it still
+ * points where the copy saw it.
+ */
+async function afterRecord(done, { git = defaultGit } = {}) {
+  if (!done || !done.branchToDelete) return { branchDeleted: false };
+  const { branch, tip } = done.branchToDelete;
+  const holder = (await git.branchState(done.top, branch)).checkedOutAt;
+  const ok = !holder && (await git.deleteBranch(done.top, branch, tip)).ok;
+  return { branchDeleted: ok };
 }
 
 /**
@@ -341,7 +359,7 @@ async function finishFolder(wb, { git = defaultGit, confirm = null, busy = [] } 
   // A copy every time, not only when ignored files go: it is what the moved
   // folder is checked against before it is deleted, so a file written after
   // these checks is noticed rather than lost.
-  const since = Date.now();
+  const since = keep.volumeNow(wb.path);
   const snap = await keep.snapshot(git, {
     repo: top, folder: wb.path, branch: wb.branch, ref: keep.refFor("finished", wb), keep: report.keep,
     expect: st.untracked, hidden: st.hidden,
@@ -350,12 +368,13 @@ async function finishFolder(wb, { git = defaultGit, confirm = null, busy = [] } 
   if (!snap.ok) throw refusal(`Could not keep a copy of the folder first: ${snap.reason} Nothing was removed.`, "NO_COPY");
   const until = keep.untilDate();
   const recover = await keep.recoverFor(git, { ref: snap.ref, repo: top, folder: wb.path, branch: wb.branch, id: wb.id, until, notKept: report.notKept });
-  const trash = await moveFolderAside(git, top, wb, snap.ref);
-  return {
-    finished: true, branch: wb.branch, ref: snap.ref, recover, removedIgnored: report.files.length > 0,
-    notKept: report.notKept.map((n) => n.path), trash, top, tree: snap.sha, since,
+  const done = {
+    mode: "finish", finished: true, branch: wb.branch, ref: snap.ref, recover, removedIgnored: report.files.length > 0,
+    notKept: report.notKept.map((n) => n.path), trash: null, top, tree: snap.sha, since,
     copy: setupMod.copyList(wb.copy_files ?? setupMod.DEFAULT_COPY),
   };
+  done.trash = await moveFolderAside(git, top, wb, snap.ref, done);
+  return done;
 }
 
 function createWorkbench({
@@ -879,7 +898,7 @@ function createWorkbench({
 
   /** The verbs' results without the paths and ids only emptyTrash needs. */
   function shown(done) {
-    const { trash, top, tree, since, copy, ...rest } = done;
+    const { trash, top, tree, since, copy, mode, branchToDelete, ...rest } = done;
     return rest;
   }
 
@@ -891,9 +910,7 @@ function createWorkbench({
   function settle(wb, done) {
     const run = async () => {
       const result = await emptyMoved(done, { git });
-      if (result.kept) {
-        await note(wb.task_id, `kept the old folder at ${result.kept}: ${someOf(result.changed)} changed after the copy was made, so it was not deleted. Look through it, then delete it yourself.`);
-      }
+      if (result.kept) await note(wb.task_id, keptWords(result, done));
       return { deleted: result.deleted, kept: result.kept, changed: result.changed };
     };
     if (trashInBackground) {
@@ -953,6 +970,7 @@ function createWorkbench({
     const done = await discardFolder(wb, { git, confirm, busy: busyIn(wb) });
     drop(wb.path);
     await markDiscarded(id, done);
+    done.branchDeleted = (await afterRecord(done, { git })).branchDeleted;
     const cleanup = await settle(wb, done);
     return { ...shown(done), cleanup };
   }
@@ -1085,7 +1103,7 @@ function createWorkbench({
    *   else is reported as found but not managed, and left alone.
    */
   async function housekeep() {
-    const report = { pruned: 0, missing: [], restored: [], adopted: [], unmanaged: [], expired: [], trashed: [] };
+    const report = { pruned: 0, missing: [], restored: [], adopted: [], unmanaged: [], expired: [], trashed: [], reconciled: [], keptTrash: [] };
     const live = store.list({});
     const seenTops = new Set();
     for (const repoRow of store.reposInUse()) {
@@ -1118,7 +1136,7 @@ function createWorkbench({
       // tried again here, inside .trash and nowhere else.
       const trashRoots = new Set(roots);
       for (const row of store.list({ includeClosed: true })) if (row.repo_id === Number(repoRow.id)) trashRoots.add(path.dirname(row.path));
-      for (const root of trashRoots) report.trashed.push(...keep.sweepTrash(root));
+      for (const root of trashRoots) await sweepTrash(root, report);
       for (const tree of trees) {
         if (tree.bare || tree.prunable || git.samePath(tree.path, top)) continue;
         if (!roots.some((root) => inside(git.real(root), git.real(tree.path)))) continue;
@@ -1146,6 +1164,48 @@ function createWorkbench({
     }
     unmanaged = report.unmanaged;
     return report;
+  }
+
+  /**
+   * Finishes what a Finish or Discard started and did not see through: the
+   * folder was moved into .trash, and then the process died. Each entry's
+   * manifest says which Workbench it was and what it was checked against.
+   *
+   * - No manifest: not ours to judge, never deleted.
+   * - Marked kept: a person has to look, never deleted.
+   * - Its Workbench still open and its folder gone: the verb is recorded
+   *   now, from the manifest, Sheet note and recover text included, and a
+   *   Discard's branch goes after that, as it would have.
+   * - Then the same check as at the time: deleted only if nothing in it
+   *   changed after the copy, else kept, with a Sheet note.
+   */
+  async function sweepTrash(root, report) {
+    for (const entry of keep.trashEntries(root)) {
+      const m = entry.manifest;
+      if (entry.kept || !m || !m.ref || !m.tree) continue;
+      let row = null;
+      try { row = store.find(m.workbench); } catch {}
+      if (!row || Number(row.task_id) !== Number(m.task_id)) continue;
+      const done = { ...m, trash: entry.trash };
+      if (row.state !== "finished" && row.state !== "discarded") {
+        if (isDir(row.path)) continue;
+        try {
+          if (m.mode === "finish") await markFinished(row.id, { ref: m.ref, notKept: m.notKept, removedIgnored: m.removedIgnored });
+          else await markDiscarded(row.id, m);
+          if (m.mode !== "finish") await afterRecord(done, { git });
+          report.reconciled.push(row.id);
+        } catch {
+          continue;
+        }
+      }
+      const result = await emptyMoved(done, { git });
+      if (result.kept) {
+        await note(row.task_id, keptWords(result, done));
+        report.keptTrash.push(result.kept);
+      } else if (result.deleted) {
+        report.trashed.push(entry.trash);
+      }
+    }
   }
 
   /**
@@ -1189,4 +1249,12 @@ function createWorkbench({
   };
 }
 
-module.exports = { STATUS_TTL_MS, WINDOWS_PATH_LIMIT, createWorkbench, discardPlanFor, discardFolder, finishFolder, emptyMoved, repoTopFor };
+/** The Sheet's words for a moved folder kept because it changed after the copy. */
+function keptWords(result, done) {
+  return `kept the old folder at ${result.kept}: ${someOf(result.changed)} changed after the copy was made, so it was not deleted. ` +
+    `It is cut loose from git (its .git file is now .git.was), so git run inside it touches no Workbench. ` +
+    `To see what differs, put the copy back beside it with the command in the note above (it is ${done.ref}) and compare the two folders, ` +
+    `for example with diff -ru; then delete the old folder yourself.`;
+}
+
+module.exports = { STATUS_TTL_MS, WINDOWS_PATH_LIMIT, createWorkbench, discardPlanFor, discardFolder, finishFolder, afterRecord, emptyMoved, keptWords, repoTopFor };

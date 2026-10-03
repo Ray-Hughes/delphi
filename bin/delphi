@@ -301,7 +301,7 @@ async function emptyAside(client, taskId, bench, made) {
   const result = await bench.emptyMoved(made);
   if (result.kept) {
     if (tty) process.stderr.write("kept.\n");
-    const words = `kept the old folder at ${result.kept}: ${result.changed.slice(0, 5).join(", ")}${result.changed.length > 5 ? ", and more" : ""} changed after the copy was made, so it was not deleted. Look through it, then delete it yourself.`;
+    const words = bench.keptWords(result, made);
     warn(words);
     try { await client.call("sheet_append", { task_id: taskId, kind: "note", body: words }); } catch {}
   } else if (tty) {
@@ -923,6 +923,8 @@ const COMMANDS = {
       task_id: task.id, ref: result.ref, unsaved: result.unsaved, files: result.files, commits: result.commits,
       detached: result.detached, ignored: result.ignored, branch_deleted: result.branchDeleted, not_kept: result.notKept,
     });
+    // The branch goes only now that the Discard is recorded.
+    result.branchDeleted = (await bench.afterRecord(result)).branchDeleted;
     await emptyAside(client, task.id, bench, result);
     say(result.keptRemote
       ? `Discarded. The branch is still on the remote as ${result.keptRemote}.`

@@ -616,7 +616,7 @@ app.whenReady().then(() => {
     console.error("sweeping lost runs", error);
   }
   benches.housekeep().then((report) => {
-    if ((report.missing.length || report.restored.length || report.adopted.length) && win && !win.isDestroyed()) {
+    if ((report.missing.length || report.restored.length || report.adopted.length || (report.reconciled || []).length) && win && !win.isDestroyed()) {
       win.webContents.send("db-changed");
     }
   }, (error) => console.error("workbench housekeeping", error));

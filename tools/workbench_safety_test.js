@@ -634,6 +634,96 @@ async function main() {
     check("an old row's setup command is not claimed as detected", old.prepare("SELECT setup_cmd_detected AS d FROM repos").get().d, 0);
   }
 
+  // -------------------------------------------------------------------------
+  section("G6 1. A process that dies after the move is finished by housekeeping, from the manifest");
+  {
+    const W = require("../workbench/workbench");
+    const r = makeRepo("g6crash");
+    for (const verb of ["discard", "finish"]) {
+      const { t, wb } = await bench(r, `crash ${verb}`);
+      write(path.join(wb.path, verb === "discard" ? "work.txt" : "build/notes.txt"), "work\n");
+      const row = store.get(wb.id);
+      const done = verb === "discard" ? await W.discardFolder(row) : await W.finishFolder(row, { confirm: (await benches.finishPlan(wb.id)).confirm });
+      check(`${verb}: a manifest beside the moved folder`, [exists(done.trash), keep.readManifest(done.trash).ref], [true, done.ref]);
+      check(`${verb}: the branch is still there until the record`, gitOk(r.app, "rev-parse", "--verify", `refs/heads/${wb.branch}`), true);
+      // The process dies here: nothing recorded.
+      const hk = await benches.housekeep();
+      check(`${verb}: housekeeping records it`, [hk.reconciled.includes(wb.id), store.get(wb.id).state], [true, verb === "discard" ? "discarded" : "finished"]);
+      check(`${verb}: with the recover text on the Sheet`, notes(t.id).some((n) => n.includes(done.ref) && n.includes("To get it back")), true);
+      check(`${verb}: then empties it`, [exists(done.trash), exists(`${done.trash}.json`)], [false, false]);
+      check(`${verb}: and a Discard's branch goes after the record, a Finish's stays`,
+        gitOk(r.app, "rev-parse", "--verify", `refs/heads/${wb.branch}`), verb !== "discard");
+    }
+
+    // Recorded, then something wrote into the moved folder, then the
+    // process died before emptying it.
+    const { t, wb } = await bench(r, "late writer");
+    write(path.join(wb.path, "work.txt"), "v1\n");
+    const done = await W.discardFolder(store.get(wb.id));
+    await benches.markDiscarded(wb.id, done);
+    check("the moved folder is cut loose from git", [exists(path.join(done.trash, ".git")), exists(path.join(done.trash, ".git.was"))], [false, true]);
+    write(path.join(done.trash, "work.txt"), "v2 after the copy\n");
+    const hk = await benches.housekeep();
+    check("housekeeping keeps a changed one, and says so", [hk.keptTrash, exists(done.trash), exists(`${done.trash}.kept`)], [[done.trash], true, true]);
+    check("in words that say it is detached and how to compare", /cut loose from git.*diff -ru/.test(notes(t.id).pop()), true);
+    // A new Workbench for the same task: git in the kept folder cannot reach it.
+    const again = (await benches.start(t.id, { runSetup: false })).workbench;
+    write(path.join(again.path, "fresh.txt"), "x\n");
+    spawnSync(GIT, ["-C", done.trash, "add", "-A"], { stdio: "ignore" });
+    check("git run in the kept folder does not touch the new Workbench", git(again.path, "diff", "--cached", "--name-only"), "");
+
+    // An entry with no manifest is never deleted.
+    const orphan = path.join(path.dirname(wb.path), keep.TRASH, "999-1700000000000");
+    write(path.join(orphan, "mine.txt"), "a person's\n");
+    await benches.housekeep();
+    check("a .trash entry with no manifest is left alone", exists(path.join(orphan, "mine.txt")), true);
+  }
+
+  // -------------------------------------------------------------------------
+  section("G6 3. The changed check skips only what git ignores");
+  {
+    const W = require("../workbench/workbench");
+    const r = makeRepo("g6skip");
+    write(path.join(r.app, "src/target/main.c"), "int main(){}\n");
+    git(r.app, "add", "-A");
+    git(r.app, "commit", "-qm", "t");
+    git(r.app, "push", "-q", "origin", "main");
+    for (const [file, kept] of [["src/target/main.c", true], ["src/coverage/notes.md", true], ["node_modules/x/late.js", false]]) {
+      const { wb } = await bench(r, `skip ${file}`);
+      const done = await W.discardFolder(store.get(wb.id));
+      await benches.markDiscarded(wb.id, done);
+      write(path.join(done.trash, file), "written after the copy\n");
+      const left = await W.emptyMoved(done);
+      check(`${file} after the copy: ${kept ? "kept" : "not counted"}`, Boolean(left.kept), kept);
+      if (left.kept) fs.rmSync(done.trash, { recursive: true, force: true });
+    }
+    const benches_ = path.join(dir, "probe-here");
+    const now = keep.volumeNow(path.join(benches_, "1-x"));
+    check("the volume's clock is read from a probe that leaves nothing behind",
+      [Math.abs(now - Date.now()) < 5000, fs.readdirSync(path.join(benches_, keep.TRASH)).filter((n) => n.startsWith(".probe")).length], [true, 0]);
+  }
+
+  // -------------------------------------------------------------------------
+  section("G6 low 1. What counts as running in the folder");
+  {
+    const r = makeRepo("g6busy");
+    const cases = [
+      ["through the /var symlink", (wb) => ({ cwd: wb.path.replace(/^\/private/, ""), runner_pid: process.pid, runner_host: os.hostname() }), true],
+      ["with a trailing slash", (wb) => ({ cwd: `${wb.path}/`, runner_pid: process.pid, runner_host: os.hostname() }), true],
+      ["in a subfolder", (wb) => ({ cwd: path.join(wb.path, "src"), runner_pid: process.pid, runner_host: os.hostname() }), true],
+      ["a sibling with the same prefix", (wb) => ({ cwd: `${wb.path}-other`, runner_pid: process.pid, runner_host: os.hostname() }), false],
+      ["from another machine, recent", (wb) => ({ cwd: wb.path, runner_pid: 1, runner_host: "elsewhere" }), true],
+      ["from another machine, two days old", (wb) => ({ cwd: wb.path, runner_pid: 1, runner_host: "elsewhere" }), false, "-2 days"],
+      ["with no runner, two days old", (wb) => ({ cwd: wb.path }), false, "-2 days"],
+    ];
+    for (const [label, meta, busy, age] of cases) {
+      const { t, wb } = await bench(r, `busy ${label}`);
+      const e = sheets.append({ taskId: t.id, kind: "run", body: "npm run dev", meta: { state: "running", ...meta(wb) } });
+      if (age) db.handle().prepare(`UPDATE comments SET created_at = datetime('now', '${age}') WHERE id = ?`).run(e.id);
+      check(`a run ${label} ${busy ? "counts" : "does not"}`, store.busyIn(store.get(wb.id)).length > 0, busy);
+    }
+  }
+
   await viaServer();
   fs.rmSync(dir, { recursive: true, force: true });
   console.log(`\n${checks - failures}/${checks} checks passed`);

@@ -401,14 +401,63 @@ function trashPath(folder, id, now = Date.now()) {
  * Renames the folder aside and drops git's registration of it. Throws,
  * having moved nothing, if the rename fails.
  */
-async function moveAside(git, { repo, folder, id }) {
+async function moveAside(git, { repo, folder, id, manifest = {} }) {
   const to = trashPath(folder, id);
   fs.mkdirSync(path.dirname(to), { recursive: true });
-  fs.renameSync(folder, to);
+  // The manifest is written before the move, so there is never a moved
+  // folder without one: it is what lets housekeeping finish the job (record
+  // it, check it, delete it) if this process dies half way.
+  const record = `${to}.json`;
+  fs.writeFileSync(record, JSON.stringify({ ...manifest, workbench: Number(id), folder, trash: to, moved_at: Date.now() }, null, 2));
+  try {
+    fs.renameSync(folder, to);
+  } catch (error) {
+    try { fs.unlinkSync(record); } catch {}
+    throw error;
+  }
+  // Cut loose from git at once. Its .git file names the registration under
+  // .git/worktrees, which a new Workbench for the same task reuses: left as
+  // it is, git run in the moved folder would read and write the new one.
+  try { fs.renameSync(path.join(to, ".git"), path.join(to, ".git.was")); } catch {}
   // The registration now points at a folder that is gone, which is exactly
   // what forgetRegistration clears, for this folder only.
   await git.forgetRegistration(repo, folder);
   return to;
+}
+
+/**
+ * The volume's own idea of now, from a probe file's mtime: what changedSince
+ * compares file times with, so a clock that differs from the disk's (a
+ * network share, a VM) cannot hide a write.
+ */
+function volumeNow(folder) {
+  const dir = path.join(path.dirname(folder), TRASH);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, `.probe-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+    fs.writeFileSync(probe, "");
+    const at = fs.statSync(probe).mtimeMs;
+    fs.unlinkSync(probe);
+    return at;
+  } catch {
+    return Date.now() - 2000;
+  }
+}
+
+/** A .trash entry's manifest, or null when it has none (and so is never deleted). */
+function readManifest(trash) {
+  try { return JSON.parse(fs.readFileSync(`${trash}.json`, "utf8")); } catch { return null; }
+}
+
+/** Every entry in a .trash folder that Delphi made: the folder, its manifest if any, whether it is kept. */
+function trashEntries(root) {
+  const dir = path.join(root, TRASH);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  return names.filter((n) => /^\d+-\d{13}$/.test(n)).map((n) => {
+    const trash = path.join(dir, n);
+    return { trash, manifest: readManifest(trash), kept: fs.existsSync(`${trash}.kept`) };
+  });
 }
 
 /** A git blob id computed here, for files in a folder git no longer knows. */
@@ -434,21 +483,46 @@ async function changedSince(git, { repo, trash, tree, since, notKept = [], copy 
     inCopy.set(rec.slice(tab + 1).normalize("NFC"), sha);
   }
   const agreed = new Set(notKept.map((n) => String(n.path || n).normalize("NFC")));
+  // Folders that hold something in the copy. A reproducible-looking folder
+  // (target/, coverage/) is skipped only when nothing in it is in the copy:
+  // the same rule the copy used, which skips reproducible output only among
+  // ignored files, never a tracked src/target/main.c.
+  const holds = new Set();
+  for (const p of inCopy.keys()) {
+    const parts = p.split("/");
+    for (let i = 1; i < parts.length; i++) holds.add(parts.slice(0, i).join("/"));
+  }
+  // Whether git would ignore a path, asked of the moved folder's own
+  // .gitignore files through the repository's git folder, with --no-index so
+  // no index anywhere is read or written. Reproducible output is only ever
+  // skipped when it is also ignored: an untracked src/coverage/notes.md is
+  // work, whatever its folder is called.
+  const common = await git.run(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const ignoredHere = async (rels) => {
+    if (!rels.length || !common.ok) return new Set();
+    const r = await git.runWith(trash, ["--git-dir", common.stdout.trim(), "--work-tree", trash, "check-ignore", "--no-index", "-z", "--stdin"],
+      { input: `${rels.join("\0")}\0` });
+    return new Set(r.stdout.split("\0").filter(Boolean));
+  };
   const changed = [];
-  const walk = (rel) => {
+  const walk = async (rel) => {
     let entries;
     try { entries = fs.readdirSync(path.join(trash, rel), { withFileTypes: true }); } catch { changed.push(`${rel}/`); return; }
+    const looks = entries.map((e) => (rel ? `${rel}/${e.name}` : e.name)).filter((c) => reproducible(c) && !inCopy.has(c.normalize("NFC")) && !holds.has(c.normalize("NFC")));
+    const skip = await ignoredHere(looks);
     for (const e of entries) {
       const child = rel ? `${rel}/${e.name}` : e.name;
-      if (!rel && e.name === ".git") continue;
-      if (reproducible(child)) continue;
-      const full = path.join(trash, child);
-      if (e.isDirectory()) { walk(child); continue; }
+      if (!rel && (e.name === ".git" || e.name === ".git.was")) continue;
       const key = child.normalize("NFC");
+      const full = path.join(trash, child);
+      if (skip.has(child) || skip.has(`${child}/`)) continue;
+      if (e.isDirectory()) { await walk(child); continue; }
       if (agreed.has(key)) continue;
       let stat;
       try { stat = fs.lstatSync(full); } catch { continue; }
-      if (Math.max(stat.mtimeMs, stat.ctimeMs) < since - 2000) continue;
+      // ctime as well as mtime: a tool can set mtime back (cp -p, tar,
+      // rsync -t) but not ctime. since is the volume's clock (volumeNow).
+      if (Math.max(stat.mtimeMs, stat.ctimeMs) < since) continue;
       const sha = inCopy.get(key);
       // A copied file (.env) still the same as the main checkout's is one
       // Start copies again, so it was never meant to be in the copy.
@@ -458,7 +532,7 @@ async function changedSince(git, { repo, trash, tree, since, notKept = [], copy 
       if (!sha || sha !== now) changed.push(key);
     }
   };
-  walk("");
+  await walk("");
   return changed;
 }
 
@@ -490,31 +564,15 @@ async function emptyTrash(git, { repo, trash, tree, since, notKept = [], copy = 
   }
   try {
     deleteTree(trash);
+    try { fs.unlinkSync(`${trash}.json`); } catch {}
     return { deleted: true, kept: null, changed: [] };
   } catch (error) {
     return { deleted: false, kept: null, changed: [], reason: String(error.code || error.message) };
   }
 }
 
-/**
- * Housekeeping's half: retries deleting what is in a .trash folder, and
- * nothing else. An entry with a .kept marker was kept on purpose and is left.
- */
-function sweepTrash(root) {
-  const dir = path.join(root, TRASH);
-  const gone = [];
-  let entries = [];
-  try { entries = fs.readdirSync(dir); } catch { return gone; }
-  for (const name of entries) {
-    if (name.endsWith(".kept") || !/^\d+-\d+$/.test(name)) continue;
-    if (fs.existsSync(path.join(dir, `${name}.kept`))) continue;
-    try { deleteTree(path.join(dir, name)); gone.push(path.join(dir, name)); } catch {}
-  }
-  return gone;
-}
-
 module.exports = {
-  TRASH, trashPath, moveAside, changedSince, deleteTree, emptyTrash, sweepTrash,
+  TRASH, trashPath, moveAside, volumeNow, readManifest, trashEntries, changedSince, deleteTree, emptyTrash,
   KEEP_DAYS, PER_FILE_MAX, TOTAL_MAX, WALK_MAX, NAMESPACES, REPRODUCIBLE_DIRS,
   reproducible, ignoredReport, nestedRepos, confirmToken, refFor, freeNames, recoverText, recoverFor, untilDate, snapshot, expire,
 };
