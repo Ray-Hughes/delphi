@@ -87,6 +87,12 @@ const LATER_COLUMNS = [
   // 1 when setup_cmd holds what Delphi detected from the lock files, 0 once a
   // person has set it, so Settings can say which it is showing.
   ["repos", "setup_cmd_detected", "INTEGER NOT NULL DEFAULT 0"],
+  // A Finish or Discard in progress (state 'closing'). See schema.sql.
+  ["workbenches", "closing_mode", "TEXT"],
+  ["workbenches", "closing_ref", "TEXT"],
+  ["workbenches", "closing_trash", "TEXT"],
+  ["workbenches", "closing_at", "TEXT"],
+  ["workbenches", "closing_actor", "TEXT"],
 ];
 
 // The same text as schema.sql. A table is created here too, rather than left to
@@ -104,7 +110,12 @@ const LATER_TABLES = [
   owner       TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  closed_at   TEXT
+  closed_at   TEXT,
+  closing_mode  TEXT,
+  closing_ref   TEXT,
+  closing_trash TEXT,
+  closing_at    TEXT,
+  closing_actor TEXT
 )`],
 ];
 
@@ -116,15 +127,20 @@ const LATER_INDEXES = [
    "CREATE INDEX IF NOT EXISTS idx_comments_ledger ON comments(task_id, promoted)"],
   ["idx_workbenches_task", "workbenches", ["task_id", "state"],
    "CREATE INDEX IF NOT EXISTS idx_workbenches_task ON workbenches(task_id, state)"],
-  // Missing counts as live in both. A Missing row is still the task's Workbench
-  // until someone picks Recreate or Forget, and letting Start make a second one
-  // beside it is how one branch ends up in two rows.
+  // Missing and Closing count as live in both. A Missing row is still the
+  // task's Workbench until someone picks Recreate or Forget, a Closing one
+  // until its Finish or Discard is recorded, and letting Start make a second
+  // one beside either is how one branch ends up in two rows.
+  //
+  // The fifth field is text the index's definition must contain. A partial
+  // index cannot be altered, so one created by an older version (without
+  // 'closing') is dropped and made again; see apply().
   ["idx_workbenches_live", "workbenches", ["task_id", "repo_id", "state"],
    "CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_live ON workbenches(task_id, repo_id) " +
-   "WHERE state IN ('active', 'parked', 'missing')"],
+   "WHERE state IN ('active', 'parked', 'missing', 'closing')", "'closing'"],
   ["idx_workbenches_path", "workbenches", ["path", "state"],
    "CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_path ON workbenches(path) " +
-   "WHERE state IN ('active', 'parked', 'missing')"],
+   "WHERE state IN ('active', 'parked', 'missing', 'closing')", "'closing'"],
 ];
 
 // Table names go into PRAGMA text, which cannot take a bound parameter. They
@@ -275,12 +291,20 @@ function apply(query) {
     }
   }
 
-  const existing = attempt("SELECT name FROM sqlite_master WHERE type = 'index'", () =>
-    new Set((query("SELECT name FROM sqlite_master WHERE type = 'index'") || []).map((r) => r.name)));
-  if (!existing) return result;
-  for (const [name, table, needs, statement] of LATER_INDEXES) {
+  const definitions = attempt("SELECT name, sql FROM sqlite_master WHERE type = 'index'", () =>
+    new Map((query("SELECT name, sql FROM sqlite_master WHERE type = 'index'") || []).map((r) => [r.name, String(r.sql || "")])));
+  if (!definitions) return result;
+  const existing = new Set(definitions.keys());
+  for (const [name, table, needs, statement, mustContain] of LATER_INDEXES) {
     const have = columns.get(table);
-    if (!have || !needs.every((c) => have.includes(c)) || existing.has(name)) continue;
+    if (!have || !needs.every((c) => have.includes(c))) continue;
+    // Out of date: dropped here and made again below. Both statements are
+    // idempotent, so two processes doing this at once agree.
+    if (existing.has(name) && mustContain && !definitions.get(name).includes(mustContain)) {
+      const drop = `DROP INDEX IF EXISTS ${plainName(name)}`;
+      if (attempt(drop, () => { query(drop); return true; })) existing.delete(name);
+    }
+    if (existing.has(name)) continue;
     attempt(statement, () => {
       query(statement);
       result.indexed.push(name);

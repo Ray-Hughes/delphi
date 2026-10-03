@@ -1294,6 +1294,24 @@ const TOOLS = {
     },
     run: (a) => benches.markFinished(benchFor(a.task_id).id, { ref: a.ref || null, notKept: a.not_kept, removedIgnored: a.removed_ignored === true }),
   },
+  workbench_closing: {
+    description: "Write a Finish or Discard's intent on the Workbench's row (state closing) before the command line moves the folder, or with cancel, undo it when the move failed.",
+    schema: {
+      type: "object",
+      required: ["task_id"],
+      properties: {
+        task_id: { type: "number" }, mode: { type: "string", enum: ["discard", "finish"] }, ref: { type: "string" },
+        trash: { type: "string" }, cancel: { type: "boolean" }, back_to: { type: "string" },
+      },
+    },
+    run: (a) => {
+      const wb = benchFor(a.task_id);
+      if (a.cancel === true) return benchStore.cancelClosing(wb.id, a.back_to || "active");
+      const row = benchStore.beginClosing(wb.id, { mode: a.mode, ref: a.ref, trash: a.trash || null });
+      if (!row) throw new Error(`Task ${a.task_id}'s Workbench is not open, so nothing was begun.`);
+      return row;
+    },
+  },
   workbench_busy: {
     description: "What is running in a task's Workbench folder right now, in words. Finish and Discard refuse while anything is.",
     schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
@@ -1873,7 +1891,7 @@ const TOOLS = {
 // above workbench_park.
 const INTERNAL_TOOLS = new Set([
   "workbench_park", "workbench_resume", "workbench_update", "workbench_commit", "workbench_push",
-  "workbench_pr", "workbench_finish_plan", "workbench_finished", "workbench_busy", "workbench_discarded", "workbench_recreate",
+  "workbench_pr", "workbench_finish_plan", "workbench_finished", "workbench_busy", "workbench_closing", "workbench_discarded", "workbench_recreate",
   "workbench_forget", "workbench_housekeep", "workbench_advanced",
 ]);
 const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";

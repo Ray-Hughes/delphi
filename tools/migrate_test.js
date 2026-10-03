@@ -86,7 +86,8 @@ const indexes = (file) => q(file, "SELECT name FROM sqlite_master WHERE type = '
 
 const NEW_COMMENT_COLUMNS = ["kind", "author_type", "meta", "promoted", "ref_id", "note_id"];
 const NEW_REPO_COLUMNS = ["base_branch", "setup_cmd", "copy_files"];
-const WORKBENCH_COLUMNS = ["id", "task_id", "repo_id", "path", "branch", "base", "state", "owner", "created_at", "updated_at", "closed_at"];
+const WORKBENCH_COLUMNS = ["id", "task_id", "repo_id", "path", "branch", "base", "state", "owner", "created_at", "updated_at", "closed_at",
+  "closing_mode", "closing_ref", "closing_trash", "closing_at", "closing_actor"];
 const NEW_INDEXES = ["idx_comments_ledger", "idx_workbenches_live", "idx_workbenches_path", "idx_workbenches_task"];
 
 // The wrapper that tells us which route ran.

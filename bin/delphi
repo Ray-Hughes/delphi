@@ -295,6 +295,18 @@ async function benchOf(client, taskId) {
  * recorded. Anything that changed after the copy keeps the folder, and the
  * Sheet says where.
  */
+/**
+ * The intent a Finish or Discard writes on the Workbench's row (state
+ * closing) before the folder moves, and its undo if the move fails, through
+ * the server, which holds the database.
+ */
+function closingVia(client, taskId, before) {
+  return {
+    intent: ({ mode, ref, trash }) => client.call("workbench_closing", { task_id: taskId, mode, ref, trash: trash || undefined }),
+    cancel: () => client.call("workbench_closing", { task_id: taskId, cancel: true, back_to: before }),
+  };
+}
+
 async function emptyAside(client, taskId, bench, made) {
   if (!made.trash) return;
   if (tty) process.stderr.write("delphi: deleting the old folder... ");
@@ -369,7 +381,7 @@ async function finishFlow(client, taskId) {
       const bench = require("../workbench/workbench");
       const { workbench: wb } = await benchOf(client, taskId);
       const { running } = await client.call("workbench_busy", { task_id: taskId });
-      const made = await bench.finishFolder(wb, { confirm: left.confirm, busy: running });
+      const made = await bench.finishFolder(wb, { confirm: left.confirm, busy: running, ...closingVia(client, taskId, wb.state) });
       await client.call("workbench_finished", { task_id: taskId, ref: made.ref, not_kept: made.notKept, removed_ignored: made.removedIgnored });
       await emptyAside(client, taskId, bench, made);
       const task = await client.call("get_task", { id: taskId });
@@ -918,7 +930,7 @@ const COMMANDS = {
     // The plan's token: if what cannot be kept changed since it was listed
     // above, this refuses rather than lose files nobody was shown.
     const { running } = await client.call("workbench_busy", { task_id: task.id });
-    const result = await bench.discardFolder(wb, { confirm: plan.confirm, busy: running });
+    const result = await bench.discardFolder(wb, { confirm: plan.confirm, busy: running, ...closingVia(client, task.id, wb.state) });
     // The server records it, then deletes the branch (its own, at the tip
     // the copy holds), then writes the note, in that order.
     const recorded = await client.call("workbench_discarded", {

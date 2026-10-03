@@ -401,8 +401,8 @@ function trashPath(folder, id, now = Date.now()) {
  * Renames the folder aside and drops git's registration of it. Throws,
  * having moved nothing, if the rename fails.
  */
-async function moveAside(git, { repo, folder, id, manifest = {} }) {
-  const to = trashPath(folder, id);
+async function moveAside(git, { repo, folder, id, manifest = {}, to: given = null }) {
+  const to = given || trashPath(folder, id);
   fs.mkdirSync(path.dirname(to), { recursive: true });
   // The manifest is written before the move, so there is never a moved
   // folder without one: it is what lets housekeeping finish the job (record

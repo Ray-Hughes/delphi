@@ -68,6 +68,12 @@ function refusal(message, code, extra = {}) {
   return error;
 }
 
+/** A Workbench part way through a Finish or Discard: nothing else may start on it. */
+function closingRefusal(wb) {
+  return refusal(`Task ${wb.task_id}'s Workbench is being put away (a ${wb.closing ? wb.closing.mode : "Finish or Discard"} is in progress). Try again in a moment; if it stays like this, housekeeping finishes or undoes it.`,
+    "CLOSING", { details: { closing: wb.closing || null } });
+}
+
 /** Up to five names, then how many more. */
 function someOf(list, n = 5) {
   return list.slice(0, n).join(", ") + (list.length > n ? `, and ${list.length - n} more` : "");
@@ -150,13 +156,19 @@ async function readyToMove(git, top, wb, busy) {
  * from where it was or still there whole, never half. The slow delete comes
  * later (emptyTrash), after the Workbench is recorded.
  */
-async function moveFolderAside(git, top, wb, ref, done) {
+async function moveFolderAside(git, top, wb, ref, done, { intent, cancel }) {
   // What housekeeping needs to finish the job if this process dies after
   // the move: how to record it, what to check it against, what to delete.
   const { trash: _t, ...manifest } = done;
+  const to = keep.trashPath(wb.path, wb.id);
+  // The intent goes on the row first (state closing, with the ref and where
+  // the folder is going). That row, not anything on disk, is what lets
+  // housekeeping finish this if the process dies after the move.
+  await intent({ mode: done.mode, ref, trash: to });
   try {
-    return await keep.moveAside(git, { repo: top, folder: wb.path, id: wb.id, manifest: { ...manifest, task_id: wb.task_id } });
+    return await keep.moveAside(git, { repo: top, folder: wb.path, id: wb.id, to, manifest: { ...manifest, task_id: wb.task_id } });
   } catch (error) {
+    try { await cancel(); } catch {}
     throw refusal(`Could not move the folder aside (${error.code || error.message}), so it is still there, whole. A copy is kept as ${ref} all the same.`,
       "GIT", { ref, details: { ref } });
   }
@@ -185,6 +197,7 @@ async function inspectForDiscard(wb, { git = defaultGit } = {}) {
   if (wb.state === "finished" || wb.state === "discarded") {
     throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already ${wb.state}.`, "CLOSED");
   }
+  if (wb.state === "closing") throw closingRefusal(wb);
   const plan = {
     unsaved: [], hidden: [], commits: [], detached: [], ignored: [], notKept: [], nested: [], operation: null,
     branchPushed: false, remote: null, remoteUrl: null, branch: wb.branch, path: wb.path,
@@ -251,7 +264,15 @@ async function discardPlanFor(wb, opts = {}) {
  * kept: the person agreed to lose those exact files, and a list that changed
  * since is refused.
  */
-async function discardFolder(wb, { git = defaultGit, confirm = null, busy = [] } = {}) {
+/** Refuses a Finish or Discard that was not given a way to write its intent: see moveFolderAside. */
+function needIntent(intent, cancel) {
+  if (typeof intent !== "function" || typeof cancel !== "function") {
+    throw new Error("Finish and Discard need intent and cancel, which write the closing state on the Workbench's row.");
+  }
+}
+
+async function discardFolder(wb, { git = defaultGit, confirm = null, busy = [], intent = null, cancel = null } = {}) {
+  needIntent(intent, cancel);
   const plan = await inspectForDiscard(wb, { git });
   if (plan.look && plan.look.blocked) throw plan.look.blocked;
   if (plan.blocked) throw refusal(plan.blocked.message, plan.blocked.code);
@@ -283,8 +304,11 @@ async function discardFolder(wb, { git = defaultGit, confirm = null, busy = [] }
     // For emptyTrash, once the Discard is recorded.
     trash: null, top: plan.top, tree: snap.sha, since, copy: setupMod.copyList(wb.copy_files ?? setupMod.DEFAULT_COPY),
   };
-  if (!plan.folderGone) done.trash = await moveFolderAside(git, plan.top, wb, snap.ref, done);
-  else await git.forgetRegistration(plan.top, wb.path);
+  if (!plan.folderGone) done.trash = await moveFolderAside(git, plan.top, wb, snap.ref, done, { intent, cancel });
+  else {
+    await intent({ mode: "discard", ref: snap.ref, trash: null });
+    await git.forgetRegistration(plan.top, wb.path);
+  }
   return done;
 }
 
@@ -341,10 +365,12 @@ async function emptyMoved(done, { git = defaultGit } = {}) {
  * unshared, commits on no branch, and ignored files without the person's
  * token for that exact list.
  */
-async function finishFolder(wb, { git = defaultGit, confirm = null, busy = [] } = {}) {
+async function finishFolder(wb, { git = defaultGit, confirm = null, busy = [], intent = null, cancel = null } = {}) {
+  needIntent(intent, cancel);
   if (wb.state === "finished" || wb.state === "discarded") {
     throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already ${wb.state}.`, "CLOSED");
   }
+  if (wb.state === "closing") throw closingRefusal(wb);
   if (wb.state === "missing" || !isDir(wb.path)) {
     throw refusal(`The folder for task ${wb.task_id}'s Workbench is gone (${wb.path}). Recreate it, or forget it.`, "MISSING");
   }
@@ -392,7 +418,7 @@ async function finishFolder(wb, { git = defaultGit, confirm = null, busy = [] } 
     notKept: report.notKept.map((n) => n.path), trash: null, top, tree: snap.sha, since,
     copy: setupMod.copyList(wb.copy_files ?? setupMod.DEFAULT_COPY),
   };
-  done.trash = await moveFolderAside(git, top, wb, snap.ref, done);
+  done.trash = await moveFolderAside(git, top, wb, snap.ref, done, { intent, cancel });
   return done;
 }
 
@@ -422,9 +448,29 @@ function createWorkbench({
   // The Sheet is the record of what happened to the work, so every verb that
   // changes a Workbench says so there. A failed note never fails the verb: the
   // folder and branch are the real thing, the note is the account of it.
-  async function note(taskId, body) {
+  async function note(taskId, body, { by = null } = {}) {
     if (!sheet || typeof sheet.append !== "function") return null;
-    try { return await sheet.append({ taskId, kind: "note", body }); } catch { return null; }
+    // by: who it is from when that is not whoever this store was made for:
+    // housekeeping finishing a closing, never put in a person's name.
+    const who = by ? { author: by, authorType: "tool" } : {};
+    try { return await sheet.append({ taskId, kind: "note", body, ...who }); } catch { return null; }
+  }
+
+  /**
+   * The intent and its undo, for a Finish or Discard run here: the row goes
+   * to closing (with the ref and the folder's destination) before anything
+   * moves, and back to what it was if the move fails.
+   */
+  function intentFor(id) {
+    const before = store.get(id).state;
+    return {
+      intent: async ({ mode, ref, trash }) => {
+        const row = store.beginClosing(id, { mode, ref, trash });
+        if (!row) throw closingRefusal(store.get(id));
+        return row;
+      },
+      cancel: async () => store.cancelClosing(id, before),
+    };
   }
 
   function drop(p) { cache.delete(p); }
@@ -535,6 +581,7 @@ function createWorkbench({
     const task = store.task(taskId);
     const { repo: repoRow, top } = await chooseRepo(task, { repoId, repo, path: given });
     const existing = store.live(task.id, repoRow.id);
+    if (existing && existing.state === "closing") throw closingRefusal(existing);
     if (existing) return { workbench: existing, created: false, warnings: [], setup_entry: null };
 
     let made;
@@ -688,6 +735,9 @@ function createWorkbench({
     if (wb.state === "finished" || wb.state === "discarded") {
       return { ...missingStatus(wb), words: wb.state === "finished" ? "Finished" : "Discarded", state: wb.state };
     }
+    if (wb.state === "closing") {
+      return { ...missingStatus(wb), words: "Being put away", state: "closing", closing: wb.closing || null };
+    }
     const hit = cache.get(wb.path);
     if (!fresh && hit && Date.now() - hit.at < STATUS_TTL_MS) return hit.value;
 
@@ -769,6 +819,7 @@ function createWorkbench({
     if (wb.state === "finished" || wb.state === "discarded") {
       throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already ${wb.state}.`, "CLOSED");
     }
+    if (wb.state === "closing") throw closingRefusal(wb);
     if (wb.state === "missing" || !isDir(wb.path)) {
       throw refusal(`The folder for task ${wb.task_id}'s Workbench is gone (${wb.path}). Recreate it, or forget it.`, "MISSING");
     }
@@ -902,10 +953,9 @@ function createWorkbench({
    */
   async function finish(id, { confirm = null } = {}) {
     const wb = store.get(id);
-    const done = await finishFolder(wb, { git, confirm, busy: busyIn(wb) });
+    const done = await finishFolder(wb, { git, confirm, busy: busyIn(wb), ...intentFor(id) });
     drop(wb.path);
-    await markFinished(id, done);
-    const cleanup = await settle(wb, done);
+    const cleanup = await recordThenEmpty(wb, done, () => markFinished(id, done));
     const task = store.task(wb.task_id);
     return { ...shown(done), cleanup, taskStatus: task.status };
   }
@@ -922,21 +972,62 @@ function createWorkbench({
   }
 
   /**
+   * The verb's record and its empty, under the moved folder's lock, so a
+   * housekeeping run at the same moment is shut out rather than racing it.
+   * The record is conditional anyway (closing to closed): whoever is second
+   * finds nothing to do and says nothing.
+   */
+  async function recordThenEmpty(wb, done, record) {
+    let release = null;
+    for (let i = 0; done.trash && !release && i < 300; i++) {
+      release = keep.takeLock(done.trash);
+      if (!release) await new Promise((r) => setTimeout(r, 100));
+    }
+    try {
+      const recorded = await record();
+      if (recorded && recorded.branchDeleted !== undefined) done.branchDeleted = recorded.branchDeleted === true;
+      if (!done.trash) return { deleted: true, kept: null, changed: [] };
+      if (trashInBackground) {
+        const held = release;
+        release = null;
+        settle(wb, done, { locked: Boolean(held) }).finally(() => held && held()).catch(() => {});
+        return { deleted: null, kept: null, changed: [], pending: true };
+      }
+      return await settle(wb, done, { locked: Boolean(release) });
+    } finally {
+      if (release) release();
+    }
+  }
+
+  /**
    * Empties the folder a Finish or Discard moved aside, now that the verb is
    * recorded. When something in it changed after the copy, it is kept, and
    * the Sheet says where. In the background for the app; awaited otherwise.
    */
-  function settle(wb, done) {
-    const run = async () => {
-      const result = await emptyMoved(done, { git });
-      if (result.kept && !result.already) await note(wb.task_id, keptWords(result, done));
-      return { deleted: result.deleted, kept: result.kept, changed: result.changed };
-    };
-    if (trashInBackground) {
-      run().catch(() => {});
-      return Promise.resolve({ deleted: null, kept: null, changed: [], pending: true });
+  async function settle(wb, done, { locked = false } = {}) {
+    const result = done.trash
+      ? await keep.emptyTrash(git, { repo: done.top, trash: done.trash, tree: done.tree, since: done.since, notKept: done.notKept || [], copy: done.copy || [], locked })
+      : { deleted: true, kept: null, changed: [] };
+    if (result.kept && !result.already) await note(wb.task_id, keptWords(result, done));
+    return { deleted: result.deleted, kept: result.kept, changed: result.changed };
+  }
+
+  /**
+   * The checks both records share: the row is closing, on this ref, the
+   * folder is gone from its path, and the ref is a copy Delphi made of this
+   * Workbench. Returns the repository's top, or a result saying it is done
+   * already (someone else recorded it first).
+   */
+  async function checkClosing(wb, ref, kind) {
+    if (wb.state === (kind === "finished" ? "finished" : "discarded")) return { already: true };
+    if (wb.state !== "closing" || !wb.closing || wb.closing.ref !== ref) {
+      throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is not being ${kind === "finished" ? "finished" : "discarded"} with the copy ${ref || "(none)"}, so nothing was recorded.`, "NOT_CLOSING");
     }
-    return run();
+    if (isDir(wb.path)) throw refusal(`The folder is still there (${wb.path}), so the Workbench was not marked ${kind}.`, "NOT_GONE");
+    const top = await repoTopOf(wb);
+    if (!top || !(await git.refExists(top, ref))) throw refusal(`There is no copy at ${ref}, so the Workbench was not marked ${kind}.`, "NO_COPY");
+    if (!(await isOwnCopy(git, top, wb, ref, kind))) throw refusal(`${ref} is not a copy Delphi made of this Workbench, so nothing was recorded.`, "NO_COPY");
+    return { top };
   }
 
   /**
@@ -944,28 +1035,22 @@ function createWorkbench({
    * folder is gone and, when a copy was made, that it is there. Like
    * markDiscarded, nothing here removes anything.
    */
-  async function markFinished(id, summary = {}) {
+  async function markFinished(id, summary = {}, { by = null } = {}) {
     const wb = store.get(id);
-    if (wb.state === "finished") return { finished: true, already: true };
     if (wb.state === "discarded") throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already discarded.`, "CLOSED");
-    if (isDir(wb.path)) throw refusal(`The folder is still there (${wb.path}), so the Workbench was not marked finished.`, "NOT_GONE");
-    // Every Finish keeps a copy now, so a Finish without one did not happen
-    // the way this records it.
-    const base = keep.refFor("finished", wb);
     const ref = String(summary.ref || "");
-    if (!(ref === base || (ref.startsWith(base) && /^-\d+$/.test(ref.slice(base.length))))) {
-      throw refusal(`A Finish is recorded with its copy, and ${ref || "no copy"} is not this Workbench's (${base}). Nothing was recorded.`, "NO_COPY");
-    }
-    const top = await repoTopOf(wb);
-    if (!top || !(await git.refExists(top, ref))) throw refusal(`There is no copy at ${ref}, so the Workbench was not marked finished.`, "NO_COPY");
-    if (!(await isOwnCopy(git, top, wb, ref, "finished"))) throw refusal(`${ref} is not a copy Delphi made of this Workbench, so nothing was recorded.`, "NO_COPY");
+    const checked = await checkClosing(wb, ref, "finished");
+    if (checked.already) return { finished: true, already: true };
+    const { top } = checked;
     const notKept = (Array.isArray(summary.notKept) ? summary.notKept : []).slice(0, 1000).map((f) => String(f).slice(0, 300));
     const recover = await keep.recoverFor(git, { ref, repo: top, folder: wb.path, branch: wb.branch, id: wb.id, until: keep.untilDate(), notKept });
     const removedIgnored = summary.removedIgnored === true || notKept.length > 0;
     drop(wb.path);
-    store.setState(wb.id, "finished");
-    await note(wb.task_id, `finished workbench; the branch ${wb.branch} is kept${removedIgnored ? `. The files git does not keep were removed. ${recover}` : ""}`);
-    store.audit(wb.task_id, "finished workbench");
+    // Closing to finished on this ref, or nothing: the second to arrive
+    // writes no note and no audit row.
+    if (!store.completeClosing(wb.id, "finished", ref)) return { finished: true, already: true };
+    await note(wb.task_id, `finished workbench; the branch ${wb.branch} is kept${removedIgnored ? `. The files git does not keep were removed. ${recover}` : ""}${by ? ` (finished by ${by}, from the Finish ${wb.closing.actor || "someone"} began)` : ""}`, { by });
+    store.audit(wb.task_id, "finished workbench", by);
     return { finished: true, recover };
   }
 
@@ -987,10 +1072,9 @@ function createWorkbench({
     if (String(typed == null ? "" : typed).trim() !== String(wb.task_id)) {
       throw refusal(`Type ${wb.task_id}, the task's number, to confirm. Nothing was thrown away.`, "CONFIRM");
     }
-    const done = await discardFolder(wb, { git, confirm, busy: busyIn(wb) });
+    const done = await discardFolder(wb, { git, confirm, busy: busyIn(wb), ...intentFor(id) });
     drop(wb.path);
-    done.branchDeleted = (await markDiscarded(id, done)).branchDeleted === true;
-    const cleanup = await settle(wb, done);
+    const cleanup = await recordThenEmpty(wb, done, () => markDiscarded(id, done));
     return { ...shown(done), cleanup };
   }
 
@@ -1001,23 +1085,13 @@ function createWorkbench({
    * done the git half in its own process; nothing here removes anything, so
    * an agent that reaches it can only describe what a person already did.
    */
-  async function markDiscarded(id, summary = {}) {
+  async function markDiscarded(id, summary = {}, { by = null } = {}) {
     const wb = store.get(id);
-    if (wb.state === "discarded") return { discarded: true, already: true };
     if (wb.state === "finished") throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already finished.`, "CLOSED");
-    const base = keep.refFor("discarded", wb);
     const ref = String(summary.ref || "");
-    if (!(ref === base || /^-\d+$/.test(ref.slice(base.length)) && ref.startsWith(base))) {
-      throw refusal(`The copy of this Workbench is called ${base}, not ${ref}. Nothing was recorded.`, "NO_COPY");
-    }
-    if (isDir(wb.path)) throw refusal(`The folder is still there (${wb.path}), so the Workbench was not marked discarded.`, "NOT_GONE");
-    const top = await repoTopOf(wb);
-    if (!top || !(await git.refExists(top, ref))) {
-      throw refusal(`There is no copy at ${ref}, so the Workbench was not marked discarded.`, "NO_COPY");
-    }
-    if (!(await isOwnCopy(git, top, wb, ref, "discarded"))) {
-      throw refusal(`${ref} is not a copy Delphi made of this Workbench, so nothing was recorded.`, "NO_COPY");
-    }
+    const checked = await checkClosing(wb, ref, "discarded");
+    if (checked.already) return { discarded: true, already: true };
+    const { top } = checked;
     const when = await git.run(top, ["log", "-1", "--format=%ct", ref]);
     const made = Number(when.ok ? when.stdout.trim() : NaN);
     const until = keep.untilDate(keep.KEEP_DAYS, Number.isFinite(made) ? made * 1000 : Date.now());
@@ -1030,7 +1104,9 @@ function createWorkbench({
     if (count(summary.detached)) parts.push(plural(count(summary.detached), "commit on no branch", "commits on no branch"));
     if (count(summary.ignored)) parts.push(plural(count(summary.ignored), "ignored file", "ignored files"));
     drop(wb.path);
-    store.setState(wb.id, "discarded");
+    // Closing to discarded on this ref, or nothing: the second to arrive
+    // writes no note, no audit row, and deletes no branch.
+    if (!store.completeClosing(wb.id, "discarded", ref)) return { discarded: true, already: true };
     // The branch goes after the record and before the note, so the note says
     // what happened rather than what was meant to.
     const tip = summary.branchToDelete && summary.branchToDelete.tip || summary.branchTip || null;
@@ -1040,8 +1116,8 @@ function createWorkbench({
       : branchDeleted ? `the branch ${wb.branch} was deleted` : `the branch ${wb.branch} is kept`;
     const notKept = (Array.isArray(summary.notKept) ? summary.notKept : []).slice(0, 1000).map((f) => String(f).slice(0, 300));
     const recover = await keep.recoverFor(git, { ref, repo: top, folder: wb.path, branch: wb.branch, id: wb.id, until, notKept });
-    await note(wb.task_id, `discarded workbench with ${parts.length ? parts.join(", ") : "nothing unsaved in it"}; ${branchWords}. ${recover}`);
-    store.audit(wb.task_id, "discarded workbench");
+    await note(wb.task_id, `discarded workbench with ${parts.length ? parts.join(", ") : "nothing unsaved in it"}; ${branchWords}. ${recover}${by ? ` (finished by ${by}, from the Discard ${wb.closing.actor || "someone"} began)` : ""}`, { by });
+    store.audit(wb.task_id, "discarded workbench", by);
     return { discarded: true, ref, until, recover, branchDeleted };
   }
 
@@ -1051,6 +1127,7 @@ function createWorkbench({
   /** Puts the folder back, on the branch it had. */
   async function recreate(id) {
     const wb = store.get(id);
+    if (wb.state === "closing") throw closingRefusal(wb);
     if (wb.state === "finished" || wb.state === "discarded") {
       throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already ${wb.state}. Start a new one instead.`, "CLOSED");
     }
@@ -1092,6 +1169,7 @@ function createWorkbench({
   async function forgetBench(id) {
     const wb = store.get(id);
     if (wb.state === "finished" || wb.state === "discarded") return { forgotten: true };
+    if (wb.state === "closing") throw closingRefusal(wb);
     // Its folder may only have been moved aside by a Finish or Discard that
     // did not finish; forgetting it would leave that folder unexplained.
     const aside = trashFor(wb);
@@ -1141,6 +1219,10 @@ function createWorkbench({
     for (const repoRow of store.reposInUse()) {
       const rows = live.filter((w) => w.repo_id === Number(repoRow.id));
       for (const row of rows) {
+        if (row.state === "closing") {
+          await settleStuckClosing(row, report);
+          continue;
+        }
         const present = isDir(row.path);
         if (!present && row.state !== "missing") {
           if (row.state === "active") store.setState(row.id, "missing");
@@ -1199,6 +1281,33 @@ function createWorkbench({
   }
 
   /**
+   * A row left closing by a process that died. Its folder back where it was
+   * and nothing in .trash means the move never happened: it is open again.
+   * A Discard of a folder that was already gone (no trash) is recorded from
+   * its copy, as housekeeping's doing. Anything with a .trash entry is the
+   * sweep's to finish.
+   */
+  async function settleStuckClosing(row, report) {
+    const c = row.closing || {};
+    const aside = c.trash && fs.existsSync(c.trash);
+    if (aside) return;
+    if (isDir(row.path)) {
+      if (store.cancelClosing(row.id, "active")) {
+        drop(row.path);
+        await note(row.task_id, `a ${c.mode || "Finish or Discard"} of this Workbench did not get as far as moving the folder, so it is open again, as it was`, { by: "housekeeping" });
+        report.reopened = [...(report.reopened || []), row.id];
+      }
+      return;
+    }
+    if (c.mode === "discard" && !c.trash) {
+      try {
+        const r = await markDiscarded(row.id, { ref: c.ref }, { by: "housekeeping" });
+        if (!r.already) report.reconciled.push(row.id);
+      } catch {}
+    }
+  }
+
+  /**
    * Finishes what a Finish or Discard started and did not see through: the
    * folder was moved into .trash, and then the process died.
    *
@@ -1226,6 +1335,15 @@ function createWorkbench({
       try {
         if (!fs.existsSync(entry.trash) || fs.existsSync(`${entry.trash}.kept`)) continue;
         row = store.get(row.id);
+        // Only the row says what this folder is: a Finish or Discard wrote
+        // its destination there before moving it. An entry no row claims is
+        // not acted on, whatever its manifest says.
+        const owned = Boolean(row.closing && row.closing.trash && (row.closing.trash === entry.trash || git.samePath(row.closing.trash, entry.trash)));
+        if (!owned) {
+          await unrecognised(row, entry.trash, "no Finish or Discard of this Workbench put it there");
+          report.unrecognised = [...(report.unrecognised || []), entry.trash];
+          continue;
+        }
         const open = row.state !== "finished" && row.state !== "discarded";
         if (open && isDir(row.path)) continue;
         // A delete that was checked and started, then stopped (a file it
@@ -1235,7 +1353,7 @@ function createWorkbench({
           const m = keep.readManifest(entry.trash) || {};
           const top = await repoTopOf(row);
           const kind = row.state === "finished" ? "finished" : "discarded";
-          if (Number(m.workbench) === Number(row.id) && top && await isOwnCopy(git, top, row, m.ref, kind)) {
+          if (top && await isOwnCopy(git, top, row, row.closing.ref, kind)) {
             try {
               keep.deleteTree(entry.trash);
               for (const ext of [".json", ".deleting"]) { try { fs.unlinkSync(`${entry.trash}${ext}`); } catch {} }
@@ -1260,9 +1378,12 @@ function createWorkbench({
             continue;
           }
           try {
-            if (done.mode === "finish") await markFinished(row.id, { ref: done.ref, notKept: done.notKept, removedIgnored: done.removedIgnored });
-            else await markDiscarded(row.id, { ...done.summary, ref: done.ref, notKept: done.notKept, branchToDelete: done.branchToDelete });
-            report.reconciled.push(row.id);
+            // Recorded as housekeeping's doing, never in the name of whoever
+            // began it: they did not see it through.
+            const r = done.mode === "finish"
+              ? await markFinished(row.id, { ref: done.ref, notKept: done.notKept, removedIgnored: done.removedIgnored }, { by: "housekeeping" })
+              : await markDiscarded(row.id, { ...done.summary, ref: done.ref, notKept: done.notKept, branchToDelete: done.branchToDelete }, { by: "housekeeping" });
+            if (!r.already) report.reconciled.push(row.id);
           } catch {
             continue;
           }
@@ -1289,17 +1410,19 @@ function createWorkbench({
    * Whether a .trash entry is what its manifest says, checked against the
    * row and git. Returns the facts to act on, all row derived, or why not.
    */
-  async function recognise(row, trash, m) {
-    if (!m) return { ok: false, why: "it has no manifest Delphi can read" };
-    if (Number(m.workbench) !== Number(row.id) || Number(m.task_id) !== Number(row.task_id)) return { ok: false, why: "its manifest names another Workbench" };
-    if (!m.folder || !(m.folder === row.path || git.samePath(m.folder, row.path))) return { ok: false, why: "its manifest names another folder" };
-    const mode = m.mode === "finish" ? "finish" : m.mode === "discard" ? "discard" : null;
-    if (!mode) return { ok: false, why: "its manifest does not say what it was" };
+  async function recognise(row, trash, manifest) {
+    // The row decides what this is and which copy it is checked against;
+    // the manifest only adds what the row has no room for (files agreed
+    // lost, the counts for the note, the branch's tip), and only when it
+    // names this same Workbench and folder.
+    const hint = manifest && Number(manifest.workbench) === Number(row.id) && Number(manifest.task_id) === Number(row.task_id)
+      && manifest.folder && (manifest.folder === row.path || git.samePath(manifest.folder, row.path)) ? manifest : {};
+    const mode = row.closing.mode === "finish" ? "finish" : "discard";
     const top = await repoTopOf(row);
     if (!top) return { ok: false, why: "its repository is not there" };
-    const ref = String(m.ref || "");
+    const ref = String(row.closing.ref || "");
     if (!(await git.refExists(top, ref)) || !(await isOwnCopy(git, top, row, ref, mode === "finish" ? "finished" : "discarded"))) {
-      return { ok: false, why: "the copy it names is missing, or is not one Delphi made of this Workbench" };
+      return { ok: false, why: "the copy its Finish or Discard made is missing, or is not one Delphi made of this Workbench" };
     }
     // Its .git file, renamed when it was moved, must point at this
     // Workbench's own registration under the repository's git folder.
@@ -1313,20 +1436,20 @@ function createWorkbench({
     const tree = (await git.run(top, ["rev-parse", `${ref}^{tree}`])).stdout.trim();
     const ct = Number((await git.run(top, ["log", "-1", "--format=%ct", ref])).stdout.trim());
     // A manifest cannot push the check's start past the copy's own time.
-    const since = Math.min(Number(m.since) || 0, Number.isFinite(ct) ? ct * 1000 : 0);
+    const since = Math.min(Number(hint.since) || 0, Number.isFinite(ct) ? ct * 1000 : 0);
     const listed = await git.runWith(top, ["ls-tree", "-r", "-z", "--name-only", ref], { timeout: 10 * 60000 });
     const missing = listed.stdout.split("\0").filter(Boolean).filter((p) => { try { fs.lstatSync(path.join(trash, p)); return false; } catch { return true; } });
     if (missing.length) return { ok: false, why: `${someOf(missing)} from the copy ${missing.length === 1 ? "is" : "are"} not in it` };
-    const notKept = (Array.isArray(m.notKept) ? m.notKept : []).map((n) => String(n));
-    const tip = m.branchToDelete && typeof m.branchToDelete.tip === "string" ? m.branchToDelete.tip : null;
+    const notKept = (Array.isArray(hint.notKept) ? hint.notKept : []).map((n) => String(n));
+    const tip = hint.branchToDelete && typeof hint.branchToDelete.tip === "string" ? hint.branchToDelete.tip : null;
     return {
       ok: true,
       done: {
         mode, ref, top, tree, since, trash, notKept, wb: row,
         copy: setupMod.copyList(row.copy_files ?? setupMod.DEFAULT_COPY),
-        removedIgnored: m.removedIgnored === true,
+        removedIgnored: hint.removedIgnored === true,
         branchToDelete: mode === "discard" && tip ? { branch: row.branch, tip } : null,
-        summary: { unsaved: m.unsaved, files: m.files, commits: m.commits, detached: m.detached, ignored: m.ignored },
+        summary: { unsaved: hint.unsaved, files: hint.files, commits: hint.commits, detached: hint.detached, ignored: hint.ignored },
       },
     };
   }
@@ -1381,7 +1504,7 @@ function createWorkbench({
   return {
     candidates, start, status, forTask, list, park, resume, update, commit, push, pr,
     finishPlan,
-    finish, markFinished, discardPlan, discard, markDiscarded, recreate, forget: forgetBench, housekeep, advanced,
+    finish, markFinished, discardPlan, discard, markDiscarded, recreate, intent: intentFor, forget: forgetBench, housekeep, advanced,
     get: (id) => store.get(id), live: (taskId) => store.live(taskId),
   };
 }

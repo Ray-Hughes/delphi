@@ -11,10 +11,11 @@
  * where, is workbench.js's business; this only knows what Delphi recorded.
  */
 
-const STATES = ["active", "parked", "finished", "discarded", "missing"];
+const STATES = ["active", "parked", "finished", "discarded", "missing", "closing"];
 // Live is what the unique indexes count. Missing is live on purpose: it is
-// still the task's Workbench until someone picks Recreate or Forget.
-const LIVE = ["active", "parked", "missing"];
+// still the task's Workbench until someone picks Recreate or Forget. So is
+// Closing: a Finish or Discard has begun and is not yet recorded.
+const LIVE = ["active", "parked", "missing", "closing"];
 const CLOSED = ["finished", "discarded"];
 // Finished and discarded rows drop out of lists after this long. They are
 // never deleted, because History links to them and the branch names in them
@@ -58,6 +59,10 @@ function shape(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
     closed_at: row.closed_at || null,
+    closing: row.closing_mode ? {
+      mode: row.closing_mode, ref: row.closing_ref || null, trash: row.closing_trash || null,
+      at: row.closing_at || null, actor: row.closing_actor || null,
+    } : null,
   };
 }
 
@@ -125,6 +130,44 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
                      VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7) RETURNING id`,
                     [idOf(taskId, "task_id"), idOf(repoId, "repo_id"), String(path), String(branch), String(base), state, writer])[0];
     return get(row.id);
+  }
+
+  /**
+   * Writes a Finish or Discard's intent onto the row before anything on disk
+   * moves, in one conditional UPDATE: only an open row (active, parked, or a
+   * missing one being discarded) becomes closing, so two verbs cannot both
+   * begin. Returns the row, or null when it was not open.
+   */
+  function beginClosing(id, { mode, ref, trash = null }) {
+    if (!["discard", "finish"].includes(mode)) throw new Error("mode must be discard or finish");
+    const from = mode === "discard" ? "'active', 'parked', 'missing'" : "'active', 'parked'";
+    const row = sql(`UPDATE workbenches SET state = 'closing', closing_mode = :p1, closing_ref = :p2, closing_trash = :p3,
+                       closing_at = datetime('now'), closing_actor = :p4, updated_at = datetime('now')
+                     WHERE id = :p5 AND state IN (${from}) RETURNING id`,
+                    [mode, String(ref), trash == null ? null : String(trash), writer, idOf(id, "Workbench id")])[0];
+    return row ? get(row.id) : null;
+  }
+
+  /** Back from closing, when the move never happened. */
+  function cancelClosing(id, backTo = "active") {
+    const to = ["active", "parked", "missing"].includes(backTo) ? backTo : "active";
+    const row = sql(`UPDATE workbenches SET state = :p1, closing_mode = NULL, closing_ref = NULL, closing_trash = NULL,
+                       closing_at = NULL, closing_actor = NULL, updated_at = datetime('now')
+                     WHERE id = :p2 AND state = 'closing' RETURNING id`, [to, idOf(id, "Workbench id")])[0];
+    return row ? get(row.id) : null;
+  }
+
+  /**
+   * Closing to finished or discarded, in one conditional UPDATE on the ref
+   * the intent named: whoever gets there second (the verb or housekeeping)
+   * changes nothing and is told so, and writes no second note.
+   */
+  function completeClosing(id, state, ref) {
+    if (!["finished", "discarded"].includes(state)) throw new Error("state must be finished or discarded");
+    const row = sql(`UPDATE workbenches SET state = :p1, closed_at = datetime('now'), updated_at = datetime('now')
+                     WHERE id = :p2 AND state = 'closing' AND closing_ref = :p3 RETURNING id`,
+                    [state, idOf(id, "Workbench id"), String(ref)])[0];
+    return row ? get(row.id) : null;
   }
 
   function setState(id, state) {
@@ -293,14 +336,14 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
   // Audited against the task, as Sheet entries are: "started workbench" belongs
   // in the task's history, where someone looking for where the work went will
   // look.
-  function audit(taskId, summary) {
+  function audit(taskId, summary, by = null) {
     const t = sql("SELECT id, title FROM tasks WHERE id = :p1", [idOf(taskId, "task_id")])[0];
     if (!t) return;
     sql(`INSERT INTO audit (action, entity, entity_id, summary, label)
-         VALUES ('update', 'task', :p1, :p2, :p3)`, [t.id, `${summary} (by ${writer})`, t.title]);
+         VALUES ('update', 'task', :p1, :p2, :p3)`, [t.id, `${summary} (by ${by || writer})`, t.title]);
   }
 
-  return { busyIn, find, get, task, live, byPath, list, insert, setState, touch, repoFolders, repo, adoptRepo, reposInUse, allRepos, updateRepo, audit, actor: writer };
+  return { beginClosing, cancelClosing, completeClosing, busyIn, find, get, task, live, byPath, list, insert, setState, touch, repoFolders, repo, adoptRepo, reposInUse, allRepos, updateRepo, audit, actor: writer };
 }
 
 module.exports = { STATES, LIVE, CLOSED, HIDE_AFTER_DAYS, shape, makeWorkbenchStore };

@@ -586,7 +586,16 @@ CREATE TABLE IF NOT EXISTS workbenches (
   owner       TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  closed_at   TEXT
+  closed_at   TEXT,
+  -- A Finish or Discard in progress: written in one conditional UPDATE
+  -- before the folder is moved aside (state 'closing'), and the only thing
+  -- housekeeping will finish a closing from. Anything on disk can be forged;
+  -- this row cannot be, by a shell alone.
+  closing_mode  TEXT,   -- 'discard' | 'finish'
+  closing_ref   TEXT,   -- the copy, refs/delphi/...
+  closing_trash TEXT,   -- where the folder was moved
+  closing_at    TEXT,
+  closing_actor TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_workbenches_task ON workbenches(task_id, state);
 -- Missing counts as live in both. A Missing row is still the task's Workbench
@@ -594,6 +603,6 @@ CREATE INDEX IF NOT EXISTS idx_workbenches_task ON workbenches(task_id, state);
 -- beside it is how one branch ends up in two rows. The path index stops two
 -- rows ever claiming one folder.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_live
-  ON workbenches(task_id, repo_id) WHERE state IN ('active', 'parked', 'missing');
+  ON workbenches(task_id, repo_id) WHERE state IN ('active', 'parked', 'missing', 'closing');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_path
-  ON workbenches(path) WHERE state IN ('active', 'parked', 'missing');
+  ON workbenches(path) WHERE state IN ('active', 'parked', 'missing', 'closing');

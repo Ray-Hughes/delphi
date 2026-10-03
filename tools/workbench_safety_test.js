@@ -532,7 +532,7 @@ async function main() {
     for (const how of ["a new file", "an appended file"]) {
       const { t, wb } = await bench(r, `late ${how}`);
       write(path.join(wb.path, "log.txt"), "one\n");
-      const done = await W.discardFolder(store.get(wb.id));
+      const done = await W.discardFolder(store.get(wb.id), benches.intent(wb.id));
       await benches.markDiscarded(wb.id, done);
       check(`${how}: recorded before anything is deleted`, [store.get(wb.id).state, exists(done.trash)], ["discarded", true]);
       if (how === "a new file") write(path.join(done.trash, "late.txt"), "written after the copy\n");
@@ -552,7 +552,7 @@ async function main() {
       const { t, wb } = await bench(r, "undeletable");
       write(path.join(wb.path, "stuck.txt"), "s\n");
       const W2 = require("../workbench/workbench");
-      const done = await W2.discardFolder(store.get(wb.id));
+      const done = await W2.discardFolder(store.get(wb.id), benches.intent(wb.id));
       await benches.markDiscarded(wb.id, done);
       execFileSync("chflags", ["uchg", path.join(done.trash, "stuck.txt")]);
       const left = await W2.emptyMoved(done);
@@ -605,7 +605,7 @@ async function main() {
     // 3. markFinished needs the copy.
     const m = await bench(r, "mark");
     fs.renameSync(m.wb.path, `${m.wb.path}.away`);
-    await rejects("markFinished with no ref refuses", benches.markFinished(m.wb.id, {}), /recorded with its copy/, "NO_COPY");
+    await rejects("markFinished with no ref refuses", benches.markFinished(m.wb.id, {}), /not being finished/, "NOT_CLOSING");
     fs.renameSync(`${m.wb.path}.away`, m.wb.path);
     check("and records nothing", store.get(m.wb.id).state, "active");
 
@@ -643,7 +643,7 @@ async function main() {
       const { t, wb } = await bench(r, `crash ${verb}`);
       write(path.join(wb.path, verb === "discard" ? "work.txt" : "build/notes.txt"), "work\n");
       const row = store.get(wb.id);
-      const done = verb === "discard" ? await W.discardFolder(row) : await W.finishFolder(row, { confirm: (await benches.finishPlan(wb.id)).confirm });
+      const done = verb === "discard" ? await W.discardFolder(row, benches.intent(wb.id)) : await W.finishFolder(row, { confirm: (await benches.finishPlan(wb.id)).confirm, ...benches.intent(wb.id) });
       check(`${verb}: a manifest beside the moved folder`, [exists(done.trash), keep.readManifest(done.trash).ref], [true, done.ref]);
       check(`${verb}: the branch is still there until the record`, gitOk(r.app, "rev-parse", "--verify", `refs/heads/${wb.branch}`), true);
       // The process dies here: nothing recorded.
@@ -659,7 +659,7 @@ async function main() {
     // process died before emptying it.
     const { t, wb } = await bench(r, "late writer");
     write(path.join(wb.path, "work.txt"), "v1\n");
-    const done = await W.discardFolder(store.get(wb.id));
+    const done = await W.discardFolder(store.get(wb.id), benches.intent(wb.id));
     await benches.markDiscarded(wb.id, done);
     check("the moved folder is cut loose from git", [exists(path.join(done.trash, ".git")), exists(path.join(done.trash, ".git.was"))], [false, true]);
     write(path.join(done.trash, "work.txt"), "v2 after the copy\n");
@@ -690,7 +690,7 @@ async function main() {
     git(r.app, "push", "-q", "origin", "main");
     for (const [file, kept] of [["src/target/main.c", true], ["src/coverage/notes.md", true], ["node_modules/x/late.js", false]]) {
       const { wb } = await bench(r, `skip ${file}`);
-      const done = await W.discardFolder(store.get(wb.id));
+      const done = await W.discardFolder(store.get(wb.id), benches.intent(wb.id));
       await benches.markDiscarded(wb.id, done);
       write(path.join(done.trash, file), "written after the copy\n");
       const left = await W.emptyMoved(done);
@@ -761,13 +761,16 @@ async function main() {
     const n = await bench(r, "untrailed");
     fs.renameSync(n.wb.path, `${n.wb.path}.away`);
     git(r.app, "update-ref", `refs/delphi/discarded/${n.t.id}-${n.wb.id}`, git(r.app, "rev-parse", "HEAD"));
-    await rejects("markDiscarded refuses a ref Delphi did not write", benches.markDiscarded(n.wb.id, { ref: `refs/delphi/discarded/${n.t.id}-${n.wb.id}` }), /not a copy Delphi made/, "NO_COPY");
+    await rejects("markDiscarded refuses a Workbench with no Discard begun", benches.markDiscarded(n.wb.id, { ref: `refs/delphi/discarded/${n.t.id}-${n.wb.id}` }), /not being discarded/, "NOT_CLOSING");
+    store.beginClosing(n.wb.id, { mode: "discard", ref: `refs/delphi/discarded/${n.t.id}-${n.wb.id}`, trash: null });
+    await rejects("and one begun on a ref Delphi did not write", benches.markDiscarded(n.wb.id, { ref: `refs/delphi/discarded/${n.t.id}-${n.wb.id}` }), /not a copy Delphi made/, "NO_COPY");
+    store.cancelClosing(n.wb.id, "active");
     fs.renameSync(`${n.wb.path}.away`, n.wb.path);
 
     // Two housekeeping runs at once over one moved folder.
     const c = await bench(r, "concurrent");
     for (let i = 0; i < 2000; i++) write(path.join(c.wb.path, `bulk/f${i}.txt`), `x${i}\n`);
-    const cdone = await W.discardFolder(store.get(c.wb.id));
+    const cdone = await W.discardFolder(store.get(c.wb.id), benches.intent(c.wb.id));
     const [a1, a2] = await Promise.all([benches.housekeep(), benches.housekeep()]);
     check("two at once record it exactly once", [a1.reconciled.length + a2.reconciled.length, anyNote(c.t.id, /^discarded workbench/)], [1, 1]);
     check("and leave no stray marker or lock", fs.readdirSync(path.dirname(cdone.trash)).filter((x) => x.startsWith(`${c.wb.id}-`)), []);
@@ -775,7 +778,7 @@ async function main() {
     // Recorded, then the process died before the branch went.
     const b = await bench(r, "pending branch");
     commit(b.wb, "w.txt", "w\n", "c");
-    const bdone = await W.discardFolder(store.get(b.wb.id));
+    const bdone = await W.discardFolder(store.get(b.wb.id), benches.intent(b.wb.id));
     const rec = await benches.markDiscarded(b.wb.id, { ...bdone, branchToDelete: null });   // the delete never happened
     check("the note is written after the branch step, and says what happened", [rec.branchDeleted, / is kept\./.test(notes(b.t.id).filter((x) => /^discarded/.test(x)).pop())], [false, true]);
     await benches.housekeep();
@@ -787,22 +790,105 @@ async function main() {
     for (const how of ["truncated manifest", "copy deleted"]) {
       const x = await bench(r, how);
       write(path.join(x.wb.path, "w.txt"), "w\n");
-      const xd = await W.discardFolder(store.get(x.wb.id));
+      const xd = await W.discardFolder(store.get(x.wb.id), benches.intent(x.wb.id));
       if (how === "truncated manifest") fs.writeFileSync(`${xd.trash}.json`, fs.readFileSync(`${xd.trash}.json`, "utf8").slice(0, 40));
       else git(r.app, "update-ref", "-d", xd.ref);
       const hk = await benches.housekeep();
-      check(`${how}: nothing recorded, the folder kept`, [hk.reconciled.includes(x.wb.id), exists(path.join(xd.trash, "w.txt"))], [false, true]);
-      check(`${how}: the Sheet says where it is`, notes(x.t.id).some((t) => t.includes(xd.trash)), true);
-      await rejects(`${how}: Forget refuses`, benches.forget(x.wb.id), /moved to/, "IN_TRASH");
+      if (how === "truncated manifest") {
+        // The row holds the intent, so the manifest is only a hint now:
+        // recorded from the row, as housekeeping's doing.
+        check(`${how}: recorded from the row's intent by housekeeping`, [hk.reconciled.includes(x.wb.id), store.get(x.wb.id).state, /finished by housekeeping/.test(notes(x.t.id).pop())], [true, "discarded", true]);
+      } else {
+        check(`${how}: nothing recorded, the folder kept`, [hk.reconciled.includes(x.wb.id), exists(path.join(xd.trash, "w.txt"))], [false, true]);
+        check(`${how}: the Sheet says where it is`, notes(x.t.id).some((t) => t.includes(xd.trash)), true);
+        await rejects(`${how}: Forget refuses`, benches.forget(x.wb.id), /being put away/, "CLOSING");
+      }
     }
 
     // The app emptying while housekeeping runs: one of them does it, once.
     const e = await bench(r, "race empty");
     for (let i = 0; i < 2000; i++) write(path.join(e.wb.path, `bulk/f${i}.txt`), `x${i}\n`);
-    const ed = await W.discardFolder(store.get(e.wb.id));
+    const ed = await W.discardFolder(store.get(e.wb.id), benches.intent(e.wb.id));
     await benches.markDiscarded(e.wb.id, ed);
     const [em, hkE] = await Promise.all([W.emptyMoved(ed), benches.housekeep()]);
     check("emptied once, with no kept note", [exists(ed.trash), em.kept || hkE.keptTrash.length ? "kept" : "ok", anyNote(e.t.id, /^kept the old folder/)], [false, "ok", 0]);
+  }
+
+  // -------------------------------------------------------------------------
+  section("G8. Only the row's intent lets housekeeping finish a Finish or Discard");
+  {
+    const W = require("../workbench/workbench");
+    const r = makeRepo("g8", { remote: false });
+    // Everything on disk forged, nothing on the row: an agent with a shell.
+    const f = await bench(r, "forged");
+    commit(f.wb, "w.txt", "work\n", "unpushed work");
+    write(path.join(f.wb.path, "draft.txt"), "uncommitted draft\n");
+    const tip = git(r.app, "rev-parse", f.wb.branch);
+    const gitfile = read(path.join(f.wb.path, ".git"));
+    const hidden = path.join(dir, `hidden-${f.wb.id}`);
+    fs.renameSync(f.wb.path, hidden);
+    const empty = execFileSync(GIT, ["-C", r.app, "hash-object", "-t", "tree", "-w", "--stdin"], { input: "", encoding: "utf8" }).trim();
+    const forgedCommit = execFileSync(GIT, ["-C", r.app, "commit-tree", empty, "-p", tip, "-m", `x\n\nDelphi-Workbench: ${f.wb.id}`], { encoding: "utf8" }).trim();
+    const fref = `refs/delphi/discarded/${f.t.id}-${f.wb.id}`;
+    git(r.app, "update-ref", fref, forgedCommit);
+    const tr = path.join(path.dirname(f.wb.path), keep.TRASH, `${f.wb.id}-${Date.now()}`);
+    fs.mkdirSync(tr, { recursive: true });
+    fs.writeFileSync(path.join(tr, ".git.was"), gitfile);
+    fs.writeFileSync(`${tr}.json`, JSON.stringify({ mode: "discard", workbench: f.wb.id, task_id: f.t.id, folder: f.wb.path, ref: fref, since: 0, branchToDelete: { tip } }));
+    const hk = await benches.housekeep();
+    check("a forgery with no intent on the row records nothing", [hk.reconciled, store.get(f.wb.id).state !== "discarded"], [[], true]);
+    check("and deletes nothing", [gitOk(r.app, "rev-parse", "--verify", `refs/heads/${f.wb.branch}`), exists(tr)], [true, true]);
+    check("and says where the folder is", notes(f.t.id).some((n) => n.includes(tr) && /cannot vouch for/.test(n)), true);
+    fs.renameSync(hidden, f.wb.path);
+
+    // A real crash after the move: recorded, and as housekeeping's doing.
+    const c = await bench(r, "crash");
+    write(path.join(c.wb.path, "w.txt"), "w\n");
+    await W.discardFolder(store.get(c.wb.id), benches.intent(c.wb.id));
+    check("the row says a Discard is under way, in words", [store.get(c.wb.id).state, (await benches.status(c.wb.id, { fresh: true })).words], ["closing", "Being put away"]);
+    await rejects("Start refuses while it is", benches.start(c.t.id, { runSetup: false }), /being put away/, "CLOSING");
+    await rejects("so does Discard", benches.discard(c.wb.id, String(c.t.id)), /being put away/, "CLOSING");
+    await rejects("and Forget", benches.forget(c.wb.id), /being put away/, "CLOSING");
+    await benches.housekeep();
+    const last = db.handle().prepare("SELECT author, author_type, body FROM comments WHERE task_id = ? AND body LIKE 'discarded workbench%'").get(c.t.id);
+    check("housekeeping records it in its own name, not the person's", [store.get(c.wb.id).state, last.author, last.author_type], ["discarded", "housekeeping", "tool"]);
+    check("and History says so", db.handle().prepare("SELECT summary FROM audit WHERE entity_id = ? ORDER BY id DESC LIMIT 1").get(c.t.id).summary, "discarded workbench (by housekeeping)");
+
+    // The verb's record racing housekeeping: one note, every time.
+    let notesSeen = 0;
+    for (let round = 0; round < 5; round++) {
+      const x = await bench(r, `race ${round}`);
+      for (let i = 0; i < 300; i++) write(path.join(x.wb.path, `b/f${i}.txt`), `x${i}\n`);
+      const done = await W.discardFolder(store.get(x.wb.id), benches.intent(x.wb.id));
+      await Promise.allSettled([benches.markDiscarded(x.wb.id, done), benches.housekeep()]);
+      notesSeen += db.handle().prepare("SELECT COUNT(*) AS n FROM comments WHERE task_id = ? AND body LIKE 'discarded workbench%'").get(x.t.id).n;
+    }
+    check("the verb and housekeeping at once write exactly one note per Discard", notesSeen, 5);
+
+    // Closing, but the move never happened: open again.
+    const s2 = await bench(r, "stuck");
+    store.beginClosing(s2.wb.id, { mode: "finish", ref: "refs/delphi/finished/x", trash: path.join(path.dirname(s2.wb.path), keep.TRASH, `${s2.wb.id}-1700000000000`) });
+    const hk2 = await benches.housekeep();
+    check("a closing whose folder is still in place is reopened", [hk2.reopened, store.get(s2.wb.id).state, /open again/.test(notes(s2.t.id).pop())], [[s2.wb.id], "active", true]);
+
+    // An old database's partial indexes are rebuilt to count closing as live.
+    const { DatabaseSync } = require("node:sqlite");
+    const old = new DatabaseSync(":memory:");
+    old.exec(`CREATE TABLE tasks (id INTEGER PRIMARY KEY);
+      CREATE TABLE workbenches (id INTEGER PRIMARY KEY, task_id INTEGER, repo_id INTEGER, path TEXT, branch TEXT, base TEXT, state TEXT, owner TEXT, created_at TEXT, updated_at TEXT, closed_at TEXT);
+      CREATE UNIQUE INDEX idx_workbenches_live ON workbenches(task_id, repo_id) WHERE state IN ('active', 'parked', 'missing');
+      CREATE UNIQUE INDEX idx_workbenches_path ON workbenches(path) WHERE state IN ('active', 'parked', 'missing');`);
+    const q = (sql) => { const st = old.prepare(sql); return /^\s*(SELECT|PRAGMA)/i.test(sql) ? st.all() : (st.run(), []); };
+    const later = require("../agent/schema_later");
+    later.apply(q);
+    later.apply(q);   // and again: nothing to do the second time
+    const defs = old.prepare("SELECT name, sql FROM sqlite_master WHERE name IN ('idx_workbenches_live', 'idx_workbenches_path') ORDER BY name").all();
+    check("both partial indexes now count closing as live", defs.map((d) => d.sql.includes("'closing'")), [true, true]);
+    check("and the closing columns are there", ["closing_mode", "closing_ref", "closing_trash", "closing_at", "closing_actor"].every((col) => old.prepare("PRAGMA table_info(workbenches)").all().some((c) => c.name === col)), true);
+    old.exec("INSERT INTO workbenches (task_id, repo_id, path, branch, base, state) VALUES (1, 1, '/a', 'b', 'main', 'closing')");
+    let dup = null;
+    try { old.exec("INSERT INTO workbenches (task_id, repo_id, path, branch, base, state) VALUES (1, 1, '/b', 'b', 'main', 'active')"); } catch (e) { dup = e.message; }
+    check("so a second live row beside a closing one is refused", /UNIQUE/.test(String(dup)), true);
   }
 
   await viaServer();
@@ -819,7 +905,7 @@ async function main() {
     try {
       await rejects("there is no discard tool, even claiming to be the CLI", agent.call("workbench_discard", { task_id: vt.t.id, typed: String(vt.t.id) }), /Unknown tool/);
       await rejects("the recorder will not mark a folder that is still there",
-        agent.call("workbench_discarded", { task_id: vt.t.id, ref: `refs/delphi/discarded/${vt.t.id}-${vt.wb.id}` }), /still there/);
+        agent.call("workbench_discarded", { task_id: vt.t.id, ref: `refs/delphi/discarded/${vt.t.id}-${vt.wb.id}` }), /not being discarded/);
       check("nothing happened", [exists(path.join(vt.wb.path, "uncommitted.txt")), store.get(vt.wb.id).state], [true, "active"]);
       // G4: an agent cannot remove ignored files by passing ignored_ok.
       const ar = makeRepo("g4agent");
