@@ -71,6 +71,20 @@ inZone("America/New_York", () => {
     T.dayLabel("2026-10-01 02:00:00", lateEvening), "2026-09-30");
   check("dayOf leaves a due date alone", T.dayOf("2026-10-03"), "2026-10-03");
 
+  // Date rolls an impossible day into the next month. A stored typo has to read
+  // as nothing, not as a different deadline.
+  check("31 February is not a day", T.parseStamp("2026-02-31"), null);
+  check("30 February is not a stamp either", T.parseStamp("2026-02-30 10:00:00"), null);
+  check("31 April with a zone is not a stamp", T.parseStamp("2026-04-31T09:00:00Z"), null);
+  check("month 13 is not a day", T.parseStamp("2026-13-01"), null);
+  check("day 00 is not a day", T.parseStamp("2026-10-00"), null);
+  check("29 February in a common year is not a day", T.dayOf("2026-02-29"), null);
+  check("29 February in a leap year is", T.dayOf("2028-02-29"), "2028-02-29");
+  check("dayOf refuses an impossible due date", T.dayOf("2026-02-31"), null);
+  check("an impossible due date has no due state", T.dueState("2026-02-31", lateEvening), null);
+  check("an impossible stamp reads as nothing", T.ago("2026-02-31 10:00:00", now), "");
+  check("a real day round-trips", T.localDay(T.parseStamp("2026-12-31")), "2026-12-31");
+
   check("secondsSince reads UTC", T.secondsSince("2026-10-03 20:59:30", now), 30);
   check("secondsSince never goes negative", T.secondsSince("2026-10-03 21:05:00", now), 0);
   check("secondsSince of garbage is NaN", Number.isNaN(T.secondsSince("nope", now)), true);

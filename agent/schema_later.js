@@ -93,6 +93,36 @@ const LATER_COLUMNS = [
   ["workbenches", "closing_trash", "TEXT"],
   ["workbenches", "closing_at", "TEXT"],
   ["workbenches", "closing_actor", "TEXT"],
+  // A handoff became a job: agent/jobs.js. See schema.sql for each column.
+  ["handoffs", "kind", "TEXT NOT NULL DEFAULT 'ask'"],
+  ["handoffs", "state", "TEXT"],
+  ["handoffs", "source", "TEXT NOT NULL DEFAULT 'handoff'"],
+  ["handoffs", "requested_by", "TEXT"],
+  ["handoffs", "requester_type", "TEXT"],
+  ["handoffs", "approval", "TEXT"],
+  ["handoffs", "approved_by", "TEXT"],
+  ["handoffs", "approved_at", "TEXT"],
+  ["handoffs", "actor", "TEXT"],
+  ["handoffs", "workbench_id", "INTEGER REFERENCES workbenches(id) ON DELETE SET NULL"],
+  ["handoffs", "cwd", "TEXT"],
+  ["handoffs", "runner_pid", "INTEGER"],
+  ["handoffs", "runner_host", "TEXT"],
+  ["handoffs", "agent_pid", "INTEGER"],
+  ["handoffs", "native_session", "TEXT"],
+  ["handoffs", "unguarded", "INTEGER NOT NULL DEFAULT 0"],
+  ["handoffs", "tokens_in", "INTEGER"],
+  ["handoffs", "tokens_out", "INTEGER"],
+  ["handoffs", "cost_usd", "REAL"],
+  ["handoffs", "last_activity", "TEXT"],
+  ["handoffs", "followup", "TEXT"],
+  ["handoffs", "turns", "INTEGER NOT NULL DEFAULT 0"],
+  ["handoffs", "updated_at", "TEXT"],
+  // A person's per project say over what agents may do there unasked.
+  ["projects", "auto_approve", "INTEGER NOT NULL DEFAULT 0"],
+  ["projects", "allow_unguarded", "INTEGER NOT NULL DEFAULT 0"],
+  // Who queued a task, so a job an agent queued waits for a person.
+  ["tasks", "queued_by", "TEXT"],
+  ["tasks", "queued_by_type", "TEXT"],
 ];
 
 // The same text as schema.sql. A table is created here too, rather than left to
@@ -117,8 +147,8 @@ const LATER_TABLES = [
   closing_at    TEXT,
   closing_actor TEXT
 )`],
-  // The file's identity and the app's heartbeat. See agent/identity.js, which
-  // mints the id once this table exists.
+  // The file's identity. See agent/identity.js, which mints the id once this
+  // table exists.
   ["meta", `CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT
@@ -131,6 +161,8 @@ const LATER_TABLES = [
 const LATER_INDEXES = [
   ["idx_comments_ledger", "comments", ["task_id", "promoted"],
    "CREATE INDEX IF NOT EXISTS idx_comments_ledger ON comments(task_id, promoted)"],
+  ["idx_handoffs_state", "handoffs", ["state"],
+   "CREATE INDEX IF NOT EXISTS idx_handoffs_state ON handoffs(state, id)"],
   ["idx_workbenches_task", "workbenches", ["task_id", "state"],
    "CREATE INDEX IF NOT EXISTS idx_workbenches_task ON workbenches(task_id, state)"],
   // Missing and Closing count as live in both. A Missing row is still the

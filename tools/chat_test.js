@@ -20,6 +20,9 @@ const { spawn, spawnSync } = require("child_process");
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "delphi-chat-"));
 process.env.DELPHI_DATA_DIR = dir;
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 process.env.DELPHI_DB = path.join(dir, "delphi.db");
 for (const real of [path.join(os.homedir(), "va", "delphi", "delphi.db"),
                     path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db")]) {
@@ -92,7 +95,9 @@ async function main() {
     const map = chat.claudeSheetMapper((a) => actions.push(a));
     for (const line of fs.readFileSync(path.join(FIX, "claude_turn.jsonl"), "utf8").replace(/\{\{CWD\}\}/g, "/w").split("\n")) map(line);
     map.flush();
-    const shape = actions.filter((a) => a.type !== "session").map((a) => [a.type, a.text || a.command || a.path || a.key, a.code]);
+    // Tokens are counted by the dispatcher, not written on the Sheet, so they are checked on their own.
+    check("the result's usage is one action", actions.filter((a) => a.type === "usage").length, 1);
+    const shape = actions.filter((a) => a.type !== "session" && a.type !== "usage").map((a) => [a.type, a.text || a.command || a.path || a.key, a.code]);
     check("actions in order", shape, [
       ["say", "Looking at the queue first. The status line reads  {id:1 ok}", undefined],
       ["run", "ls", undefined],
@@ -120,7 +125,7 @@ async function main() {
     const map = chat.copilotSheetMapper((a) => actions.push(a));
     for (const line of fs.readFileSync(path.join(FIX, "copilot_turn.jsonl"), "utf8").replace(/\{\{CWD\}\}/g, "/w").split("\n")) map(line);
     map.flush();
-    check("actions in order", actions.map((a) => [a.type, a.text || a.command || a.path || a.key || a.id, a.code]), [
+    check("actions in order", actions.filter((a) => a.type !== "usage").map((a) => [a.type, a.text || a.command || a.path || a.key || a.id, a.code]), [
       ["say", "Checking the build.", undefined],
       ["run", "make build", undefined],
       ["ran", "call_1", 0],

@@ -89,22 +89,51 @@ function migrateLegacyDatabase() {
   ];
 
   for (const source of candidates) {
+    if (!fs.existsSync(source) || locate.samePath(source, DB_PATH)) continue;
     try {
-      if (!fs.existsSync(source) || locate.samePath(source, DB_PATH)) continue;
       ensureDataDir();
-      // COPYFILE_EXCL as the last word on "never over a real one": if anything
-      // made the file between the check above and here, the copy fails.
-      fs.copyFileSync(source, DB_PATH, fs.constants.COPYFILE_EXCL);
-      for (const suffix of ["-wal", "-shm"]) {
-        if (fs.existsSync(source + suffix)) fs.copyFileSync(source + suffix, DB_PATH + suffix);
-      }
-      console.log(`Brought your existing database across from ${source}`);
-      return source;
+      return placeCopy(source) ? source : null;
     } catch (error) {
       console.error(`Could not copy ${source}`, error);
+      return null;
     }
   }
   return null;
+}
+
+/**
+ * Copies one legacy database into place, all or nothing.
+ *
+ * The main file and its write-ahead log, never the -shm: that is an index into
+ * the log for the processes that had it open, and a copy of one describes a log
+ * that is no longer there. Both are copied under temporary names first, with
+ * COPYFILE_EXCL, and only then put in place: the log first, then the database
+ * by link, which like EXCL fails rather than replace a file that appeared in
+ * the meantime. If any step fails, what this placed is taken back, because a
+ * database without its log is the last session's work silently missing.
+ */
+function placeCopy(source) {
+  const tag = `.migrating-${process.pid}`;
+  const tmpDb = DB_PATH + tag;
+  const tmpWal = DB_PATH + tag + "-wal";
+  const hasWal = fs.existsSync(source + "-wal");
+  let placedWal = false;
+  try {
+    fs.copyFileSync(source, tmpDb, fs.constants.COPYFILE_EXCL);
+    if (hasWal) fs.copyFileSync(source + "-wal", tmpWal, fs.constants.COPYFILE_EXCL);
+    if (hasWal) {
+      fs.linkSync(tmpWal, DB_PATH + "-wal");
+      placedWal = true;
+    }
+    fs.linkSync(tmpDb, DB_PATH);
+    console.log(`Brought your existing database across from ${source}`);
+    return true;
+  } catch (error) {
+    if (placedWal) { try { fs.rmSync(DB_PATH + "-wal", { force: true }); } catch {} }
+    throw error;
+  } finally {
+    for (const t of [tmpDb, tmpWal]) { try { fs.rmSync(t, { force: true }); } catch {} }
+  }
 }
 
 module.exports = {

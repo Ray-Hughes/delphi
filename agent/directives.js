@@ -124,14 +124,13 @@ function scratchpadInstructions(project) {
 /** The short form, appended to the descriptions of the tools it bears on. */
 function scratchpadToolNote(project) {
   const where = project
-    ? `Default destination is the "${project.name}" project, project_id ${project.id}, ` +
-      `unless the draft plainly belongs to another project's work.`
+    ? `Default: "${project.name}" (project_id ${project.id}) unless the work plainly belongs elsewhere.`
     : `No default project is set, so pick the project that fits.`;
+  // Short, because it rides on four tool descriptions that every session pays
+  // for. The full directive is in the server's instructions.
   return (
-    ` SCRATCHPAD MODE IS ON: this tracker holds the scratchpad for this session. ` +
-    `Your plan and working document belong here, through write_scratchpad, not in ` +
-    `a temp directory, a scratchpad folder or /tmp. Checkbox lines in a pad become ` +
-    `tasks, so write the plan as checkboxes rather than calling add_task as well. ` +
+    ` SCRATCHPAD MODE IS ON: your plan and working notes go in a pad (write_scratchpad), ` +
+    `not /tmp or a scratchpad folder. Checkbox lines become tasks, so do not add_task them too. ` +
     `${where}`
   );
 }

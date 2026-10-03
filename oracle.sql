@@ -17,10 +17,14 @@ PRAGMA foreign_keys = ON;
 
 -- A thing worth connecting to. Kept separate from the rows that mention it, so
 -- one ticket referenced by four notes is one node rather than four strings.
+-- project, term and code are learned from the user's rows (oracle.js). A table
+-- made before them is dropped and remade by the rebuild, since every row in it
+-- is derived; CREATE IF NOT EXISTS alone would keep the old CHECK forever.
 CREATE TABLE IF NOT EXISTS entities (
   id          INTEGER PRIMARY KEY,
   kind        TEXT NOT NULL
-                CHECK (kind IN ('ticket', 'pr', 'repo', 'service', 'file', 'person', 'env', 'concept')),
+                CHECK (kind IN ('ticket', 'pr', 'repo', 'service', 'file', 'person', 'env', 'concept',
+                              'project', 'term', 'code')),
   name        TEXT NOT NULL,          -- canonical form, e.g. PROJ-1234
   display     TEXT,                   -- what to show if different from the name
   summary     TEXT,                   -- filled in as things are learned about it

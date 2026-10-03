@@ -108,6 +108,17 @@ contextBridge.exposeInMainWorld("delphi", {
     create: (payload) => call("handoffs:create", payload),
     cancel: (id) => call("handoffs:cancel", id),
   },
+  // Jobs, for the Runs panel: handoffs, queued tasks and a person's own
+  // requests, as one list. See agent/jobs.js for a run's shape.
+  runs: {
+    list: (opts) => call("runs:list", opts),
+    get: (id) => call("runs:get", id),
+    create: (payload) => call("runs:create", payload),
+    approve: (id) => call("runs:approve", id),
+    reject: (id, why) => call("runs:reject", id, why),
+    stop: (id) => call("runs:stop", id),
+    reply: (id, message) => call("runs:reply", id, message),
+  },
   locks: {
     list: (projectId) => call("locks:list", projectId),
     release: (projectId, key, holder) => call("locks:release", projectId, key, holder),
@@ -246,6 +257,8 @@ contextBridge.exposeInMainWorld("delphi", {
   onSheetRunOutput: (fn) => ipcRenderer.on("sheet-run-output", (_e, payload) => fn(payload)),
   onSheetRunDone: (fn) => ipcRenderer.on("sheet-run-done", (_e, payload) => fn(payload)),
   onWorkbenchEvent: (fn) => ipcRenderer.on("workbench-event", (_e, payload) => fn(payload)),
+  // A job changed: { id, state, project_id }. Fetch the list again.
+  onRunsChanged: (fn) => ipcRenderer.on("runs-changed", (_e, payload) => fn(payload)),
   // A task with a live Workbench was marked done in the app: offer Finish.
   // { taskId, workbenchId, taskTitle, path, branch, state }
   onWorkbenchPrompt: (fn) => ipcRenderer.on("workbench-prompt", (_e, payload) => fn(payload)),

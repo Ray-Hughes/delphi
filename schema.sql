@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS projects (
   -- a value on a new install and accept it on an old one. Validated in db.js,
   -- where every database behaves the same.
   task_view   TEXT NOT NULL DEFAULT 'list',
+  -- Whether a job an agent asks for here starts without a person approving it.
+  -- Off by default: an agent setting another agent to work is the loop a
+  -- person is there to see.
+  auto_approve    INTEGER NOT NULL DEFAULT 0,
+  -- Whether a job may run where agent/guard.py cannot see its commands
+  -- (Copilot always, Claude Code when the hook is not installed). A person's
+  -- decision per project, never a default.
+  allow_unguarded INTEGER NOT NULL DEFAULT 0,
   sort_order  INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
@@ -80,6 +88,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- someone made; a claim is a lease an agent took and can lose.
   claimed_by   TEXT,
   claim_expires TEXT,
+  -- Who put it in the queue, and what kind of writer that was. A queue named
+  -- after a harness is run by the app's dispatcher, and a job an agent queued
+  -- waits for a person; NULL is treated as an agent, because asking is the
+  -- safe mistake.
+  queued_by      TEXT,
+  queued_by_type TEXT,
   -- A person's marker for the card. Declared here as well as in
   -- agent/schema_later.js because a new database gets this definition after
   -- schema_later has run, so without it a fresh install had no colour column
@@ -549,10 +563,48 @@ CREATE TABLE IF NOT EXISTS handoffs (
   wake            INTEGER NOT NULL DEFAULT 1,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   started_at      TEXT,
-  finished_at     TEXT
+  finished_at     TEXT,
+  -- A handoff is now one kind of job, the unit of agent work the dispatcher
+  -- runs (agent/jobs.js, agent/dispatch.js); a task queued for an agent and a
+  -- person's own request are the others. The same table rather than a second
+  -- one, so every reader of handoffs keeps working.
+  --
+  -- ask reads and answers; do changes code, and only ever in a Workbench.
+  kind            TEXT NOT NULL DEFAULT 'ask',
+  -- The job's real state: queued, needs_approval, running, waiting_on_human,
+  -- done, failed, stopped. No CHECK, because status above has one that cannot
+  -- be widened, and status is kept in step with this for older readers. NULL
+  -- on a row an older server wrote; agent/jobs.js reads that from status.
+  state           TEXT,
+  source          TEXT NOT NULL DEFAULT 'handoff',   -- handoff, queue or person
+  requested_by    TEXT,
+  requester_type  TEXT,                              -- human, agent or tool
+  -- pending, approved, rejected, auto (the project lets agents start work), or
+  -- not_needed (a person asked).
+  approval        TEXT,
+  approved_by     TEXT,
+  approved_at     TEXT,
+  actor           TEXT,                              -- who the agent writes as
+  workbench_id    INTEGER REFERENCES workbenches(id) ON DELETE SET NULL,
+  cwd             TEXT,
+  -- The process running it, so a restart can tell a job whose app died from
+  -- one another app is still running.
+  runner_pid      INTEGER,
+  runner_host     TEXT,
+  agent_pid       INTEGER,
+  native_session  TEXT,                              -- the harness's id, for a reply
+  unguarded       INTEGER NOT NULL DEFAULT 0,
+  tokens_in       INTEGER,
+  tokens_out      INTEGER,
+  cost_usd        REAL,
+  last_activity   TEXT,
+  followup        TEXT,                              -- a person's reply, not yet sent
+  turns           INTEGER NOT NULL DEFAULT 0,
+  updated_at      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status, id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_state ON handoffs(state, id);
 CREATE INDEX IF NOT EXISTS idx_handoffs_project ON handoffs(project_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_handoffs_from ON handoffs(from_session_id, status);
 
@@ -624,9 +676,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_path
 -- agent/identity.js), and never changed: it is how the app, `delphi doctor`
 -- and an agent's whoami can tell two databases apart, and how a server the app
 -- launched refuses to write to any file but the one it was launched for. The
--- app's heartbeat lives here too, so an agent can be told whether anything will
--- dispatch its handoff. Key and value, because these are a handful of facts
--- about the file, not rows of anything.
+-- app's heartbeat is deliberately not here: a write every 30 seconds would look
+-- to every other connection like an agent's write (see agent/identity.js). Key
+-- and value, because these are a handful of facts about the file, not rows.
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT

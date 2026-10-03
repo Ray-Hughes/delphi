@@ -153,6 +153,32 @@ async function embed(text) {
   return { vector: lexicalVector(text), model: p.name, dims: LEXICAL_DIMS };
 }
 
+/**
+ * One query's vector from Ollama, or null, quickly.
+ *
+ * For the MCP server, which asks on every oracle_ask and search. embed() above
+ * waits up to twenty seconds and falls back to a lexical vector, which is right
+ * for indexing and wrong here: an agent waiting on a model that is not running
+ * is paying for nothing, and a lexical vector compared with neural ones is
+ * noise. So this gives up after a short timeout, and remembers for half a
+ * minute that Ollama did not answer, so a session of searches with it stopped
+ * pays the timeout once rather than every time.
+ */
+let queryDownUntil = 0;
+async function embedQuery(text, { timeoutMs = Number(process.env.DELPHI_EMBED_TIMEOUT_MS) || 1500 } = {}) {
+  if (Date.now() < queryDownUntil) return null;
+  try {
+    const r = await post(`${OLLAMA}/api/embeddings`, { model: MODEL, prompt: String(text).slice(0, NEURAL_CHAR_LIMIT) }, timeoutMs);
+    if (r && Array.isArray(r.embedding) && r.embedding.length) {
+      return { model: `ollama:${MODEL}`, vector: normalise(Float32Array.from(r.embedding)) };
+    }
+  } catch {
+    // Not running, not pulled, or too slow. The caller ranks without it.
+  }
+  queryDownUntil = Date.now() + 30000;
+  return null;
+}
+
 const toBlob = (v) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
 const fromBlob = (b) => new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4);
 
@@ -278,4 +304,4 @@ function status(db) {
   return { models: rows, total: rows.reduce((n, r) => n + r.n, 0) };
 }
 
-module.exports = { embed, reindex, nearest, similarity, provider, status, fromBlob };
+module.exports = { embed, embedQuery, reindex, nearest, similarity, provider, status, fromBlob };

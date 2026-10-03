@@ -17,6 +17,9 @@ const { execFileSync } = require("child_process");
 
 const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "delphi-main-ipc-")));
 process.env.DELPHI_DATA_DIR = path.join(dir, "data");
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 process.env.DELPHI_DB = path.join(dir, "data", "delphi.db");
 fs.mkdirSync(process.env.DELPHI_DATA_DIR);
 for (const real of [path.join(os.homedir(), "va", "delphi", "delphi.db"),
@@ -240,7 +243,7 @@ async function main() {
     await call("settings:set", { checkoutNoticeSeen: info.checkoutDbIgnored });
     check("once acknowledged, the notice is no longer due", (await call("app:dataInfo")).checkoutNoticeDue, false);
   }
-  const beat = require("../agent/identity").appState((s) => db.handle().prepare(s).all(), { isAlive: require("../sheet/store").pidAlive });
+  const beat = require("../agent/identity").appState(locate.resolve(), { isAlive: require("../sheet/store").pidAlive, processes: () => [] });
   check("the app has written its heartbeat, so agents see it running", [beat.running, beat.pid], [true, process.pid]);
 
   section("refusals keep their code");

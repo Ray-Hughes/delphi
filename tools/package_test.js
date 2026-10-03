@@ -495,7 +495,8 @@ async function main() {
   const dbPath = path.join(dataDir, "delphi.db");
   const env = { ...process.env, DELPHI_DATA_DIR: dataDir, DELPHI_DB: dbPath };
   delete env.ELECTRON_RUN_AS_NODE;
-  for (const name of ["DELPHI_ACTOR", "DELPHI_SESSION", "DELPHI_PROJECT", "DELPHI_WORKBENCH", "DELPHI_CLIENT"]) delete env[name];
+  for (const name of ["DELPHI_ACTOR", "DELPHI_SESSION", "DELPHI_PROJECT", "DELPHI_WORKBENCH", "DELPHI_CLIENT", "DELPHI_DB_ID"]) delete env[name];
+  delete process.env.DELPHI_DB_ID;
 
   try {
     section("electron-builder.config.js");

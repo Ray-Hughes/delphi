@@ -18,6 +18,9 @@ const path = require("path");
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "delphi-pad-"));
 process.env.DELPHI_DATA_DIR = dir;
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 
 const db = require("../db");
 const pads = require("../pads");

@@ -13,6 +13,9 @@ const state = {
   wsProjects: [],
   // Workspace id to the ids of the projects in it, for the sidebar's tree.
   wsMembers: new Map(),
+  // Project id to the workspace it is drawn under in full: its primary one,
+  // else the first that holds it. The others show a pointer row instead.
+  wsHome: new Map(),
   projectId: null,     // null means the All view
   view: "new",         // new | overview | tasks | notes | links | history | settings
   showDone: false,
@@ -471,6 +474,13 @@ async function refresh() {
   // workspaces and the tree has to know which project sits under which.
   const members = await Promise.all(state.workspaces.map((w) => window.delphi.workspaces.projects(w.id)));
   state.wsMembers = new Map(state.workspaces.map((w, i) => [w.id, members[i].map((p) => p.id)]));
+  state.wsHome = new Map();
+  state.workspaces.forEach((w, i) => {
+    for (const p of members[i]) if (p.is_primary && !state.wsHome.has(p.id)) state.wsHome.set(p.id, w.id);
+  });
+  state.workspaces.forEach((w, i) => {
+    for (const p of members[i]) if (!state.wsHome.has(p.id)) state.wsHome.set(p.id, w.id);
+  });
   state.wsProjects = state.workspaceId
     ? members[state.workspaces.findIndex((w) => w.id === state.workspaceId)] || []
     : [];
@@ -708,8 +718,10 @@ function renderSidebar() {
  * Every project, under the workspace it belongs to, then the rest.
  *
  * A project in two workspaces is listed under both, because each is a true
- * answer to "what is in this folder". The counts are open tasks, the number
- * that says whether a project needs looking at.
+ * answer to "what is in this folder", but drawn in full only under its home
+ * one. Drawn in full twice, the open project's sessions appeared twice, with
+ * two "+ New session" rows and two places claiming to be where you are. The
+ * counts are open tasks, the number that says whether a project needs looking at.
  */
 function renderProjectTree(box) {
   const counted = new Set();
@@ -742,7 +754,11 @@ function renderProjectTree(box) {
     const kids = el("div", { className: "gkids" });
     for (const p of inside) {
       counted.add(p.id);
-      kids.append(...projectRows(p, () => openProjectIn(p, w.id)));
+      const home = state.wsHome.get(p.id);
+      const homeName = (state.workspaces.find((x) => x.id === home) || {}).name;
+      kids.append(...(home === w.id || !homeName
+        ? projectRows(p, () => openProjectIn(p, w.id))
+        : [echoRow(p, homeName, () => openProjectIn(p, home))]));
     }
     box.append(kids);
   }
@@ -817,6 +833,23 @@ function projectRows(p, open) {
     kids.append(srow);
   }
   return [row, kids];
+}
+
+/**
+ * A project's second mention, under a workspace that is not its home: the name,
+ * dimmed, and where it lives in full. Never marked current and never given the
+ * sessions, so there is one of each on screen. Opens the project at home.
+ */
+function echoRow(p, homeName, open) {
+  const row = el("div", { className: "gs echo", tabIndex: 0, role: "button",
+    title: `${p.name}\nAlso in ${homeName}, where its sessions are` });
+  row.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }));
+  row.append(el("span", { className: "nm dim", textContent: p.name }));
+  row.append(el("span", { className: "kbd", textContent: `in ${homeName}` }));
+  row.onclick = open;
+  row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+  row.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
+  return row;
 }
 
 /** The settings button for a project open outside any workspace. */
@@ -2397,6 +2430,10 @@ const MIND_MAP_KINDS = [
   ["env", "Environments", "--graph-env"],
   ["person", "People", "--graph-person"],
   ["pr", "Pull requests", "--graph-pr"],
+  // Learned from the user's own rows rather than listed (oracle.js).
+  ["project", "Projects", "--graph-project"],
+  ["term", "Terms", "--graph-term"],
+  ["code", "Code", "--graph-code"],
 ];
 
 const MIND_MAP_LIMITS = [40, 60, 100, 250];
@@ -6958,10 +6995,29 @@ async function paintDataInfo(section, dl) {
   pathRow("Settings", dir ? `${dir.replace(/[\\/]+$/, "")}/settings.json` : null);
   dl.append(el("dt", { textContent: "History" }), el("dd", { textContent: "Every change is recorded and can be reversed." }));
 
-  if (info && info.checkoutDbIgnored) {
-    const other = typeof info.checkoutDbIgnored === "string" ? info.checkoutDbIgnored : "the checkout";
-    section.append(el("p", { className: "data-warn", role: "status",
-      textContent: `A second database at ${other} is not used. Merge it or delete it.` }));
+  // Shown until acknowledged, then not again for that path. A notice on every
+  // visit is one people learn to scroll past, which is worse than none. The
+  // wording never says delete: the other file holds work this one lacks, and
+  // removing it before merging is the one way to lose that work for good.
+  if (info && info.checkoutNoticeDue && typeof info.checkoutDbIgnored === "string") {
+    const other = info.checkoutDbIgnored;
+    const note = el("div", { className: "data-warn", role: "status" });
+    note.append(el("span", {
+      textContent: `A second database at ${other} holds work this one doesn't have. It isn't used. Merge it in before removing it.`,
+    }));
+    const seen = el("button", { className: "btn sm", type: "button", textContent: "Got it" });
+    seen.onclick = async () => {
+      seen.disabled = true;
+      try {
+        await window.delphi.settings.set({ checkoutNoticeSeen: other });
+        note.remove();
+      } catch (error) {
+        seen.disabled = false;
+        notifyError(error);
+      }
+    };
+    note.append(seen);
+    section.append(note);
   }
 }
 

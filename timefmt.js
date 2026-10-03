@@ -27,6 +27,23 @@
   const pad2 = (n) => String(n).padStart(2, "0");
   const DAY_ONLY = /^\d{4}-\d{2}-\d{2}$/;
   const HAS_ZONE = /(?:[zZ]|[+-]\d{2}:?\d{2})$/;
+  const LEADING_DAY = /^(\d{4})-(\d{2})-(\d{2})/;
+
+  /**
+   * Whether text that starts with YYYY-MM-DD names a day that exists. Date is
+   * lenient and rolls 31 February over to 3 March without a word, so a typo in
+   * a due date would otherwise become a real, different, deadline. Checked on
+   * the calendar in UTC, where no clock change can move the answer. Text that
+   * does not start with a day is left for Date to judge.
+   */
+  function realDay(text) {
+    const m = LEADING_DAY.exec(text);
+    if (!m) return true;
+    const [y, mo, d] = [+m[1], +m[2], +m[3]];
+    const at = new Date(Date.UTC(2000, mo - 1, d));
+    at.setUTCFullYear(y);
+    return at.getUTCFullYear() === y && at.getUTCMonth() === mo - 1 && at.getUTCDate() === d;
+  }
 
   /**
    * A stored stamp as a Date, or null when there is nothing usable.
@@ -41,9 +58,11 @@
     if (value instanceof Date) return Number.isFinite(value.getTime()) ? value : null;
     if (typeof value === "number") return Number.isFinite(value) ? new Date(value) : null;
     const text = String(value).trim();
+    if (!realDay(text)) return null;
     let at;
     if (DAY_ONLY.test(text)) {
-      at = new Date(+text.slice(0, 4), +text.slice(5, 7) - 1, +text.slice(8, 10));
+      at = new Date(2000, +text.slice(5, 7) - 1, +text.slice(8, 10));
+      at.setFullYear(+text.slice(0, 4));
     } else {
       const iso = text.replace(" ", "T");
       at = new Date(HAS_ZONE.test(iso) ? iso : `${iso}Z`);
@@ -65,7 +84,7 @@
   function dayOf(value) {
     if (value == null || value === "") return null;
     const text = String(value).trim();
-    if (DAY_ONLY.test(text)) return text;
+    if (DAY_ONLY.test(text)) return realDay(text) ? text : null;
     const at = parseStamp(value);
     return at ? localDay(at) : null;
   }

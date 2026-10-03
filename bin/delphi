@@ -1083,11 +1083,26 @@ function delphiEntries(servers) {
 /** Where one registered entry's server would land, and whether that is this database. */
 function judgeEntry(agent, where, name, entry, resolved, dbId) {
   const env = (entry.env && typeof entry.env === "object") ? entry.env : {};
-  const lands = locate.resolve({ env: { DELPHI_DB: env.DELPHI_DB, DELPHI_DATA_DIR: env.DELPHI_DATA_DIR } });
+  // The entry's env over this process's, less the Delphi variables this shell
+  // happens to carry: a client starts the server with roughly the person's
+  // environment (XDG_CONFIG_HOME, APPDATA and all) plus what the entry adds.
+  const base = {};
+  for (const [k, v] of Object.entries(process.env)) if (!k.startsWith("DELPHI_")) base[k] = v;
+  const lands = locate.resolve({ env: { ...base, ...env } });
   const args = Array.isArray(entry.args) ? entry.args.map(String) : [];
   const server = args.find((a) => /mcp_server\.js$/.test(a)) || null;
   const problems = [];
   if (server && !fs.existsSync(server)) problems.push("its server file " + server + " does not exist");
+  // Resolved against whatever folder the client starts the server in, which
+  // is not this one and is not the same from one session to the next.
+  for (const key of ["DELPHI_DB", "DELPHI_DATA_DIR"]) {
+    if (env[key] && !path.isAbsolute(String(env[key]))) problems.push("its " + key + " " + env[key] + " is relative, so where it lands depends on the folder the client starts in");
+  }
+  // A server from before the shared resolver decides by its own rule (it
+  // preferred the installed copy), so where it lands is only a guess here.
+  if (server && fs.existsSync(server) && !fs.existsSync(path.join(path.dirname(server), "locate.js"))) {
+    problems.push("its server " + server + " is an older one without agent/locate.js beside it, so the database it picks may differ from the one shown");
+  }
   const same = locate.samePath(lands.dbPath, resolved.dbPath);
   if (!same) problems.push("it writes to " + lands.dbPath + ", not " + resolved.dbPath);
   if (env.DELPHI_DB_ID && dbId && env.DELPHI_DB_ID !== dbId) problems.push("its DELPHI_DB_ID " + env.DELPHI_DB_ID + " is not this database's, so its server will refuse to start");
@@ -1216,7 +1231,9 @@ async function doctor(args) {
   if (w) {
     line("id", w.db_id || "none yet");
     if (w.db_created_at) line("id since", w.db_created_at);
-    line("app", w.app_running ? "running (pid " + w.app.pid + ", checked in " + w.app.age_seconds + "s ago)" : "not running. " + w.app.reason + " Handoffs wait until it is.");
+    line("app", w.app_running === true ? "running (pid " + w.app.pid + ", checked in " + w.app.age_seconds + "s ago)"
+      : w.app_running === false ? "not running. " + w.app.reason + " Handoffs wait until it is."
+        : "not certain. " + w.app.reason);
     line("you are", w.actor + " (" + w.author_type + ")");
     line("route", w.sqlite_route);
   }

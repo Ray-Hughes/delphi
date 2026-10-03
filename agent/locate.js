@@ -27,6 +27,7 @@
  * editor launched it with, and it can be read from outside app.asar.
  */
 
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -101,26 +102,32 @@ function resolve({ env = process.env, platform = process.platform, home = os.hom
  */
 function ignoredNotice(resolved) {
   if (!resolved.checkoutDbIgnored) return null;
+  // Never "delete it". The checkout copy is where an unpackaged app wrote for
+  // months, so it holds work the other one does not have.
   return `delphi: a database exists beside the source at ${resolved.checkoutDbIgnored}, and it is not used. ` +
-    `Delphi uses ${resolved.dbPath}. Nothing reads or writes the checkout copy any more; ` +
-    `move it aside once anything in it you still want has been brought across.`;
+    `Delphi uses ${resolved.dbPath}. Merge it into this one (delphi merge, coming) before removing it. ` +
+    `It holds work this one doesn't have.`;
 }
 
 /**
  * Where Electron keeps its own profile (cookies, local storage, the
  * single-instance lock) for this data folder.
  *
- * null means leave Electron's default alone, which is the per-user folder
- * itself. A data folder chosen by override gets a profile inside it instead, so
- * the single-instance lock is per database: two apps on one database cannot
- * run, while a test's hidden app on a temp folder, or a developer's app on a
- * separate dev folder, never collides with the one in use. An override that
- * names the per-user folder anyway is the same database, so it keeps the
- * default profile and the same lock.
+ * null means the per-user folder itself, for the per-user database however it
+ * was named. Any other database gets a profile of its own in its data folder,
+ * named by a hash of the database's path rather than by the folder, so the
+ * single-instance lock is per database: two apps on one file cannot run, while
+ * a test's hidden app, a dev copy, or DELPHI_DB naming a second file in the
+ * same folder never collides with the app in use.
  */
 function electronProfileDir(resolved) {
-  if (resolved.source === "default" || samePath(resolved.dataDir, resolved.conventional)) return null;
-  return path.join(resolved.dataDir, "electron-profile");
+  const real = (p) => {
+    try { return path.join(fs.realpathSync(path.dirname(p)), path.basename(p)); } catch { return path.resolve(p); }
+  };
+  const dbPath = real(resolved.dbPath);
+  if (dbPath === real(path.join(resolved.conventional, DB_FILE))) return null;
+  const hash = crypto.createHash("sha1").update(dbPath).digest("hex").slice(0, 10);
+  return path.join(resolved.dataDir, `electron-profile-${hash}`);
 }
 
 module.exports = { APP_NAME, DB_FILE, CHECKOUT_DIR, conventionalDataDir, resolve, ignoredNotice, electronProfileDir, samePath };

@@ -517,6 +517,9 @@
     --graph-env:     var(--warn);
     --graph-person:  color-mix(in srgb, var(--crit) 75%, var(--warn));
     --graph-pr:      color-mix(in srgb, var(--warn) 60%, var(--accent));
+    --graph-project: var(--ink);
+    --graph-term:    color-mix(in srgb, var(--accent) 55%, var(--good));
+    --graph-code:    color-mix(in srgb, var(--ink-faint) 60%, var(--accent));
   }
 
   .mm-tools { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; margin-bottom: var(--s3); }
@@ -738,8 +741,10 @@
   .kv dd.data-path .mono { overflow-wrap: anywhere; min-width: 0; }
   .data-warn {
     margin: var(--s3) 0 0; padding: var(--s2) var(--s3); font-size: 12px;
+    display: flex; align-items: baseline; gap: var(--s3);
     color: var(--warn); border: 1px solid var(--warn); border-radius: var(--r-sm);
   }
+  .data-warn .btn { flex: 0 0 auto; white-space: nowrap; }
 
   .field { width: 100%; padding: 7px 10px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--bg); outline: none; }
   .field:focus { border-color: var(--accent); background: var(--surface); }

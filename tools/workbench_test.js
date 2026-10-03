@@ -20,6 +20,9 @@ const { execFileSync, spawnSync } = require("child_process");
 
 const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "delphi-workbench-")));
 process.env.DELPHI_DATA_DIR = path.join(dir, "data");
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 process.env.DELPHI_DB = path.join(dir, "data", "delphi.db");
 fs.mkdirSync(process.env.DELPHI_DATA_DIR);
 for (const real of [path.join(os.homedir(), "va", "delphi", "delphi.db"),
@@ -494,7 +497,9 @@ async function mcp(t1) {
   await agent.start();
   try {
     const names = (await agent.request("tools/list", {})).tools.map((t) => t.name);
-    for (const t of ["workbench_start", "workbench_status", "workbench_finish", "workbench_list"]) check(`${t} is listed`, names.includes(t), true);
+    for (const t of ["workbench_start", "workbench_finish", "workbench_list"]) check(`${t} is listed`, names.includes(t), true);
+    // Folded into workbench_list's task_id, and still callable by name.
+    check("workbench_status is not listed", names.includes("workbench_status"), false);
     check("no discard tool is listed", names.filter((n) => /discard/.test(n)), []);
     check("nor any of the command line's own", names.filter((n) => /^workbench_(park|commit|push|forget|housekeep)/.test(n)), []);
     await rejects("internal tools refuse anyone but the command line", agent.call("workbench_discard", { task_id: t1.id, typed: String(t1.id) }), /Unknown tool workbench_discard/);

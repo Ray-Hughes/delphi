@@ -45,12 +45,11 @@ app.setName("Delphi");
 //
 // Electron's lock is per userData folder, so the folder is chosen to make the
 // lock per database: the per-user folder for the per-user database, set
-// explicitly so a checkout and the installed app share it, and a profile inside
-// the data folder when one is chosen by DELPHI_DATA_DIR or DELPHI_DB. That
-// keeps the lock rather than skipping it under an override, so a developer's
-// dev copy still cannot run twice, while a test's hidden app on its own temp
-// folder, or a dev copy beside the real one, never collides with the app in
-// use. It also stops those sharing the real app's cookies and local storage.
+// explicitly so a checkout and the installed app share it, and for any other
+// database a profile named by a hash of its path. That keeps the lock rather
+// than skipping it under an override, so a developer's dev copy still cannot
+// run twice, while a test's hidden app, a dev copy, or a second file in the
+// same folder never collides with the app in use. It also stops those sharing the real app's cookies and local storage.
 // See agent/locate.js electronProfileDir.
 {
   const profile = locate.electronProfileDir(paths.RESOLVED);
@@ -119,6 +118,12 @@ let settings = {
   // notice in Settings is shown once per file rather than on every visit.
   // null means not yet acknowledged. See app:dataInfo.
   checkoutNoticeSeen: null,
+  // The dispatcher (agent/dispatch.js): how many jobs run at once in all, how
+  // many per harness (a key missing here means 1, because subscriptions
+  // throttle), and how long one may run before it is stopped.
+  jobConcurrency: 3,
+  jobHarnessLimits: {},
+  jobTimeoutMinutes: 60,
 };
 let schedulerTimer = null;
 let vaultTimer = null;
@@ -682,6 +687,14 @@ app.whenReady().then(() => {
   } catch (error) {
     console.error("sweeping lost runs", error);
   }
+  // Jobs the last app was running when it died are failed as interrupted,
+  // with a note on their Sheet, and never rerun on their own.
+  try {
+    const interrupted = dispatcher.recover();
+    if (interrupted.length) console.log(`marked ${interrupted.length} interrupted jobs`);
+  } catch (error) {
+    console.error("recovering jobs", error);
+  }
   benches.housekeep().then((report) => {
     if ((report.missing.length || report.restored.length || report.adopted.length || (report.reconciled || []).length) && win && !win.isDestroyed()) {
       win.webContents.send("db-changed");
@@ -882,18 +895,24 @@ function watchForExternalWrites() {
 /**
  * Tells agents a Delphi app is running against this database.
  *
- * A row in meta, rewritten every 30 seconds. whoami and handoff_send read it,
- * so an agent handing work over is told whether anything will dispatch it now,
- * instead of being promised a wake-up by an app that is not running. Its own
- * timer rather than the scheduler's, whose interval is a setting a person can
- * stretch to minutes. One small write; this app's own writes do not move
- * PRAGMA data_version, so checkForExternalWrites does not react to it.
+ * A small file beside the database (agent/identity.js aliveFile), replaced
+ * every 30 seconds. whoami and handoff_send read it, so an agent handing work
+ * over is told whether anything will dispatch it now, instead of being promised
+ * a wake-up by an app that is not running. A file and not a row: a row is a
+ * write every other connection sees through PRAGMA data_version, and another
+ * Delphi on the same file took each beat for an agent's write and refreshed
+ * everything. Its own timer rather than the scheduler's, whose interval is a
+ * setting a person can stretch to minutes.
+ *
+ * db_id is the one this app's open handle reports, so a server refusing a
+ * mismatched DELPHI_DB_ID can tell when it is this app that is on a stale file.
  */
 let heartbeatTimer = null;
 function startHeartbeat() {
+  const started = new Date().toISOString();
   const beat = () => {
     try {
-      db.appBeat({ version: app.getVersion() });
+      identity.writeAlive(paths.RESOLVED, { version: app.getVersion(), dbId: db.identity().db_id, started });
     } catch (error) {
       console.error("could not write the app heartbeat", error);
     }
@@ -943,6 +962,9 @@ app.on("before-quit", () => {
     try { sheets.update(entryId, { meta: { state: "fail", code: "quit", exit: null } }); } catch {}
   }
   appRuns.clear();
+  // Running jobs the same: their agents are stopped and their rows say
+  // interrupted now, rather than at the next start's recovery.
+  try { dispatcher.shutdown("Delphi quit"); } catch {}
 });
 app.on("will-quit", () => globalShortcut.unregisterAll());
 // Taken away on the way out, so an agent is told at once that nothing is
@@ -952,7 +974,7 @@ app.on("will-quit", () => {
   if (!heartbeatTimer) return;
   clearInterval(heartbeatTimer);
   heartbeatTimer = null;
-  try { db.appBeatClear(); } catch {}
+  try { identity.clearAlive(paths.RESOLVED); } catch {}
 });
 
 // ---------------------------------------------------------------------------
@@ -1706,128 +1728,99 @@ handle("harness:start", ({ sessionId, prompt, system, autoAllow }) =>
   runTurn({ sessionId, prompt, system, autoAllow }).then(() => ({ ok: true })));
 
 // ---------------------------------------------------------------------------
-// Handoffs
+// Jobs
 //
-// An agent asking another agent. The MCP server can only write the row: it runs
-// in a separate process with no registry and no window, so it cannot spawn
-// anything. This is the half that reads those rows and runs them, and it is here
-// because this is where the harnesses already live.
+// One unit of agent work, whoever asked for it: a handoff an agent sent, a task
+// queued for a harness, or a person's own request. The MCP server can only
+// write the rows: it runs in a separate process with no window, so it cannot
+// spawn anything. agent/dispatch.js is the half that runs them, several at
+// once, each code-changing one in its own Workbench, with a person approving
+// what agents asked for. It is here because this is where the harnesses live.
 
-handle("handoffs:list", (opts) => db.listHandoffs(opts || {}));
-handle("handoffs:create", (payload) => {
-  const created = db.createHandoff(payload);
-  // Straight away rather than at the next sweep. A minute of nothing happening
-  // is how a feature like this gets a reputation for not working.
-  setTimeout(dispatchHandoffs, 50);
-  return created;
+const { createDispatcher } = require("./agent/dispatch");
+const { makeWorkbenchStore: makeJobBenchStore } = require("./workbench/store");
+// Its own Workbench verbs, attributed to Delphi rather than to "you": a
+// Workbench a job started was started by the dispatcher, on a person's say-so.
+const jobBenches = createWorkbench({
+  store: makeJobBenchStore({ sql: db.sqlP, actor: "delphi" }),
+  sheet: makeSheetStore({ sql: db.sqlP, actor: "delphi", authorType: "tool" }),
+  runEntry: sheetRun.runEntry,
+  logDir: SHEET_LOG_DIR,
+  settings: () => settings,
+  onEvent: (event) => {
+    if (win && !win.isDestroyed()) win.webContents.send("workbench-event", event);
+  },
 });
-handle("handoffs:cancel", (id) => db.updateHandoff(id, { status: "cancelled" }));
+const dispatcher = createDispatcher({
+  sql: db.sqlP,
+  benches: jobBenches,
+  logDir: SHEET_LOG_DIR,
+  dbPath: db.DB_PATH,
+  dbId: () => db.identity().db_id,
+  settings: () => settings,
+  onChange: (change) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("runs-changed", change);
+      // The Sheet a job writes on is open in a task panel more often than not.
+      win.webContents.send("db-changed");
+    }
+    scheduleVaultExport();
+  },
+  // The wake. The sender's turn ended minutes ago, so the only way it learns
+  // the answer is to be given a turn of its own, which is what a timer is for.
+  onFinished: (run) => {
+    if (run.state === "done" && run.wake && run.from_session_id) {
+      db.createAlert({
+        sessionId: run.from_session_id,
+        kind: "harvest",
+        fireAt: new Date().toISOString().slice(0, 19).replace("T", " "),
+        payload: { handoffId: run.id },
+      });
+      setTimeout(fireTimers, 50);
+    }
+  },
+});
+
+// opts: { projectId, states, taskId, limit }. Newest first.
+handle("runs:list", (opts = {}) => dispatcher.list({
+  projectId: opts && opts.projectId != null ? opts.projectId : null,
+  states: opts && Array.isArray(opts.states) ? opts.states : null,
+  taskId: opts && opts.taskId != null ? opts.taskId : null,
+  limit: (opts && opts.limit) || 100,
+}));
+handle("runs:get", (id) => dispatcher.get(id));
+// A person's own request: it runs without approval. Refused at once, with the
+// sentence that says what to set, when the project has nowhere to run it.
+handle("runs:create", (payload = {}) => dispatcher.create({
+  projectId: payload.projectId, harness: payload.harness, request: payload.request,
+  taskId: payload.taskId ?? null, kind: payload.kind || "ask", context: payload.context ?? null,
+}, { by: "you", type: "human" }));
+handle("runs:approve", (id) => dispatcher.approve(id, { by: "you" }));
+handle("runs:reject", (id, why) => dispatcher.reject(id, { by: "you", why: why ?? null }));
+handle("runs:stop", (id) => dispatcher.stop(id, { by: "you" }));
+handle("runs:reply", (id, message) => dispatcher.reply(id, message, { by: "you" }));
+
+// The older channels, kept for the window that still calls them.
+handle("handoffs:list", (opts) => db.listHandoffs(opts || {}));
+handle("handoffs:create", (payload = {}) => dispatcher.create({
+  projectId: payload.projectId, harness: payload.toHarness, request: payload.request,
+  taskId: payload.taskId ?? null, kind: payload.kind || "ask", context: payload.context ?? null,
+  wake: payload.wake === true, fromSessionId: payload.fromSessionId ?? null,
+}, { by: "you", type: "human" }));
+handle("handoffs:cancel", (id) => {
+  const run = dispatcher.get(id);
+  return run && run.state === "needs_approval" ? dispatcher.reject(id, { by: "you" }) : dispatcher.stop(id, { by: "you" });
+});
 handle("locks:list", (projectId) => db.listLocks(projectId ?? null));
 handle("locks:release", (projectId, key, holder) => db.releaseLock({ projectId, key, holder }));
 
-// One dispatch at a time. Two overlapping passes would both see the same queued
-// row and run it twice, and "twice" here means two agents doing the same work in
-// the same folder.
-let dispatching = false;
-
-async function dispatchHandoffs() {
-  if (dispatching) return;
-  dispatching = true;
-  try {
-    for (const handoff of db.pendingHandoffs()) {
-      try {
-        await runHandoff(handoff);
-      } catch (error) {
-        db.updateHandoff(handoff.id, { status: "failed", reply: String(error.message || error) });
-      }
-    }
-  } finally {
-    dispatching = false;
-    if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
-  }
-  // The wake, straight after the work. Outside the guard so a wake that itself
-  // hands something off does not deadlock against the pass that is still
-  // holding it.
-  await fireTimers();
-}
-
 /**
- * Runs one handoff, in the receiving agent's own session.
- *
- * Its own session rather than a throwaway, so "ask Codex" means the same Codex
- * that has been working this project all week and knows what it looked at an
- * hour ago. That continuity is most of the value: a reviewer with no memory of
- * the codebase is a worse reviewer.
+ * A dispatch pass, then any wakes that are due. The pass only starts jobs and
+ * never waits on one, so calling it from every external write is cheap.
  */
-// How many handoffs one project may finish in an hour before Delphi stops
-// running them by itself. Two agents that each wake the other are a loop that
-// spends money at machine speed with nobody watching, and a limit somebody has
-// to raise deliberately is the only thing that reliably stops it.
-const HANDOFF_LIMIT_PER_HOUR = 12;
-
-async function runHandoff(handoff) {
-  if (db.handoffsSince(handoff.project_id, 1) >= HANDOFF_LIMIT_PER_HOUR) {
-    db.updateHandoff(handoff.id, {
-      status: "failed",
-      reply:
-        `Delphi stopped this one. ${HANDOFF_LIMIT_PER_HOUR} handoffs have already finished in this ` +
-        `project in the last hour, which usually means two agents are handing work back and forth. ` +
-        `Nothing is lost: the request is on the handoff and can be run again.`,
-    });
-    return;
-  }
-  const target = db.getHarness(handoff.to_harness);
-  if (!target || !target.enabled) {
-    db.updateHandoff(handoff.id, {
-      status: "failed",
-      reply: `There is no agent called "${handoff.to_harness}" turned on here.`,
-    });
-    return;
-  }
-
-  let session = db.listSessions(handoff.project_id).find((x) => x.harness === handoff.to_harness);
-  if (!session) {
-    session = db.createSession({
-      projectId: handoff.project_id,
-      title: target.label,
-      harness: handoff.to_harness,
-    });
-  }
-  db.updateHandoff(handoff.id, { status: "running", to_session_id: session.id });
-
-  const from = handoff.from_session_id ? db.getSession(handoff.from_session_id) : null;
-  const context = handoff.context_json ? `\n\nContext:\n${handoff.context_json}` : "";
-  const task = handoff.task_id ? db.taskDetail(handoff.task_id) : null;
-  const asked = from ? (from.harness || "the Delphi chat") : "the person using Delphi";
-
-  const { text, failure } = await runTurn({
-    sessionId: session.id,
-    collect: true,
-    prompt:
-      `A request has been handed to you through Delphi by ${asked}.\n\n` +
-      `${handoff.request}${context}` +
-      (task ? `\n\nThis is about task ${task.task.id}: ${task.task.title}` : "") +
-      `\n\nAnswer it directly. Your reply goes straight back to whoever asked, ` +
-      `so write it for them rather than for a person reading a terminal.`,
-  });
-
-  db.updateHandoff(handoff.id, {
-    status: failure ? "failed" : "ready",
-    reply: failure || text,
-  });
-
-  // The wake. The sender's turn ended minutes ago, so the only way it learns the
-  // answer is to be given a turn of its own, which is what a timer is for. Due
-  // now rather than later: there is nothing to wait for, and the delay would
-  // only be there to look like waiting.
-  if (!failure && handoff.wake && handoff.from_session_id) {
-    db.createAlert({
-      sessionId: handoff.from_session_id,
-      kind: "harvest",
-      fireAt: new Date().toISOString().slice(0, 19).replace("T", " "),
-      payload: { handoffId: handoff.id },
-    });
-  }
+async function dispatchHandoffs() {
+  dispatcher.tick();
+  await fireTimers();
 }
 
 /**

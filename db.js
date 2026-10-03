@@ -587,7 +587,13 @@ function createProject({ key, name, summary = null, colour = "#7c8698", path = n
 }
 
 function updateProject(id, fields) {
-  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view", "path", "icon"];
+  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view", "path", "icon", "auto_approve", "allow_unguarded"];
+  // What agents may do here unasked. Only ever 0 or 1, and only ever from the
+  // window: the MCP server has no way to write either, so no agent can approve
+  // its own work by changing them.
+  for (const key of ["auto_approve", "allow_unguarded"]) {
+    if (fields[key] !== undefined) fields = { ...fields, [key]: fields[key] === true || fields[key] === 1 ? 1 : 0 };
+  }
   if (fields.task_view !== undefined && !TASK_VIEWS.includes(fields.task_view)) {
     throw new Error(`task_view must be one of ${TASK_VIEWS.join(", ")}`);
   }
@@ -1034,7 +1040,11 @@ const LEASE_MINUTES = 30;
 function setQueue(id, queue) {
   const before = rowOf("task", id);
   if (!before) throw new Error("No such task");
-  run("UPDATE tasks SET queue = :queue, updated_at = datetime('now') WHERE id = :id", { id, queue });
+  // Who queued it travels with it, because a queue named after a harness is
+  // run by the dispatcher, and a person's queueing is their approval. The
+  // app's writes are the person's.
+  run(`UPDATE tasks SET queue = :queue, queued_by = :by, queued_by_type = :type, updated_at = datetime('now') WHERE id = :id`,
+      { id, queue, by: queue ? "you" : null, type: queue ? "human" : null });
   const after = one("SELECT * FROM tasks WHERE id = :id", { id });
   record({ action: "update", entity: "task", entityId: id,
            summary: queue ? `queued for agents (${queue})` : "taken out of the queue",
@@ -2599,17 +2609,13 @@ function adoptProjectPaths() {
   return withPath.length;
 }
 
-// Which database this is, and the app's heartbeat in it. The heartbeat is how
-// an agent is told whether anything will dispatch its handoff; see
-// agent/identity.js.
-const metaQuery = (statement) => open().prepare(statement).all();
-const dbIdentity = () => identity.current(metaQuery);
-const appBeat = (options) => identity.beat(metaQuery, options);
-const appBeatClear = (options) => identity.clearBeat(metaQuery, options);
+// Which database this is, as this connection sees it. The app's heartbeat is
+// deliberately not here: see agent/identity.js for why it is a file.
+const dbIdentity = () => identity.current((statement) => open().prepare(statement).all());
 
 module.exports = {
   DB_PATH,
-  identity: dbIdentity, appBeat, appBeatClear,
+  identity: dbIdentity,
   // The graph builder works against the connection directly, so it is exposed
   // rather than every graph query being proxied through this module.
   handle: open,

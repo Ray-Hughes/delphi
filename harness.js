@@ -106,6 +106,13 @@ const forgetPaths = () => whichCache.clear();
 //                                              this harness needs to be told
 //                                              about Delphi's own MCP server
 //   {if:autoAllow} {ifnot:autoAllow}           gate a group and are then removed
+//   {if:jobWrite} {if:jobRead} {if:jobUnguarded}
+//                                              the same, for a job the dispatcher
+//                                              runs (agent/dispatch.js): one that
+//                                              changes code in its Workbench, one
+//                                              that only reads, and one a project
+//                                              has let run where the guard cannot
+//                                              see. A job never sets autoAllow.
 
 const BUILTINS = [
   {
@@ -128,7 +135,14 @@ const BUILTINS = [
       // whether this can edit the folder it is pointed at, so it is a decision
       // somebody makes rather than a default they inherit.
       ["--permission-mode", "bypassPermissions", "{if:autoAllow}"],
-      ["--tools", "", "{ifnot:autoAllow}"],
+      ["--tools", "", "{ifnot:autoAllow}", "{ifnot:jobWrite}", "{ifnot:jobRead}"],
+      // A job that only reads gets the reading tools and nothing else.
+      ["--tools", "Read,Glob,Grep", "{if:jobRead}"],
+      // A job that changes code: edits accepted, which Claude Code keeps to the
+      // folder it runs in (the Workbench), and Bash allowed, which is why the
+      // dispatcher runs this only with agent/guard.py installed as the hook, or
+      // with the project's explicit say-so. Never bypassPermissions.
+      ["--permission-mode", "acceptEdits", "--allowedTools", "Bash", "{if:jobWrite}"],
       "{mcpFlags}",
     ],
   },
@@ -149,7 +163,10 @@ const BUILTINS = [
       "--skip-git-repo-check",
       ["-m", "{model}"],
       ["-s", "danger-full-access", "{if:autoAllow}"],
-      ["-s", "read-only", "{ifnot:autoAllow}"],
+      ["-s", "read-only", "{ifnot:autoAllow}", "{ifnot:jobWrite}"],
+      // A job that changes code: Codex's own sandbox, writable only in the
+      // folder it runs in (the Workbench), with no network.
+      ["-s", "workspace-write", "{if:jobWrite}"],
       "{mcpFlags}",
       "{prompt}",
     ],
@@ -173,6 +190,9 @@ const BUILTINS = [
       "--no-color",
       ["--model", "{model}"],
       ["--allow-all-tools", "{if:autoAllow}"],
+      // Nothing can guard Copilot's commands, so a job gets its tools only in a
+      // project that has said unguarded agents may run there.
+      ["--allow-all-tools", "{if:jobUnguarded}"],
       // --session-id rather than --resume. --resume takes an optional value, so
       // passing it without one opens an interactive picker, and there is nobody
       // here to pick.

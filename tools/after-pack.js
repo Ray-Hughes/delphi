@@ -44,10 +44,13 @@ const OUTSIDE_TOO = [
   "pads.js",
   "git.js",
   "harness.js",
+  // The app indexes with it; the server embeds a query with it.
+  "embeddings.js",
   "agent/schema_later.js",
   "agent/launch.js",
   "agent/locate.js",
   "agent/identity.js",
+  "agent/jobs.js",
   "sheet",
   "workbench",
 ];

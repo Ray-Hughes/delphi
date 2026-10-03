@@ -37,6 +37,9 @@ const ELECTRON = process.versions.electron ? process.execPath : require("electro
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "delphi-migrate-"));
 process.env.DELPHI_DATA_DIR = dir;
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 process.env.DELPHI_DB = path.join(dir, "unused.db");
 const REAL = [path.join(os.homedir(), "va", "delphi", "delphi.db"),
               path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db")];
@@ -148,7 +151,7 @@ async function exercise(label, command, extraEnv, expectBinary) {
   check("the fixture starts old", columns(file, "comments").includes("kind"), false);
 
   await withServer(command, env, async (client, stderr) => {
-    const task = await client.call("get_task", { id: 1 });
+    const task = await client.call("get_task", { id: 1, detail: "full" });
     check("the server answers", task.task.title, "an old task with comments");
     check("old comments come back as they were", task.comments.map((c) => c.body),
           ["Plain words.", "Multi\nline, with a fence:\n```\n$ npm test\n```"]);
@@ -230,6 +233,9 @@ async function exercise(label, command, extraEnv, expectBinary) {
     check("a renamed line renames its task verbatim",
           q(file, `SELECT title FROM tasks WHERE id = ${Number(pad.tasks[0].id)}`)[0].title, "first :p1 :p2 renamed $&");
 
+    // A job needs somewhere to run, and the fixture's folder is a path from
+    // another machine, so the project is pointed at a folder that exists.
+    q(file, `UPDATE projects SET path = '${dir.replace(/'/g, "''")}' WHERE id = 1`);
     const handoff = await client.call("handoff_send", { to: "codex", project_id: 1, request: `review :p1 $&`, context: { branch: "$'" } });
     check("handoff_send returns the row it wrote", [typeof handoff.id, handoff.request, handoff.context_json],
           ["number", "review :p1 $&", '{"branch":"$\'"}']);
@@ -378,7 +384,7 @@ function openWithApp(dataDir) {
   const broken = path.join(dir, "raced-broken", "delphi.db");
   freshFixture(broken);
   const refusing = (statement) => {
-    if (/ADD COLUMN kind /.test(statement)) throw new Error("duplicate column name: kind");
+    if (/ALTER TABLE comments ADD COLUMN kind /.test(statement)) throw new Error("duplicate column name: kind");
     return q(broken, statement);
   };
   check("an ALTER that failed and left the column missing is still an error",
