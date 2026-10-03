@@ -88,7 +88,13 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then app="release/mac-$(uname -m | sed 's/x86_64/x64/')/Delphi.app"; else app="release/win-unpacked"; fi
-          ELECTRON_RUN_AS_NODE=1 "$(node -p "require('electron')")" tools/package_test.js --app "$app"
+          # The electron package fetches its binary on first require and says so
+          # on stdout, which would land in the path below. So require it once on
+          # its own first, and only then ask for the path.
+          node -e "require('electron')" > /dev/null
+          electron="$(node -p "require('electron')")"
+          test -x "$electron" || { echo "no Electron binary at $electron"; exit 1; }
+          ELECTRON_RUN_AS_NODE=1 "$electron" tools/package_test.js --app "$app"
 
       - uses: actions/upload-artifact@v4
         with:
