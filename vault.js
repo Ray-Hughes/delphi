@@ -1,4 +1,4 @@
-// Markdown mirror of the memory notes.
+// Markdown mirror of the memory notes, and a clean text copy of each task's Sheet.
 //
 // The database is the source of truth. This writes a plain-file copy of it that
 // Obsidian, ripgrep, git or any editor can read, so the knowledge is not trapped
@@ -14,6 +14,8 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const paths = require("./paths");
+const sheetFormat = require("./sheet/format");
+const { makeSheetStore } = require("./sheet/store");
 
 // A folder beside the source in a checkout, and in Documents once installed. The
 // whole point of the mirror is that a person opens it in Obsidian or an editor,
@@ -85,6 +87,10 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
   const written = new Set();
   let notes = 0;
   let pads = 0;
+  let sheets = 0;
+  // Reads only: the store is used for its view of a Sheet, the same one
+  // delphi cat prints, and nothing here writes through it.
+  const sheetStore = db.sqlP ? makeSheetStore({ sql: db.sqlP, actor: "vault" }) : null;
 
   const allTitles = [];
   for (const project of projects) {
@@ -151,6 +157,25 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
       }
     }
 
+    // Each task's Sheet, clean, the way `delphi cat 42 | pbcopy` gives it: no
+    // ids, no {} metadata, so it reads as the conversation it was and greps
+    // as text. Done tasks too, since that is when a Sheet is most worth
+    // having. A task with nothing on its Sheet gets no file. Named by id
+    // first, so a renamed task replaces its file rather than leaving a twin.
+    const sheetTasks = sheetStore
+      ? db.listTasks({ projectId: project.id, includeDone: true, includeSubtasks: true }).filter((t) => Number(t.comment_count) > 0)
+      : [];
+    if (sheetTasks.length) {
+      const sheetDir = path.join(dir, "sheets");
+      fs.mkdirSync(sheetDir, { recursive: true });
+      for (const task of sheetTasks) {
+        const file = path.join(sheetDir, `${task.id}-${slug(task.title)}.sheet`);
+        fs.writeFileSync(file, sheetFormat.format(sheetStore.sheet(task.id), { clean: true }));
+        written.add(path.resolve(file));
+        sheets++;
+      }
+    }
+
     // An index per project, so the vault is navigable rather than a flat pile,
     // and so open work is visible next to the knowledge about it.
     const tasks = db.listTasks({ projectId: project.id });
@@ -187,14 +212,14 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
     written.add(path.resolve(indexFile));
   }
 
-  // Remove files for notes that were deleted in the app.
+  // Remove files for notes, pads and Sheets that were deleted in the app.
   let removed = 0;
   const sweep = (dir) => {
     if (!fs.existsSync(dir)) return;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) sweep(full);
-      else if (entry.name.endsWith(".md") && !written.has(path.resolve(full))) {
+      else if ((entry.name.endsWith(".md") || entry.name.endsWith(".sheet")) && !written.has(path.resolve(full))) {
         fs.unlinkSync(full);
         removed++;
       }
@@ -202,7 +227,7 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
   };
   sweep(vault);
 
-  return { vault, projects: projects.length, notes, pads, removed };
+  return { vault, projects: projects.length, notes, pads, sheets, removed };
 }
 
 module.exports = { exportAll, DEFAULT_VAULT };

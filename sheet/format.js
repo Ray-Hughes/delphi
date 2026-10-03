@@ -523,8 +523,21 @@ function clean(textOrSheet) {
   return format(sheet, { clean: true });
 }
 
+/**
+ * The whole command a run entry ran. Usually its body; but a command of
+ * several lines (an agent's heredoc, recorded by sheet/chat.js) is stored as
+ * its first line and " ...", because a run's body is one line, and the whole
+ * of it is kept in meta.script. Copying the entry, or showing its output,
+ * should give what actually ran.
+ */
+function runCommand(entry) {
+  const meta = parseMetaObject(entry && entry.meta);
+  if (typeof meta.script === "string" && meta.script.trim()) return meta.script;
+  return entry && entry.body != null ? String(entry.body) : "";
+}
+
 module.exports = {
   SIGILS, META_ORDER,
   inferAuthorType, format, formatEntry, parse, clean, parseMeta, formatMeta, stripAnsi,
-  normaliseBody,
+  normaliseBody, runCommand,
 };

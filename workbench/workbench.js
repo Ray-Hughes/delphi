@@ -12,9 +12,14 @@
  *
  * - Finish removes the folder only when nothing in it is unsaved and nothing on
  *   the branch is unshared, and it never forces. The branch is always kept.
- * - Discard is the only verb that throws work away. It needs the task's number
- *   typed back, it lists what goes first, and it deletes the branch only when
- *   the branch never reached a remote. Agents are never offered it.
+ * - Discard removes the folder, but keeps a copy of everything in it first
+ *   (workbench/keep.js), so reaching it loses nothing for thirty days. It
+ *   still needs the task's number typed back and lists what goes, and agents
+ *   are still never offered it; but those are courtesies now, not the only
+ *   thing between an agent and a week of work.
+ * - A folder git cannot read is Unreadable, never Missing, and neither Finish
+ *   nor Discard touches it: not being able to see what is in a folder is no
+ *   reason to think nothing is.
  * - A folder that disappears is marked Missing, never forgotten silently, so a
  *   task does not quietly lose track of where its work was.
  *
@@ -28,6 +33,7 @@ const path = require("path");
 const naming = require("./naming");
 const setupMod = require("./setup");
 const defaultGit = require("./git");
+const keep = require("./keep");
 
 // Status is asked for on every repaint of a task panel and every row of the
 // Overview, and each answer is three or four git processes. Ten seconds is
@@ -60,6 +66,121 @@ function refusal(message, code, extra = {}) {
   error.code = code;
   Object.assign(error, extra);
   return error;
+}
+
+/** Up to five names, then how many more. */
+function someOf(list, n = 5) {
+  return list.slice(0, n).join(", ") + (list.length > n ? `, and ${list.length - n} more` : "");
+}
+
+function unreadableWords(wb, reason) {
+  return `${reason} Finish and Discard leave the folder alone until git can read it again. It is at ${wb.path}.`;
+}
+
+/** The real top folder of a Workbench's repository, from its row, or from the folder itself. */
+async function repoTopFor(git, wb) {
+  const fromRow = await git.toplevel(wb.repo_path);
+  if (fromRow) return (await git.mainCheckout(fromRow)) || fromRow;
+  if (isDir(wb.path)) return git.mainCheckout(wb.path);
+  return null;
+}
+
+/**
+ * Everything Discard needs to know, read without a store, so the command line
+ * can run Discard in its own process (see bin/delphi) and nothing that an
+ * agent can reach over MCP ever removes a folder.
+ *
+ * keepPaths is the ignored files the copy takes; the plan a person is shown
+ * leaves it out, since it can run to thousands of paths.
+ */
+async function inspectForDiscard(wb, { git = defaultGit } = {}) {
+  if (wb.state === "finished" || wb.state === "discarded") {
+    throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already ${wb.state}.`, "CLOSED");
+  }
+  const plan = {
+    unsaved: [], commits: [], detached: [], ignored: [], notKept: [], operation: null,
+    branchPushed: false, remote: null, remoteUrl: null, branch: wb.branch, path: wb.path,
+    folderGone: !isDir(wb.path), unreadable: null, ref: keep.refFor("discarded", wb),
+    until: keep.untilDate(), recover: null, top: null, keepPaths: [],
+  };
+  const top = await repoTopFor(git, wb);
+  if (!top) {
+    plan.unreadable = plan.folderGone
+      ? `The repository at ${wb.repo_path} is not there any more, so there is nothing to keep a copy in. Forget this Workbench instead.`
+      : `The repository at ${wb.repo_path} is not there any more, so there is nowhere to keep a copy of the folder. Nothing was thrown away.`;
+    return plan;
+  }
+  plan.top = top;
+  if (!plan.folderGone) {
+    const st = await git.status(wb.path);
+    if (!st.ok) { plan.unreadable = unreadableWords(wb, st.reason); return plan; }
+    plan.unsaved = st.files;
+    plan.detached = await git.lonelyCommits(wb.path);
+    plan.operation = await git.operation(wb.path);
+    const report = await keep.ignoredReport(git, wb.path, { main: top, copy: setupMod.copyList(wb.copy_files ?? setupMod.DEFAULT_COPY) });
+    if (!report.ok) { plan.unreadable = unreadableWords(wb, report.reason); return plan; }
+    plan.ignored = report.groups;
+    plan.notKept = report.notKept;
+    plan.keepPaths = report.keep;
+  }
+  // Asked of the remote itself when it answers, so a branch pushed from
+  // another machine counts. Offline, the last known answer stands, which
+  // errs towards keeping the branch.
+  await git.fetchBranch(top, wb.branch);
+  plan.branchPushed = await git.refExists(top, `refs/remotes/${git.REMOTE}/${wb.branch}`);
+  plan.commits = await git.localOnlyCommits(top, wb.branch);
+  plan.remote = plan.branchPushed ? `${git.REMOTE}/${wb.branch}` : null;
+  plan.remoteUrl = plan.branchPushed ? await git.remoteUrl(top) : null;
+  plan.recover = keep.recoverText({ ref: plan.ref, repo: top, folder: wb.path, branch: wb.branch, until: plan.until });
+  return plan;
+}
+
+/** The plan as a person (or a window) is shown it. */
+function publicPlan(plan) {
+  const { keepPaths, top, ...shown } = plan;
+  return shown;
+}
+
+/** What Discard would remove, and how to get it back, before anyone confirms. */
+async function discardPlanFor(wb, opts = {}) {
+  return publicPlan(await inspectForDiscard(wb, opts));
+}
+
+/**
+ * Discard's git half: keep a copy, then remove the folder, then the branch if
+ * it never reached a remote. Runs without a store, in the app's process or the
+ * command line's, and never in the MCP server's. The caller records the result
+ * (markDiscarded), which checks for itself that the folder is gone and the
+ * copy is there before it believes a word of it.
+ */
+async function discardFolder(wb, { git = defaultGit } = {}) {
+  const plan = await inspectForDiscard(wb, { git });
+  if (plan.unreadable) throw refusal(plan.unreadable, "UNREADABLE");
+  const snap = await keep.snapshot(git, {
+    repo: plan.top, folder: plan.folderGone ? null : wb.path, branch: wb.branch, ref: plan.ref, keep: plan.keepPaths,
+    message: `Kept by Delphi before discarding task ${wb.task_id}'s Workbench\n\nBranch: ${wb.branch}\nFolder: ${wb.path}\n`,
+  });
+  if (!snap.ok) throw refusal(`Could not keep a copy of the folder first: ${snap.reason} Nothing was thrown away.`, "NO_COPY");
+  if (!plan.folderGone) {
+    const removed = await git.worktreeRemove(plan.top, wb.path, { force: true });
+    if (!removed.ok) {
+      throw refusal(`${git.plain(removed, "git would not remove the folder.")} A copy is kept as ${snap.ref} all the same.`, "GIT", { ref: snap.ref });
+    }
+  } else {
+    await git.forgetRegistration(plan.top, wb.path);
+  }
+  let branchDeleted = false;
+  if (!plan.branchPushed && snap.tip) {
+    const holder = (await git.branchState(plan.top, wb.branch)).checkedOutAt;
+    if (!holder) branchDeleted = (await git.deleteBranch(plan.top, wb.branch, snap.tip)).ok;
+  }
+  return {
+    discarded: true, branchDeleted, keptRemote: plan.remote, branch: wb.branch,
+    ref: snap.ref, sha: snap.sha, until: plan.until, recover: plan.recover,
+    unsaved: plan.unsaved.length, files: plan.unsaved.slice(0, 5),
+    commits: plan.commits.length, detached: plan.detached.length,
+    ignored: plan.ignored.reduce((n, g) => n + g.count, 0),
+  };
 }
 
 function createWorkbench({
@@ -161,10 +282,14 @@ function createWorkbench({
       const wanted = String(given || repo);
       pick = list.find((c) => c.name.toLowerCase() === wanted.toLowerCase());
       if (!pick) {
+        // A path names one of the project's own repositories by another
+        // route, or nothing. Taking any repository on disk and adding it to
+        // the project would let one call quietly attach a stranger's
+        // checkout; that is the project settings' job, done on purpose.
         const top = await git.toplevel(path.resolve(wanted));
         if (top) {
           const main = (await git.mainCheckout(top)) || top;
-          pick = list.find((c) => git.samePath(c.path, main)) || { repo_id: null, name: path.basename(main), path: main, source: "given", is_primary: 0 };
+          pick = list.find((c) => git.samePath(c.path, main)) || null;
         }
       }
       if (!pick) {
@@ -185,13 +310,7 @@ function createWorkbench({
     return { repo: row, top: pick.path };
   }
 
-  /** The real top folder of a Workbench's repository, from its row, or from the folder itself. */
-  async function repoTopOf(wb) {
-    const fromRow = await git.toplevel(wb.repo_path);
-    if (fromRow) return (await git.mainCheckout(fromRow)) || fromRow;
-    if (isDir(wb.path)) return git.mainCheckout(wb.path);
-    return null;
-  }
+  const repoTopOf = (wb) => repoTopFor(git, wb);
 
   // ---------------------------------------------------------------------------
   // Start
@@ -202,7 +321,17 @@ function createWorkbench({
     const existing = store.live(task.id, repoRow.id);
     if (existing) return { workbench: existing, created: false, warnings: [], setup_entry: null };
 
-    const made = await serial(top, () => create(task, repoRow, top));
+    let made;
+    try {
+      made = await serial(top, () => create(task, repoRow, top));
+    } catch (error) {
+      // Two processes (the app and the command line, two agents) starting
+      // the same task at once: whichever loses the race to git or to the
+      // unique index fails here, and the answer it wanted is the winner's.
+      const theirs = await awaitLive(task.id, repoRow.id, error);
+      if (theirs) return { workbench: theirs, created: false, warnings: [], setup_entry: null };
+      throw error;
+    }
     if (!made.created) return made;
 
     const { workbench } = made;
@@ -230,6 +359,21 @@ function createWorkbench({
       return { ...made, setup_entry: null, setup: setupCmd };
     }
     return { ...made, setup_entry: await setup() };
+  }
+
+  // Codes a lost start race fails with. Anything else (no base branch, a
+  // bare repository) is the real answer and is not worth waiting on.
+  const RACY = new Set(["GIT", "FOLDER_EXISTS", "CHECKED_OUT_ELSEWHERE"]);
+
+  async function awaitLive(taskId, repoId, error) {
+    const racy = RACY.has(error && error.code) || /UNIQUE|constraint/i.test(String(error && error.message));
+    const until = Date.now() + (racy ? 8000 : 0);
+    for (;;) {
+      const row = store.live(taskId, repoId) || store.live(taskId);
+      if (row) return row;
+      if (Date.now() >= until) return null;
+      await new Promise((r) => setTimeout(r, 100));
+    }
   }
 
   async function create(task, repoRow, top) {
@@ -283,6 +427,10 @@ function createWorkbench({
         throw refusal(`There is a file at ${folder} where the Workbench folder would go. Move it, then start again.`, "FOLDER_EXISTS", { path: folder });
       }
       emit(task.id, null, "creating", `Making ${branch}`);
+      // A folder of this name that git still lists but that is gone (an
+      // earlier Workbench removed by hand) would make the add fail. Only that
+      // one registration is cleared, never the repository's others.
+      await git.forgetRegistration(top, folder);
       const mode = state.local ? "local" : state.remote ? "remote" : "new";
       const added = await git.worktreeAdd(top, folder, { branch, startPoint, mode });
       if (!added.ok) throw refusal(git.plain(added, "git could not make the folder."), "GIT");
@@ -309,9 +457,15 @@ function createWorkbench({
 
   function missingStatus(wb) {
     return {
-      words: "Missing", state: "missing", unsaved: 0, files: [], ahead: 0, behind: 0,
+      words: "Missing", state: "missing", unsaved: 0, files: [], ahead: 0, behind: 0, lonely: 0, operation: null,
       base: wb.base, hasRemote: false, hasRemoteBranch: false, checkedAt: new Date().toISOString(),
     };
+  }
+
+  // Drawn like Missing by the window, but it is not: the folder is there and
+  // may be full of work. It only means git cannot say what is in it.
+  function unreadableStatus(wb, reason) {
+    return { ...missingStatus(wb), words: "Unreadable", state: "unreadable", message: unreadableWords(wb, reason) };
   }
 
   async function statusOf(wb, { fresh = false } = {}) {
@@ -322,27 +476,39 @@ function createWorkbench({
     if (!fresh && hit && Date.now() - hit.at < STATUS_TTL_MS) return hit.value;
 
     let value;
-    const s = wb.state === "missing" || !isDir(wb.path) ? null : await git.status(wb.path);
-    if (!s || !s.ok) {
+    // The folder decides, not the row: a row marked missing whose folder is
+    // back is read, and a folder that is there is never called Missing.
+    const s = isDir(wb.path) ? await git.status(wb.path) : null;
+    if (!s) {
       value = missingStatus(wb);
+    } else if (!s.ok) {
+      value = unreadableStatus(wb, s.reason);
     } else {
       const remote = await git.hasRemote(wb.path);
       const hasRemoteBranch = remote && await git.refExists(wb.path, `refs/remotes/${git.REMOTE}/${wb.branch}`);
+      const operation = await git.operation(wb.path);
+      // On no branch and no remote: a commit on a detached HEAD. Counted on
+      // its own, because pushing the branch does not save it.
+      const lonely = (await git.lonelyCommits(wb.path)).length;
       // Unshared means on no remote at all. With no remote there is nowhere to
       // share to, and the branch is kept by Finish, so nothing counts here.
-      const ahead = remote ? await git.countCommits(wb.path, ["HEAD", "--not", `--remotes=${git.REMOTE}`]) : 0;
+      const ahead = remote ? Math.max(0, await git.countCommits(wb.path, ["HEAD", "--not", `--remotes=${git.REMOTE}`]) - lonely) : 0;
       const onto = await git.baseRef(wb.path, wb.base);
       const behind = onto ? await git.countCommits(wb.path, [`HEAD..${onto}`]) : 0;
       const parts = [];
+      if (operation) parts.push(`In the middle of ${operation}`);
       if (s.unsaved) parts.push(plural(s.unsaved, "unsaved change", "unsaved changes"));
       if (ahead) parts.push(`${plural(ahead, "commit", "commits")} not shared yet`);
+      if (lonely) parts.push(`${plural(lonely, "commit", "commits")} on no branch`);
       if (behind) parts.push(`${parts.length ? "behind" : "Behind"} ${wb.base} by ${behind}`);
       value = {
         words: parts.join(", ") || "Ready",
-        state: s.unsaved ? "unsaved" : ahead ? "unshared" : behind ? "behind" : "ready",
+        state: operation ? "busy" : s.unsaved ? "unsaved" : ahead || lonely ? "unshared" : behind ? "behind" : "ready",
         unsaved: s.unsaved,
         files: s.files,
         ahead,
+        lonely,
+        operation,
         behind,
         base: wb.base,
         hasRemote: remote,
@@ -387,18 +553,23 @@ function createWorkbench({
     return wb;
   }
 
-  function park(id) {
+  async function park(id) {
     const wb = requireOpen(store.get(id));
     if (wb.state === "parked") return wb;
     const row = store.setState(wb.id, "parked");
+    await note(wb.task_id, `parked workbench on ${wb.branch}`);
     store.audit(wb.task_id, "parked workbench");
     return row;
   }
 
-  function resume(id) {
-    const wb = requireOpen(store.get(id));
+  /** Active again. A parked one whose folder went while it was parked is put back first. */
+  async function resume(id) {
+    const wb = store.get(id);
+    if (wb.state !== "finished" && wb.state !== "discarded" && !isDir(wb.path)) return recreate(id);
+    requireOpen(wb);
     if (wb.state === "active") return wb;
     const row = store.setState(wb.id, "active");
+    await note(wb.task_id, `resumed workbench on ${wb.branch}`);
     store.audit(wb.task_id, "resumed workbench");
     return row;
   }
@@ -406,6 +577,7 @@ function createWorkbench({
   async function update(id) {
     const wb = requireOpen(store.get(id));
     const before = await statusOf(wb, { fresh: true });
+    if (before.state === "unreadable") return { ok: false, words: before.message, conflict: null };
     if (before.unsaved) {
       return {
         ok: false,
@@ -476,9 +648,36 @@ function createWorkbench({
   // ---------------------------------------------------------------------------
   // Finish
 
-  async function finish(id) {
+  /**
+   * What Finish would remove that git does not carry, for a surface to show
+   * before it asks: ignored files that are not reproducible, and copied files
+   * that differ from the main checkout's. Both need "these can go".
+   */
+  async function finishPlan(id) {
+    const wb = requireOpen(store.get(id));
+    const top = await repoTopOf(wb);
+    const report = await keep.ignoredReport(git, wb.path, { main: top, copy: setupMod.copyList(wb.copy_files ?? setupMod.DEFAULT_COPY) });
+    if (!report.ok) throw refusal(unreadableWords(wb, report.reason), "UNREADABLE");
+    return {
+      ignored: report.groups, files: report.files.map((f) => f.path), changedCopies: report.changedCopies,
+      notKept: report.notKept, needsConfirm: report.files.length > 0, _report: report, _top: top,
+    };
+  }
+
+  /**
+   * Removes the folder once its work is safe, keeping the branch. Never
+   * forces. Ignored files that are not reproducible (and copied files that
+   * were changed) stop it until the caller passes ignoredOk, which is a
+   * person saying "these can go"; even then a copy of them is kept under
+   * refs/delphi/finished/ for thirty days.
+   */
+  async function finish(id, { ignoredOk = false } = {}) {
     const wb = requireOpen(store.get(id));
     const st = await statusOf(wb, { fresh: true });
+    if (st.state === "unreadable") throw refusal(st.message, "UNREADABLE");
+    if (st.operation) {
+      throw refusal(`This folder is in the middle of ${st.operation}. Finish it or stop it there first: removing the folder now would lose it.`, "BUSY");
+    }
     if (st.unsaved) {
       const shown = st.files.slice(0, 5).join(", ") + (st.files.length > 5 ? `, and ${st.files.length - 5} more` : "");
       throw refusal(`There ${st.unsaved === 1 ? "is" : "are"} ${plural(st.unsaved, "unsaved change", "unsaved changes")} in the Workbench (${shown}). Commit them first. Finish never puts work aside on its own.`,
@@ -488,81 +687,102 @@ function createWorkbench({
       throw refusal(`${plural(st.ahead, "commit is", "commits are")} not shared yet. Push first: Finish only removes a folder whose work is safe on the remote.`,
         "UNSHARED", { ahead: st.ahead });
     }
-    const top = await repoTopOf(wb);
-    const removed = await git.worktreeRemove(top || wb.path, wb.path);
+    if (st.lonely) {
+      throw refusal(`${plural(st.lonely, "commit is", "commits are")} on no branch, made while the folder was not on ${wb.branch}. Removing the folder would lose ${st.lonely === 1 ? "it" : "them"}. Put ${st.lonely === 1 ? "it" : "them"} on the branch first.`,
+        "LONELY", { lonely: st.lonely });
+    }
+    const plan = await finishPlan(id);
+    const top = plan._top;
+    if (!top) throw refusal(`The repository at ${wb.repo_path} is not there any more, so the folder was left in place.`, "NO_REPO");
+    let kept = null;
+    if (plan.needsConfirm) {
+      if (!ignoredOk) {
+        const names = plan.ignored.map((g) => (g.count > 1 || g.dir.endsWith("/") ? `${g.dir} (${plural(g.count, "file", "files")})` : g.dir));
+        const changed = plan.changedCopies.length ? ` ${someOf(plan.changedCopies)} ${plan.changedCopies.length === 1 ? "differs" : "differ"} from the main checkout's copy.` : "";
+        throw refusal(`The folder has files git does not keep: ${someOf(names)}.${changed} Finishing removes them. Say these can go to finish anyway (a copy is kept for ${keep.KEEP_DAYS} days), or move them out first.`,
+          "IGNORED", { details: { ignored: plan.ignored, files: plan.files, changedCopies: plan.changedCopies, notKept: plan.notKept } });
+      }
+      const snap = await keep.snapshot(git, {
+        repo: top, folder: wb.path, branch: wb.branch, ref: keep.refFor("finished", wb), keep: plan._report.keep,
+        message: `Kept by Delphi before finishing task ${wb.task_id}'s Workbench\n\nBranch: ${wb.branch}\nFolder: ${wb.path}\n`,
+      });
+      if (!snap.ok) throw refusal(`Could not keep a copy of the ignored files first: ${snap.reason} Nothing was removed.`, "NO_COPY");
+      kept = { ref: snap.ref, until: keep.untilDate() };
+    }
+    const removed = await git.worktreeRemove(top, wb.path);
     if (!removed.ok) throw refusal(git.plain(removed, "git would not remove the folder."), "GIT");
-    if (top) await git.worktreePrune(top);
     drop(wb.path);
     store.setState(wb.id, "finished");
-    await note(wb.task_id, `finished workbench; the branch ${wb.branch} is kept`);
+    const recover = kept ? keep.recoverText({ ref: kept.ref, repo: top, folder: wb.path, branch: wb.branch, until: kept.until }) : null;
+    await note(wb.task_id, `finished workbench; the branch ${wb.branch} is kept${kept ? `. The files git does not keep were removed. ${recover}` : ""}`);
     store.audit(wb.task_id, "finished workbench");
     const task = store.task(wb.task_id);
-    return { finished: true, taskStatus: task.status, branch: wb.branch };
+    return { finished: true, taskStatus: task.status, branch: wb.branch, ref: kept && kept.ref, recover };
   }
 
   // ---------------------------------------------------------------------------
   // Discard
 
-  /** What Discard would throw away, in full, before anyone is asked to confirm it. */
+  /** What Discard would remove, and how to get it back, before anyone is asked to confirm it. */
   async function discardPlan(id) {
-    const wb = store.get(id);
-    if (wb.state === "finished" || wb.state === "discarded") {
-      throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already ${wb.state}.`, "CLOSED");
-    }
-    const top = await repoTopOf(wb);
-    const st = isDir(wb.path) ? await statusOf(wb, { fresh: true }) : missingStatus(wb);
-    let branchPushed = false;
-    let commits = [];
-    let url = null;
-    if (top) {
-      // Asked of the remote itself when it answers, so a branch pushed from
-      // another machine counts. Offline, the last known answer stands, which
-      // errs towards keeping the branch.
-      await git.fetchBranch(top, wb.branch);
-      branchPushed = await git.refExists(top, `refs/remotes/${git.REMOTE}/${wb.branch}`);
-      commits = await git.localOnlyCommits(top, wb.branch);
-      url = await git.remoteUrl(top);
-    }
-    return {
-      unsaved: st.files,
-      commits,
-      branchPushed,
-      remote: branchPushed ? `${git.REMOTE}/${wb.branch}` : null,
-      remoteUrl: branchPushed ? url : null,
-      branch: wb.branch,
-      path: wb.path,
-    };
+    return discardPlanFor(store.get(id), { git });
   }
 
+  /**
+   * Discard, in process: the git half (discardFolder) then the record. The
+   * command line does the same two halves itself, the second through the
+   * workbench_discarded tool.
+   */
   async function discard(id, typed) {
     const wb = store.get(id);
     if (String(typed == null ? "" : typed).trim() !== String(wb.task_id)) {
       throw refusal(`Type ${wb.task_id}, the task's number, to confirm. Nothing was thrown away.`, "CONFIRM");
     }
-    const plan = await discardPlan(id);
+    const done = await discardFolder(wb, { git });
+    drop(wb.path);
+    await markDiscarded(id, done);
+    return done;
+  }
+
+  /**
+   * Records a Discard that has already happened, after checking for itself
+   * that it has: the folder is gone and the copy is in the repository under
+   * this Workbench's own name. The command line calls it over MCP once it has
+   * done the git half in its own process; nothing here removes anything, so
+   * an agent that reaches it can only describe what a person already did.
+   */
+  async function markDiscarded(id, summary = {}) {
+    const wb = store.get(id);
+    if (wb.state === "discarded") return { discarded: true, already: true };
+    if (wb.state === "finished") throw refusal(`Workbench ${wb.id} for task ${wb.task_id} is already finished.`, "CLOSED");
+    const ref = keep.refFor("discarded", wb);
+    if (summary.ref !== ref) throw refusal(`The copy of this Workbench is called ${ref}, not ${summary.ref}. Nothing was recorded.`, "NO_COPY");
+    if (isDir(wb.path)) throw refusal(`The folder is still there (${wb.path}), so the Workbench was not marked discarded.`, "NOT_GONE");
     const top = await repoTopOf(wb);
-    if (isDir(wb.path)) {
-      const removed = await git.worktreeRemove(top || wb.path, wb.path, { force: true });
-      if (!removed.ok) throw refusal(git.plain(removed, "git would not remove the folder."), "GIT");
+    if (!top || !(await git.refExists(top, ref))) {
+      throw refusal(`There is no copy at ${ref}, so the Workbench was not marked discarded.`, "NO_COPY");
     }
-    if (top) await git.worktreePrune(top);
-    let branchDeleted = false;
-    if (!plan.branchPushed && top) {
-      const holder = (await git.branchState(top, wb.branch)).checkedOutAt;
-      if (!holder) branchDeleted = (await git.deleteBranch(top, wb.branch)).ok;
-    }
+    const when = await git.run(top, ["log", "-1", "--format=%ct", ref]);
+    const made = Number(when.ok ? when.stdout.trim() : NaN);
+    const until = keep.untilDate(keep.KEEP_DAYS, Number.isFinite(made) ? made * 1000 : Date.now());
+    const count = (v) => (Number.isSafeInteger(Number(v)) && Number(v) > 0 ? Math.min(Number(v), 1e6) : 0);
+    const files = (Array.isArray(summary.files) ? summary.files : []).slice(0, 5).map((f) => String(f).slice(0, 200));
+    const unsaved = count(summary.unsaved);
+    const parts = [];
+    if (unsaved) parts.push(`${plural(unsaved, "unsaved file", "unsaved files")}${files.length ? ` (${files.join(", ")}${unsaved > files.length ? ", ..." : ""})` : ""}`);
+    if (count(summary.commits)) parts.push(plural(count(summary.commits), "local commit", "local commits"));
+    if (count(summary.detached)) parts.push(plural(count(summary.detached), "commit on no branch", "commits on no branch"));
+    if (count(summary.ignored)) parts.push(plural(count(summary.ignored), "ignored file", "ignored files"));
+    const branchDeleted = summary.branchDeleted === true;
+    const pushed = await git.refExists(top, `refs/remotes/${git.REMOTE}/${wb.branch}`);
+    const branchWords = pushed ? `the branch is kept on the remote as ${git.REMOTE}/${wb.branch}`
+      : branchDeleted ? `the branch ${wb.branch} was deleted` : `the branch ${wb.branch} is kept`;
     drop(wb.path);
     store.setState(wb.id, "discarded");
-    const dropped = [];
-    if (plan.unsaved.length) {
-      const names = plan.unsaved.slice(0, 5).join(", ") + (plan.unsaved.length > 5 ? ", ..." : "");
-      dropped.push(`${plural(plan.unsaved.length, "unsaved file", "unsaved files")} (${names})`);
-    }
-    if (branchDeleted && plan.commits.length) dropped.push(plural(plan.commits.length, "local commit", "local commits"));
-    const kept = plan.branchPushed ? `; the branch is kept on the remote as ${plan.remote}` : branchDeleted ? "" : `; the branch ${wb.branch} is kept`;
-    await note(wb.task_id, `discarded workbench: ${dropped.length ? `dropped ${dropped.join(", ")}` : "nothing unsaved was dropped"}${kept}`);
+    const recover = keep.recoverText({ ref, repo: top, folder: wb.path, branch: wb.branch, until });
+    await note(wb.task_id, `discarded workbench with ${parts.length ? parts.join(", ") : "nothing unsaved in it"}; ${branchWords}. ${recover}`);
     store.audit(wb.task_id, "discarded workbench");
-    return { discarded: true, branchDeleted, keptRemote: plan.remote, branch: wb.branch };
+    return { discarded: true, ref, until, recover };
   }
 
   // ---------------------------------------------------------------------------
@@ -576,7 +796,7 @@ function createWorkbench({
     }
     const top = await repoTopOf(wb);
     if (!top) throw refusal(`The repository at ${wb.repo_path} is not there any more, so there is nothing to recreate the folder from.`, "NO_REPO");
-    await git.worktreePrune(top);
+    await git.forgetRegistration(top, wb.path);
     const state = await git.branchState(top, wb.branch);
     const back = state.checkedOutAt && git.samePath(state.checkedOutAt, wb.path);
     if (state.checkedOutAt && !back) {
@@ -616,7 +836,7 @@ function createWorkbench({
       throw refusal(`The folder is still there (${wb.path}). Finish it or discard it instead, so nothing in it is lost by accident.`, "NOT_MISSING");
     }
     const top = await repoTopOf(wb);
-    if (top) await git.worktreePrune(top);
+    if (top) await git.forgetRegistration(top, wb.path);
     drop(wb.path);
     store.setState(wb.id, "discarded");
     await note(wb.task_id, `forgot workbench; the branch ${wb.branch} was left as it is`);
@@ -631,51 +851,49 @@ function createWorkbench({
    * Squares the rows with what is on disk. Run on app start and on every
    * `delphi status`, so the list is never further wrong than one launch.
    *
-   * - git worktree prune, so git forgets folders that were deleted by hand.
-   * - A row whose folder is gone becomes Missing; one whose folder came back
-   *   becomes active again.
+   * Only repositories that have had a Workbench are touched: a repository
+   * Delphi merely knows about is the person's own business.
+   *
+   * - git worktree prune, for folders gone more than a week (a disk that is
+   *   not mounted today is not a deleted folder), and kept copies past
+   *   their thirty days are expired.
+   * - An active row whose folder is gone becomes Missing, and active again
+   *   when it comes back. A parked one stays parked either way: its status
+   *   says Missing while the folder is away, and the person's choice to set
+   *   it aside outlives a disk being unplugged.
+   * - A folder that is there but that git cannot read is left as it is; its
+   *   status says Unreadable.
    * - A worktree under a Workbench folder with no row is adopted when its
-   *   branch is one Delphi would have made and its task is real; anything else
-   *   is reported as found but not managed, and left alone.
+   *   branch is one Delphi would have made for that same task; anything
+   *   else is reported as found but not managed, and left alone.
    */
   async function housekeep() {
-    const report = { pruned: 0, missing: [], restored: [], adopted: [], unmanaged: [] };
+    const report = { pruned: 0, missing: [], restored: [], adopted: [], unmanaged: [], expired: [] };
     const live = store.list({});
     const seenTops = new Set();
-    for (const repoRow of store.allRepos()) {
+    for (const repoRow of store.reposInUse()) {
       const rows = live.filter((w) => w.repo_id === Number(repoRow.id));
-      const top0 = await git.toplevel(repoRow.path);
-      const top = top0 ? ((await git.mainCheckout(top0)) || top0) : null;
-      if (!top) {
-        for (const row of rows) {
-          if (row.state !== "missing" && !isDir(row.path)) {
-            store.setState(row.id, "missing");
-            report.missing.push(row.id);
-          }
-        }
-        continue;
-      }
-      if (!seenTops.has(top)) {
-        await git.worktreePrune(top);
-        report.pruned++;
-      }
-      const trees = await git.worktreeList(top);
-      const known = (p) => trees.some((t) => !t.prunable && git.samePath(t.path, p));
       for (const row of rows) {
-        const present = isDir(row.path) && known(row.path);
-        if (row.state !== "missing" && !present) {
-          store.setState(row.id, "missing");
+        const present = isDir(row.path);
+        if (!present && row.state !== "missing") {
+          if (row.state === "active") store.setState(row.id, "missing");
           drop(row.path);
           report.missing.push(row.id);
-        } else if (row.state === "missing" && present) {
+        } else if (present && row.state === "missing") {
           store.setState(row.id, "active");
           drop(row.path);
           report.restored.push(row.id);
         }
       }
-      if (seenTops.has(top)) continue;
+      const top0 = await git.toplevel(repoRow.path);
+      const top = top0 ? ((await git.mainCheckout(top0)) || top0) : null;
+      if (!top || seenTops.has(top)) continue;
       seenTops.add(top);
+      await git.worktreePrune(top);
+      report.pruned++;
+      report.expired.push(...await keep.expire(git, top));
 
+      const trees = await git.worktreeList(top);
       const roots = [naming.rootFor({ repoTop: top })];
       const override = overrideDir();
       if (override) roots.push(naming.rootFor({ repoTop: top, overrideDir: override }));
@@ -688,7 +906,8 @@ function createWorkbench({
         if (m && tree.branch && naming.ADOPTABLE.test(tree.branch)) {
           let task = null;
           try { task = store.task(Number(m[1])); } catch {}
-          if (task && Number(task.project_id) === Number(repoRow.project_id) && !store.live(task.id, repoRow.id)) {
+          if (task && Number(task.project_id) === Number(repoRow.project_id) && !store.live(task.id, repoRow.id)
+              && branchIsFor(tree.branch, task)) {
             const base = repoRow.base_branch || await git.defaultBranch(top) || "main";
             try {
               adopted = store.insert({ taskId: task.id, repoId: repoRow.id, path: git.real(tree.path), branch: tree.branch, base });
@@ -705,6 +924,19 @@ function createWorkbench({
     }
     unmanaged = report.unmanaged;
     return report;
+  }
+
+  /**
+   * Whether a branch names this task: its lead is the task's number, or its
+   * ticket key. A folder called 12-something on a branch made for task 40 is
+   * somebody's hand made worktree, and adopting it would hand task 12 another
+   * task's work.
+   */
+  function branchIsFor(branch, task) {
+    const lead = /^[^/]+\/((?:[A-Z][A-Z0-9]+-\d+)|\d+)-/.exec(branch);
+    if (!lead) return false;
+    if (/^\d+$/.test(lead[1])) return Number(lead[1]) === Number(task.id);
+    return lead[1] === naming.ticketOf(task.ref);
   }
 
   /** The real names, for people learning what a Workbench is underneath. */
@@ -729,9 +961,10 @@ function createWorkbench({
 
   return {
     candidates, start, status, forTask, list, park, resume, update, commit, push, pr,
-    finish, discardPlan, discard, recreate, forget: forgetBench, housekeep, advanced,
+    finishPlan: async (id) => { const { _report, _top, ...shown } = await finishPlan(id); return shown; },
+    finish, discardPlan, discard, markDiscarded, recreate, forget: forgetBench, housekeep, advanced,
     get: (id) => store.get(id), live: (taskId) => store.live(taskId),
   };
 }
 
-module.exports = { STATUS_TTL_MS, WINDOWS_PATH_LIMIT, createWorkbench };
+module.exports = { STATUS_TTL_MS, WINDOWS_PATH_LIMIT, createWorkbench, discardPlanFor, discardFolder, repoTopFor };

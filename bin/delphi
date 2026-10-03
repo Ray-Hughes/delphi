@@ -29,6 +29,13 @@ const { runEntry, logPathFor } = require("../sheet/run");
 const { splitCommand } = require("../agent/launch");
 
 const HELP = {
+  open: [
+    "delphi open <task>",
+    "The task's Sheet, full screen and live. Type to add to it: plain text says, $ runs, ! notes, ? q | a | b asks,",
+    "/ledger /status /task /work /finish /park /update. Esc walks the entries: y copies one clean, Y with its output,",
+    "v then y a range, p promotes, f files, Enter folds, a to d answers, r reruns, e edits, o pages, q quits.",
+    "Needs a terminal at both ends.",
+  ],
   cat: [
     "delphi cat <task> [--ledger] [--tail N] [--raw] [--clean]",
     "Print a task's Sheet. --ledger is only what was promoted; --tail N the last N entries.",
@@ -84,9 +91,21 @@ const HELP = {
   discard: [
     "delphi discard <task>",
     "Throw a Workbench away. Lists what would be lost, then asks you to type the task number.",
-    "Needs a person at a terminal. A branch that reached the remote is kept.",
+    "Needs a person at a terminal. A branch that reached the remote is kept, and a copy of everything",
+    "in the folder is kept for 30 days; the command that puts it back is printed.",
   ],
   done: ["delphi done <task>", "Mark a task done. If it still has a Workbench, offers to finish that too."],
+  chat: [
+    "delphi chat <task> [--agent claude|copilot] [--auto] [--allow-unguarded] [\"<message>\"]",
+    "Talk to an agent on a task's Sheet. What it says, the commands it runs and the files it edits are written",
+    "onto the Sheet as it goes, as the agent. A later delphi chat on the same task picks the conversation up again.",
+    "With a message, or with text piped in, it runs that one turn and stops; otherwise it asks for each line.",
+    "Without --auto, Claude Code can only talk and use Delphi's tools, and Copilot asks before each tool.",
+    "--auto lets the agent run commands and edit files without asking. For Claude Code that needs agent/guard.py",
+    "installed (and chat without the guard needs --allow-unguarded). The guard is a Claude Code hook and cannot",
+    "see Copilot's commands, so Copilot with --auto needs --allow-unguarded.",
+    "Uses the harness from Delphi's settings; DELPHI_CHAT_AGENT names a different binary.",
+  ],
   "shell-init": ["delphi shell-init [bash|zsh]", "Print a work function for your shell that really changes folder. Use: eval \"$(delphi shell-init)\""],
   help: ["delphi help [<command>]", "This, or the detail for one command."],
 };
@@ -103,7 +122,7 @@ function usage(command) {
 
 // --- arguments -----------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["--tail", "--cwd", "--why", "--title", "--repo", "--project"]);
+const VALUE_FLAGS = new Set(["--tail", "--cwd", "--why", "--title", "--repo", "--project", "--agent"]);
 
 function parseArgs(argv) {
   const positional = [];
@@ -169,6 +188,11 @@ function actorEnv() {
   return { actor: name, env: process.env.DELPHI_AUTHOR_TYPE ? {} : { DELPHI_AUTHOR_TYPE: "human" } };
 }
 
+// Where the server's own complaints go. Standard error, except while the Sheet
+// has the screen, where a stray line would be drawn over and then lost; they
+// are held and printed once the terminal is given back.
+let serverWarn = (text) => process.stderr.write(text);
+
 function connect({ timeoutMs = 60000 } = {}) {
   const { actor, env } = actorEnv();
   const client = openServer({
@@ -180,9 +204,37 @@ function connect({ timeoutMs = 60000 } = {}) {
     // Every call this makes is a quick read or write; the command itself runs
     // here, not in the server. A minute is generous and still ends a hang.
     timeoutMs,
-    warn: (...parts) => process.stderr.write(`${parts.join(" ")}\n`),
+    warn: (...parts) => serverWarn(`${parts.join(" ")}\n`),
   });
   return client;
+}
+
+/**
+ * A second server for an agent in chat, attributed to it, so its entries are
+ * written exactly as an agent calling the tools itself would write them.
+ */
+async function connectAgent(actor) {
+  const client = openServer({
+    server: process.env.DELPHI_MCP_SERVER || undefined,
+    actor,
+    env: { DELPHI_AUTHOR_TYPE: "agent" },
+    clientName: "delphi-chat",
+    detached: process.platform !== "win32",
+    timeoutMs: 60000,
+    warn: (...parts) => serverWarn(`${parts.join(" ")}\n`),
+  });
+  await client.start();
+  return client;
+}
+
+/** How a chat prints an entry at a terminal: the clean line, and a run's result under it. */
+function printChatEntry(entry, { updated }) {
+  if (!updated) { say(fmt.formatEntry(entry, { clean: true })); return; }
+  const meta = entry.meta || {};
+  if (entry.kind !== "run" || meta.state === "running") return;
+  const verdict = meta.state === "ok" ? "ok" : `fail:${meta.code}`;
+  const timing = meta.dur_ms !== undefined ? ` in ${(meta.dur_ms / 1000).toFixed(1)}s` : "";
+  say(`  ${verdict}${timing}, ${plural(meta.lines || 0, "line", "lines")} of output (delphi out ${entry.id})`);
 }
 
 /** One argv word, quoted for a POSIX shell only when it needs it. */
@@ -242,6 +294,7 @@ async function finishFlow(client, taskId) {
   if (status.state === "missing") {
     throw new Error(`Task ${taskId}'s Workbench folder is gone. delphi work ${taskId} puts it back.`);
   }
+  if (status.state === "unreadable") throw new Error(status.message || status.words);
   if (person && status.unsaved) {
     say(`${plural(status.unsaved, "file has", "files have")} unsaved changes:`);
     for (const file of status.files.slice(0, 20)) say(`  ${file}`);
@@ -271,13 +324,76 @@ async function finishFlow(client, taskId) {
       say(`To open a pull request: ${pr.url}`);
     }
   }
-  const done = await client.call("workbench_finish", { task_id: taskId });
+  // Files git does not keep (an edited .env, notes in build/) are named, and
+  // go only on a yes. Without a person the server's refusal names them.
+  let ignoredOk = false;
+  if (person) {
+    const left = await client.call("workbench_finish_plan", { task_id: taskId });
+    if (left.needsConfirm) {
+      say("The folder has files git does not keep, which finishing removes:");
+      for (const g of left.ignored.slice(0, 20)) say(`  ${g.dir}  (${plural(g.count, "file", "files")})`);
+      if (left.ignored.length > 20) say(`  and ${left.ignored.length - 20} more`);
+      for (const f of left.changedCopies) say(`  ${f} differs from the main checkout's copy`);
+      if (!(await yes("These can go? A copy is kept for 30 days."))) { say("Nothing was finished."); return 1; }
+      ignoredOk = true;
+    }
+  }
+  const done = await client.call("workbench_finish", { task_id: taskId, ignored_ok: ignoredOk });
   say(`Finished. The folder is put away and the branch ${done.branch} is kept.`);
+  if (done.recover) say(done.recover);
   if (person && done.task_status === "doing" && await yes(`Mark task ${taskId} done?`)) {
     await client.call("update_task", { id: taskId, status: "done" });
     say(`Task ${taskId} is done.`);
   }
   return 0;
+}
+
+/**
+ * Start or open a task's Workbench, then a shell in it. The client is closed
+ * before the shell unless the caller still needs it: the Sheet in a terminal
+ * goes back to its own screen afterwards.
+ */
+async function workFlow(client, taskId, { repo, pathOnly = false, closeClient = true } = {}) {
+  // Setup is run here rather than in the server, so its output streams to
+  // the terminal instead of arriving all at once a minute later.
+  const made = await client.call("workbench_start", { task_id: taskId, repo, run_setup: false });
+  for (const line of made.warnings || []) warn(line);
+  let wb = made.workbench;
+  if (wb.state === "missing") {
+    warn(`the folder for task ${taskId}'s Workbench was gone, so it is being put back.`);
+    wb = await client.call("workbench_recreate", { task_id: taskId });
+  } else if (wb.state === "parked") {
+    wb = await client.call("workbench_resume", { task_id: taskId });
+  }
+  if (made.created) {
+    warn(`made a Workbench for task ${taskId} at ${wb.path}, on the branch ${wb.branch}.`);
+    if (made.setup_cmd) {
+      const resolved = await resolve(client, String(taskId), "work");
+      const store = {
+        append: (f) => client.call("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
+        update: (id, f) => client.call("sheet_update", { id, meta: f.meta, body: f.body }),
+      };
+      warn(`setting up with: ${made.setup_cmd}`);
+      const entry = await runEntry({
+        store, taskId, command: made.setup_cmd, cwd: wb.path, logDir: resolved.log_dir,
+        onChunk: (chunk) => process.stderr.write(chunk),
+      });
+      if (!entry.meta || entry.meta.state !== "ok") {
+        warn(`setup did not finish (${made.setup_cmd}); delphi out ${entry.id} shows what it said. The folder is ready otherwise.`);
+      }
+    }
+  }
+  if (pathOnly || !interactive()) {
+    say(wb.path);
+    return 0;
+  }
+  if (closeClient) client.close();
+  return subshell(wb);
+}
+
+/** Holds the terminal until the person has read what is on it. */
+async function pause() {
+  if (interactive()) await ask("Press Enter to go back to the Sheet. ");
 }
 
 const shQuote = (text) => `'${String(text).replace(/'/g, "'\\''")}'`;
@@ -500,63 +616,136 @@ const COMMANDS = {
     // A log older than the entry belongs to an earlier entry that had the same
     // id before it was deleted, and is not shown as this one's.
     const file = logPathFor(logDir, entry.task_id, entry.id);
+    // A command of several lines is on the Sheet by its first line; the
+    // whole of it is shown above its output. At a terminal it goes on top;
+    // piped, to standard error, so what a script reads is still only output.
+    const script = entry.meta && typeof entry.meta.script === "string" ? entry.meta.script : null;
+    const header = script ? `$ ${script}\n\n` : "";
     if (!fs.existsSync(file) || logPredates(file, entry)) {
       const out = entry.meta && entry.meta.out;
-      if (!out) throw new Error(`Entry ${entry.id} has no output recorded.`);
-      say(out);
+      if (!out && !script) throw new Error(`Entry ${entry.id} has no output recorded.`);
+      if (header) (tty ? process.stdout : process.stderr).write(header);
+      say(out || "(no output was recorded)");
       return 0;
     }
     if (!tty) {
+      if (header) process.stderr.write(header);
       const data = fs.readFileSync(file);
       process.stdout.write(flags.raw ? data : fmt.stripAnsi(data.toString("utf8")));
       return 0;
     }
+    let shown = file;
+    let tmp = null;
+    if (header) {
+      tmp = fs.mkdtempSync(path.join(os.tmpdir(), "delphi-out-"));
+      shown = path.join(tmp, `entry-${entry.id}.txt`);
+      fs.writeFileSync(shown, Buffer.concat([Buffer.from(header), fs.readFileSync(file)]));
+    }
+    const cleanup = () => { if (tmp) try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} };
     const pager = splitCommand(process.env.PAGER || "less -R");
-    if (!pager.length) { process.stdout.write(fs.readFileSync(file)); return 0; }
+    if (!pager.length) { process.stdout.write(fs.readFileSync(shown)); cleanup(); return 0; }
     return new Promise((done) => {
-      const child = spawn(pager[0], [...pager.slice(1), file], { stdio: "inherit" });
-      child.on("error", () => { process.stdout.write(fs.readFileSync(file)); done(0); });
-      child.on("close", (code) => done(code || 0));
+      const child = spawn(pager[0], [...pager.slice(1), shown], { stdio: "inherit" });
+      child.on("error", () => { process.stdout.write(fs.readFileSync(shown)); cleanup(); done(0); });
+      child.on("close", (code) => { cleanup(); done(code || 0); });
     });
+  },
+
+  async open(client, { positional }) {
+    const { openSheet } = require("../sheet/tui/sheet");
+    const ref = String(need(positional[0], "The task", "open"));
+    const held = [];
+    const before = serverWarn;
+    serverWarn = (text) => { held.push(text); };
+    try {
+      await openSheet({
+        client,
+        task: ref,
+        // The command line's own flows, so the never-lose-work questions are
+        // asked the same way here as at the shell. The Sheet gives the
+        // terminal back while they run.
+        hooks: {
+          finish: async (taskId) => { await finishFlow(client, taskId); await pause(); },
+          work: async (taskId) => {
+            const code = await workFlow(client, taskId, { closeClient: false });
+            if (code) await pause();
+          },
+          // /agent: plain text typed in the Sheet goes to the agent as well.
+          attachAgent: (name, resolved, { allowUnguarded = false, onEntry } = {}) => require("../sheet/chat").createChatSession({
+            adapter: name, personClient: client, openAgentClient: connectAgent, resolved, allowUnguarded, onEntry,
+          }),
+        },
+      });
+    } finally {
+      serverWarn = before;
+      for (const text of held.slice(-20)) process.stderr.write(text);
+    }
+    return 0;
+  },
+
+  async chat(client, { positional, flags }) {
+    const { createChatSession } = require("../sheet/chat");
+    const resolved = await resolve(client, positional[0], "chat");
+    const taskId = resolved.task.id;
+    const session = await createChatSession({
+      adapter: String(flags.agent || "claude"),
+      personClient: client,
+      openAgentClient: connectAgent,
+      resolved,
+      autoAllow: Boolean(flags.auto),
+      allowUnguarded: Boolean(flags["allow-unguarded"]),
+      onEntry: tty ? printChatEntry : () => {},
+      onError: (error) => warn(`could not write to the Sheet: ${error.message}`),
+    });
+    if (session.resume && tty) warn(`picking up ${session.row.label}'s conversation on task ${taskId}.`);
+
+    // Ctrl-C belongs to the turn: the agent is in its own process group, so
+    // the terminal's interrupt reaches only this process, which stops the
+    // agent and records what it left running as fail:130.
+    const onInterrupt = () => { if (!session.stop()) process.exit(130); };
+    process.on("SIGINT", onInterrupt);
+    const turn = async (message) => {
+      const mine = await client.call("sheet_append", { task_id: taskId, kind: "say", body: message });
+      if (tty) say(fmt.formatEntry(mine, { clean: true }));
+      const result = await session.send(message, { skip: [mine.id] });
+      if (result.interrupted) { warn("stopped."); return 130; }
+      if (result.code !== 0 && !result.written.length) {
+        warn(`${session.row.label} exited ${result.code === null ? "without starting" : result.code} and said nothing.` +
+          `${result.stderr.trim() ? `\n${result.stderr.trim().split("\n").slice(-8).join("\n")}` : ""}`);
+        return 1;
+      }
+      if (!tty) for (const e of result.written) say(String(e.id));
+      return 0;
+    };
+    try {
+      const given = positional.slice(1).join(" ");
+      const piped = !given && !process.stdin.isTTY ? fs.readFileSync(0, "utf8") : "";
+      if ((given || piped).trim()) return await turn((given || piped).trim());
+      if (!interactive()) throw new UsageError("Give the message, or pipe it in: there is no terminal to ask at.", "chat");
+      say(`Talking to ${session.row.label} on task ${taskId}. An empty line or Ctrl-D ends it; Ctrl-C stops a turn.`);
+      const rl = require("readline").createInterface({ input: process.stdin, output: process.stdout });
+      rl.on("SIGINT", () => { if (!session.stop()) rl.close(); });
+      const lines = rl[Symbol.asyncIterator]();
+      for (;;) {
+        rl.setPrompt(`${taskId} ${session.adapter.name}> `);
+        rl.prompt();
+        const next = await lines.next();
+        if (next.done || !String(next.value).trim()) break;
+        // Not paused: readline holds the terminal in raw mode, and a paused
+        // one would not see the Ctrl-C that stops the turn.
+        await turn(String(next.value).trim());
+      }
+      rl.close();
+      return 0;
+    } finally {
+      process.removeListener("SIGINT", onInterrupt);
+      session.close();
+    }
   },
 
   async work(client, { positional, flags }) {
     const { task } = await resolve(client, positional[0], "work");
-    // Setup is run here rather than in the server, so its output streams to
-    // the terminal instead of arriving all at once a minute later.
-    const made = await client.call("workbench_start", { task_id: task.id, repo: flags.repo, run_setup: false });
-    for (const line of made.warnings || []) warn(line);
-    let wb = made.workbench;
-    if (wb.state === "missing") {
-      warn(`the folder for task ${task.id}'s Workbench was gone, so it is being put back.`);
-      wb = await client.call("workbench_recreate", { task_id: task.id });
-    } else if (wb.state === "parked") {
-      wb = await client.call("workbench_resume", { task_id: task.id });
-    }
-    if (made.created) {
-      warn(`made a Workbench for task ${task.id} at ${wb.path}, on the branch ${wb.branch}.`);
-      if (made.setup_cmd) {
-        const resolved = await resolve(client, String(task.id), "work");
-        const store = {
-          append: (f) => client.call("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
-          update: (id, f) => client.call("sheet_update", { id, meta: f.meta, body: f.body }),
-        };
-        warn(`setting up with: ${made.setup_cmd}`);
-        const entry = await runEntry({
-          store, taskId: task.id, command: made.setup_cmd, cwd: wb.path, logDir: resolved.log_dir,
-          onChunk: (chunk) => process.stderr.write(chunk),
-        });
-        if (!entry.meta || entry.meta.state !== "ok") {
-          warn(`setup did not finish (${made.setup_cmd}); delphi out ${entry.id} shows what it said. The folder is ready otherwise.`);
-        }
-      }
-    }
-    if (flags.path || !interactive()) {
-      say(wb.path);
-      return 0;
-    }
-    client.close();
-    return subshell(wb);
+    return workFlow(client, task.id, { repo: flags.repo, pathOnly: Boolean(flags.path) });
   },
 
   async benches(client, { flags }) {
@@ -619,26 +808,55 @@ const COMMANDS = {
 
   async discard(client, { positional }) {
     const { task } = await resolve(client, positional[0], "discard");
-    const plan = await client.call("workbench_discard_plan", { task_id: task.id });
-    say(`Discarding task ${task.id}'s Workbench (${plan.path}) throws away:`);
+    // The git half runs here, in this process, and the server only records
+    // it (workbench_discarded), checking for itself that the folder is gone
+    // and the copy is there. So no MCP tool, whoever calls it, removes a
+    // folder; see the head of workbench/keep.js.
+    const bench = require("../workbench/workbench");
+    const { workbench: wb } = await benchOf(client, task.id);
+    const plan = await bench.discardPlanFor(wb);
+    if (plan.unreadable) { warn(plan.unreadable); return 1; }
+    const list = (items, show) => {
+      for (const item of items.slice(0, 20)) say(`    ${show(item)}`);
+      if (items.length > 20) say(`    and ${items.length - 20} more`);
+    };
+    say(`Discarding task ${task.id}'s Workbench (${plan.path}) removes:`);
     if (plan.unsaved.length) {
       say(`  ${plural(plan.unsaved.length, "unsaved file", "unsaved files")}:`);
-      for (const file of plan.unsaved.slice(0, 20)) say(`    ${file}`);
+      list(plan.unsaved, (file) => file);
     }
     if (!plan.branchPushed && plan.commits.length) {
       say(`  ${plural(plan.commits.length, "commit that exists nowhere else", "commits that exist nowhere else")}:`);
-      for (const c of plan.commits.slice(0, 20)) say(`    ${c.sha.slice(0, 7)} ${c.subject}`);
+      list(plan.commits, (c) => `${c.sha.slice(0, 7)} ${c.subject}`);
     }
-    if (!plan.unsaved.length && (plan.branchPushed || !plan.commits.length)) say("  nothing unsaved.");
+    if (plan.detached.length) {
+      say(`  ${plural(plan.detached.length, "commit on no branch", "commits on no branch")}:`);
+      list(plan.detached, (c) => `${c.sha.slice(0, 7)} ${c.subject}`);
+    }
+    if (plan.ignored.length) {
+      say(`  files git ignores, by folder:`);
+      list(plan.ignored, (g) => `${g.dir}  (${plural(g.count, "file", "files")})`);
+    }
+    if (!plan.unsaved.length && !plan.detached.length && !plan.ignored.length && (plan.branchPushed || !plan.commits.length)) say("  nothing unsaved.");
     say(plan.branchPushed
       ? `The branch ${plan.branch} reached the remote, so it is kept there as ${plan.remote}.`
       : `The branch ${plan.branch} never reached a remote, so it will be deleted.`);
+    say(`${plan.recover}`);
+    if (plan.notKept.length) {
+      say(`  These are not kept:`);
+      list(plan.notKept, (n) => `${n.path}  (${n.why})`);
+    }
     const typed = (await ask(`Type ${task.id} to confirm: `)).trim();
     if (typed !== String(task.id)) { say("Nothing was thrown away."); return 1; }
-    const result = await client.call("workbench_discard", { task_id: task.id, typed });
+    const result = await bench.discardFolder(wb);
+    await client.call("workbench_discarded", {
+      task_id: task.id, ref: result.ref, unsaved: result.unsaved, files: result.files, commits: result.commits,
+      detached: result.detached, ignored: result.ignored, branch_deleted: result.branchDeleted,
+    });
     say(result.keptRemote
       ? `Discarded. The branch is still on the remote as ${result.keptRemote}.`
       : result.branchDeleted ? "Discarded, and the branch deleted." : `Discarded. The branch ${result.branch} is kept.`);
+    say(result.recover);
     return 0;
   },
 
@@ -718,6 +936,19 @@ async function main(argv) {
     process.stderr.write("delphi: discard throws work away, so it only runs at a terminal where a person can type the task number. Nothing was thrown away.\n");
     return 1;
   }
+  // An agent's session says what it is in DELPHI_AUTHOR_TYPE, and a terminal
+  // can be faked with script(1). Discard keeps a copy anyway; this is so an
+  // agent that gets this far is told plainly that it is not its call.
+  if (command === "discard" && process.env.DELPHI_AUTHOR_TYPE === "agent") {
+    process.stderr.write("delphi: discard is for a person to decide, and this is an agent's session. Say what you would discard and why in the task's Sheet instead. Nothing was thrown away.\n");
+    return 1;
+  }
+  // Before anything touches the terminal: the full screen view in a pipe or a
+  // script would only spray escape codes into whatever reads it.
+  if (command === "open" && !interactive()) {
+    process.stderr.write("delphi: open needs a terminal at both ends, and this is not one. To read a Sheet in a pipe or a script, use delphi cat <task>.\n");
+    return 1;
+  }
   const handler = Object.hasOwn(COMMANDS, command) ? COMMANDS[command] : null;
   if (!handler) {
     process.stderr.write(`delphi: no command '${command}'.\n\n${usage()}`);
@@ -734,7 +965,7 @@ async function main(argv) {
 
   // Starting a Workbench fetches, rebasing and pushing cross a network, and
   // setup can take minutes; a minute's patience is for the quick calls.
-  const slow = new Set(["work", "update", "finish", "discard", "status", "benches", "done"]);
+  const slow = new Set(["open", "work", "update", "finish", "discard", "status", "benches", "done"]);
   const client = connect({ timeoutMs: slow.has(command) ? 30 * 60 * 1000 : 60000 });
   try {
     await client.start();

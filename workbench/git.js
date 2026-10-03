@@ -14,7 +14,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const core = require("../git");
 
 // A fetch or a push crosses a network, so it gets a budget measured in what a
@@ -25,6 +25,44 @@ const REMOTE = "origin";
 
 const run = (dir, args, { timeout, write = false } = {}) => core.runGit(dir, args, { timeout, write });
 const text = (result) => (result.ok ? result.stdout.trim() : "");
+
+/**
+ * runGit with an environment and a stdin, which keeping a copy of a folder
+ * needs: a temporary index named in GIT_INDEX_FILE, and a list of paths fed on
+ * stdin so that no path is ever a command line word. Otherwise the same rules
+ * as runGit: argv only, no prompts, resolves rather than rejects.
+ */
+function runWith(dir, args, { env = {}, input = null, timeout = WRITE_TIMEOUT } = {}) {
+  return new Promise((resolve) => {
+    const bin = core.findGit();
+    if (!bin) {
+      resolve({ ok: false, code: null, stdout: "", stderr: "git was not found on this machine" });
+      return;
+    }
+    const child = spawn(bin, ["-C", String(dir), ...args], {
+      stdio: [input == null ? "ignore" : "pipe", "pipe", "pipe"],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeout);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", (e) => { clearTimeout(timer); resolve({ ok: false, code: null, stdout, stderr: String(e.message || e) }); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) resolve({ ok: false, code: null, stdout, stderr: `git did not finish within ${timeout}ms` });
+      else resolve({ ok: code === 0, code, stdout, stderr });
+    });
+    if (input != null) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(input);
+    }
+  });
+}
 
 /** The real path of something that exists, else the path resolved. git reports real paths. */
 function real(p) {
@@ -218,8 +256,28 @@ async function worktreeRemove(repo, dir, { force = false } = {}) {
   return withLockRetry(() => run(repo, args, { timeout: WRITE_TIMEOUT, write: true }));
 }
 
-async function worktreePrune(repo) {
-  return run(repo, ["worktree", "prune"], { timeout: WRITE_TIMEOUT, write: true });
+/**
+ * Forgets folders git still lists but that are gone. Only ones gone for more
+ * than a week: a folder on a disk that is not mounted right now, or a network
+ * share that is down, looks exactly like a deleted one, and pruning it would
+ * cost the person their worktree the next time the disk comes back.
+ */
+async function worktreePrune(repo, { expire = "1.week.ago" } = {}) {
+  return run(repo, ["worktree", "prune", `--expire=${expire}`], { timeout: WRITE_TIMEOUT, write: true });
+}
+
+/**
+ * Forgets one folder git still lists but that is gone, and nothing else. For
+ * the verbs that know which folder they mean (Recreate, Forget, Discard,
+ * Start into a folder name that was used before), where a repository wide
+ * prune would sweep up other people's folders too. A locked registration is
+ * left alone: someone locked it on purpose.
+ */
+async function forgetRegistration(repo, dir) {
+  const entry = (await worktreeList(repo)).find((w) => w.path === dir || samePath(w.path, dir));
+  if (!entry || !entry.prunable || entry.locked) return { ok: true, removed: false };
+  const result = await run(repo, ["worktree", "remove", "--force", entry.path], { timeout: WRITE_TIMEOUT, write: true });
+  return { ok: result.ok, removed: result.ok };
 }
 
 // ---------------------------------------------------------------------------
@@ -251,14 +309,26 @@ function parseStatusFiles(out) {
   return { files, conflicted };
 }
 
+/**
+ * The folder's status, or ok:false with a plain reason when git cannot read
+ * it. A folder whose own top is somewhere else (its .git file was deleted, so
+ * git walked up and found some enclosing repository) counts as unreadable
+ * too: reading the enclosing one would describe somebody else's files.
+ */
 async function status(dir) {
+  const top = await run(dir, ["rev-parse", "--show-toplevel"]);
+  if (!top.ok) return { ok: false, reason: plain(top, UNREADABLE, { strict: true }) };
+  if (!samePath(top.stdout.trim(), dir)) {
+    return { ok: false, reason: "This folder is no longer a checkout of its own: git finds a different repository around it." };
+  }
   const result = await run(dir, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]);
-  if (!result.ok) return { ok: false, reason: plain(result, "git could not read the folder") };
+  if (!result.ok) return { ok: false, reason: plain(result, UNREADABLE, { strict: true }) };
   const head = core.parseStatus(result.stdout);
   const { files, conflicted } = parseStatusFiles(result.stdout);
   return {
     ok: true,
     branch: head.branch,
+    detached: head.detached,
     upstream: head.upstream,
     ahead: head.ahead,
     behind: head.behind,
@@ -266,6 +336,58 @@ async function status(dir) {
     conflicted,
     unsaved: files.length,
   };
+}
+
+const UNREADABLE = "Git cannot read this folder.";
+
+// The operations a person can be part way through, by the file git keeps
+// while one is. Asked by path rather than guessed, because a linked
+// worktree keeps them in its own git folder, not the main one.
+const OPERATIONS = [
+  ["rebase-merge", "a rebase"],
+  ["rebase-apply", "a rebase"],
+  ["MERGE_HEAD", "a merge"],
+  ["CHERRY_PICK_HEAD", "a cherry-pick"],
+  ["REVERT_HEAD", "a revert"],
+  ["sequencer", "a cherry-pick or revert"],
+  ["BISECT_LOG", "a bisect"],
+];
+
+/** The operation the folder is part way through, in words ("a rebase"), or null. */
+async function operation(dir) {
+  const result = await run(dir, ["rev-parse", "--path-format=absolute", ...OPERATIONS.flatMap(([p]) => ["--git-path", p])]);
+  if (!result.ok) return null;
+  const paths = result.stdout.split("\n");
+  for (let i = 0; i < OPERATIONS.length; i++) {
+    if (paths[i] && fs.existsSync(paths[i].trim())) return OPERATIONS[i][1];
+  }
+  return null;
+}
+
+/**
+ * Commits the folder's HEAD has that no branch and no remote has: what a
+ * commit on a detached HEAD, or one left behind by a rebase stopped part way,
+ * looks like. Removing the folder loses them, because HEAD is the only thing
+ * pointing at them and HEAD goes with the folder.
+ */
+async function lonelyCommits(dir) {
+  const result = await run(dir, ["log", "-z", "--format=%H%x1f%s", "HEAD", "--not", "--branches", "--remotes"]);
+  if (!result.ok) return [];
+  return result.stdout.split("\0").filter(Boolean).map((r) => {
+    const [sha, subject] = r.split("\x1f");
+    return { sha: sha.trim(), subject: subject || "" };
+  });
+}
+
+/**
+ * Files git ignores, as git lists them: a folder that is ignored as a whole
+ * comes back once, with a trailing slash, rather than file by file, so a
+ * node_modules costs one line here instead of a hundred thousand.
+ */
+async function ignoredPaths(dir) {
+  const result = await run(dir, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"]);
+  if (!result.ok) return { ok: false, reason: plain(result, UNREADABLE, { strict: true }), paths: [] };
+  return { ok: true, paths: result.stdout.split("\0").filter(Boolean) };
 }
 
 async function countCommits(dir, args) {
@@ -312,6 +434,15 @@ async function push(dir, branch) {
  * explicable state, which is the one place a Workbench must never put them.
  */
 async function pullRebase(dir, base) {
+  // A rebase, merge or bisect the person started themselves is theirs to
+  // finish. Starting another on top would fail anyway, and the abort below
+  // would then throw away the one they were part way through, amended
+  // commits and all.
+  const busy = await operation(dir);
+  if (busy) {
+    return { ok: false, conflict: false, files: [], offline: false,
+      reason: `This folder is in the middle of ${busy}. Finish it or stop it there first; nothing was changed.` };
+  }
   const fetched = await fetch(dir, base);
   const onto = await baseRef(dir, base);
   if (!onto) return { ok: false, conflict: false, files: [], reason: `There is no branch called ${base} to update from.`, offline: fetched.offline };
@@ -319,7 +450,9 @@ async function pullRebase(dir, base) {
   if (result.ok) return { ok: true, conflict: false, files: [], reason: null, offline: fetched.offline };
   const now = await status(dir);
   const files = now.ok ? now.conflicted : [];
-  await run(dir, ["rebase", "--abort"], { timeout: WRITE_TIMEOUT, write: true });
+  // Nothing was in progress a moment ago, so a rebase in progress now is the
+  // one this call started, and only that one is ever aborted.
+  if (await operation(dir) === "a rebase") await run(dir, ["rebase", "--abort"], { timeout: WRITE_TIMEOUT, write: true });
   return {
     ok: false,
     conflict: files.length > 0,
@@ -331,8 +464,14 @@ async function pullRebase(dir, base) {
   };
 }
 
-async function deleteBranch(repo, branch) {
-  return run(repo, ["branch", "-D", branch], { timeout: WRITE_TIMEOUT, write: true });
+/**
+ * Deletes a local branch, but only if it still points where the caller last
+ * saw it. Discard has already kept that commit, so a branch that moved since
+ * (someone committed to it in another folder) is left alone rather than lost.
+ */
+async function deleteBranch(repo, branch, expected) {
+  const args = expected ? ["update-ref", "-d", `refs/heads/${branch}`, expected] : ["branch", "-D", branch];
+  return run(repo, args, { timeout: WRITE_TIMEOUT, write: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +559,19 @@ async function prCreate(dir, { base, branch, title, body }) {
 // git's message, matched, and what a person should be told instead. First match
 // wins, so the specific ones come before the general.
 const PLAIN = [
-  [/not a git repository/i, () => "That folder is not a git repository."],
+  [/locked working tree(?:, lock reason: ([^\n]+))?|is locked|worktree.*locked/i,
+    (m) => `This folder is marked as locked${m[1] ? ` (${m[1].trim()})` : ""}, so it was left in place. Unlock it first if it should go.`],
+  [/dubious ownership|safe\.directory/i, () => "This folder belongs to another user account, so git will not read it until it is marked safe."],
+  [/index file (?:smaller than expected|corrupt)|bad (?:index file )?signature|bad index version|unable to read index|index uses .* extension/i,
+    () => "Git's record of what is in this folder is damaged, so it cannot tell what has changed."],
+  [/gitdir file points to non-existent location|not a git repository|invalid gitfile|gitdir/i,
+    () => "That folder is not a git repository, or git's link to it is broken."],
+  [/unable to (?:read|write) (?:tree|object)|loose object .* is corrupt|object file .* is empty|missing (?:blob|tree|commit)|bad object/i,
+    () => "Part of the repository's history is damaged or missing."],
+  [/submodules? .*(?:cannot|can't)|containing submodules|cannot be (?:moved or )?removed/i,
+    () => "This folder has submodules in it, which git will not remove on its own. Remove them first."],
+  [/unable to create temporary file|read-only file system|insufficient permission/i,
+    () => "Git does not have permission to write in this folder or its repository."],
   [/is already (?:checked out|used by worktree) at '([^']+)'/i, (m) => `That branch is already open in another folder: ${m[1]}.`],
   [/a branch named '([^']+)' already exists/i, (m) => `A branch called ${m[1]} already exists.`],
   [/'([^']+)' already exists/i, (m) => `There is already something at ${m[1]}.`],
@@ -437,23 +588,28 @@ const PLAIN = [
   [/git was not found/i, () => "git is not installed, or Delphi cannot find it. Install git and try again."],
 ];
 
-/** git's failure as a sentence someone new to git can act on. */
-function plain(result, fallback) {
+/**
+ * git's failure as a sentence someone new to git can act on. strict gives the
+ * fallback rather than git's own first line when nothing matches, for the
+ * places (status, above all) where a person must never see git's words.
+ */
+function plain(result, fallback, { strict = false } = {}) {
   const raw = `${result && result.stderr || ""}\n${result && result.stdout || ""}`;
   for (const [pattern, say] of PLAIN) {
     const m = pattern.exec(raw);
     if (m) return say(m);
   }
+  if (strict) return fallback;
   const reason = core.reasonFrom(result || {}, fallback);
   return reason.replace(/^(fatal|error): /i, "").replace(/^\w/, (c) => c.toUpperCase());
 }
 
 module.exports = {
-  REMOTE, real, samePath,
+  REMOTE, real, samePath, run, runWith,
   toplevel, mainCheckout, isBare, isLinkedWorktree, hasSubmodules, hasRemote, refExists, defaultBranch, baseRef,
   fetch, fetchBranch, remoteUrl,
-  parseWorktrees, worktreeList, branchState, worktreeAdd, worktreeRemove, worktreePrune,
-  parseStatusFiles, status, countCommits, localOnlyCommits,
+  parseWorktrees, worktreeList, branchState, worktreeAdd, worktreeRemove, worktreePrune, forgetRegistration,
+  parseStatusFiles, status, operation, lonelyCommits, ignoredPaths, countCommits, localOnlyCommits,
   commitAll, push, pullRebase, deleteBranch,
   compareUrl, gh, prCreate, plain,
 };

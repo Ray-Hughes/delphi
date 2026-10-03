@@ -2282,10 +2282,14 @@ function deleteHarness(id) {
 const getHandoff = (id) => one("SELECT * FROM handoffs WHERE id = :id", { id });
 
 const listHandoffs = ({ projectId = null, sessionId = null, status = null, limit = 50 } = {}) => {
+  // Only the parameters the query names are bound: node:sqlite refuses a
+  // named parameter the statement does not use, so binding all four at once
+  // failed on every call that left a filter out.
   const where = [];
-  if (projectId != null) where.push("h.project_id = :projectId");
-  if (sessionId != null) where.push("(h.from_session_id = :sessionId OR h.to_session_id = :sessionId)");
-  if (status) where.push("h.status = :status");
+  const params = { limit: Math.max(1, Math.min(Number(limit) || 50, 500)) };
+  if (projectId != null) { where.push("h.project_id = :projectId"); params.projectId = projectId; }
+  if (sessionId != null) { where.push("(h.from_session_id = :sessionId OR h.to_session_id = :sessionId)"); params.sessionId = sessionId; }
+  if (status) { where.push("h.status = :status"); params.status = status; }
   return all(
     `SELECT h.*, t.title AS task_title,
             f.title AS from_title, f.harness AS from_harness,
@@ -2296,7 +2300,7 @@ const listHandoffs = ({ projectId = null, sessionId = null, status = null, limit
      LEFT JOIN sessions r ON r.id = h.to_session_id
      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
      ORDER BY h.id DESC LIMIT :limit`,
-    { projectId, sessionId, status, limit }
+    params
   );
 };
 

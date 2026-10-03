@@ -846,9 +846,29 @@ const handle = (channel, fn) =>
       // Returning the message rather than throwing keeps the renderer able to
       // show what went wrong instead of a rejected promise with no detail.
       console.error(channel, error);
-      return { ok: false, error: String(error.message || error) };
+      return { ok: false, error: String(error.message || error), ...errorExtras(error) };
     }
   });
+
+// What a refusal carries besides its sentence: the code a window branches on
+// (UNSAVED, IGNORED, ...) and the lists it shows. JSON round tripped, so
+// nothing that cannot cross the boundary ever reaches it.
+const ERROR_FIELDS = ["files", "ahead", "lonely", "path", "branch", "candidates", "ref"];
+function errorExtras(error) {
+  if (!error || typeof error !== "object") return {};
+  const out = {};
+  if (typeof error.code === "string" && error.code) out.code = error.code;
+  let details = error.details && typeof error.details === "object" ? error.details : null;
+  if (!details) {
+    const picked = {};
+    for (const k of ERROR_FIELDS) if (error[k] !== undefined) picked[k] = error[k];
+    if (Object.keys(picked).length) details = picked;
+  }
+  if (details) {
+    try { out.details = JSON.parse(JSON.stringify(details)); } catch {}
+  }
+  return out;
+}
 
 handle("projects:list", () => db.listProjects());
 // Its own channel rather than a flag on projects:list, because every caller of
@@ -931,7 +951,19 @@ const SHEET_LOG_LIMIT = 200 * 1024;
  * from meta.log. meta is written by agents, and a path taken from it would let
  * any of them have the window display an arbitrary file.
  */
+/**
+ * A run's output for the window. An agent's multi-line command is stored as
+ * its first line and " ...", with the whole of it in meta.script, so the
+ * script leads the text: what is shown is what ran, then what it said.
+ */
 function readSheetLog(entry) {
+  const log = readRunLog(entry);
+  const script = entry.meta && typeof entry.meta.script === "string" && entry.meta.script.trim() ? entry.meta.script : null;
+  return script ? { ...log, text: `$ ${script}\n\n${log.text}` } : log;
+}
+
+/** The log file's tail as it is, with nothing added. */
+function readRunLog(entry) {
   if (entry.kind !== "run") throw new Error(`Entry ${entry.id} is a ${entry.kind}, not a run, so it has no output.`);
   const file = sheetRun.logPathFor(SHEET_LOG_DIR, entry.task_id, entry.id);
   const none = { path: null, text: (entry.meta && entry.meta.out) || "", truncated: false };
@@ -965,11 +997,14 @@ function entryCopyText(entry, { withOutput = false } = {}) {
     const options = (entry.meta && Array.isArray(entry.meta.options)) ? entry.meta.options : [];
     return [entry.body, ...options.map((o) => `[${o.key}] ${o.label}`)].join("\n");
   }
+  // A run's source is what ran: the whole script when the body is only its
+  // first line (sheet/format.js runCommand).
+  const source = entry.kind === "run" ? sheetFormat.runCommand(entry) : entry.body;
   if (entry.kind === "run" && withOutput) {
-    const output = sheetFormat.normaliseBody(readSheetLog(entry).text);
-    return output ? `${entry.body}\n${output}` : entry.body;
+    const output = sheetFormat.normaliseBody(readRunLog(entry).text);
+    return output ? `${source}\n${output}` : source;
   }
-  return entry.body;
+  return source;
 }
 
 handle("sheet:read", (taskId, opts = {}) => {
@@ -1028,6 +1063,11 @@ handle("sheet:run", (taskId, command) => new Promise((resolve, reject) => {
   const { StringDecoder } = require("string_decoder");
   const decoder = new StringDecoder("utf8");
   const send = (channel, payload) => { if (win && !win.isDestroyed()) win.webContents.send(channel, payload); };
+  // Batched and capped (sheet/run.js liveBatcher): the payload keeps its
+  // shape, { entryId, taskId, chunk }, with truncated: true when some was cut.
+  let runEntryId = null;
+  const live = sheetRun.liveBatcher((p) => send("sheet-run-output", { entryId: runEntryId, taskId: Number(taskId), ...p }));
+  const queue = (entryId, text) => { runEntryId = entryId; live.push(text); };
   let answered = false;
   const answer = (entry) => { if (!answered) { answered = true; resolve(entry); } };
   const id = Number(taskId);
@@ -1041,16 +1081,18 @@ handle("sheet:run", (taskId, command) => new Promise((resolve, reject) => {
     },
     onChunk: (chunk, entry) => {
       const text = decoder.write(chunk);
-      if (text) send("sheet-run-output", { entryId: entry.id, taskId: id, chunk: text });
+      if (text) queue(entry.id, text);
     },
   }).then((entry) => {
     appRuns.delete(entry.id);
     const rest = decoder.end();
-    if (rest) send("sheet-run-output", { entryId: entry.id, taskId: id, chunk: rest });
+    if (rest) queue(entry.id, rest);
+    live.end();
     send("sheet-run-done", { entryId: entry.id, taskId: id, entry });
     scheduleVaultExport();
     answer(entry);
   }, (error) => {
+    live.cancel();
     if (!answered) reject(error);
     else console.error("sheet:run", error);
   });
@@ -1207,13 +1249,16 @@ handle("workbench:start", benchWrite(async (taskId, opts = {}) => {
 }));
 handle("workbench:open", (id, target) => openWorkbench(id, target));
 handle("workbench:status", (id, opts = {}) => benches.status(id, { fresh: Boolean(opts && opts.fresh) }));
-handle("workbench:park", (id) => benches.park(id));
-handle("workbench:resume", (id) => benches.resume(id));
+handle("workbench:park", benchWrite((id) => benches.park(id)));
+handle("workbench:resume", benchWrite((id) => benches.resume(id)));
 handle("workbench:update", benchWrite((id) => benches.update(id)));
 handle("workbench:commit", (id, message) => benches.commit(id, message));
 handle("workbench:push", (id) => benches.push(id));
 handle("workbench:pr", (id, opts = {}) => benches.pr(id, { create: Boolean(opts && opts.create) }));
-handle("workbench:finish", benchWrite((id) => benches.finish(id)));
+// opts.ignoredOk is the person's "these can go", given after the window has
+// shown them what finishPlan (or an IGNORED refusal's details) listed.
+handle("workbench:finishPlan", (id) => benches.finishPlan(id));
+handle("workbench:finish", benchWrite((id, opts = {}) => benches.finish(id, { ignoredOk: Boolean(opts && opts.ignoredOk === true) })));
 handle("workbench:discardPlan", (id) => benches.discardPlan(id));
 // Checked here as well as in the module: the typed number is the whole of
 // Discard's protection, and it costs nothing to ask twice.

@@ -48,6 +48,22 @@ MUST_BLOCK = [
   "/usr/local/bin/delphi discard 42", "echo 42 | delphi discard 42",
   "cd ~/src/app && delphi discard 42", "DELPHI_DB=/tmp/x.db delphi discard 42",
   "sh -c 'delphi discard 42'",
+  # Wrappers, subshells and the binary found at run time (G3 review): each of
+  # these runs delphi discard as surely as typing it.
+  "env delphi discard 42", "env -i PATH=/usr/bin DELPHI_ACTOR=me delphi discard 42",
+  "command delphi discard 42", "exec delphi discard 42", "nohup delphi discard 42 &",
+  "time delphi discard 42", "time -p delphi discard 42", "nice -n 5 delphi discard 42",
+  "timeout 60 delphi discard 42", "xargs -I{} delphi discard {}",
+  "script -q /dev/null delphi discard 42", "script -q /dev/null node bin/delphi discard 42",
+  "(sleep 4; echo 42) | script -q /dev/null node /x/bin/delphi discard 42",
+  "script -qc 'delphi discard 42' /dev/null", "bash -lc \"delphi discard 42\"",
+  "(delphi discard 42)", "{ delphi discard 42; }", "echo $(delphi discard 42)",
+  "$(which delphi) discard 42", "\"$(which delphi)\" discard 42", "`which delphi` discard 42",
+  "$(command -v delphi) discard 42", "sudo env nohup delphi discard 42",
+  # Pretending to be the command line, to reach the tools it alone is offered.
+  "DELPHI_CLIENT=delphi-cli node agent/mcp_server.js",
+  "export DELPHI_CLIENT=delphi-cli", "env DELPHI_CLIENT=delphi-cli node agent/mcp_server.js",
+  "printf '{}' | DELPHI_CLIENT=delphi-cli node agent/mcp_server.js",
 ]
 
 MUST_ALLOW = [
@@ -71,6 +87,11 @@ MUST_ALLOW = [
   "delphi say 42 'left it for a person to discard'",
   "git commit -m 'guard: refuse delphi discard'",
   "grep -n 'delphi discard' agent/guard.py",
+  # Wrappers around anything else, and the words in an argument, are fine.
+  "env FOO=1 npm test", "nohup npm start &", "time delphi status 42", "script -q /dev/null delphi open 42",
+  "sh script.sh discard", "echo $(delphi status 42)", "(cd app && delphi finish 42)",
+  "git commit -m 'env delphi discard is refused now'", "grep -rn DELPHI_CLIENT agent/",
+  "echo \"$DELPHI_CLIENT\"",
 ]
 
 fails = []

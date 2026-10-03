@@ -361,7 +361,10 @@ async function main() {
   const gone = await benches.discard(wd.id, ` ${td.id} `);
   check("discarded, branch deleted", [gone.discarded, gone.branchDeleted, gone.keptRemote], [true, true, null]);
   check("folder gone, branch gone", [exists(wd.path), gitOk(app, "rev-parse", "--verify", `refs/heads/${wd.branch}`)], [false, false]);
-  check("the Sheet records what was dropped", notes(td.id).pop(), "discarded workbench: dropped 1 unsaved file (loose.txt), 1 local commit");
+  check("the Sheet records what went, and how to get it back", notes(td.id).pop(),
+    `discarded workbench with 1 unsaved file (loose.txt), 1 local commit; the branch ${wd.branch} was deleted. ` +
+    `Everything in it is kept until ${gone.until} as refs/delphi/discarded/${td.id}-${wd.id}. To get it back: ` +
+    `git -C ${fs.realpathSync(app)} worktree add -b ${wd.branch}-recovered ${wd.path} refs/delphi/discarded/${td.id}-${wd.id}`);
 
   const tp = task("Throw away pushed");
   const wp = (await benches.start(tp.id, { runSetup: false })).workbench;

@@ -50,6 +50,9 @@ const DEFAULTS = {
   once: false,
   promptStdin: false,
   allowUnguarded: false,
+  // Off by default in this release: a Workbench per task is new, and a runner
+  // that starts making branches in somebody's repository should be a choice.
+  workbenches: false,
   verbose: false,
 };
 
@@ -75,6 +78,11 @@ Delphi queue runner: claims queued tasks and spawns a headless agent for each.
   --once                 Take at most one pass, then exit
   --max N                Stop after N tasks
   --server PATH          Path to mcp_server.js
+  --workbenches          Give each task its own Workbench (a folder and a branch of
+                         the project's repository) and run the agent there instead
+                         of in --cwd. The Workbench is left in place for a person
+                         to review and finish. Makes --concurrency above 1 safe in
+                         one repository. Off by default in this release
   --allow-unguarded      Start even when agent/guard.py is not installed as a hook
   --verbose              Log each MCP call
   -h, --help             This
@@ -94,6 +102,7 @@ function parseArgs(argv) {
       case "--once": o.once = true; break;
       case "--prompt-stdin": o.promptStdin = true; break;
       case "--allow-unguarded": o.allowUnguarded = true; break;
+      case "--workbenches": o.workbenches = true; break;
       case "--verbose": o.verbose = true; break;
       case "--queue": o.queue = need(i, flag); i++; break;
       case "--project": o.project = need(i, flag); i++; break;
@@ -179,7 +188,7 @@ function clip(text, limit) {
  * queue: the last agent to touch this probably left the reason it failed, and an
  * agent that starts cold repeats it.
  */
-function buildBrief(claim) {
+function buildBrief(claim, { workbench = null } = {}) {
   const task = claim.task;
   const lines = [];
 
@@ -229,6 +238,15 @@ function buildBrief(claim) {
     }
   }
 
+  if (workbench) {
+    lines.push("## Where you are working");
+    lines.push([
+      `This folder is the task's Workbench: its own copy of the repository, on the branch ${workbench.branch}, so nothing you do here touches anyone else's work.`,
+      "Commit your changes on this branch. Do not switch branches, push, or remove the folder: a person reviews the Workbench and finishes it.",
+    ].join("\n"));
+    lines.push("");
+  }
+
   lines.push("## How to finish");
   lines.push([
     "Do the work here, in this working directory.",
@@ -241,6 +259,44 @@ function buildBrief(claim) {
   ].join("\n"));
 
   return clip(lines.join("\n"), MAX_BRIEF);
+}
+
+// --- the Workbench -------------------------------------------------------------
+
+/**
+ * The task's Workbench, made if it has none, with setup run the first time.
+ * Returns { workbench } to work in, or { refuse } with the reason the task
+ * goes back instead: a parked Workbench is a person's decision to set it
+ * aside, and a missing one needs a person to say whether to put it back.
+ *
+ * Setup is run here, as a recorded command attributed to this runner, rather
+ * than inside the server's tool call, so its output goes to a log like any
+ * other run and a slow npm ci does not hold one MCP request for minutes.
+ */
+async function prepareWorkbench(server, taskId) {
+  const made = await server.call("workbench_start", { task_id: taskId, run_setup: false });
+  for (const line of made.warnings || []) warn(`task ${taskId}: ${line}`);
+  const wb = made.workbench;
+  if (wb.state === "parked") {
+    return { refuse: `Its Workbench is parked: a person set it aside. Resuming it (delphi work ${taskId}) lets agents at it again.` };
+  }
+  if (wb.state === "missing") {
+    return { refuse: `Its Workbench folder (${wb.path}) is gone. A person can put it back with delphi work ${taskId}.` };
+  }
+  if (made.created && made.setup_cmd) {
+    const { runEntry } = require("../sheet/run");
+    const resolved = await server.call("sheet_resolve", { task: String(taskId) });
+    const store = {
+      append: (f) => server.call("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
+      update: (id, f) => server.call("sheet_update", { id, meta: f.meta, body: f.body }),
+    };
+    log(`task ${taskId}: setting up its Workbench with ${made.setup_cmd}`);
+    const entry = await runEntry({ store, taskId, command: made.setup_cmd, cwd: wb.path, logDir: resolved.log_dir });
+    if (!entry.meta || entry.meta.state !== "ok") {
+      return { refuse: `Setting up its Workbench failed (${made.setup_cmd}, entry ${entry.id} on the Sheet). The folder is kept.` };
+    }
+  }
+  return { workbench: wb, created: made.created };
 }
 
 // --- running one task --------------------------------------------------------
@@ -387,7 +443,7 @@ async function main() {
   await server.start();
 
   log(`queue '${options.queue}'${options.project ? ` in project '${options.project}'` : ", every project"} as '${options.actor}', agent '${binary}', timeout ${options.timeout}s, lease ${options.lease}m`);
-  log(`agent runs in ${options.cwd}`);
+  log(options.workbenches ? "each task's agent runs in that task's own Workbench" : `agent runs in ${options.cwd}`);
   log(`guard.py ${guard.installed ? `installed via ${guard.file}` : "NOT installed"}`);
 
   if (options.dryRun) {
@@ -437,7 +493,22 @@ async function main() {
     log(`claimed ${id}: ${claim.task.title}`);
 
     try {
-      const result = await runAgent(argv, buildBrief(claim), options, register);
+      let workbench = null;
+      if (options.workbenches) {
+        const prepared = await prepareWorkbench(server, id);
+        if (prepared.refuse) {
+          await server.call("queue_release", { task_id: id, reason: clip(prepared.refuse, MAX_SUMMARY) });
+          warn(`released ${id}: ${prepared.refuse}`);
+          // Counted as finding nothing, so the worker backs off: the same
+          // task is at the top of the pool again, and only a person changes that.
+          started--;
+          return false;
+        }
+        workbench = prepared.workbench;
+        log(`task ${id} works in ${workbench.path} on ${workbench.branch}${prepared.created ? " (new)" : ""}`);
+      }
+      const runOptions = workbench ? { ...options, cwd: workbench.path } : options;
+      const result = await runAgent(argv, buildBrief(claim, { workbench }), runOptions, register);
       const seconds = Math.round((Date.now() - startedAt) / 1000);
       const output = (result.stdout || "").trim();
 
@@ -467,7 +538,8 @@ async function main() {
         : `Agent finished in ${seconds}s and said nothing. Worth checking before trusting this one.`;
       await server.call("queue_complete", {
         task_id: id,
-        summary: `${summary}\n\n(Run unattended by ${options.actor} via ${path.basename(binary)}, ${seconds}s.)`,
+        summary: `${summary}\n\n(Run unattended by ${options.actor} via ${path.basename(binary)}, ${seconds}s.` +
+          `${workbench ? ` The work is in its Workbench at ${workbench.path} on ${workbench.branch}, left for a person to review and finish.` : ""})`,
       });
       log(`completed ${id} in ${seconds}s`);
       return true;
@@ -596,4 +668,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, projectFilter, buildBrief, refusal, describeFailure, clip, splitCommand, resolveBinary, guardStatus };
+module.exports = { parseArgs, projectFilter, buildBrief, prepareWorkbench, refusal, describeFailure, clip, splitCommand, resolveBinary, guardStatus };

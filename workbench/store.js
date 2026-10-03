@@ -24,7 +24,7 @@ const HIDE_AFTER_DAYS = 90;
 const LIVE_SQL = LIVE.map((s) => `'${s}'`).join(", ");
 
 const SELECT = `SELECT w.*, t.title AS task_title, t.status AS task_status, t.project_id AS project_id,
-       r.name AS repo_name, r.path AS repo_path
+       r.name AS repo_name, r.path AS repo_path, r.copy_files AS repo_copy_files
   FROM workbenches w
   JOIN tasks t ON t.id = w.task_id
   JOIN repos r ON r.id = w.repo_id`;
@@ -43,6 +43,9 @@ function shape(row) {
     repo_id: Number(row.repo_id),
     repo_name: row.repo_name,
     repo_path: row.repo_path,
+    // The repo's copy list rides along, so Finish and Discard can tell a
+    // copied .env that was edited from one that was not, without a second read.
+    copy_files: row.repo_copy_files === undefined ? null : row.repo_copy_files,
     path: row.path,
     branch: row.branch,
     base: row.base,
@@ -173,11 +176,21 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
     const existing = sql("SELECT * FROM repos WHERE project_id = :p1 AND path = :p2", [pid, String(path)])[0];
     if (existing) return existing;
     const hasPrimary = sql("SELECT 1 AS one FROM repos WHERE project_id = :p1 AND is_primary = 1", [pid]).length > 0;
-    return sql(`INSERT INTO repos (project_id, name, path, is_primary) VALUES (:p1, :p2, :p3, :p4) RETURNING *`,
-               [pid, String(name || path), String(path), hasPrimary ? 0 : 1])[0];
+    const mine = sql(`INSERT INTO repos (project_id, name, path, is_primary) VALUES (:p1, :p2, :p3, :p4) RETURNING *`,
+                     [pid, String(name || path), String(path), hasPrimary ? 0 : 1])[0];
+    // Two processes adopting the same folder at once (two Starts racing)
+    // both insert. The oldest row wins and the other is removed at once,
+    // before anything hangs off it, so both go on to use the same repo_id and
+    // a Workbench made by one is found by the other.
+    const first = sql("SELECT * FROM repos WHERE project_id = :p1 AND path = :p2 ORDER BY id LIMIT 1", [pid, String(path)])[0];
+    if (first && Number(first.id) !== Number(mine.id)) {
+      sql("DELETE FROM repos WHERE id = :p1", [mine.id]);
+      return first;
+    }
+    return mine;
   }
 
-  /** Every repo that has ever had a Workbench, for housekeeping. */
+  /** Every repo that has ever had a Workbench, for housekeeping, which leaves every other repo alone. */
   function reposInUse() {
     return sql("SELECT * FROM repos WHERE id IN (SELECT DISTINCT repo_id FROM workbenches) ORDER BY id", []);
   }

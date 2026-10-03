@@ -212,36 +212,53 @@ async function main() {
     await timed("bg_exit", { command: "(sleep 4; echo late) & echo now", progressMs: 0 }, (e, ms) => {
       check("a background job holding the pipes does not hold the entry", [e.meta.state, e.meta.out, ms < 2500], ["ok", "now", true]);
     });
+    // Every case below acts when the command says it is ready, never after a
+    // fixed delay. A delay raced the guard (a python process started before
+    // the command, slow on a loaded machine), so onStart had not yet handed
+    // over control, and raced the shell, which could take the SIGINT before
+    // its trap was set and end at once with 130. Times are measured from the
+    // moment of acting, for the same reason.
+    const whenReady = (opts, act) => new Promise((resolve, reject) => {
+      const store = fakeStore();
+      let control = null;
+      let at = null;
+      runEntry({
+        store, taskId: 7, cwd: work, logDir, progressMs: 0, ...opts,
+        onStart: (c) => { control = c; },
+        onChunk: (chunk) => {
+          if (at === null && /ready/.test(String(chunk))) { at = Date.now(); act(control); }
+        },
+      }).then((entry) => resolve([entry, at === null ? null : Date.now() - at]), reject);
+    });
     {
       const controller = new AbortController();
-      setTimeout(() => controller.abort(), 400);
-      await timed("bg_interrupt", { command: "sleep 6 & echo started; wait", signal: controller.signal, progressMs: 0 }, (e, ms) => {
-        check("Ctrl-C with a background job (SIGINT ignored) ends within the kill delay", [e.meta.state, e.meta.code, ms < 5000], ["fail", 130, true]);
-      });
+      const [e, ms] = await whenReady({ command: "sleep 6 & echo ready; wait", signal: controller.signal }, () => controller.abort());
+      check("Ctrl-C with a background job (SIGINT ignored) ends within the kill delay", [e.meta.state, e.meta.code, ms !== null && ms < 5000], ["fail", 130, true]);
     }
     {
       const controller = new AbortController();
-      setTimeout(() => controller.abort(), 400);
-      await timed("trap", { command: "trap '' INT; sleep 6", signal: controller.signal, progressMs: 0 }, (e, ms) => {
-        check("a SIGINT trap is killed after three seconds", [e.meta.code, ms >= 3000 && ms < 5500], [130, true]);
-      });
+      const [e, ms] = await whenReady({ command: "trap '' INT; echo ready; sleep 6", signal: controller.signal }, () => controller.abort());
+      check("a SIGINT trap is killed after three seconds, and says killed (137)", [e.meta.code, ms !== null && ms >= 2900 && ms < 5500], [137, true]);
     }
     {
-      let control = null;
-      const pending = timed("twice", { command: "trap '' INT; sleep 6", progressMs: 0, onStart: (c) => { control = c; } }, (e, ms) => [e, ms]);
-      await new Promise((r) => setTimeout(r, 300));
-      control.interrupt();
-      control.interrupt();
-      const [e, ms] = await pending;
-      check("a second interrupt kills at once", [e.meta.code, ms < 2000], [130, true]);
+      const [e, ms] = await whenReady({ command: "trap '' INT; echo ready; sleep 6" }, (control) => { control.interrupt(); control.interrupt(); });
+      check("a second interrupt kills at once, and says killed (137)", [e.meta.code, ms !== null && ms < 2000], [137, true]);
     }
     {
-      let control = null;
-      const pending = timed("hup", { command: "sleep 6", progressMs: 0, onStart: (c) => { control = c; } }, (e) => e);
-      await new Promise((r) => setTimeout(r, 300));
-      control.kill("SIGHUP");
-      const e = await pending;
+      const [e] = await whenReady({ command: "echo ready; sleep 6" }, (control) => control.kill("SIGHUP"));
       check("a runner going away records why", [e.meta.state, e.meta.code], ["fail", "SIGHUP"]);
+    }
+    {
+      // A background job that let go of the pipes is still killed when the
+      // run ends: nothing a run starts outlives it unless it leaves the group.
+      const marker = path.join(work, `bg-${process.pid}.pid`);
+      await timed("bg_left", { command: `sleep 30 >/dev/null 2>&1 & echo $! > ${marker}; echo ok`, progressMs: 0 }, () => {});
+      const pid = Number(fs.readFileSync(marker, "utf8").trim());
+      await new Promise((r) => setTimeout(r, 200));
+      let alive = true;
+      try { process.kill(pid, 0); } catch { alive = false; }
+      check("a background job is killed with its run", alive, false);
+      fs.rmSync(marker, { force: true });
     }
     await timed("who", { command: "true", progressMs: 0 }, (e, _ms, store) => {
       const first = store.rows.get(e.id);

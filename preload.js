@@ -3,9 +3,20 @@ const { contextBridge, ipcRenderer } = require("electron");
 // Every call returns {ok, data} or {ok:false, error}. Unwrapping here means the
 // renderer can await a plain value and handle failure in one place, rather than
 // every call site repeating the same check.
+// A refusal keeps its code and details (UNSAVED with the files, IGNORED with
+// what Finish would remove), so a window can offer the next step rather than
+// match on the wording. The context bridge copies an Error as its message
+// alone and drops every other property, so a coded refusal crosses as a plain
+// object instead: message, code and details, and a toString that gives the
+// message, so String(error) and `${error}` read the same as before. Anything
+// without a code is still thrown as an Error, exactly as it always was.
 const call = async (channel, ...args) => {
   const result = await ipcRenderer.invoke(channel, ...args);
-  if (!result.ok) throw new Error(result.error);
+  if (!result.ok) {
+    if (!result.code) throw new Error(result.error);
+    const message = String(result.error);
+    throw { name: "Error", message, code: result.code, details: result.details || null, toString: () => message };
+  }
   return result.data;
 };
 
@@ -63,7 +74,10 @@ contextBridge.exposeInMainWorld("delphi", {
     commit: (id, message) => call("workbench:commit", id, message),
     push: (id) => call("workbench:push", id),
     pr: (id, opts) => call("workbench:pr", id, opts),
-    finish: (id) => call("workbench:finish", id),
+    // opts: { ignoredOk: true } once a person has said the files listed by
+    // finishPlan, or by an IGNORED refusal's details, can go.
+    finishPlan: (id) => call("workbench:finishPlan", id),
+    finish: (id, opts) => call("workbench:finish", id, opts),
     discardPlan: (id) => call("workbench:discardPlan", id),
     discard: (id, typed) => call("workbench:discard", id, typed),
     recreate: (id) => call("workbench:recreate", id),

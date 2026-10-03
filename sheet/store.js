@@ -97,7 +97,14 @@ function idOf(value, what) {
 
 // Meta keys that say how a run went. Anything else may carry them by accident
 // or on purpose, and a say entry that claims fail:1 is drawn as a failed run.
-const RUN_ONLY_META = ["state", "exit", "code"];
+const RUN_ONLY_META = ["state", "exit", "code", "out"];
+
+/** Refuses meta that only a run may carry, on anything that is not a run. */
+function refuseRunMeta(kind, meta, what) {
+  if (!meta || kind === "run" || typeof meta !== "object") return;
+  const runKeys = RUN_ONLY_META.filter((k) => Object.prototype.hasOwnProperty.call(meta, k));
+  if (runKeys.length) throw new Error(`${runKeys.join(", ")} only belong on a run entry; ${what} is a ${kind}.`);
+}
 
 /**
  * A body as it is stored: line endings made \n and blank lines at either end
@@ -312,6 +319,9 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
       throw new Error(`Use ${kind}() for a${kind === "ask" ? "n ask" : " decide"} entry, not append().`);
     }
     if (!KINDS.includes(kind)) throw new Error(`kind must be one of say, run, note, got '${kind}'.`);
+    // The same rule update keeps: a say that claims fail:1 is drawn as a
+    // failed run, and an agent could write one straight in rather than edit it.
+    refuseRunMeta(kind, meta, "this entry");
     const task = requireTask(taskId);
     const text = validateBody(kind, body);
     const entry = insert({ task, kind, body: text, meta, refId, promote, author, authorType: type });
@@ -329,10 +339,7 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     if (meta !== undefined && meta !== null && (typeof meta !== "object" || Array.isArray(meta))) {
       throw new Error("meta must be an object.");
     }
-    if (meta && before.kind !== "run") {
-      const runKeys = RUN_ONLY_META.filter((k) => Object.prototype.hasOwnProperty.call(meta, k));
-      if (runKeys.length) throw new Error(`${runKeys.join(", ")} only belong on a run entry; entry ${before.id} is a ${before.kind}.`);
-    }
+    refuseRunMeta(before.kind, meta, `entry ${before.id}`);
     // Words are their author's. Anyone may finish a run (meta), but a body
     // rewritten by someone else would put words in another person's or agent's
     // mouth, and History would show it as theirs.

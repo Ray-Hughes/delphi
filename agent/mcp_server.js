@@ -379,7 +379,7 @@ function benchFor(taskId) {
  */
 function workbenchNotice(taskId) {
   const wb = benchStore.live(taskId);
-  if (!wb || wb.state === "missing") return null;
+  if (!wb || wb.state === "missing" || !fs.existsSync(wb.path)) return null;
   return {
     id: wb.id, path: wb.path, branch: wb.branch, state: wb.state,
     note: `This task still has a live Workbench at ${wb.path}. A person will Finish it; do not remove the folder or the branch yourself.`,
@@ -1201,11 +1201,18 @@ const TOOLS = {
 
   workbench_finish: {
     description:
-      "Put a task's Workbench away once its work is committed and pushed: the folder is removed and the branch is kept. Refuses, saying why, when anything is unsaved or not pushed; it never forces and never stashes. Usually a person does this after reviewing. There is no tool to throw a Workbench away: that is a person's decision.",
-    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+      "Put a task's Workbench away once its work is committed and pushed: the folder is removed and the branch is kept. Refuses, saying why, when anything is unsaved or not pushed, when a rebase or merge is part way through, or when the folder holds files git does not keep (an edited .env, notes in build/); it never forces and never stashes. ignored_ok is a person saying those files can go, and only a person says it: ask in the Sheet. Usually a person does this after reviewing. There is no tool to throw a Workbench away: that is a person's decision.",
+    schema: {
+      type: "object",
+      required: ["task_id"],
+      properties: {
+        task_id: { type: "number" },
+        ignored_ok: { type: "boolean", description: "A person has seen the files git does not keep and said they can go. A copy is kept for 30 days all the same." },
+      },
+    },
     run: async (a) => {
-      const done = await benches.finish(benchFor(a.task_id).id);
-      return { finished: true, task_status: done.taskStatus, branch: done.branch };
+      const done = await benches.finish(benchFor(a.task_id).id, { ignoredOk: a.ignored_ok === true });
+      return { finished: true, task_status: done.taskStatus, branch: done.branch, ref: done.ref || null, recover: done.recover || null };
     },
   },
 
@@ -1220,8 +1227,11 @@ const TOOLS = {
 
   // The rest are for the delphi command line only: left out of tools/list and
   // refused unless DELPHI_CLIENT says the CLI is calling. That is a courtesy,
-  // not a boundary. The boundaries on throwing work away are Discard's typed
-  // confirm, the CLI's refusal without a terminal, and the guard's rule.
+  // not a boundary, and nothing here depends on it: no tool in this server
+  // removes a folder that has anything in it without keeping a copy first.
+  // Discard in particular has no tool. The command line does its git work in
+  // its own process and only records the result here, through
+  // workbench_discarded, which believes nothing it is told.
   workbench_park: {
     description: "Mark a task's Workbench parked. Nothing on disk changes.",
     schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
@@ -1252,15 +1262,27 @@ const TOOLS = {
     schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" }, create: { type: "boolean" } } },
     run: (a) => benches.pr(benchFor(a.task_id).id, { create: a.create === true }),
   },
-  workbench_discard_plan: {
-    description: "What discarding the Workbench would throw away.",
+  workbench_finish_plan: {
+    description: "The files git does not keep that Finish would remove, summarised by folder.",
     schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
-    run: (a) => benches.discardPlan(benchFor(a.task_id).id),
+    run: (a) => benches.finishPlan(benchFor(a.task_id).id),
   },
-  workbench_discard: {
-    description: "Throw a Workbench away. typed must be the task id, typed by a person.",
-    schema: { type: "object", required: ["task_id", "typed"], properties: { task_id: { type: "number" }, typed: { type: "string" } } },
-    run: (a) => benches.discard(benchFor(a.task_id).id, a.typed),
+  workbench_discarded: {
+    description: "Record a Discard the command line has already done. Refuses unless the folder is gone and the Workbench's kept copy (ref) is in its repository.",
+    schema: {
+      type: "object",
+      required: ["task_id", "ref"],
+      properties: {
+        task_id: { type: "number" }, ref: { type: "string" },
+        unsaved: { type: "number" }, files: { type: "array", items: { type: "string" } },
+        commits: { type: "number" }, detached: { type: "number" }, ignored: { type: "number" },
+        branch_deleted: { type: "boolean" },
+      },
+    },
+    run: (a) => benches.markDiscarded(benchFor(a.task_id).id, {
+      ref: a.ref, unsaved: a.unsaved, files: a.files, commits: a.commits, detached: a.detached,
+      ignored: a.ignored, branchDeleted: a.branch_deleted === true,
+    }),
   },
   workbench_recreate: {
     description: "Put a missing Workbench's folder back on its branch.",
@@ -1533,7 +1555,14 @@ const TOOLS = {
     description:
       "The other agents Delphi can hand work to on this machine, and whether each is turned on. Call this before handoff_send if you are guessing at a name.",
     schema: { type: "object", properties: {} },
-    run: () => sql("SELECT key, label, enabled FROM harnesses ORDER BY sort_order, id"),
+    // The launch fields ride along (plan 6.6), so a client that runs agents
+    // itself (sheet/chat.js) launches them as Settings says, edits included.
+    run: () => sql("SELECT key, label, enabled, command, args_json, parser, mcp_style FROM harnesses ORDER BY sort_order, id")
+      .map(({ args_json: argsJson, ...row }) => {
+        let args = [];
+        try { args = JSON.parse(argsJson); } catch {}
+        return { ...row, args: Array.isArray(args) ? args : [] };
+      }),
   },
 
   lock_acquire: {
@@ -1812,7 +1841,7 @@ const TOOLS = {
 // above workbench_park.
 const INTERNAL_TOOLS = new Set([
   "workbench_park", "workbench_resume", "workbench_update", "workbench_commit", "workbench_push",
-  "workbench_pr", "workbench_discard_plan", "workbench_discard", "workbench_recreate",
+  "workbench_pr", "workbench_finish_plan", "workbench_discarded", "workbench_recreate",
   "workbench_forget", "workbench_housekeep", "workbench_advanced",
 ]);
 const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";

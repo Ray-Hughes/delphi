@@ -183,7 +183,7 @@ async function main() {
   await call("sheet:interrupt", long.id);
   await wait(800);
   const stopped = sent.find(([c]) => c === "sheet-run-done");
-  check("interrupt twice kills it", stopped && [stopped[1].entry.meta.state, stopped[1].entry.meta.code], ["fail", 130]);
+  check("interrupt twice kills it, and says killed (137)", stopped && [stopped[1].entry.meta.state, stopped[1].entry.meta.code], ["fail", 137]);
   let notRunning = null;
   try { await call("sheet:interrupt", long.id); } catch (e) { notRunning = e.message; }
   check("interrupting a finished run says so", /not running/.test(notRunning || ""), true);
@@ -202,6 +202,32 @@ async function main() {
   const logFile = path.join(process.env.DELPHI_DATA_DIR, "sheets", String(runTask.id), `${started.id}.log`);
   await call("tasks:uncomment", started.id);
   check("deleting a run deletes its log", fs.existsSync(logFile), false);
+
+  section("a multi-line command shows and copies in full");
+  {
+    const { makeSheetStore } = require("../sheet/store");
+    const agentSheet = makeSheetStore({ sql: db.sqlP, actor: "claude-code:1", authorType: "agent" });
+    const script = "set -e\nnpm ci\nnpm test";
+    const multi = agentSheet.append({ taskId: runTask.id, kind: "run", body: "set -e ...", meta: { state: "ok", code: 0, script } });
+    const logPath = path.join(process.env.DELPHI_DATA_DIR, "sheets", String(runTask.id), `${multi.id}.log`);
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.writeFileSync(logPath, "all green\n");
+    check("copy gives the whole script", await call("sheet:copy", multi.id), script);
+    check("copy with output gives the script, then the output", await call("sheet:copy", multi.id, { withOutput: true }), `${script}\nall green`);
+    check("the log leads with the script", (await call("sheet:log", multi.id)).text, `$ ${script}\n\nall green\n`);
+    const single = agentSheet.append({ taskId: runTask.id, kind: "run", body: "echo one", meta: { state: "ok", code: 0 } });
+    check("a one line command copies as its body", await call("sheet:copy", single.id), "echo one");
+  }
+
+  section("refusals keep their code");
+  const loose = db.createTask({ projectId: null, title: "in no project" });
+  const coded = await handlers.get("workbench:start")({}, loose.id, {});
+  check("a coded refusal crosses with its code, the message unchanged",
+    [coded.ok, coded.code, /not in a project/.test(coded.error)], [false, "NO_PROJECT", true]);
+  const plain = await handlers.get("sheet:log")({}, 999999);
+  check("an uncoded one has no code", [plain.ok, plain.code], [false, undefined]);
+  const preloadText = fs.readFileSync(path.join(__dirname, "..", "preload.js"), "utf8");
+  check("preload carries code and details through", /code: result\.code, details:/.test(preloadText), true);
 
   console.log(`\n${checks - failures}/${checks} checks passed`);
   fs.rmSync(dir, { recursive: true, force: true });

@@ -20,10 +20,16 @@
  * - The run ends when the shell exits, not when its pipes close. A background
  *   job (`cmd &`) inherits the pipes and can hold them open for hours; after a
  *   short grace for the last output, the pipes are cut and the entry finished.
+ *   Whatever is still running in the command's process group then is killed
+ *   with it (SIGKILL), so a run never leaves a job behind that nobody can see
+ *   or stop. A job that must outlive its run has to leave the group on
+ *   purpose (setsid, nohup into a daemon), which is the honest way to say so.
  * - An interrupt escalates. The first sends SIGINT to the whole process group;
  *   a second, or three seconds of being ignored, sends SIGKILL. A SIGINT trap or
  *   a background job (which a non-interactive shell starts with SIGINT ignored)
- *   cannot keep it alive.
+ *   cannot keep it alive. A run ended by SIGINT finishes as fail:130 and one
+ *   that had to be killed as fail:137, the codes a shell reports for each, in
+ *   the app and the command line alike.
  * - The runner's pid and host go in meta, so a run whose runner died without
  *   finishing it (kill -9, a crash, a closed laptop) is found by
  *   sheet/store.js sweepLost and marked fail:lost.
@@ -124,6 +130,7 @@ async function runEntry({
   // never part of a longer UTF-8 sequence.
   const head = [];
   let interrupted = 0;
+  let escalated = false;
   let killedFor = null;
   let killTimer = null;
   let progressTimer = null;
@@ -187,9 +194,10 @@ async function runEntry({
       interrupted++;
       if (interrupted === 1) {
         group("SIGINT");
-        killTimer = setTimeout(() => group("SIGKILL"), KILL_AFTER_MS);
+        killTimer = setTimeout(() => { escalated = true; group("SIGKILL"); }, KILL_AFTER_MS);
         if (killTimer.unref) killTimer.unref();
       } else {
+        escalated = true;
         group("SIGKILL");
       }
     };
@@ -216,8 +224,8 @@ async function runEntry({
       clearInterval(progressTimer);
       if (signal) signal.removeEventListener("abort", interrupt);
       // Whatever is left of the group (a background job still holding the
-      // pipes) goes with the run when it was interrupted or killed.
-      if (interrupted || killedFor) group("SIGKILL");
+      // pipes, or one that let go of them) goes with the run. See the head.
+      group("SIGKILL");
       try { child.stdout.destroy(); } catch {}
       try { child.stderr.destroy(); } catch {}
       try { fs.closeSync(sink); } catch {}
@@ -228,9 +236,10 @@ async function runEntry({
       } else if (killedFor) {
         Object.assign(meta, { state: "fail", code: killedFor, exit: code });
       } else if (interrupted) {
-        // 130 is what a shell reports for a command ended by Ctrl-C, whatever
-        // the program did with the signal, so that is what the entry says.
-        Object.assign(meta, { state: "fail", code: 130, exit: code });
+        // 130 is what a shell reports for a command ended by Ctrl-C, and 137
+        // for one that had to be killed (128 + SIGKILL), so that is what the
+        // entry says, whatever the program did with the signal.
+        Object.assign(meta, { state: "fail", code: escalated ? 137 : 130, exit: code });
       } else if (code === null) {
         Object.assign(meta, { state: "fail", code: sig || "signal", exit: null });
       } else {
@@ -250,4 +259,46 @@ async function runEntry({
   });
 }
 
-module.exports = { SHORT_OUTPUT_LINES, KILL_AFTER_MS, EXIT_GRACE_MS, PROGRESS_MS, GUARD_ADVICE, logPathFor, countLines, runnerMeta, runEntry };
+// Live output to a window is batched per run and sent at most every
+// LIVE_FLUSH_MS, never more than LIVE_MAX characters at a time. A command
+// printing as fast as it can (a 30 MB build log, a loop of echoes) used to cost
+// one IPC message per pipe read, which is what froze the window. Anything cut
+// is still in the log, read in full once the run ends; truncated says so.
+const LIVE_FLUSH_MS = 75;
+const LIVE_MAX = 200 * 1024;
+
+/**
+ * A per run batcher: push(text) as output arrives, end() when the run is over
+ * (it sends whatever is left at once). send gets { chunk, truncated } with
+ * truncated present only when something was cut since the last send.
+ */
+function liveBatcher(send, { flushMs = LIVE_FLUSH_MS, max = LIVE_MAX } = {}) {
+  let pending = "";
+  let cut = false;
+  let timer = null;
+  const flush = () => {
+    clearTimeout(timer);
+    timer = null;
+    if (!pending) return;
+    const payload = { chunk: pending };
+    if (cut) payload.truncated = true;
+    pending = "";
+    cut = false;
+    try { send(payload); } catch {}
+  };
+  return {
+    push(text) {
+      if (!text) return;
+      pending += text;
+      if (pending.length > max) {
+        pending = pending.slice(-max);
+        cut = true;
+      }
+      if (!timer) timer = setTimeout(flush, flushMs);
+    },
+    end: flush,
+    cancel() { clearTimeout(timer); timer = null; pending = ""; },
+  };
+}
+
+module.exports = { LIVE_FLUSH_MS, LIVE_MAX, liveBatcher, SHORT_OUTPUT_LINES, KILL_AFTER_MS, EXIT_GRACE_MS, PROGRESS_MS, GUARD_ADVICE, logPathFor, countLines, runnerMeta, runEntry };
