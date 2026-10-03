@@ -83,14 +83,21 @@ function toEntry(row) {
   };
 }
 
-/** A whole number id, or a plain sentence saying what was wrong with it. */
+/**
+ * A whole number id, or a plain sentence saying what was wrong with it. Only a
+ * positive integer or a string of digits: Number() would also take true,
+ * "0x1" and "1e0", and an id that is secretly 1 is how the wrong entry changes.
+ */
 function idOf(value, what) {
-  const n = Number(value);
-  if (value === null || value === undefined || value === "" || !Number.isSafeInteger(n) || n <= 0) {
-    throw new Error(`${what} must be a whole number, got '${value}'.`);
-  }
-  return n;
+  const ok = (typeof value === "number" && Number.isSafeInteger(value) && value > 0)
+    || (typeof value === "string" && /^\d+$/.test(value.trim()) && Number.isSafeInteger(Number(value)) && Number(value) > 0);
+  if (!ok) throw new Error(`${what} must be a whole number, got '${value}'.`);
+  return Number(value);
 }
+
+// Meta keys that say how a run went. Anything else may carry them by accident
+// or on purpose, and a say entry that claims fail:1 is drawn as a failed run.
+const RUN_ONLY_META = ["state", "exit", "code"];
 
 /**
  * A body as it is stored: line endings made \n and blank lines at either end
@@ -322,6 +329,17 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     if (meta !== undefined && meta !== null && (typeof meta !== "object" || Array.isArray(meta))) {
       throw new Error("meta must be an object.");
     }
+    if (meta && before.kind !== "run") {
+      const runKeys = RUN_ONLY_META.filter((k) => Object.prototype.hasOwnProperty.call(meta, k));
+      if (runKeys.length) throw new Error(`${runKeys.join(", ")} only belong on a run entry; entry ${before.id} is a ${before.kind}.`);
+    }
+    // Words are their author's. Anyone may finish a run (meta), but a body
+    // rewritten by someone else would put words in another person's or agent's
+    // mouth, and History would show it as theirs.
+    const rewrites = body !== undefined && cleanBody(body) !== before.body;
+    if (rewrites && before.author !== writer) {
+      throw new Error(`Entry ${before.id} was written by ${before.author}; only they can change what it says. Add an entry instead.`);
+    }
     const changes = (key) => meta && Object.prototype.hasOwnProperty.call(meta, key)
       && JSON.stringify(meta[key]) !== JSON.stringify((before.meta || {})[key]);
     let text = body === undefined ? before.body : validateBody(before.kind, body);
@@ -352,6 +370,12 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     if (finished) {
       const code = after.meta.code === null || after.meta.code === undefined ? "" : `:${after.meta.code}`;
       audit(task, `finished ${clip(after.body, 40)}: ${after.meta.state === "ok" ? "ok" : `fail${code}`}`);
+    } else if (after.body !== before.body) {
+      // The words before the edit, kept where History can show them, because
+      // an edit that leaves no trace of what was there is how a finding
+      // quietly disappears.
+      const was = before.body.length > 2000 ? `${before.body.slice(0, 1997)}...` : before.body;
+      audit(task, `edited entry ${after.id}, which said: "${was}"`);
     } else {
       audit(task, `edited entry ${after.id}`);
     }
@@ -359,9 +383,12 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
   }
 
   function promote(id, on = true) {
+    // Strictly a boolean. "false" is a string and true in JavaScript, so a
+    // loose check promoted what the caller asked to unpromote.
+    if (on !== true && on !== false) throw new Error(`on must be true or false, got '${on}'.`);
     const before = get(id);
     const task = requireTask(before.task_id);
-    const flag = on === false || on === 0 || on === "false" ? 0 : 1;
+    const flag = on ? 1 : 0;
     sql("UPDATE comments SET promoted = :p1, updated_at = datetime('now') WHERE id = :p2", [flag, before.id]);
     audit(task, `${flag ? "promoted" : "unpromoted"} entry ${before.id}`);
     return get(before.id);
@@ -450,6 +477,14 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     if (!option) {
       throw new Error(`Choose one of ${options.map((o) => o.key).join(", ")} for entry ${askEntry.id}, not '${choice}'.`);
     }
+    // One answer per question. A second would sit in the ledger beside the
+    // first, both promoted, and the next agent would have to guess which holds.
+    const prior = sql("SELECT id, meta FROM comments WHERE kind = 'decide' AND ref_id = :p1 ORDER BY id LIMIT 1", [askEntry.id])[0];
+    if (prior) {
+      let was = "?";
+      try { was = JSON.parse(prior.meta).choice || was; } catch {}
+      throw new Error(`Entry ${askEntry.id} is already decided as ${was} in entry ${prior.id}; ask again to revisit.`);
+    }
     const reason = why === null || why === undefined ? "" : cleanBody(why);
     const task = requireTask(askEntry.task_id);
     const entry = insert({
@@ -460,6 +495,31 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     });
     audit(task, `decided ${option.key} on ${askEntry.id}`);
     return entry;
+  }
+
+  /**
+   * Finishes runs whose runner died without finishing them, as fail:lost.
+   * Only runs started on this host by a runner whose pid is gone: a pid on
+   * another machine says nothing about this one, and an entry written by an
+   * agent through sheet_append has no runner here to ask about.
+   */
+  function sweepLost({ taskId = null, host, isAlive } = {}) {
+    const params = [];
+    let where = "kind = 'run' AND meta LIKE '%\"state\":\"running\"%'";
+    if (taskId !== null && taskId !== undefined) {
+      params.push(idOf(taskId, "task_id"));
+      where += ` AND task_id = :p${params.length}`;
+    }
+    const lost = [];
+    for (const row of sql(`SELECT id, meta FROM comments WHERE ${where} ORDER BY id`, params)) {
+      let meta = null;
+      try { meta = JSON.parse(row.meta); } catch { continue; }
+      if (!meta || meta.state !== "running" || !meta.runner_pid || meta.runner_host !== host) continue;
+      if (isAlive(Number(meta.runner_pid))) continue;
+      update(row.id, { meta: { state: "fail", code: "lost", exit: null } });
+      lost.push(Number(row.id));
+    }
+    return lost;
   }
 
   /** Tasks done more than `days` ago, whose run logs can go. */
@@ -475,8 +535,14 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
 
   return {
     resolveTask, header, entries, read, ledger, context, append, update, promote, file, ask,
-    decide: decideAsk, get, sheet, prunable,
+    decide: decideAsk, get, sheet, prunable, sweepLost,
   };
 }
 
-module.exports = { KINDS, NOTE_KINDS, LEDGER_TAIL, makeSheetStore, toEntry };
+/** Whether a pid is a live process on this machine. EPERM means alive, someone else's. */
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === "EPERM"; }
+}
+
+module.exports = { KINDS, NOTE_KINDS, LEDGER_TAIL, makeSheetStore, toEntry, idOf, pidAlive };

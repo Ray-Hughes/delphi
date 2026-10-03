@@ -43,6 +43,33 @@ contextBridge.exposeInMainWorld("delphi", {
     log: (id) => call("sheet:log", id),
     copy: (id, opts) => call("sheet:copy", id, opts),
     copyAll: (taskId, opts) => call("sheet:copyAll", taskId, opts),
+    // Runs a command as a `$ ` entry. Resolves with the entry once it has
+    // started or been refused; output arrives on onSheetRunOutput.
+    run: (taskId, command) => call("sheet:run", taskId, command),
+    interrupt: (entryId) => call("sheet:interrupt", entryId),
+  },
+  // A task's own folder and branch. Every call takes the Workbench id except
+  // forTask, candidates, start and list. Start returns once the folder exists;
+  // setup continues and reports on onWorkbenchEvent.
+  workbench: {
+    forTask: (taskId) => call("workbench:forTask", taskId),
+    candidates: (taskId) => call("workbench:candidates", taskId),
+    start: (taskId, opts) => call("workbench:start", taskId, opts),
+    open: (id, target) => call("workbench:open", id, target),
+    status: (id, opts) => call("workbench:status", id, opts),
+    park: (id) => call("workbench:park", id),
+    resume: (id) => call("workbench:resume", id),
+    update: (id) => call("workbench:update", id),
+    commit: (id, message) => call("workbench:commit", id, message),
+    push: (id) => call("workbench:push", id),
+    pr: (id, opts) => call("workbench:pr", id, opts),
+    finish: (id) => call("workbench:finish", id),
+    discardPlan: (id) => call("workbench:discardPlan", id),
+    discard: (id, typed) => call("workbench:discard", id, typed),
+    recreate: (id) => call("workbench:recreate", id),
+    forget: (id) => call("workbench:forget", id),
+    list: (opts) => call("workbench:list", opts),
+    advanced: (id) => call("workbench:advanced", id),
   },
   notes: {
     list: (projectId) => call("notes:list", projectId),
@@ -157,6 +184,8 @@ contextBridge.exposeInMainWorld("delphi", {
     create: (payload) => call("repos:create", payload),
     setPrimary: (id) => call("repos:setPrimary", id),
     remove: (id) => call("repos:delete", id),
+    // base_branch, setup_cmd and copy_files: the per repository Workbench settings.
+    update: (id, fields) => call("repos:update", id, fields),
   },
   oracle: {
     stats: () => call("oracle:stats"),
@@ -189,6 +218,16 @@ contextBridge.exposeInMainWorld("delphi", {
   // Another process (an agent, the command line) wrote to the database.
   onDbChanged: (fn) => ipcRenderer.on("db-changed", () => fn()),
   onFocusTask: (fn) => ipcRenderer.on("focus-task", (_e, payload) => fn(payload)),
+  // Progress of a Workbench Start: { workbenchId, taskId, phase, text }, phase
+  // one of fetching, creating, copying, setup, ready, failed.
+  // A composer run's output as it arrives, { entryId, taskId, chunk }, and its
+  // finished entry, { entryId, taskId, entry }.
+  onSheetRunOutput: (fn) => ipcRenderer.on("sheet-run-output", (_e, payload) => fn(payload)),
+  onSheetRunDone: (fn) => ipcRenderer.on("sheet-run-done", (_e, payload) => fn(payload)),
+  onWorkbenchEvent: (fn) => ipcRenderer.on("workbench-event", (_e, payload) => fn(payload)),
+  // A task with a live Workbench was marked done in the app: offer Finish.
+  // { taskId, workbenchId, taskTitle, path, branch, state }
+  onWorkbenchPrompt: (fn) => ipcRenderer.on("workbench-prompt", (_e, payload) => fn(payload)),
   // A reply and command output both arrive a piece at a time, because the
   // renderer can neither make the request nor spawn the process. Register these
   // once, at module scope: none of the listeners in this file can be removed, so

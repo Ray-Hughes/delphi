@@ -8,7 +8,7 @@ DRY RUN, nothing will be claimed or spawned
 
 Would spawn, in <CWD>:
   <AGENT> -n <brief>
-  brief as the last argument, 1044 characters
+  brief as the last argument, 1254 characters
 
 --- brief for task 1 ---
 You are an agent working one task from the Delphi queue, unattended.
@@ -21,17 +21,22 @@ priority high, project Runner test
 Do the first thing.
 Carefully.
 
-## What has already been said on this task
-### claude-code:3 (<T>)
-Tried X, it failed with :p1 and $& in it
+## The task's Sheet
+Every entry in its ledger (findings, dead ends and decisions that hold for this task) and its latest entries, oldest first. Read it before you start: it is what earlier agents and people already learned.
 
-### ray (<T>)
-multi
-line
+---
+task: 1
+title: first queued
+project: run-test
+status: todo
+---
+@ claude-code:3: Tried X, it failed with :p1 and $& in it
+> ray: multi
+  line
 
-```
-$ ls
-```
+  ```
+  $ ls
+  ```
 
 ## How to finish
 Do the work here, in this working directory.

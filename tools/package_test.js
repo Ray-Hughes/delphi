@@ -43,9 +43,7 @@ const PKG = require(path.join(ROOT, "package.json"));
 // file exists it is reported as pending rather than failed, so the config can
 // lead the code. Remove an entry once its file lands; after that, missing is a
 // failure like anything else.
-const PENDING = new Set([
-  "workbench",
-]);
+const PENDING = new Set([]);
 
 let checks = 0;
 let failures = 0;

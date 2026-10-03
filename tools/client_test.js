@@ -37,8 +37,11 @@ function fake(name, body) {
   return file;
 }
 
-// Answers the first request it reads, then exits at once without waiting for
-// stdout to drain.
+// Answers the first request it reads, then exits the moment the write has been
+// handed to the pipe. Not before: a process that exits with its write still
+// queued loses it on some Nodes (23 on macOS among them), and that is the
+// fixture's bug, not the client's. What this tests is that a reply followed at
+// once by the end of the stream is still read.
 const answerAndDie = fake("answer-and-die", `
 let buffer = "";
 process.stdin.setEncoding("utf8");
@@ -47,8 +50,7 @@ process.stdin.on("data", (chunk) => {
   const i = buffer.indexOf("\\n");
   if (i < 0) return;
   const req = JSON.parse(buffer.slice(0, i));
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { said: "x".repeat(20000) } }) + "\\n");
-  process.exit(0);
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { said: "x".repeat(20000) } }) + "\\n", () => process.exit(0));
 });
 `);
 

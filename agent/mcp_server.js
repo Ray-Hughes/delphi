@@ -343,7 +343,7 @@ const pads = require("../pads");
 // text and rules and is handed this file's sql(), so it works on either route
 // and the two sides cannot disagree about what a valid entry is. See the head
 // of sheet/store.js.
-const { makeSheetStore } = require("../sheet/store");
+const { makeSheetStore, pidAlive } = require("../sheet/store");
 const sheetFormat = require("../sheet/format");
 const AUTHOR_TYPE = ["human", "agent", "tool"].includes(process.env.DELPHI_AUTHOR_TYPE)
   ? process.env.DELPHI_AUTHOR_TYPE : null;
@@ -351,6 +351,40 @@ const sheets = makeSheetStore({ sql, actor: ACTOR, authorType: AUTHOR_TYPE });
 // Run logs live beside the database, which is DATA_DIR in the app's terms, so
 // they inherit its "never in git" rule.
 const SHEET_LOG_DIR = path.join(path.dirname(DB), "sheets");
+
+// Workbenches, from the same modules the app uses, for the same reason the
+// Sheet store is shared. Setup commands run through sheet/run.js so they are
+// guarded and recorded like any other `$ ` entry.
+const { makeWorkbenchStore } = require("../workbench/store");
+const { createWorkbench } = require("../workbench/workbench");
+const { runEntry } = require("../sheet/run");
+const benchStore = makeWorkbenchStore({ sql, actor: ACTOR });
+const benches = createWorkbench({
+  store: benchStore, sheet: sheets, runEntry, logDir: SHEET_LOG_DIR,
+  settings: () => readSettings(),
+});
+
+/** A task's live Workbench, or a sentence saying it has none. */
+function benchFor(taskId) {
+  const wb = benchStore.live(taskId);
+  if (!wb) throw new Error(`Task ${taskId} has no Workbench. Start one with workbench_start.`);
+  return wb;
+}
+
+/**
+ * What an agent is told when it closes a task that still has a Workbench. The
+ * update goes through; the folder and the branch are a person's to Finish,
+ * because Finish is where someone looks at the work before it is put away, and
+ * an agent finishing its own work as a side effect skips exactly that.
+ */
+function workbenchNotice(taskId) {
+  const wb = benchStore.live(taskId);
+  if (!wb || wb.state === "missing") return null;
+  return {
+    id: wb.id, path: wb.path, branch: wb.branch, state: wb.state,
+    note: `This task still has a live Workbench at ${wb.path}. A person will Finish it; do not remove the folder or the branch yourself.`,
+  };
+}
 
 /** What an agent is shown of a task's Sheet: the ledger plus the recent tail. */
 function sheetContext(taskId) {
@@ -371,13 +405,17 @@ function sheetContext(taskId) {
 /**
  * The folder a command for this task should run in, and where that came from.
  *
- * The primary repo first, then the project's primary workspace folder, then the
+ * The task's Workbench first, because that is where its work is and running
+ * a command anywhere else is how one task's build ends up in another's folder.
+ * Then the primary repo, then the project's primary workspace folder, then the
  * project's own folder. repos is empty in most real databases, which is why the
- * other two count. A Workbench will come first once it exists.
+ * other two count.
  */
 function resolveTaskFolder(task) {
-  if (task.project_id == null) return { cwd: null, cwd_source: null };
   const exists = (p) => { try { return Boolean(p) && fs.statSync(p).isDirectory(); } catch { return false; } };
+  const bench = benchStore.live(task.id);
+  if (bench && bench.state !== "missing" && exists(bench.path)) return { cwd: bench.path, cwd_source: "workbench" };
+  if (task.project_id == null) return { cwd: null, cwd_source: null };
   const repos = sql("SELECT path FROM repos WHERE project_id = :p1 ORDER BY is_primary DESC, id", [task.project_id]);
   for (const r of repos) if (exists(r.path)) return { cwd: r.path, cwd_source: "repo" };
   const spaces = sql(
@@ -710,7 +748,8 @@ const TOOLS = {
             [a.id, after.status, ACTOR]);
       }
       audit("update", "task", a.id, a.status ? `status to ${a.status}` : "updated", after.title);
-      return after;
+      const notice = a.status === "done" ? workbenchNotice(a.id) : null;
+      return notice ? { ...after, workbench: notice } : after;
     },
   },
 
@@ -882,7 +921,9 @@ const TOOLS = {
         sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'done', :p2)", [a.task_id, ACTOR]);
       }
       audit("update", "task", a.task_id, "status to done", before.title);
-      return sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
+      const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
+      const notice = workbenchNotice(a.task_id);
+      return notice ? { ...after, workbench: notice } : after;
     },
   },
 
@@ -992,6 +1033,9 @@ const TOOLS = {
     },
     run: (a) => {
       const mode = a.mode || "tail";
+      // A run whose runner died is finished as fail:lost before anyone reads
+      // it as still going. Cheap: one indexed query for this task's runs.
+      try { sheets.sweepLost({ taskId: a.task_id, host: os.hostname(), isAlive: pidAlive }); } catch {}
       const read = sheets.read(a.task_id, { mode, n: a.n, afterId: a.after_id, since: a.since });
       const header = sheets.header(a.task_id);
       return {
@@ -1058,7 +1102,7 @@ const TOOLS = {
       required: ["id"],
       properties: { id: { type: "number" }, on: { type: "boolean", description: "Defaults to true." } },
     },
-    run: (a) => sheets.promote(a.id, a.on !== false),
+    run: (a) => sheets.promote(a.id, a.on === undefined ? true : a.on),
   },
 
   sheet_file: {
@@ -1119,8 +1163,124 @@ const TOOLS = {
       const project = task.project_id != null
         ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [task.project_id])[0] || null
         : null;
-      return { task, project, workbench: null, ...resolveTaskFolder(task), log_dir: SHEET_LOG_DIR };
+      return { task, project, workbench: benchStore.live(task.id), ...resolveTaskFolder(task), log_dir: SHEET_LOG_DIR };
     },
+  },
+
+  workbench_start: {
+    description:
+      "Give a task its own folder and branch to work in (a Workbench), so it cannot collide with any other task's work. Returns the folder's path: run your commands there. If the task already has one, that one is returned (created: false). The branch is named for the task; existing branches are reused. Setup (npm ci and the like) runs as a recorded command unless run_setup is false. Read warnings: they say when the remote could not be reached and the local copy was used.",
+    schema: {
+      type: "object",
+      required: ["task_id"],
+      properties: {
+        task_id: { type: "number" },
+        repo: { type: "string", description: "Which repository, by name or path, when the project has several and none is primary." },
+        run_setup: { type: "boolean", description: "Defaults to true." },
+      },
+    },
+    run: async (a) => {
+      const made = await benches.start(a.task_id, { repo: a.repo || null, runSetup: a.run_setup !== false });
+      return {
+        workbench: made.workbench, created: made.created, warnings: made.warnings || [],
+        setup_entry: made.setup_entry || null, setup_cmd: made.setup_cmd || null,
+      };
+    },
+  },
+
+  workbench_status: {
+    description:
+      "Whether a task's Workbench has unsaved changes, commits not shared yet, or is behind its base branch, in words. Returns workbench null when the task has none.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: async (a) => {
+      const wb = benchStore.live(a.task_id);
+      if (!wb) return { workbench: null };
+      return { workbench: wb, status: await benches.status(wb.id, { fresh: true }) };
+    },
+  },
+
+  workbench_finish: {
+    description:
+      "Put a task's Workbench away once its work is committed and pushed: the folder is removed and the branch is kept. Refuses, saying why, when anything is unsaved or not pushed; it never forces and never stashes. Usually a person does this after reviewing. There is no tool to throw a Workbench away: that is a person's decision.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: async (a) => {
+      const done = await benches.finish(benchFor(a.task_id).id);
+      return { finished: true, task_status: done.taskStatus, branch: done.branch };
+    },
+  },
+
+  workbench_list: {
+    description: "Live Workbenches (active, parked or missing), with status in words. Pass project_id or project to narrow to one project.",
+    schema: {
+      type: "object",
+      properties: { project_id: { type: "number" }, project: { type: "string" } },
+    },
+    run: (a) => benches.list({ projectId: resolveProjectId(a) }),
+  },
+
+  // The rest are for the delphi command line only: left out of tools/list and
+  // refused unless DELPHI_CLIENT says the CLI is calling. That is a courtesy,
+  // not a boundary. The boundaries on throwing work away are Discard's typed
+  // confirm, the CLI's refusal without a terminal, and the guard's rule.
+  workbench_park: {
+    description: "Mark a task's Workbench parked. Nothing on disk changes.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => benches.park(benchFor(a.task_id).id),
+  },
+  workbench_resume: {
+    description: "Mark a parked Workbench active again.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => benches.resume(benchFor(a.task_id).id),
+  },
+  workbench_update: {
+    description: "Bring in the latest from the base branch by rebasing onto it. Stops, changing nothing, on a conflict.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => benches.update(benchFor(a.task_id).id),
+  },
+  workbench_commit: {
+    description: "Commit everything in the Workbench folder.",
+    schema: { type: "object", required: ["task_id", "message"], properties: { task_id: { type: "number" }, message: { type: "string" } } },
+    run: (a) => benches.commit(benchFor(a.task_id).id, a.message),
+  },
+  workbench_push: {
+    description: "Push the Workbench's branch to origin.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => benches.push(benchFor(a.task_id).id),
+  },
+  workbench_pr: {
+    description: "Where to open a pull request, or with create, open one with gh.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" }, create: { type: "boolean" } } },
+    run: (a) => benches.pr(benchFor(a.task_id).id, { create: a.create === true }),
+  },
+  workbench_discard_plan: {
+    description: "What discarding the Workbench would throw away.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => benches.discardPlan(benchFor(a.task_id).id),
+  },
+  workbench_discard: {
+    description: "Throw a Workbench away. typed must be the task id, typed by a person.",
+    schema: { type: "object", required: ["task_id", "typed"], properties: { task_id: { type: "number" }, typed: { type: "string" } } },
+    run: (a) => benches.discard(benchFor(a.task_id).id, a.typed),
+  },
+  workbench_recreate: {
+    description: "Put a missing Workbench's folder back on its branch.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => benches.recreate(benchFor(a.task_id).id),
+  },
+  workbench_forget: {
+    description: "Stop tracking a missing Workbench. The branch is left alone.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => benches.forget(benchFor(a.task_id).id),
+  },
+  workbench_housekeep: {
+    description: "Prune, mark missing folders, adopt orphaned Workbench folders.",
+    schema: { type: "object", properties: {} },
+    run: () => benches.housekeep(),
+  },
+  workbench_advanced: {
+    description: "The real branch, path and git commands behind a Workbench.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => benches.advanced(benchFor(a.task_id).id),
   },
 
   add_note: {
@@ -1648,6 +1808,15 @@ const TOOLS = {
   },
 };
 
+// Callable only by the delphi command line, and not listed. See the comment
+// above workbench_park.
+const INTERNAL_TOOLS = new Set([
+  "workbench_park", "workbench_resume", "workbench_update", "workbench_commit", "workbench_push",
+  "workbench_pr", "workbench_discard_plan", "workbench_discard", "workbench_recreate",
+  "workbench_forget", "workbench_housekeep", "workbench_advanced",
+]);
+const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";
+
 // --- JSON-RPC ---------------------------------------------------------------
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
@@ -1683,7 +1852,7 @@ async function handle(req) {
     const scratchpad = scratchpadState();
     const suffix = scratchpad.on ? directives.scratchpadToolNote(scratchpad.project) : "";
     return {
-      tools: Object.entries(TOOLS).map(([name, t]) => ({
+      tools: Object.entries(TOOLS).filter(([name]) => !INTERNAL_TOOLS.has(name)).map(([name, t]) => ({
         name,
         description: t.description + (suffix && SCRATCHPAD_TOOLS.has(name) ? suffix : ""),
         inputSchema: t.schema,
@@ -1693,7 +1862,7 @@ async function handle(req) {
 
   if (method === "tools/call") {
     const tool = TOOLS[params.name];
-    if (!tool) throw new Error(`Unknown tool ${params.name}`);
+    if (!tool || (INTERNAL_TOOLS.has(params.name) && !CLI_CLIENT)) throw new Error(`Unknown tool ${params.name}`);
     const result = await tool.run(params.arguments || {});
     const content = [{ type: "text", text: JSON.stringify(result, null, 2) }];
 

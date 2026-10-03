@@ -207,7 +207,20 @@ function buildBrief(claim) {
     lines.push("");
   }
 
-  if (claim.comments && claim.comments.length) {
+  if (claim.sheet && String(claim.sheet).trim()) {
+    // The Sheet as the server gives it: the ledger (promoted findings, dead
+    // ends, decisions) and then the latest entries. The ledger is the part an
+    // agent most needs, and the old "last twelve comments" lost it the moment
+    // a task had more than twelve.
+    lines.push("## The task's Sheet");
+    lines.push("Every entry in its ledger (findings, dead ends and decisions that hold for this task) and its latest entries, oldest first. Read it before you start: it is what earlier agents and people already learned.");
+    if (claim.comments_total > claim.comments_shown) {
+      lines.push(`${claim.comments_total - claim.comments_shown} older entries are not shown; sheet_read with mode full has them.`);
+    }
+    lines.push("");
+    lines.push(clip(String(claim.sheet).trim(), 24000));
+    lines.push("");
+  } else if (claim.comments && claim.comments.length) {
     lines.push("## What has already been said on this task");
     for (const comment of claim.comments.slice(-12)) {
       lines.push(`### ${comment.author} (${comment.created_at})`);
@@ -555,7 +568,10 @@ async function dryRun(server, options, argv, binary) {
   }
 
   const first = await server.call("get_task", { id: take[0].id });
-  const brief = buildBrief({ claimed: first.task.id, task: first.task, project: first.project, subtasks: first.subtasks, comments: first.comments });
+  const brief = buildBrief({
+    claimed: first.task.id, task: first.task, project: first.project, subtasks: first.subtasks, comments: first.comments,
+    sheet: first.sheet, comments_total: first.comments_total, comments_shown: first.comments_shown,
+  });
 
   const shown = options.promptStdin ? argv : (argv.includes("{}") ? argv.map((a) => (a === "{}" ? "<brief>" : a)) : [...argv, "<brief>"]);
   console.log("");

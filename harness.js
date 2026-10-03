@@ -556,10 +556,20 @@ function start(options, emit) {
     return Promise.resolve();
   }
 
+  const sessionActor = actor || `${harness.key}:${sessionId || "adhoc"}`;
   const { flags, file } = mcpFlags(harness.mcp_style, {
     dbPath, projectId, sessionId,
-    actor: actor || `${harness.key}:${sessionId || "adhoc"}`,
+    actor: sessionActor,
   });
+  // The same identity in the agent's own environment, not only in its MCP
+  // config. An agent that shells out to `delphi` starts a second MCP server
+  // from that environment; without these it would be recorded as the person,
+  // on whatever database the shell found.
+  const identity = {
+    DELPHI_ACTOR: sessionActor,
+    DELPHI_AUTHOR_TYPE: "agent",
+    ...(dbPath ? { DELPHI_DB: dbPath } : {}),
+  };
 
   const template = typeof harness.args === "string" ? JSON.parse(harness.args) : harness.args;
   const argv = expand(template, {
@@ -573,7 +583,7 @@ function start(options, emit) {
       // appends it to the prompt, and an inherited one would hand it whatever
       // Electron was launched with.
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...(extraEnv || {}) },
+      env: { ...process.env, ...identity, ...(extraEnv || {}) },
     });
 
     if (sessionId) live.set(sessionId, child);

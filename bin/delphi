@@ -39,11 +39,13 @@ const HELP = {
   note: ["delphi note <task> \"<text>\" [--promote]", "Add a short note. --promote puts it in the ledger the next agent reads first."],
   run: [
     "delphi run <task> [--cwd DIR] -- <command...>",
-    "Run a shell command and record it on the Sheet with its result. Everything after -- is the command.",
+    "Run a shell command and record it on the Sheet with its result. Everything after -- is the command:",
+    "one argument is taken as written (pipes and all); several are quoted word by word, so nothing in them",
+    "is read by the shell twice.",
     "The guard is asked first, for every command; a refused one is recorded with the reason and never run.",
     "There is no override. If it genuinely needs doing, run it yourself in a normal terminal.",
     "Runs in the project's folder unless --cwd says otherwise. Output goes to a log; see delphi out.",
-    "Ctrl-C interrupts the command and records it as fail:130.",
+    "Ctrl-C interrupts the command and records it as fail:130; a second Ctrl-C kills it.",
   ],
   ask: ["delphi ask <task> \"<question>\" <option> <option> [<option> <option>]", "Ask a question with two to four answers, keyed a to d."],
   decide: ["delphi decide <entry> <a|b|c|d> [--why \"<text>\"]", "Answer a question. The decision is promoted automatically."],
@@ -54,18 +56,46 @@ const HELP = {
   ],
   out: ["delphi out <entry> [--raw]", "Show a run's full output, through $PAGER at a terminal. Piped, colour codes are stripped unless --raw."],
   import: [
-    "delphi import <task> <file.sheet> [--clean]",
+    "delphi import <task> <file.sheet|-> [--clean]",
     "Append the entries in a Sheet text file to a task. Append only: every entry gets a new id and is",
     "attributed to you, not to whoever the file says wrote it. --clean reads clean text (a vault file).",
+    "- reads the text from standard input. A run that was still running in the file comes in as fail:lost.",
   ],
+  work: [
+    "delphi work <task> [--path] [--repo NAME]",
+    "Go to the task's Workbench: its own folder and branch, made the first time you ask.",
+    "Opens a shell there with [<task>] in the prompt; type exit to come back. --path only prints the folder.",
+    "A shell cannot change its parent's folder, so for a real cd add  eval \"$(delphi shell-init)\"  to your",
+    "shell's startup file and use  work <task>  instead.",
+  ],
+  benches: ["delphi benches [--project KEY]", "List the live Workbenches, with what state each is in, in words."],
+  status: ["delphi status [<task>]", "How a Workbench is doing: Ready, unsaved changes, commits not shared yet, behind its base."],
+  update: [
+    "delphi update <task>",
+    "Bring the latest from the base branch into a task's Workbench. This updates the Workbench, not the task.",
+    "Stops, changing nothing, if your changes and the latest clash.",
+  ],
+  park: ["delphi park <task>", "Set a Workbench aside. Nothing on disk changes; delphi work picks it up again."],
+  finish: [
+    "delphi finish <task>",
+    "Put a Workbench away: offers to commit and push what is left, then a pull request, then removes the folder.",
+    "The branch is always kept. Refuses rather than lose anything.",
+  ],
+  discard: [
+    "delphi discard <task>",
+    "Throw a Workbench away. Lists what would be lost, then asks you to type the task number.",
+    "Needs a person at a terminal. A branch that reached the remote is kept.",
+  ],
+  done: ["delphi done <task>", "Mark a task done. If it still has a Workbench, offers to finish that too."],
+  "shell-init": ["delphi shell-init [bash|zsh]", "Print a work function for your shell that really changes folder. Use: eval \"$(delphi shell-init)\""],
   help: ["delphi help [<command>]", "This, or the detail for one command."],
 };
 
 const TASKS = "A <task> is its id, its legacy id (T-17) or its ticket ref (ABC-1234). An <entry> is an entry id.";
 
 function usage(command) {
-  if (command && HELP[command]) return `${HELP[command].join("\n")}\n`;
-  const lines = ["delphi: a task's Sheet from the shell", ""];
+  if (command && Object.hasOwn(HELP, command)) return `${HELP[command].join("\n")}\n`;
+  const lines = ["delphi: a task's Sheet and Workbench from the shell", ""];
   for (const key of Object.keys(HELP)) lines.push(`  ${HELP[key][0]}`);
   lines.push("", TASKS, "Writes are attributed to DELPHI_ACTOR, or your username when it is not set.", "");
   return lines.join("\n");
@@ -73,7 +103,7 @@ function usage(command) {
 
 // --- arguments -----------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["--tail", "--cwd", "--why", "--title"]);
+const VALUE_FLAGS = new Set(["--tail", "--cwd", "--why", "--title", "--repo", "--project"]);
 
 function parseArgs(argv) {
   const positional = [];
@@ -139,7 +169,7 @@ function actorEnv() {
   return { actor: name, env: process.env.DELPHI_AUTHOR_TYPE ? {} : { DELPHI_AUTHOR_TYPE: "human" } };
 }
 
-function connect() {
+function connect({ timeoutMs = 60000 } = {}) {
   const { actor, env } = actorEnv();
   const client = openServer({
     server: process.env.DELPHI_MCP_SERVER || undefined,
@@ -149,10 +179,189 @@ function connect() {
     detached: process.platform !== "win32",
     // Every call this makes is a quick read or write; the command itself runs
     // here, not in the server. A minute is generous and still ends a hang.
-    timeoutMs: 60000,
+    timeoutMs,
     warn: (...parts) => process.stderr.write(`${parts.join(" ")}\n`),
   });
   return client;
+}
+
+/** One argv word, quoted for a POSIX shell only when it needs it. */
+function shellWord(word) {
+  const text = String(word);
+  return /^[A-Za-z0-9_\/.,:=@%+^-]+$/.test(text) ? text : `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+/** Whether a log file was last written before its entry existed, so is not its log. */
+function logPredates(file, entry) {
+  const created = Date.parse(String(entry.created_at || "").replace(" ", "T") + "Z");
+  if (!Number.isFinite(created)) return false;
+  try { return fs.statSync(file).mtimeMs < created - 2000; } catch { return false; }
+}
+
+// --- asking a person -------------------------------------------------------------
+
+/** Whether a person is at both ends: prompts are only ever shown to one. */
+function interactive() {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+function ask(question) {
+  return new Promise((done) => {
+    const rl = require("readline").createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => { rl.close(); done(String(answer)); });
+    rl.on("SIGINT", () => { rl.close(); process.stdout.write("\n"); done(""); });
+  });
+}
+
+async function yes(question) {
+  const answer = (await ask(`${question} [y/n] `)).trim().toLowerCase();
+  return answer === "y" || answer === "yes";
+}
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const warn = (text) => process.stderr.write(`delphi: ${text}\n`);
+
+// --- Workbenches -------------------------------------------------------------------
+
+async function benchOf(client, taskId) {
+  const read = await client.call("workbench_status", { task_id: taskId });
+  if (!read.workbench) throw new Error(`Task ${taskId} has no Workbench. Start one with delphi work ${taskId}.`);
+  return read;
+}
+
+/**
+ * Finish, asked step by step: commit what is unsaved, push what is unshared,
+ * offer a pull request, then put the folder away. Without a person at the
+ * terminal nothing is offered, and the server's refusal says what is left.
+ * Every "no" stops with nothing finished, because a half finished Finish is
+ * the one outcome nobody asked for.
+ */
+async function finishFlow(client, taskId) {
+  const person = interactive();
+  let { status } = await benchOf(client, taskId);
+  if (status.state === "missing") {
+    throw new Error(`Task ${taskId}'s Workbench folder is gone. delphi work ${taskId} puts it back.`);
+  }
+  if (person && status.unsaved) {
+    say(`${plural(status.unsaved, "file has", "files have")} unsaved changes:`);
+    for (const file of status.files.slice(0, 20)) say(`  ${file}`);
+    if (status.files.length > 20) say(`  and ${status.files.length - 20} more`);
+    if (!(await yes("Commit them?"))) { say("Nothing was finished."); return 1; }
+    const message = (await ask("Commit message: ")).trim();
+    if (!message) { say("A commit needs a message. Nothing was finished."); return 1; }
+    status = await client.call("workbench_commit", { task_id: taskId, message });
+  }
+  if (person && status.ahead) {
+    if (!(await yes(`${plural(status.ahead, "commit is", "commits are")} not shared yet. Push to origin?`))) {
+      say("Nothing was finished.");
+      return 1;
+    }
+    const pushed = await client.call("workbench_push", { task_id: taskId });
+    if (!pushed.ok) { warn(`${pushed.reason} Nothing was finished.`); return 1; }
+  }
+  if (person) {
+    const pr = await client.call("workbench_pr", { task_id: taskId });
+    if (pr.via === "gh") {
+      if (await yes("Open a pull request with gh?")) {
+        const made = await client.call("workbench_pr", { task_id: taskId, create: true });
+        if (made.url) say(`Pull request: ${made.url}`);
+        else if (made.reason) warn(made.reason);
+      }
+    } else if (pr.via === "compare" && pr.url) {
+      say(`To open a pull request: ${pr.url}`);
+    }
+  }
+  const done = await client.call("workbench_finish", { task_id: taskId });
+  say(`Finished. The folder is put away and the branch ${done.branch} is kept.`);
+  if (person && done.task_status === "doing" && await yes(`Mark task ${taskId} done?`)) {
+    await client.call("update_task", { id: taskId, status: "done" });
+    say(`Task ${taskId} is done.`);
+  }
+  return 0;
+}
+
+const shQuote = (text) => `'${String(text).replace(/'/g, "'\\''")}'`;
+
+/**
+ * A shell in the Workbench, with the task in the prompt. A program cannot
+ * change its parent shell's folder, which is the first thing that confuses
+ * people, so this opens a child shell there instead and says how to leave.
+ *
+ * The person's own startup files still run: zsh through a temporary ZDOTDIR
+ * whose files source the real ones, bash through --rcfile. The prefix is
+ * re-applied before each prompt in zsh, because prompt themes rebuild PROMPT
+ * on every line and would drop it.
+ */
+function subshell(wb) {
+  const windows = process.platform === "win32";
+  const shell = windows ? (process.env.ComSpec || "cmd.exe") : (process.env.SHELL || "/bin/sh");
+  const name = path.basename(shell);
+  const label = `[${wb.task_id}] `;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "delphi-work-"));
+  const env = { ...process.env, DELPHI_WORKBENCH: String(wb.task_id) };
+  let args = [];
+  if (name === "zsh") {
+    const real = process.env.ZDOTDIR || os.homedir();
+    fs.writeFileSync(path.join(tmp, ".zshenv"), [
+      `ZDOTDIR=${shQuote(real)}`,
+      '[ -f "$ZDOTDIR/.zshenv" ] && . "$ZDOTDIR/.zshenv"',
+      `ZDOTDIR=${shQuote(tmp)}`,
+      "",
+    ].join("\n"));
+    fs.writeFileSync(path.join(tmp, ".zshrc"), [
+      `ZDOTDIR=${shQuote(real)}`,
+      '[ -f "$ZDOTDIR/.zshrc" ] && . "$ZDOTDIR/.zshrc"',
+      `_delphi_workbench_prompt() { [[ "$PROMPT" == ${shQuote(label)}* ]] || PROMPT=${shQuote(label)}"$PROMPT"; }`,
+      "precmd_functions+=(_delphi_workbench_prompt)",
+      "_delphi_workbench_prompt",
+      `cd ${shQuote(wb.path)}`,
+      "",
+    ].join("\n"));
+    env.ZDOTDIR = tmp;
+  } else if (name === "bash") {
+    const rc = path.join(tmp, "bashrc");
+    fs.writeFileSync(rc, [
+      '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"',
+      `PS1=${shQuote(label)}"$PS1"`,
+      `cd ${shQuote(wb.path)}`,
+      "",
+    ].join("\n"));
+    args = ["--rcfile", rc, "-i"];
+  }
+  say(`You are in Workbench ${wb.task_id} (${wb.branch}). Type exit to come back.`);
+  if (name !== "zsh" && name !== "bash") say(`(Your shell, ${name}, keeps its own prompt; the folder is ${wb.path}.)`);
+  // The shell owns Ctrl-C while it runs. Without this the terminal's interrupt
+  // would end this process too, and leave the shell running without a parent.
+  const ignore = () => {};
+  process.on("SIGINT", ignore);
+  return new Promise((done) => {
+    const child = spawn(shell, args, { cwd: wb.path, env, stdio: "inherit" });
+    const end = (code) => {
+      process.removeListener("SIGINT", ignore);
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+      say(`Back from Workbench ${wb.task_id}.`);
+      done(code || 0);
+    };
+    child.on("error", (error) => { warn(`could not start ${shell}: ${error.message}`); end(1); });
+    child.on("close", (code) => end(code));
+  });
+}
+
+function shellInit(kind) {
+  if (kind && kind !== "bash" && kind !== "zsh") {
+    throw new UsageError(`shell-init knows bash and zsh, not '${kind}'.`, "shell-init");
+  }
+  return [
+    "# Delphi: work <task> moves this shell into the task's Workbench, making it the first time.",
+    "work() {",
+    '  if [ -z "$1" ]; then echo "usage: work <task>" >&2; return 2; fi',
+    "  local dir",
+    '  dir="$(command delphi work "$1" --path)" || return $?',
+    '  cd "$dir" || return $?',
+    '  export DELPHI_WORKBENCH="$1"',
+    "}",
+    "",
+  ].join("\n");
 }
 
 // --- commands ------------------------------------------------------------------
@@ -164,6 +373,9 @@ async function resolve(client, ref, command) {
 const COMMANDS = {
   async cat(client, { positional, flags }) {
     const { task } = await resolve(client, positional[0], "cat");
+    if (flags.ledger && flags.tail !== undefined) {
+      throw new UsageError("--ledger and --tail cannot be used together: the ledger is always shown whole. Use one or the other.", "cat");
+    }
     const mode = flags.ledger ? "ledger" : flags.tail !== undefined ? "tail" : "full";
     const args = { task_id: task.id, mode };
     if (mode === "tail") {
@@ -195,7 +407,11 @@ const COMMANDS = {
   async run(client, { positional, flags, rest }) {
     const resolved = await resolve(client, positional[0], "run");
     if (!rest || !rest.length) throw new UsageError("Put the command after --, as in: delphi run 42 -- npm test", "run");
-    const command = rest.join(" ");
+    // One argument is the command exactly as written, quotes and all, which
+    // is what  delphi run 42 -- "make test | tee log"  means. Several are argv,
+    // each quoted for the shell, so  -- echo "$F"  runs echo with one argument
+    // whatever F holds, and the recorded command reruns identically.
+    const command = rest.length === 1 ? rest[0] : rest.map(shellWord).join(" ");
     const cwd = flags.cwd ? path.resolve(flags.cwd) : resolved.cwd || process.cwd();
     const store = {
       append: (f) => client.call("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
@@ -203,19 +419,33 @@ const COMMANDS = {
     };
     // Ctrl-C belongs to the command. It is in its own process group, so the
     // terminal's interrupt reaches only this process, which passes it on and
-    // stays alive to record the result.
+    // stays alive to record the result. A second Ctrl-C kills it outright.
+    // A closed terminal (SIGHUP) or a kill (SIGTERM) takes the command with
+    // it and still finishes the entry, so it is never left "running".
     const controller = new AbortController();
-    const onInterrupt = () => controller.abort();
+    let control = null;
+    const onInterrupt = () => (control ? control.interrupt() : controller.abort());
+    const onHangup = () => control && control.kill("SIGHUP");
+    const onTerm = () => control && control.kill("SIGTERM");
+    const quiet = () => {};
     process.on("SIGINT", onInterrupt);
+    process.on("SIGHUP", onHangup);
+    process.on("SIGTERM", onTerm);
+    // The terminal may be gone by the time output arrives.
+    process.stdout.on("error", quiet);
+    process.stderr.on("error", quiet);
     let entry;
     try {
       entry = await runEntry({
         store, taskId: resolved.task.id, command, cwd, logDir: resolved.log_dir,
         signal: controller.signal,
-        onChunk: (chunk) => process.stdout.write(chunk),
+        onStart: (c) => { control = c; },
+        onChunk: (chunk) => { try { process.stdout.write(chunk); } catch {} },
       });
     } finally {
       process.removeListener("SIGINT", onInterrupt);
+      process.removeListener("SIGHUP", onHangup);
+      process.removeListener("SIGTERM", onTerm);
     }
     const meta = entry.meta || {};
     if (meta.code === "guard" || meta.code === "error") {
@@ -263,11 +493,14 @@ const COMMANDS = {
   async out(client, { positional, flags }) {
     const id = entryId(positional[0], "out");
     const entry = await client.call("sheet_get", { id });
+    if (entry.kind !== "run") throw new Error(`Entry ${entry.id} is a ${entry.kind}, not a run, so it has no output.`);
     const { log_dir: logDir } = await client.call("sheet_resolve", { task: String(entry.task_id) });
     // Where this machine would have written it, not meta.log: meta is written
     // by whoever wrote the entry, and this should only ever open a run log.
+    // A log older than the entry belongs to an earlier entry that had the same
+    // id before it was deleted, and is not shown as this one's.
     const file = logPathFor(logDir, entry.task_id, entry.id);
-    if (!fs.existsSync(file)) {
+    if (!fs.existsSync(file) || logPredates(file, entry)) {
       const out = entry.meta && entry.meta.out;
       if (!out) throw new Error(`Entry ${entry.id} has no output recorded.`);
       say(out);
@@ -287,10 +520,146 @@ const COMMANDS = {
     });
   },
 
+  async work(client, { positional, flags }) {
+    const { task } = await resolve(client, positional[0], "work");
+    // Setup is run here rather than in the server, so its output streams to
+    // the terminal instead of arriving all at once a minute later.
+    const made = await client.call("workbench_start", { task_id: task.id, repo: flags.repo, run_setup: false });
+    for (const line of made.warnings || []) warn(line);
+    let wb = made.workbench;
+    if (wb.state === "missing") {
+      warn(`the folder for task ${task.id}'s Workbench was gone, so it is being put back.`);
+      wb = await client.call("workbench_recreate", { task_id: task.id });
+    } else if (wb.state === "parked") {
+      wb = await client.call("workbench_resume", { task_id: task.id });
+    }
+    if (made.created) {
+      warn(`made a Workbench for task ${task.id} at ${wb.path}, on the branch ${wb.branch}.`);
+      if (made.setup_cmd) {
+        const resolved = await resolve(client, String(task.id), "work");
+        const store = {
+          append: (f) => client.call("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
+          update: (id, f) => client.call("sheet_update", { id, meta: f.meta, body: f.body }),
+        };
+        warn(`setting up with: ${made.setup_cmd}`);
+        const entry = await runEntry({
+          store, taskId: task.id, command: made.setup_cmd, cwd: wb.path, logDir: resolved.log_dir,
+          onChunk: (chunk) => process.stderr.write(chunk),
+        });
+        if (!entry.meta || entry.meta.state !== "ok") {
+          warn(`setup did not finish (${made.setup_cmd}); delphi out ${entry.id} shows what it said. The folder is ready otherwise.`);
+        }
+      }
+    }
+    if (flags.path || !interactive()) {
+      say(wb.path);
+      return 0;
+    }
+    client.close();
+    return subshell(wb);
+  },
+
+  async benches(client, { flags }) {
+    const rows = await client.call("workbench_list", flags.project ? { project: String(flags.project) } : {});
+    if (!rows.length) {
+      if (tty) say("No Workbenches yet. Start one with delphi work <task>.");
+      return 0;
+    }
+    for (const r of rows) {
+      if (tty) {
+        say(`#${r.task_id}  ${r.state.padEnd(7)}  ${r.status.words}`);
+        say(`      ${r.task_title}`);
+        say(`      ${r.branch}  ${r.path}`);
+      } else {
+        say([r.task_id, r.state, r.status.words, r.branch, r.path].join("\t"));
+      }
+    }
+    return 0;
+  },
+
+  async status(client, { positional }) {
+    // Housekeeping first, so a folder deleted by hand shows as Missing here
+    // rather than as an error.
+    const kept = await client.call("workbench_housekeep", {});
+    for (const id of kept.adopted || []) warn(`found Workbench ${id} on disk and took it back.`);
+    if (!positional[0]) return COMMANDS.benches(client, { flags: {} });
+    const { task } = await resolve(client, positional[0], "status");
+    const read = await client.call("workbench_status", { task_id: task.id });
+    if (!read.workbench) { say(`Task ${task.id} has no Workbench.`); return 0; }
+    const wb = read.workbench;
+    say(`#${task.id}  ${wb.state === "active" ? "" : `${wb.state}, `}${read.status.words}`);
+    if (tty) {
+      say(`      ${wb.branch}  ${wb.path}`);
+      if (read.status.state === "missing") say(`      The folder is gone. delphi work ${task.id} puts it back.`);
+    }
+    return 0;
+  },
+
+  async update(client, { positional }) {
+    const { task } = await resolve(client, positional[0], "update");
+    await benchOf(client, task.id);
+    const result = await client.call("workbench_update", { task_id: task.id });
+    if (result.ok) { say(result.words); return 0; }
+    warn(result.words);
+    return 1;
+  },
+
+  async park(client, { positional }) {
+    const { task } = await resolve(client, positional[0], "park");
+    await benchOf(client, task.id);
+    await client.call("workbench_park", { task_id: task.id });
+    say(`Parked task ${task.id}'s Workbench. delphi work ${task.id} picks it up again.`);
+    return 0;
+  },
+
+  async finish(client, { positional }) {
+    const { task } = await resolve(client, positional[0], "finish");
+    return finishFlow(client, task.id);
+  },
+
+  async discard(client, { positional }) {
+    const { task } = await resolve(client, positional[0], "discard");
+    const plan = await client.call("workbench_discard_plan", { task_id: task.id });
+    say(`Discarding task ${task.id}'s Workbench (${plan.path}) throws away:`);
+    if (plan.unsaved.length) {
+      say(`  ${plural(plan.unsaved.length, "unsaved file", "unsaved files")}:`);
+      for (const file of plan.unsaved.slice(0, 20)) say(`    ${file}`);
+    }
+    if (!plan.branchPushed && plan.commits.length) {
+      say(`  ${plural(plan.commits.length, "commit that exists nowhere else", "commits that exist nowhere else")}:`);
+      for (const c of plan.commits.slice(0, 20)) say(`    ${c.sha.slice(0, 7)} ${c.subject}`);
+    }
+    if (!plan.unsaved.length && (plan.branchPushed || !plan.commits.length)) say("  nothing unsaved.");
+    say(plan.branchPushed
+      ? `The branch ${plan.branch} reached the remote, so it is kept there as ${plan.remote}.`
+      : `The branch ${plan.branch} never reached a remote, so it will be deleted.`);
+    const typed = (await ask(`Type ${task.id} to confirm: `)).trim();
+    if (typed !== String(task.id)) { say("Nothing was thrown away."); return 1; }
+    const result = await client.call("workbench_discard", { task_id: task.id, typed });
+    say(result.keptRemote
+      ? `Discarded. The branch is still on the remote as ${result.keptRemote}.`
+      : result.branchDeleted ? "Discarded, and the branch deleted." : `Discarded. The branch ${result.branch} is kept.`);
+    return 0;
+  },
+
+  async done(client, { positional }) {
+    const { task } = await resolve(client, positional[0], "done");
+    const after = await client.call("update_task", { id: task.id, status: "done" });
+    say(`Task ${task.id} is done.`);
+    if (!after.workbench) return 0;
+    if (interactive()) {
+      if (await yes(`It still has a Workbench at ${after.workbench.path}. Finish it now?`)) return finishFlow(client, task.id);
+      return 0;
+    }
+    warn(`task ${task.id} still has a Workbench at ${after.workbench.path}. Run delphi finish ${task.id} when its work is pushed.`);
+    return 0;
+  },
+
   async import(client, { positional, flags }) {
     const { task } = await resolve(client, positional[0], "import");
     const file = need(positional[1], "The file", "import");
-    const parsed = fmt.parse(fs.readFileSync(file, "utf8"), { clean: Boolean(flags.clean) });
+    const text = file === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(file, "utf8");
+    const parsed = fmt.parse(text, { clean: Boolean(flags.clean) });
     const newIds = new Map();
     let added = 0;
     const skipped = [];
@@ -308,7 +677,10 @@ const COMMANDS = {
         const [choice, ...why] = entry.body.split("\n");
         written = await client.call("sheet_decide", { ask_id: askId, choice: choice.trim(), why: why.join("\n") || undefined });
       } else {
-        const meta = entry.kind === "run" ? (entry.meta || null) : null;
+        let meta = entry.kind === "run" ? (entry.meta || null) : null;
+        // Nothing is running it here. Imported as running, it would wait for
+        // an answer forever.
+        if (meta && (meta.state === "running" || !meta.state)) meta = { ...meta, state: "fail", code: "lost" };
         written = await client.call("sheet_append", {
           task_id: task.id, kind: entry.kind, body: entry.body, meta, promote: Boolean(entry.promoted),
         });
@@ -330,7 +702,23 @@ async function main(argv) {
     process.stdout.write(usage(args[0]));
     return 0;
   }
-  const handler = COMMANDS[command];
+  if (command === "shell-init") {
+    try {
+      process.stdout.write(shellInit(args[0]));
+      return 0;
+    } catch (error) {
+      process.stderr.write(`delphi: ${error.message}\n`);
+      return 1;
+    }
+  }
+  // Refused before anything else happens, so the refusal cannot depend on the
+  // database, the task or the server. Throwing work away is a person's call,
+  // and a person is at a terminal; a script or an agent's shell is not.
+  if (command === "discard" && !interactive()) {
+    process.stderr.write("delphi: discard throws work away, so it only runs at a terminal where a person can type the task number. Nothing was thrown away.\n");
+    return 1;
+  }
+  const handler = Object.hasOwn(COMMANDS, command) ? COMMANDS[command] : null;
   if (!handler) {
     process.stderr.write(`delphi: no command '${command}'.\n\n${usage()}`);
     return 1;
@@ -344,7 +732,10 @@ async function main(argv) {
   }
   if (parsed.flags.help) { process.stdout.write(usage(command)); return 0; }
 
-  const client = connect();
+  // Starting a Workbench fetches, rebasing and pushing cross a network, and
+  // setup can take minutes; a minute's patience is for the quick calls.
+  const slow = new Set(["work", "update", "finish", "discard", "status", "benches", "done"]);
+  const client = connect({ timeoutMs: slow.has(command) ? 30 * 60 * 1000 : 60000 });
   try {
     await client.start();
     return await handler(client, parsed);

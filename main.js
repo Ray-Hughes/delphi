@@ -55,6 +55,13 @@ let settings = {
   // preference already suppresses all of it for the people who need that, so
   // this is a second, independent off switch rather than the only one.
   animations: true,
+  // The command that opens a Workbench folder in an editor, split like a shell
+  // would split it, with the folder appended. null means VS Code's `code` when
+  // it is installed, else the system's default for a folder.
+  workbenchEditor: null,
+  // What Workbench branches start with. null means the OS username, which is
+  // what shows whose branch is whose on a shared remote.
+  workbenchBranchPrefix: null,
 };
 let schedulerTimer = null;
 let vaultTimer = null;
@@ -597,6 +604,22 @@ app.whenReady().then(() => {
   } catch (error) {
     console.error("could not seed the harness registry", error);
   }
+  // Squares Workbench rows with the disk: folders deleted by hand become
+  // Missing, orphaned ones are adopted. Not awaited: it runs git per repo and
+  // the window has no reason to wait for it. The window is told afterwards.
+  // Runs whose runner died (the app last time, a closed terminal, a killed
+  // agent) are finished as fail:lost, so nothing waits on them forever.
+  try {
+    const lost = sheets.sweepLost({ host: require("os").hostname(), isAlive: require("./sheet/store").pidAlive });
+    if (lost.length) console.log(`finished ${lost.length} lost runs`);
+  } catch (error) {
+    console.error("sweeping lost runs", error);
+  }
+  benches.housekeep().then((report) => {
+    if ((report.missing.length || report.restored.length || report.adopted.length) && win && !win.isDestroyed()) {
+      win.webContents.send("db-changed");
+    }
+  }, (error) => console.error("workbench housekeeping", error));
   createWindow();
   createTray();
   refreshMenu();
@@ -792,7 +815,18 @@ app.on("window-all-closed", (e) => e.preventDefault());
 // cancelled, and the app carried on running with no window and no explanation.
 //
 // before-quit fires for all of them, so the flag is set once, here.
-app.on("before-quit", () => { app.isQuitting = true; });
+app.on("before-quit", () => {
+  app.isQuitting = true;
+  // Commands started from the composer die with the app rather than running on
+  // unwatched, and their entries say so now, synchronously, while the database
+  // is still open. Anything that slips past this is swept as fail:lost on the
+  // next start.
+  for (const [entryId, control] of appRuns) {
+    try { control.kill("quit"); } catch {}
+    try { sheets.update(entryId, { meta: { state: "fail", code: "quit", exit: null } }); } catch {}
+  }
+  appRuns.clear();
+});
 app.on("will-quit", () => globalShortcut.unregisterAll());
 
 // ---------------------------------------------------------------------------
@@ -833,9 +867,31 @@ handle("projects:delete", (id, opts) => {
 
 handle("tasks:list", (opts) => db.listTasks(opts));
 handle("tasks:create", (payload) => { const r = db.createTask(payload); scheduleVaultExport(); return r; });
-handle("tasks:update", (id, fields) => { const r = db.updateTask(id, fields); scheduleVaultExport(); return r; });
-handle("tasks:delete", (id) => { const r = db.deleteTask(id); scheduleVaultExport(); return r; });
-handle("tasks:detail", (id) => db.taskDetail(id));
+handle("tasks:update", (id, fields) => {
+  const before = db.handle().prepare("SELECT status FROM tasks WHERE id = ?").get(Number(id));
+  const r = db.updateTask(id, fields);
+  scheduleVaultExport();
+  promptFinishIfDone(id, before && before.status);
+  return r;
+});
+// A deleted task's run logs go with it. Comment ids are reused after a delete
+// (no AUTOINCREMENT), and a log left behind would be shown as the output of
+// whatever entry gets its id next.
+handle("tasks:delete", (id) => {
+  const r = db.deleteTask(id);
+  try { fs.rmSync(path.join(SHEET_LOG_DIR, String(Number(id))), { recursive: true, force: true }); } catch {}
+  scheduleVaultExport();
+  return r;
+});
+// The Workbench rides along with the detail, status words included, so the
+// task panel can draw its button without a second round trip.
+handle("tasks:detail", async (id) => {
+  const detail = db.taskDetail(id);
+  if (detail) {
+    try { detail.workbench = await benches.forTask(id); } catch { detail.workbench = null; }
+  }
+  return detail;
+});
 handle("tasks:queue", (id, queue) => { const r = db.setQueue(id, queue); scheduleVaultExport(); return r; });
 // projectId is optional in both, and leaving it out is the whole pool. The
 // global Queue tab passes nothing; a project's Queue tab passes its id.
@@ -847,7 +903,14 @@ handle("tasks:comment", (taskId, body, author) => {
   scheduleVaultExport();
   return r;
 });
-handle("tasks:uncomment", (id) => db.deleteComment(id));
+handle("tasks:uncomment", (id) => {
+  const row = db.handle().prepare("SELECT id, task_id, kind FROM comments WHERE id = ?").get(Number(id));
+  const r = db.deleteComment(id);
+  if (row && row.kind === "run") {
+    try { fs.rmSync(sheetRun.logPathFor(SHEET_LOG_DIR, row.task_id, row.id), { force: true }); } catch {}
+  }
+  return r;
+});
 
 // ---------------------------------------------------------------------------
 // The Sheet. The same store the MCP server uses, handed db.sqlP, so an entry
@@ -869,13 +932,26 @@ const SHEET_LOG_LIMIT = 200 * 1024;
  * any of them have the window display an arbitrary file.
  */
 function readSheetLog(entry) {
+  if (entry.kind !== "run") throw new Error(`Entry ${entry.id} is a ${entry.kind}, not a run, so it has no output.`);
   const file = sheetRun.logPathFor(SHEET_LOG_DIR, entry.task_id, entry.id);
-  let size;
-  try { size = fs.statSync(file).size; } catch { return { path: null, text: (entry.meta && entry.meta.out) || "", truncated: false }; }
+  const none = { path: null, text: (entry.meta && entry.meta.out) || "", truncated: false };
+  let stat;
+  try { stat = fs.statSync(file); } catch { return none; }
+  // Last written before this entry existed: an earlier entry's log that had
+  // this id before a delete, never this one's.
+  const created = Date.parse(String(entry.created_at || "").replace(" ", "T") + "Z");
+  if (Number.isFinite(created) && stat.mtimeMs < created - 2000) return none;
+  const size = stat.size;
   const start = Math.max(0, size - SHEET_LOG_LIMIT);
-  const buffer = Buffer.alloc(size - start);
+  let buffer = Buffer.alloc(size - start);
   const fd = fs.openSync(file, "r");
   try { fs.readSync(fd, buffer, 0, buffer.length, start); } finally { fs.closeSync(fd); }
+  // A tail cut at a byte offset can start inside a character or a colour code.
+  // Starting at the next line is what makes the first line shown a whole one.
+  if (start > 0) {
+    const newline = buffer.indexOf(10);
+    if (newline >= 0) buffer = buffer.subarray(newline + 1);
+  }
   return { path: file, text: sheetFormat.stripAnsi(buffer.toString("utf8")), truncated: start > 0 };
 }
 
@@ -923,6 +999,71 @@ handle("sheet:file", (id, kind, title) => { const r = sheets.file(id, kind, titl
 handle("sheet:ask", (taskId, question, options) => { const r = sheets.ask(taskId, question, options); scheduleVaultExport(); return r; });
 handle("sheet:decide", (askId, choice, why) => { const r = sheets.decide(askId, choice, why || null); scheduleVaultExport(); return r; });
 handle("sheet:log", (id) => readSheetLog(sheets.get(id)));
+
+// Runs started from the composer, by entry id, for interrupting and for
+// killing on quit.
+const appRuns = new Map();
+
+/**
+ * Where a command typed in the composer runs: the task's Workbench, then the
+ * project's repositories and folders in the order a Workbench Start would pick
+ * them, then the home folder. The same order sheet_resolve gives the CLI.
+ */
+function runFolder(taskId) {
+  const isDir = (p) => { try { return Boolean(p) && fs.statSync(p).isDirectory(); } catch { return false; } };
+  const bench = benchStore.live(taskId);
+  if (bench && bench.state !== "missing" && isDir(bench.path)) return bench.path;
+  const task = benchStore.task(taskId);
+  for (const folder of benchStore.repoFolders(task.project_id)) if (isDir(folder.path)) return folder.path;
+  return app.getPath("home");
+}
+
+/**
+ * Runs a command as a `$ ` entry, as the person, through the same runner and
+ * guard as the command line. Resolves as soon as the command has started (or
+ * been refused), with the entry; output follows on sheet-run-output and the
+ * finished entry on sheet-run-done.
+ */
+handle("sheet:run", (taskId, command) => new Promise((resolve, reject) => {
+  const { StringDecoder } = require("string_decoder");
+  const decoder = new StringDecoder("utf8");
+  const send = (channel, payload) => { if (win && !win.isDestroyed()) win.webContents.send(channel, payload); };
+  let answered = false;
+  const answer = (entry) => { if (!answered) { answered = true; resolve(entry); } };
+  const id = Number(taskId);
+  let cwd;
+  try { cwd = runFolder(id); } catch (error) { reject(error); return; }
+  sheetRun.runEntry({
+    store: sheets, taskId: id, command: String(command == null ? "" : command), cwd, logDir: SHEET_LOG_DIR,
+    onStart: (control) => {
+      appRuns.set(control.entry.id, control);
+      answer(sheets.get(control.entry.id));
+    },
+    onChunk: (chunk, entry) => {
+      const text = decoder.write(chunk);
+      if (text) send("sheet-run-output", { entryId: entry.id, taskId: id, chunk: text });
+    },
+  }).then((entry) => {
+    appRuns.delete(entry.id);
+    const rest = decoder.end();
+    if (rest) send("sheet-run-output", { entryId: entry.id, taskId: id, chunk: rest });
+    send("sheet-run-done", { entryId: entry.id, taskId: id, entry });
+    scheduleVaultExport();
+    answer(entry);
+  }, (error) => {
+    if (!answered) reject(error);
+    else console.error("sheet:run", error);
+  });
+}));
+
+// SIGINT to the command's process group; a second call, or three seconds of
+// being ignored, is SIGKILL. The same escalation as Ctrl-C in the terminal.
+handle("sheet:interrupt", (entryId) => {
+  const control = appRuns.get(Number(entryId));
+  if (!control) throw new Error(`Entry ${entryId} is not running in this window.`);
+  control.interrupt();
+  return { interrupted: true };
+});
 handle("sheet:copy", (id, opts = {}) => {
   const text = entryCopyText(sheets.get(id), opts || {});
   clipboard.writeText(text);
@@ -933,6 +1074,164 @@ handle("sheet:copyAll", (taskId, opts = {}) => {
   clipboard.writeText(text);
   return text;
 });
+
+// ---------------------------------------------------------------------------
+// Workbenches. The same modules the MCP server uses, handed db.sqlP and this
+// process's Sheet store, so a Workbench started here and one started by an
+// agent are the same thing in the same table. The app's writes are the
+// person's, so they are audited as "you".
+
+const { makeWorkbenchStore } = require("./workbench/store");
+const { createWorkbench } = require("./workbench/workbench");
+const launch = require("./agent/launch");
+const benchStore = makeWorkbenchStore({ sql: db.sqlP, actor: "you" });
+const benches = createWorkbench({
+  store: benchStore,
+  sheet: sheets,
+  runEntry: sheetRun.runEntry,
+  logDir: SHEET_LOG_DIR,
+  settings: () => settings,
+  onEvent: (event) => {
+    if (win && !win.isDestroyed()) win.webContents.send("workbench-event", event);
+  },
+});
+
+/**
+ * Done prompts Finish. A task that moves to done here while it still has a
+ * Workbench asks the window to offer Finish; declining does nothing. Only for
+ * changes made in the app: an agent's update_task gets a notice in its result
+ * instead, and a person's Finish is never triggered by an agent.
+ */
+function promptFinishIfDone(taskId, previousStatus) {
+  try {
+    const task = db.handle().prepare("SELECT id, title, status FROM tasks WHERE id = ?").get(Number(taskId));
+    if (!task || task.status !== "done" || previousStatus === "done") return;
+    const wb = benchStore.live(task.id);
+    if (!wb || wb.state === "missing") return;
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("workbench-prompt", {
+        taskId: task.id, workbenchId: wb.id, taskTitle: task.title, path: wb.path, branch: wb.branch, state: wb.state,
+      });
+    }
+  } catch (error) {
+    console.error("workbench prompt", error);
+  }
+}
+
+/** Starts a program that outlives the call, and says whether it started at all. */
+function launchDetached(command, args, cwd) {
+  return new Promise((resolve, reject) => {
+    const { spawn } = require("child_process");
+    let child;
+    try {
+      child = spawn(command, args, { cwd, detached: true, stdio: "ignore" });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    child.once("error", reject);
+    child.once("spawn", () => { child.unref(); resolve(); });
+  });
+}
+
+/**
+ * Opens a Workbench where a person works on it. The editor is the setting when
+ * there is one, then VS Code when it is installed, then whatever the system
+ * opens a folder with, so the button always does something.
+ */
+async function openWorkbench(id, target) {
+  const wb = benchStore.get(id);
+  if (!fs.existsSync(wb.path)) throw new Error(`The folder is gone (${wb.path}). Recreate it, or forget it.`);
+  const folder = async () => {
+    const failed = await shell.openPath(wb.path);
+    if (failed) throw new Error(failed);
+    return { opened: true, via: "folder" };
+  };
+  if (target === "folder") return folder();
+  if (target === "editor") {
+    if (settings.workbenchEditor) {
+      const argv = launch.splitCommand(settings.workbenchEditor);
+      const bin = launch.resolveBinary(argv[0]) || argv[0];
+      await launchDetached(bin, [...argv.slice(1), wb.path], wb.path);
+      return { opened: true, via: argv[0] };
+    }
+    const code = [launch.resolveBinary("code"), "/opt/homebrew/bin/code", "/usr/local/bin/code",
+      "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"].find((p) => p && fs.existsSync(p));
+    if (code) {
+      await launchDetached(code, [wb.path], wb.path);
+      return { opened: true, via: "code" };
+    }
+    return folder();
+  }
+  if (target === "terminal") {
+    if (isMac) {
+      await launchDetached("open", ["-a", "Terminal", wb.path], wb.path);
+      return { opened: true, via: "Terminal" };
+    }
+    if (process.platform === "win32") {
+      try {
+        await launchDetached("wt", ["-d", wb.path], wb.path);
+        return { opened: true, via: "wt" };
+      } catch {
+        await launchDetached("cmd.exe", ["/c", "start", "", "cmd.exe"], wb.path);
+        return { opened: true, via: "cmd" };
+      }
+    }
+    try {
+      await launchDetached("x-terminal-emulator", [], wb.path);
+      return { opened: true, via: "x-terminal-emulator" };
+    } catch {
+      await launchDetached("gnome-terminal", [`--working-directory=${wb.path}`], wb.path);
+      return { opened: true, via: "gnome-terminal" };
+    }
+  }
+  throw new Error("Open where? editor, terminal or folder.");
+}
+
+// Every write schedules the vault, because each one leaves a note on the Sheet.
+const benchWrite = (fn) => async (...args) => { const r = await fn(...args); scheduleVaultExport(); return r; };
+
+handle("workbench:forTask", (taskId) => benches.forTask(taskId));
+handle("workbench:candidates", (taskId) => benches.candidates(taskId));
+// Returns once the folder exists. Setup carries on behind it and reports on
+// workbench-event, because npm ci can take minutes and a dialog that waits for
+// it looks like a hang.
+handle("workbench:start", benchWrite(async (taskId, opts = {}) => {
+  const made = await benches.start(taskId, {
+    repoId: opts && opts.repoId != null ? opts.repoId : null,
+    path: (opts && opts.path) || null,
+    runSetup: !opts || opts.runSetup !== false,
+    background: true,
+  });
+  return { ...made.workbench, created: made.created, warnings: made.warnings || [], setup: made.setup || null };
+}));
+handle("workbench:open", (id, target) => openWorkbench(id, target));
+handle("workbench:status", (id, opts = {}) => benches.status(id, { fresh: Boolean(opts && opts.fresh) }));
+handle("workbench:park", (id) => benches.park(id));
+handle("workbench:resume", (id) => benches.resume(id));
+handle("workbench:update", benchWrite((id) => benches.update(id)));
+handle("workbench:commit", (id, message) => benches.commit(id, message));
+handle("workbench:push", (id) => benches.push(id));
+handle("workbench:pr", (id, opts = {}) => benches.pr(id, { create: Boolean(opts && opts.create) }));
+handle("workbench:finish", benchWrite((id) => benches.finish(id)));
+handle("workbench:discardPlan", (id) => benches.discardPlan(id));
+// Checked here as well as in the module: the typed number is the whole of
+// Discard's protection, and it costs nothing to ask twice.
+handle("workbench:discard", benchWrite((id, typed) => {
+  const wb = benchStore.get(id);
+  if (String(typed == null ? "" : typed).trim() !== String(wb.task_id)) {
+    throw new Error(`Type ${wb.task_id}, the task's number, to confirm. Nothing was thrown away.`);
+  }
+  return benches.discard(id, typed);
+}));
+handle("workbench:recreate", benchWrite((id) => benches.recreate(id)));
+handle("workbench:forget", benchWrite((id) => benches.forget(id)));
+handle("workbench:list", (opts = {}) => benches.list({
+  projectId: opts && opts.projectId != null ? opts.projectId : null,
+  includeClosed: Boolean(opts && opts.includeClosed),
+}));
+handle("workbench:advanced", (id) => benches.advanced(id));
+handle("repos:update", (id, fields) => benchStore.updateRepo(id, fields || {}));
 
 handle("notes:list", (projectId) => db.listNotes(projectId));
 handle("notes:create", (payload) => { const r = db.createNote(payload); scheduleVaultExport(); return r; });
@@ -1511,6 +1810,21 @@ handle("settings:set", (fields) => {
   if (fields.scratchpadMode !== undefined) settings.scratchpadMode = fields.scratchpadMode === true;
 
   if (fields.animations !== undefined) settings.animations = fields.animations !== false;
+
+  if (fields.workbenchEditor !== undefined) {
+    const value = fields.workbenchEditor == null ? "" : String(fields.workbenchEditor).trim();
+    if (value.length > 200) throw new Error("The editor command must be 200 characters or fewer");
+    settings.workbenchEditor = value || null;
+  }
+  // Checked against what git accepts in a ref, because a prefix git refuses
+  // would make every Start fail with git's message instead of this one.
+  if (fields.workbenchBranchPrefix !== undefined) {
+    const value = fields.workbenchBranchPrefix == null ? "" : String(fields.workbenchBranchPrefix).trim();
+    if (value && (!/^[A-Za-z0-9._-]{1,40}$/.test(value) || /^[.-]|\.\.|\.lock$|\.$/.test(value))) {
+      throw new Error("The branch prefix may use letters, digits, dots, hyphens and underscores, up to 40, and cannot start with a dot or hyphen");
+    }
+    settings.workbenchBranchPrefix = value || null;
+  }
 
   // Checked against the projects that exist, because this id is handed to agents
   // as the place to write. A stale id would send them at a project that is not

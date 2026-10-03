@@ -205,7 +205,7 @@ async function route(name, env) {
       "update task noted (by claude-code:9)",
       "update task ran npm test (by claude-code:9)",
       "update task finished npm test: ok (by claude-code:9)",
-      `update task edited entry ${say.id} (by claude-code:9)`,
+      `update task edited entry ${say.id}, which said: "the DLQ fills at 9am" (by claude-code:9)`,
       `update task promoted entry ${say.id} (by claude-code:9)`,
       `update task unpromoted entry ${say.id} (by claude-code:9)`,
       'update task asked "retry strategy" (by claude-code:9)',
@@ -250,6 +250,42 @@ async function route(name, env) {
     check("queue_next for one project", (await client.call("queue_next", { queue: "nothing-here", project: "mcp-sheet" })).claimed, null);
     const comment = await client.call("add_comment", { task_id: busy.id, body: "old style" });
     check("add_comment writes a typed say", [comment.kind, comment.author_type], ["say", "agent"]);
+
+    section(`${name}: the G2 review's store rules`);
+    // Item 7: one answer per question.
+    await rejects("a second decision on a decided question", client.call("sheet_decide", { ask_id: ask.id, choice: "b" }),
+      new RegExp(`already decided as a in entry ${decision.id}; ask again to revisit`));
+    // Item 8: words are their author's; run meta is for runs.
+    const other = openServer({ actor: "codex:2", env, clientName: "test", warn: () => {} });
+    await other.start();
+    try {
+      await rejects("another actor cannot rewrite an entry", other.call("sheet_update", { id: say.id, body: "rewritten" }),
+        /was written by claude-code:9; only they can change what it says/);
+      const finishedByOther = await other.call("sheet_update", { id: run.id, meta: { lines: 4 } });
+      check("but anyone may add meta to a run", finishedByOther.meta.lines, 4);
+    } finally {
+      other.close();
+    }
+    await rejects("run meta on a say", client.call("sheet_update", { id: say.id, meta: { state: "fail", code: 1 } }), /state, code only belong on a run entry/);
+    // Item 11: strict booleans and ids.
+    await rejects("on: 'false' is not a boolean", client.call("sheet_promote", { id: say.id, on: "false" }), /on must be true or false/);
+    check("and did not promote", (await client.call("sheet_get", { id: say.id })).promoted, 0);
+    for (const bad of [true, "0x1", "1e0", 1.5, -1]) {
+      await rejects(`an id of ${JSON.stringify(bad)}`, client.call("sheet_get", { id: bad }), /must be a whole number/);
+    }
+    check("a string of digits is still an id", (await client.call("sheet_get", { id: String(say.id) })).id, say.id);
+    // Item 3: a run whose runner is gone is finished as fail:lost on read.
+    const lostRun = await client.call("sheet_append", { task_id: task.id, kind: "run", body: "sleep 999",
+      meta: { state: "running", runner_pid: 2147483646, runner_host: os.hostname() } });
+    const elsewhere = await client.call("sheet_append", { task_id: task.id, kind: "run", body: "sleep 998",
+      meta: { state: "running", runner_pid: 2147483646, runner_host: "some-other-host" } });
+    const alive = await client.call("sheet_append", { task_id: task.id, kind: "run", body: "sleep 997",
+      meta: { state: "running", runner_pid: process.pid, runner_host: os.hostname() } });
+    await client.call("sheet_read", { task_id: task.id, mode: "tail", n: 1 });
+    const metaOf = async (id) => (await client.call("sheet_get", { id })).meta;
+    check("a dead runner's run is lost", [(await metaOf(lostRun.id)).state, (await metaOf(lostRun.id)).code], ["fail", "lost"]);
+    check("another host's run is left alone", (await metaOf(elsewhere.id)).state, "running");
+    check("a live runner's run is left alone", (await metaOf(alive.id)).state, "running");
   } finally {
     client.close();
   }

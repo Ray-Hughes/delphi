@@ -457,4 +457,7 @@ async function log(folder, limit = 20) {
   }).filter((c) => c.sha);
 }
 
-module.exports = { status, commit, isRepo, branches, log };
+// runGit, findGit, parseStatus and reasonFrom are exported for workbench/git.js,
+// which needs the same binary, the same environment rules and the same parser
+// rather than a second copy of each that would drift.
+module.exports = { status, commit, isRepo, branches, log, runGit, findGit, parseStatus, reasonFrom };

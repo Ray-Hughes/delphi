@@ -173,6 +173,30 @@ check("with the reason", db.sqlP("SELECT body FROM comments WHERE task_id = :p1 
       "Released: the fixture says no");
 
 // ---------------------------------------------------------------------------
+// G2 review, item 5: the brief used to take the last twelve comments and lose
+// the ledger. It now carries the Sheet the server gives, ledger first.
+
+section("the brief carries the ledger");
+{
+  const { makeSheetStore } = require("../sheet/store");
+  const sheets = makeSheetStore({ sql: db.sqlP, actor: "claude-code:1" });
+  const deep = db.createTask({ projectId: project.id, title: "long history" });
+  const ask = sheets.ask(deep.id, "Which database?", ["postgres", "sqlite"]);
+  sheets.decide(ask.id, "b", "single user");
+  sheets.append({ taskId: deep.id, kind: "say", body: "DEAD END: the v2 API is gone, do not retry it", promote: true });
+  for (let i = 0; i < 30; i++) sheets.append({ taskId: deep.id, kind: "note", body: `step ${i}` });
+  const context = sheets.context(deep.id);
+  const brief = runner.buildBrief({
+    claimed: deep.id, task: db.sqlP("SELECT * FROM tasks WHERE id = :p1", [deep.id])[0],
+    comments: context.entries, sheet: context.text, comments_total: context.total, comments_shown: context.shown,
+  });
+  check("the dead end, promoted early, is in the brief", brief.includes("DEAD END: the v2 API is gone"), true);
+  check("so is the decision and its question", [brief.includes("Which database?"), brief.includes("single user")], [true, true]);
+  check("and the latest entries", brief.includes("step 29"), true);
+  check("and what was left out is said", /\d+ older entries are not shown/.test(brief), true);
+}
+
+// ---------------------------------------------------------------------------
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 fs.rmSync(dir, { recursive: true, force: true });

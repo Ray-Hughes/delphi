@@ -129,7 +129,7 @@ function suite(label, delphi) {
   check("out, piped, is the log without colour", out.out, "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\n");
   check("out --raw keeps it", delphi(["out", String(longId), "--raw"]).out.includes("\x1b[32m"), true);
   check("out of a refused run is its reason", /Blocked by guard/.test(delphi(["out", String(refusedId)]).out), true);
-  check("out of a say has nothing to show", /no output recorded/.test(delphi(["out", said.out.trim()]).err), true);
+  check("out of a say has nothing to show", /is a say, not a run, so it has no output/.test(delphi(["out", said.out.trim()]).err), true);
   check("a run with no command is a usage error", delphi(["run", tag]).code, 1);
 
   section(`${label}: asking and deciding`);
@@ -212,8 +212,93 @@ async function finish({ task, noteId, unique }, label) {
   }
 }
 
+/** The G2 review's findings about the command line, each as it was reproduced. */
+async function review(delphi) {
+  const task = db.createTask({ projectId: project.id, title: "review findings" });
+  const id = String(task.id);
+  const lastRun = () => entryRow(db.handle().prepare("SELECT MAX(id) AS id FROM comments WHERE task_id = ? AND kind = 'run'").get(task.id).id);
+
+  section("item 2: run does not hand its argv to the shell twice");
+  const marker = path.join(dir, "INJECTED");
+  const injected = delphi(["run", id, "--", "echo", `x; touch ${marker}`]);
+  check("several arguments are each one word", [injected.code, injected.out.trim(), fs.existsSync(marker)], [0, `x; touch ${marker}`, false]);
+  check("and the recorded command reruns identically", lastRun().body, `echo 'x; touch ${marker}'`);
+  const piped = delphi(["run", id, "--", "echo one | tr o 0"]);
+  check("one argument is the command as written", piped.out.trim(), "0ne");
+  check("plain words stay plain", (delphi(["run", id, "--", "echo", "a-b", "c/d"]), lastRun().body), "echo a-b c/d");
+
+  section("item 3: a closed terminal finishes the run");
+  {
+    const { spawn } = require("child_process");
+    const child = spawn(process.execPath, [CLI, "run", id, "--", "sleep 27; echo finished"], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    await new Promise((r) => setTimeout(r, 2500));
+    child.kill("SIGHUP");
+    const code = await new Promise((r) => child.on("close", (c) => r(c)));
+    const row = lastRun();
+    check("the entry is finished, saying why", [row.meta.state, row.meta.code], ["fail", "SIGHUP"]);
+    check("the CLI exited", typeof code, "number");
+    // A moment for the killed shell to be reaped: an unreaped zombie still
+    // matches pgrep, and is not a running command.
+    await new Promise((r) => setTimeout(r, 1000));
+    const pids = spawnSync("pgrep", ["-f", "sleep 27; echo finished"], { encoding: "utf8" }).stdout.trim();
+    check("and the command did not outlive it", pids, "");
+  }
+
+  section("item 6: a log belongs to its entry only");
+  const ran = delphi(["run", id, "--", "echo SECRET-OF-A-DELETED-RUN"]);
+  const runId = lastRun().id;
+  db.handle().prepare("DELETE FROM comments WHERE id = ?").run(runId);
+  const reused = entryRow(delphi(["say", id, "an unrelated remark"]).out);
+  check("the id was reused, as SQLite does", [ran.code, reused.id], [0, runId]);
+  const out = delphi(["out", String(reused.id)]);
+  check("out of a say shows no run's output", [out.code, out.out.includes("SECRET"), /not a run/.test(out.err)], [1, false, true]);
+
+  section("item 9: commands are looked up as own properties");
+  for (const name of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
+    const r = delphi([name]);
+    check(`delphi ${name} is an unknown command, not a crash`, [r.code, /no command/.test(r.err)], [1, true]);
+  }
+  check("help constructor does not crash", delphi(["help", "constructor"]).code, 0);
+
+  section("item 10: import and cat");
+  const sheetText = [
+    "---", `task: ${id}`, "title: x", "status: todo", "---",
+    "$ make build  {id:5 by:ray running cwd:/tmp}",
+    "> ray: hello from stdin", "",
+  ].join("\n");
+  const target = db.createTask({ projectId: project.id, title: "import target" });
+  const imported = delphi(["import", String(target.id), "-"], { input: sheetText });
+  check("import - reads stdin", imported.code, 0);
+  const rows = db.handle().prepare("SELECT kind, body, meta FROM comments WHERE task_id = ? ORDER BY id").all(target.id);
+  check("an imported running entry is lost, not running", rows.map((r) => [r.kind, r.kind === "run" ? JSON.parse(r.meta).state + ":" + JSON.parse(r.meta).code : r.body]),
+    [["run", "fail:lost"], ["say", "hello from stdin"]]);
+  const both = delphi(["cat", id, "--ledger", "--tail", "3"]);
+  check("--ledger with --tail is refused clearly", [both.code, /cannot be used together/.test(both.err)], [1, true]);
+
+  section("item 4: an agent tab's own shell is attributed to the agent");
+  {
+    const harness = require("../harness");
+    const events = [];
+    await harness.start({
+      harness: { key: "fake", label: "Fake", command: "/usr/bin/env", args: [], parser: "text", mcp_style: "none" },
+      sessionId: 77, cwd: dir, prompt: "x", dbPath: process.env.DELPHI_DB, projectId: project.id,
+      actor: "fake:77",
+    }, (e) => events.push(e));
+    const env = events.filter((e) => e.type === "text").map((e) => e.text).join("");
+    check("DELPHI_ACTOR is in the agent's environment", /^DELPHI_ACTOR=fake:77$/m.test(env), true);
+    check("so is DELPHI_AUTHOR_TYPE=agent", /^DELPHI_AUTHOR_TYPE=agent$/m.test(env), true);
+    check("and the database", env.includes(`DELPHI_DB=${process.env.DELPHI_DB}`), true);
+    const said = delphi(["say", id, "from an agent's shell"], { env: { DELPHI_ACTOR: "fake:77", DELPHI_AUTHOR_TYPE: "agent" } });
+    const row = entryRow(said.out);
+    check("and delphi honours it", [row.author, row.author_type], ["fake:77", "agent"]);
+  }
+}
+
 async function main() {
   const electronNode = makeRunner(process.execPath, { ELECTRON_RUN_AS_NODE: "1" });
+  await review(electronNode);
   const first = suite("electron as node", electronNode);
   await finish(first, "electron as node");
   const ledger = electronNode(["cat", String(first.task.id), "--ledger"]).out;

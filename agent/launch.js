@@ -101,14 +101,12 @@ function guardStatus(cwd) {
  * Where guard.py is, or null.
  *
  * The copy in the packaged app's resources first, because python cannot read
- * inside app.asar. A checkout has it beside this file. DELPHI_GUARD is for the
- * tests, which need to point at a guard that is not there.
+ * inside app.asar. A checkout has it beside this file. There is deliberately no
+ * environment variable to point it elsewhere: anything that can set one for a
+ * runner could point it at an empty file, which "allows" everything. Tests pass
+ * a path to guardCheck instead.
  */
 function guardPath() {
-  if (process.env.DELPHI_GUARD !== undefined) {
-    const forced = path.resolve(process.env.DELPHI_GUARD);
-    return isFile(forced) ? forced : null;
-  }
   const candidates = [];
   if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, "agent", "guard.py"));
   candidates.push(path.join(__dirname, "guard.py"));
@@ -117,6 +115,20 @@ function guardPath() {
 
 function isFile(file) {
   try { return fs.statSync(file).isFile(); } catch { return false; }
+}
+
+/**
+ * Whether a file is plausibly the guard rather than something empty or
+ * truncated in its place. Python runs an empty file and exits 0, which this
+ * runner would otherwise read as "allowed".
+ */
+function looksLikeGuard(file) {
+  try {
+    const text = fs.readFileSync(file, "utf8");
+    return /def check_bash\b/.test(text) && /Blocked by guard/.test(text);
+  } catch {
+    return false;
+  }
 }
 
 // A version manager's shim picks a python by reading config in the current
@@ -132,11 +144,9 @@ let pythonCache;
  *
  * Proved by running --version rather than trusted because it exists: macOS
  * ships /usr/bin/python3 as a stub that offers to install the developer tools,
- * and a shim on PATH exists and still fails. DELPHI_PYTHON, when set, is the
- * only candidate, so a test can make python missing on purpose.
+ * and a shim on PATH exists and still fails. Fixed places first, then PATH.
  */
 function findPython() {
-  if (process.env.DELPHI_PYTHON !== undefined) return provePython(process.env.DELPHI_PYTHON);
   if (pythonCache !== undefined) return pythonCache;
   const candidates = process.platform === "win32"
     ? []
@@ -156,38 +166,67 @@ function findPython() {
 
 function provePython(candidate) {
   if (!candidate || SHIM.test(candidate) || !isFile(candidate)) return null;
-  const r = spawnSync(candidate, ["--version"], { encoding: "utf8", timeout: 10000 });
+  const r = spawnSync(candidate, ["--version"], { encoding: "utf8", timeout: 10000, env: guardEnv() });
   return r.status === 0 && /Python 3/.test(`${r.stdout}${r.stderr}`) ? candidate : null;
+}
+
+/**
+ * The guard's whole environment. Not the caller's: PYTHONPATH can load a
+ * sitecustomize that empties stdin, PYTHONIOENCODING can make the payload
+ * undecodable, and either makes guard.py fail open. -I and -S already ignore
+ * those; a clean environment is the second lock on the same door.
+ */
+function guardEnv() {
+  const env = { PATH: process.platform === "win32" ? (process.env.PATH || "") : "/usr/bin:/bin", LC_ALL: "C.UTF-8", LANG: "C.UTF-8" };
+  for (const key of ["SystemRoot", "SYSTEMROOT", "windir"]) if (process.env[key]) env[key] = process.env[key];
+  return env;
+}
+
+/** JSON with everything outside ASCII escaped, so no stdin encoding can garble it. */
+function asciiJson(value) {
+  return JSON.stringify(value).replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 /**
  * Asks guard.py whether a shell command may run.
  *
- * Fails closed. guard.py itself fails open on a payload it cannot parse, because
- * it sits in an agent's hook chain where refusing every tool call is the worse
- * outcome. Here nothing waits on the answer but the command, so when the guard
- * cannot give one (no python, no guard.py, a crash) the answer is no, with the
- * reason said plainly.
+ * Fails closed. guard.py itself fails open on a payload it cannot parse, on
+ * purpose, because it sits in an agent's hook chain where refusing every tool
+ * call is the worse outcome; that file is left as it is. This side is the one
+ * that refuses: allowed means exit 0 with nothing at all on stderr. Exit 0 with
+ * "could not parse hook payload, allowing", exit 2 without the guard's own
+ * words, a crash, a timeout, no python, no guard: every one of those is "the
+ * guard could not answer", and the answer is no.
+ *
+ * `guard` and `python` are for the tests, which need a guard that is missing
+ * or broken. Production never passes them.
  *
  * Resolves { allowed, reason, unavailable }. Never rejects.
  */
-function guardCheck(command) {
+function guardCheck(command, { guard, python } = {}) {
   return new Promise((resolve) => {
-    const guard = guardPath();
-    if (!guard) return resolve({ allowed: false, unavailable: true, reason: "guard.py was not found" });
-    const python = findPython();
-    if (!python) return resolve({ allowed: false, unavailable: true, reason: "no working python3 was found" });
+    const guardFile = guard === undefined ? guardPath() : (isFile(path.resolve(guard)) ? path.resolve(guard) : null);
+    if (!guardFile) return resolve({ allowed: false, unavailable: true, reason: "guard.py was not found" });
+    if (!looksLikeGuard(guardFile)) return resolve({ allowed: false, unavailable: true, reason: `${guardFile} is not the guard (it is empty or damaged)` });
+    const pythonBin = python === undefined ? findPython() : provePython(python);
+    if (!pythonBin) return resolve({ allowed: false, unavailable: true, reason: "no working python3 was found" });
 
     let child;
     try {
-      child = spawn(python, [guard], { stdio: ["pipe", "ignore", "pipe"] });
+      // -I: ignore PYTHON* variables and the user's site-packages. -S: no site
+      // module at all, so no sitecustomize. guard.py needs only the stdlib.
+      child = spawn(pythonBin, ["-I", "-S", guardFile], {
+        stdio: ["pipe", "ignore", "pipe"],
+        env: guardEnv(),
+        cwd: path.dirname(guardFile),
+      });
     } catch (error) {
       return resolve({ allowed: false, unavailable: true, reason: `python3 would not start: ${error.message}` });
     }
     let stderr = "";
     let settled = false;
     const timer = setTimeout(() => {
-      try { child.kill(); } catch {}
+      try { child.kill("SIGKILL"); } catch {}
       done({ allowed: false, unavailable: true, reason: "the guard took longer than 15 seconds" });
     }, 15000);
     function done(value) {
@@ -199,17 +238,18 @@ function guardCheck(command) {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => done({ allowed: false, unavailable: true, reason: `python3 would not start: ${error.message}` }));
-    child.on("close", (code) => {
-      if (code === 0) return done({ allowed: true, reason: null, unavailable: false });
+    child.on("close", (code, signal) => {
       const first = stderr.split("\n").map((l) => l.trim()).find(Boolean) || "";
-      if (code === 2) {
+      if (code === 0 && !stderr.trim()) return done({ allowed: true, reason: null, unavailable: false });
+      if (code === 2 && /^Blocked by guard:/.test(first)) {
         return done({ allowed: false, unavailable: false, reason: first.replace(/^Blocked by guard:\s*/, "") || "refused" });
       }
-      done({ allowed: false, unavailable: true, reason: `guard.py exited ${code}${first ? `: ${first}` : ""}` });
+      const how = code === null ? `was killed (${signal})` : `exited ${code}`;
+      done({ allowed: false, unavailable: true, reason: `guard.py ${how} without a clear answer${first ? `: ${first}` : ""}` });
     });
     child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify({ tool_name: "Bash", tool_input: { command: String(command) } }));
+    child.stdin.end(asciiJson({ tool_name: "Bash", tool_input: { command: String(command) } }));
   });
 }
 
-module.exports = { splitCommand, resolveBinary, guardStatus, guardPath, findPython, guardCheck };
+module.exports = { splitCommand, resolveBinary, guardStatus, guardPath, findPython, provePython, guardCheck, asciiJson };

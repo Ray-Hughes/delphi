@@ -29,6 +29,9 @@ const path = require("path");
 const DEFAULTS = {
   scratchpadMode: false,
   scratchpadProjectId: null,
+  // Read by the MCP server's Workbenches, so a branch an agent starts carries
+  // the same prefix as one started in the app.
+  workbenchBranchPrefix: null,
 };
 
 /**

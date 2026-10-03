@@ -13,9 +13,24 @@
  *
  * No pty. A Sheet is a record, not a terminal emulator, so interactive
  * programs are out of scope; stdin is closed.
+ *
+ * An entry must never be left "running" for good, because a running entry is
+ * a promise that an answer is coming. Hence three rules:
+ *
+ * - The run ends when the shell exits, not when its pipes close. A background
+ *   job (`cmd &`) inherits the pipes and can hold them open for hours; after a
+ *   short grace for the last output, the pipes are cut and the entry finished.
+ * - An interrupt escalates. The first sends SIGINT to the whole process group;
+ *   a second, or three seconds of being ignored, sends SIGKILL. A SIGINT trap or
+ *   a background job (which a non-interactive shell starts with SIGINT ignored)
+ *   cannot keep it alive.
+ * - The runner's pid and host go in meta, so a run whose runner died without
+ *   finishing it (kill -9, a crash, a closed laptop) is found by
+ *   sheet/store.js sweepLost and marked fail:lost.
  */
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const launch = require("../agent/launch");
@@ -28,6 +43,14 @@ const SHORT_OUTPUT_LINES = 5;
 // A five line answer can still be a megabyte of minified JSON, which is not
 // something to inline into every read of the Sheet.
 const SHORT_OUTPUT_BYTES = 8 * 1024;
+// How long after the shell exits its output may still be arriving. Long enough
+// for a pipe to drain, short enough that `cmd &` does not hold the entry.
+const EXIT_GRACE_MS = 300;
+// How long an interrupted command gets to stop on its own before it is killed.
+const KILL_AFTER_MS = 3000;
+// Live progress: meta.lines is written at most this often while a run goes, so
+// a window watching the database sees it move.
+const PROGRESS_MS = 1000;
 
 const GUARD_ADVICE = "If this genuinely needs doing, run it yourself in a normal terminal. The guard has no override.";
 
@@ -35,24 +58,41 @@ function logPathFor(logDir, taskId, entryId) {
   return path.join(logDir, String(Number(taskId)), `${Number(entryId)}.log`);
 }
 
-/** Lines as a person would count them: a trailing newline does not start another. */
+/**
+ * Lines as a person would count them, and as meta.out shows them: \n, \r\n and
+ * a lone \r (a progress bar redrawing) each end a line, and a trailing break
+ * does not start another.
+ */
 function countLines(text) {
-  if (!text) return 0;
-  const n = text.split("\n").length;
-  return text.endsWith("\n") ? n - 1 : n;
+  const normal = String(text || "").replace(/\r\n?/g, "\n");
+  if (!normal) return 0;
+  const n = normal.split("\n").length;
+  return normal.endsWith("\n") ? n - 1 : n;
 }
 
-async function runEntry({ store, taskId, command, cwd, logDir, env = {}, onChunk = null, signal = null } = {}) {
+/** Who is running this, so a sweep can tell a live run from an orphaned one. */
+function runnerMeta() {
+  return { runner_pid: process.pid, runner_host: os.hostname() };
+}
+
+async function runEntry({
+  store, taskId, command, cwd, logDir, env = {}, onChunk = null, signal = null,
+  onStart = null, progressMs = PROGRESS_MS, guard = undefined,
+} = {}) {
   if (!store || typeof store.append !== "function" || typeof store.update !== "function") {
     throw new Error("runEntry needs a store with append and update");
   }
   if (!logDir) throw new Error("runEntry needs a log folder");
   const workDir = path.resolve(cwd || process.cwd());
 
-  const entry = await store.append({ taskId, kind: "run", body: command, meta: { state: "running", cwd: workDir } });
-  const finish = (meta) => store.update(entry.id, { meta });
+  const entry = await store.append({ taskId, kind: "run", body: command, meta: { state: "running", cwd: workDir, ...runnerMeta() } });
+  // Writes to the entry are queued, so a progress update can never land after
+  // the final one and make a finished run look running again.
+  let writes = Promise.resolve();
+  const write = (meta) => (writes = writes.then(() => store.update(entry.id, { meta })));
+  const finish = (meta) => write(meta);
 
-  const verdict = await launch.guardCheck(entry.body);
+  const verdict = await launch.guardCheck(entry.body, guard || {});
   if (!verdict.allowed) {
     const reason = verdict.unavailable
       ? `The guard could not run (${verdict.reason}), so nothing was run.`
@@ -76,14 +116,20 @@ async function runEntry({ store, taskId, command, cwd, logDir, env = {}, onChunk
     : [process.env.SHELL || "/bin/sh", ["-c", entry.body]];
 
   const started = Date.now();
-  let lines = 0;
-  let endedWithNewline = true;
+  let breaks = 0;
+  let lastByte = -1;
   let bytes = 0;
   // Bytes, decoded once at the end, because a chunk boundary can fall inside a
-  // multibyte character. Counting newlines on the bytes is safe: 0x0a is never
-  // part of a longer UTF-8 sequence.
+  // multibyte character. Counting breaks on the bytes is safe: 0x0a and 0x0d are
+  // never part of a longer UTF-8 sequence.
   const head = [];
-  let aborted = false;
+  let interrupted = 0;
+  let killedFor = null;
+  let killTimer = null;
+  let progressTimer = null;
+  let reported = 0;
+
+  const linesSoFar = () => breaks + (bytes && lastByte !== 10 && lastByte !== 13 ? 1 : 0);
 
   return new Promise((resolve, reject) => {
     let child;
@@ -103,42 +149,85 @@ async function runEntry({ store, taskId, command, cwd, logDir, env = {}, onChunk
       return;
     }
 
+    const group = (sig) => {
+      try {
+        if (windows) child.kill();
+        else process.kill(-child.pid, sig);
+      } catch {}
+    };
+
     const take = (chunk) => {
-      fs.writeSync(sink, chunk);
+      try { fs.writeSync(sink, chunk); } catch {}
       bytes += chunk.length;
-      for (const byte of chunk) if (byte === 10) lines++;
-      if (chunk.length) endedWithNewline = chunk[chunk.length - 1] === 10;
+      for (const byte of chunk) {
+        if (byte === 10) { if (lastByte !== 13) breaks++; }
+        else if (byte === 13) breaks++;
+        lastByte = byte;
+      }
       if (bytes <= SHORT_OUTPUT_BYTES) head.push(chunk);
       if (onChunk) {
-        try { onChunk(chunk); } catch {}
+        try { onChunk(chunk, entry); } catch {}
       }
     };
     child.stdout.on("data", take);
     child.stderr.on("data", take);
 
+    if (progressMs > 0) {
+      progressTimer = setInterval(() => {
+        const now = linesSoFar();
+        if (now === reported) return;
+        reported = now;
+        write({ lines: now }).catch(() => {});
+      }, progressMs);
+      if (progressTimer.unref) progressTimer.unref();
+    }
+
+    /** SIGINT first; a second call, or three seconds unheeded, is SIGKILL. */
     const interrupt = () => {
-      aborted = true;
-      try {
-        if (windows) child.kill();
-        else process.kill(-child.pid, "SIGINT");
-      } catch {}
+      interrupted++;
+      if (interrupted === 1) {
+        group("SIGINT");
+        killTimer = setTimeout(() => group("SIGKILL"), KILL_AFTER_MS);
+        if (killTimer.unref) killTimer.unref();
+      } else {
+        group("SIGKILL");
+      }
+    };
+    /** Ends it now, and records why: the caller is going away (SIGHUP, SIGTERM). */
+    const kill = (reason = "killed") => {
+      killedFor = String(reason);
+      group("SIGKILL");
     };
     if (signal) {
       if (signal.aborted) interrupt();
       else signal.addEventListener("abort", interrupt, { once: true });
     }
+    if (onStart) {
+      try { onStart({ entry, pid: child.pid, interrupt, kill }); } catch {}
+    }
 
     let closed = false;
+    let graceTimer = null;
     const close = (code, sig, spawnError) => {
       if (closed) return;
       closed = true;
+      clearTimeout(graceTimer);
+      clearTimeout(killTimer);
+      clearInterval(progressTimer);
       if (signal) signal.removeEventListener("abort", interrupt);
+      // Whatever is left of the group (a background job still holding the
+      // pipes) goes with the run when it was interrupted or killed.
+      if (interrupted || killedFor) group("SIGKILL");
+      try { child.stdout.destroy(); } catch {}
+      try { child.stderr.destroy(); } catch {}
       try { fs.closeSync(sink); } catch {}
-      const total = lines + (bytes && !endedWithNewline ? 1 : 0);
+      const total = linesSoFar();
       const meta = { dur_ms: Date.now() - started, lines: total, log };
       if (spawnError) {
         Object.assign(meta, { state: "fail", code: "error", exit: null, out: `Could not start ${shell}: ${spawnError.message}` });
-      } else if (aborted) {
+      } else if (killedFor) {
+        Object.assign(meta, { state: "fail", code: killedFor, exit: code });
+      } else if (interrupted) {
         // 130 is what a shell reports for a command ended by Ctrl-C, whatever
         // the program did with the signal, so that is what the entry says.
         Object.assign(meta, { state: "fail", code: 130, exit: code });
@@ -151,11 +240,14 @@ async function runEntry({ store, taskId, command, cwd, logDir, env = {}, onChunk
         const out = fmt.normaliseBody(fmt.stripAnsi(Buffer.concat(head).toString("utf8")));
         if (out) meta.out = out;
       }
-      Promise.resolve(finish(meta)).then(resolve, reject);
+      finish(meta).then(resolve, reject);
     };
     child.on("error", (error) => close(null, null, error));
+    child.on("exit", (code, sig) => {
+      graceTimer = setTimeout(() => close(code, sig, null), EXIT_GRACE_MS);
+    });
     child.on("close", (code, sig) => close(code, sig, null));
   });
 }
 
-module.exports = { SHORT_OUTPUT_LINES, GUARD_ADVICE, logPathFor, countLines, runEntry };
+module.exports = { SHORT_OUTPUT_LINES, KILL_AFTER_MS, EXIT_GRACE_MS, PROGRESS_MS, GUARD_ADVICE, logPathFor, countLines, runnerMeta, runEntry };
