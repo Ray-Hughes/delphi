@@ -78,6 +78,19 @@ function check(what, ok, detail) {
 }
 
 function note(text) { notes.push(text); console.log(`  note ${text}`); }
+
+// Removing a temp folder is housekeeping, not a check. On Windows a file the
+// app just had open can stay locked for a moment after the process exits, and
+// the first release run that launched the app failed on that alone, with every
+// check passed. So retry for a while, and if it still will not go, say so and
+// move on: a leftover folder in the temp directory is not a broken build.
+function removeTemp(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+  } catch (error) {
+    note(`could not remove ${dir} (${error.code || error.message}), left for the system to clear`);
+  }
+}
 function section(name) { console.log(`\n${name}`); }
 
 function argValue(flag) {
@@ -415,7 +428,7 @@ function smokeLaunch(binary, args, label, env, want) {
       console.log(`  ok   ${label}: all ${schemaLater.LATER_COLUMNS.length} later columns and ${schemaLater.LATER_TABLES.length} later tables are there`);
     }
   } finally {
-    fs.rmSync(dataDir, { recursive: true, force: true });
+    removeTemp(dataDir);
   }
 }
 
@@ -539,7 +552,7 @@ async function main() {
       smokeLaunch(binary, [], `packaged ${version}`, env, version);
     }
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    removeTemp(tmp);
   }
 
   console.log(`\n${checks - failures}/${checks} checks passed${notes.length ? `, ${notes.length} notes` : ""}`);
