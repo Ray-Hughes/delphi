@@ -34,11 +34,20 @@ function candidates(platform = process.platform, env = process.env) {
   return list;
 }
 
-function pipeTo(argv, text, { timeoutMs = 3000 } = {}) {
+// pbcopy decides how to read its input from the locale, and in a C or POSIX
+// locale (an ssh session, a launchd job, a bare env) it reads bytes as Mac
+// Roman and the clipboard gets mojibake. The text is always UTF-8, so it says so.
+const UTF8_ENV = { LANG: "en_US.UTF-8", LC_CTYPE: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" };
+
+// Past this, OSC 52 is not attempted: terminals that take it at all cap it
+// (some at 100 KB), and pushing megabytes of base64 at one stalls it.
+const OSC52_MAX = 1024 * 1024;
+
+function pipeTo(argv, text, { timeoutMs = 3000, env = process.env } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(argv[0], argv.slice(1), { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+      child = spawn(argv[0], argv.slice(1), { stdio: ["pipe", "ignore", "ignore"], windowsHide: true, env });
     } catch {
       resolve(false);
       return;
@@ -61,13 +70,13 @@ function pipeTo(argv, text, { timeoutMs = 3000 } = {}) {
  */
 async function copy(text, { out = process.stdout, env = process.env, platform = process.platform, run = pipeTo } = {}) {
   let sent = false;
-  if (out && out.isTTY && env.DELPHI_NO_OSC52 !== "1") {
+  if (out && out.isTTY && env.DELPHI_NO_OSC52 !== "1" && Buffer.byteLength(String(text)) <= OSC52_MAX) {
     try { out.write(osc52(text, { tmux: Boolean(env.TMUX) })); sent = true; } catch {}
   }
   for (const c of candidates(platform, env)) {
-    if (await run(c.argv, text)) return { via: sent ? `osc52+${c.via}` : c.via };
+    if (await run(c.argv, text, { env: c.via === "pbcopy" ? { ...process.env, ...env, ...UTF8_ENV } : { ...process.env, ...env } })) return { via: sent ? `osc52+${c.via}` : c.via };
   }
   return { via: sent ? "osc52" : null };
 }
 
-module.exports = { osc52, copy, candidates };
+module.exports = { osc52, copy, candidates, OSC52_MAX, UTF8_ENV };

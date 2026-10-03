@@ -117,6 +117,8 @@ function readOne(buf, i, final) {
     if (i + 1 + len > buf.length) return final ? { key: key("escape"), next: i + 1 } : { need: true };
     return { key: charKey(buf.toString("utf8", i + 1, i + 1 + len), true), next: i + 1 + len };
   }
+  // CR LF is one Enter (text pasted without bracketed paste), not two.
+  if (b === 0x0d && buf[i + 1] === 0x0a) return { key: controlKey(b), next: i + 2 };
   if (b < 0x20 || b === 0x7f) return { key: controlKey(b), next: i + 1 };
   const len = utf8Length(b);
   // A stray continuation byte or an invalid lead: skipped, not guessed at.
@@ -142,6 +144,15 @@ function decodeSome(input, final) {
     if (r.paste) {
       const end = buf.indexOf(PASTE_END, r.next, "latin1");
       if (end < 0) {
+        // A paste whose end marker has not come may never come (a terminal
+        // that lost it, a cat of a file holding the start). Ctrl-C is not
+        // something a person pastes, so one there ends it and gets through.
+        const ctrlC = buf.indexOf(0x03, r.next);
+        if (ctrlC >= 0) {
+          keys.push(key("paste", { text: buf.toString("utf8", r.next, ctrlC).replace(/\r\n?/g, "\n") }));
+          i = ctrlC;
+          continue;
+        }
         if (!final) break;
         keys.push(key("paste", { text: buf.toString("utf8", r.next) }));
         i = buf.length;
@@ -167,15 +178,15 @@ function decode(buffer) {
  * For a live stream. push(chunk) returns the keys that are certain now, and
  * calls onKeys later with any that only time could settle (a lone Esc).
  */
-function createDecoder({ escMs = 50, onKeys = () => {} } = {}) {
+function createDecoder({ escMs = 50, pasteMs = 1000, onKeys = () => {} } = {}) {
   let pending = Buffer.alloc(0);
   let timer = null;
+  // A lone escape is Esc after escMs. A paste is given longer, since a big
+  // one arrives in many reads, but not forever: after pasteMs with no end
+  // marker, what came is the paste and keys are keys again.
   const settle = () => {
     timer = null;
     if (!pending.length) return;
-    // A paste still open after the wait is not finished arriving; a lone
-    // escape is Esc. Only the second is settled by the clock.
-    if (pending.indexOf(PASTE_START, 0, "latin1") === 0) return;
     const { keys } = decodeSome(pending, true);
     pending = Buffer.alloc(0);
     if (keys.length) onKeys(keys);
@@ -187,7 +198,7 @@ function createDecoder({ escMs = 50, onKeys = () => {} } = {}) {
       const { keys, rest } = decodeSome(pending, false);
       pending = Buffer.from(rest);
       if (pending.length) {
-        timer = setTimeout(settle, escMs);
+        timer = setTimeout(settle, pending.indexOf(PASTE_START, 0, "latin1") === 0 ? pasteMs : escMs);
         if (timer.unref) timer.unref();
       }
       return keys;

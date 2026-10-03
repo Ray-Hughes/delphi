@@ -6601,9 +6601,9 @@ async function renderSettings(root) {
   benchBox.append(editor.sub);
 
   const prefix = benchField({
-    id: "wb-prefix", key: "workbenchBranchPrefix", value: settings.workbenchBranchPrefix, placeholder: "your username",
+    id: "wb-prefix", key: "workbenchBranchPrefix", value: settings.workbenchBranchPrefix, placeholder: settings.workbenchBranchPrefixDefault || "your username",
     label: "Branch prefix",
-    hint: "What every Workbench branch starts with, so a shared remote shows whose branch is whose. Leave it empty for your username on this computer.",
+    hint: `What every Workbench branch starts with, so a shared remote shows whose branch is whose. Leave it empty for your username on this computer${settings.workbenchBranchPrefixDefault ? ` (${settings.workbenchBranchPrefixDefault})` : ""}.`,
   });
   // The same cleaning workbench/naming.js gives a prefix, so the example is
   // the name git will really be given.
@@ -6613,7 +6613,7 @@ async function renderSettings(root) {
   const paintExample = () => {
     example.textContent = "";
     example.append("A task 42 called \"Fix the zip DLQ backlog\" gets ",
-      el("span", { className: "mono", textContent: `${cleanPrefix(prefix.input.value) || "<your username>"}/42-fix-the-zip-dlq-backlog` }),
+      el("span", { className: "mono", textContent: `${cleanPrefix(prefix.input.value) || settings.workbenchBranchPrefixDefault || "<your username>"}/42-fix-the-zip-dlq-backlog` }),
       ", or leads with its ticket, such as EF-1288, when it has one.");
   };
   prefix.input.addEventListener("input", paintExample);
@@ -7009,8 +7009,6 @@ const notifyError = (error) => notify(error, { error: true });
  */
 function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, className = "" }) {
   return new Promise((resolve) => {
-    // A toast left over from the last step would sit on top of this one.
-    document.querySelector(".wb-toast")?.remove();
     const overlay = el("div", { className: "overlay" });
     const box = el("div", { className: `ask wb-dialog ${className}`.trim(), role: "dialog" });
     box.setAttribute("aria-modal", "true");
@@ -7136,6 +7134,25 @@ async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) 
       return;
     }
 
+    // A repository inside the folder, or a file Delphi cannot read, stops
+    // Finish outright, and asked first: a nested repository looks like an
+    // unsaved folder, and committing it would record a link to it and none
+    // of its files.
+    const first = await wbApi.finishPlan(wbId);
+    if (first.blocked) { await wbStop(first.blocked.code === "NESTED" ? "Other repositories are inside this folder" : "Finish cannot go ahead", first.blocked.message, first.nested && first.nested.length ? first.nested : first.unreadable); return; }
+
+    // Hidden changes (assume-unchanged, skip-worktree) are unsaved work that
+    // an ordinary commit leaves behind, so committing here would not clear
+    // them. Finish's own refusal explains them; it refuses before touching
+    // anything, so asking it is safe.
+    if (st.hidden && st.hidden.length) {
+      try { await wbApi.finish(wbId); } catch (error) {
+        if (error.code !== "UNSAVED") throw error;
+        const hidden = (error.details && error.details.hidden) || st.hidden;
+        await wbStop("Hidden changes in the folder", error.message, hidden);
+      }
+      return;
+    }
     if (st.unsaved) {
       const files = el("div", { className: "grp" },
         el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(st.unsaved) }),
@@ -7170,6 +7187,12 @@ async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) 
       if (!pushed.ok) { notifyError(pushed.reason); return; }
     }
 
+    // Files git does not keep (a build, an .env that was edited) go with the
+    // folder. Read again after the commit and push, before the pull request
+    // is offered, so nobody opens one and then learns Finish cannot go ahead.
+    const plan = await wbApi.finishPlan(wbId);
+    if (plan.blocked) { await wbStop(plan.blocked.code === "NESTED" ? "Other repositories are inside this folder" : "Finish cannot go ahead", plan.blocked.message, plan.nested && plan.nested.length ? plan.nested : plan.unreadable); return; }
+
     const pr = await wbApi.pr(wbId);
     if (pr.via) {
       const go = await wbDialog({
@@ -7194,24 +7217,23 @@ async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) 
       }
     }
 
-    // Files git does not keep (node_modules, a build, an .env that was
-    // edited) go with the folder. Asked about first, by name, because the
-    // branch carries none of them.
-    const plan = await wbApi.finishPlan(wbId);
-    let ignoredOk = false;
+    let confirm = null;
     if (plan.needsConfirm) {
       if (!(await confirmIgnored(plan))) return;
-      ignoredOk = true;
+      confirm = plan.confirm;
     }
-    let r;
-    try {
-      r = await wbApi.finish(wbId, ignoredOk ? { ignoredOk: true } : {});
-    } catch (error) {
-      // Something new appeared between the plan and the finish: ask again
-      // from the refusal's own list, once.
-      if (error.code !== "IGNORED" || ignoredOk || !error.details) throw error;
-      if (!(await confirmIgnored(error.details))) return;
-      r = await wbApi.finish(wbId, { ignoredOk: true });
+    // The token agrees to exactly the files that were shown. When the folder
+    // changed since, Finish refuses with the new list and a new token, and the
+    // person is asked again about what is there now.
+    let r = null;
+    for (let tries = 0; !r; tries++) {
+      try {
+        r = await wbApi.finish(wbId, confirm ? { confirm } : {});
+      } catch (error) {
+        if (error.code !== "IGNORED" || !error.details || !error.details.confirm || tries >= 4) throw error;
+        if (!(await confirmIgnored(error.details, { changed: true }))) return;
+        confirm = error.details.confirm;
+      }
     }
     notify(`Finished. The folder is gone and the branch ${r.branch} is kept.${keptWords(r)}`);
     await done();
@@ -7255,18 +7277,31 @@ function sizeWords(bytes) {
 /** What a snapshot leaves out, said before anyone agrees to it. */
 function notKeptGroup(notKept) {
   if (!notKept || !notKept.length) return null;
-  return el("div", { className: "grp" },
-    el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(notKept.length) }),
-      notKept.length === 1 ? "file not kept in the copy" : "files not kept in the copy"),
-    wbList(notKept, (f) => [el("span", { className: "mono", textContent: f.path }), el("span", { className: "hint", textContent: f.why })]));
+  // The only things a Finish or Discard loses for good, so they lead in the
+  // danger colour and say so in as many words.
+  return el("div", { className: "grp lost" },
+    el("div", { className: "grp-h" }, "Not kept, gone for good"),
+    wbList(notKept, (f) => [el("span", { className: "mono", textContent: f.path || f }), f.why ? el("span", { className: "hint", textContent: f.why }) : null]));
+}
+
+/** A refusal that nothing in a dialog can fix: the module's words, and what they name. */
+function wbStop(title, message, items = []) {
+  return wbDialog({
+    title,
+    lead: message,
+    body: items && items.length ? [el("div", { className: "grp" }, wbList(items, (p) => el("span", { className: "mono", textContent: p })))] : [],
+    actions: [{ label: "OK", value: null, kind: "primary" }],
+  });
 }
 
 /**
  * The "these can go" step of Finish: the ignored folders and the copied files
  * that differ from the main checkout, named, with what is kept and for how long.
  */
-function confirmIgnored(plan) {
+function confirmIgnored(plan, { changed: again = false } = {}) {
   const body = [];
+  if (again) body.push(el("p", { className: "wb-lead", textContent: "The folder changed since you were last asked. This is what is there now." }));
+  body.push(notKeptGroup(plan.notKept));
   const ignored = plan.ignored || [];
   if (ignored.length) {
     body.push(el("div", { className: "grp" },
@@ -7281,8 +7316,9 @@ function confirmIgnored(plan) {
       wbList(changed, (f) => [el("span", { className: "mono", textContent: f }),
         el("span", { className: "hint", textContent: "differs from the main checkout" })])));
   }
-  body.push(notKeptGroup(plan.notKept));
-  body.push(el("p", { className: "wb-lead", textContent: "A copy of them is kept for 30 days, and Finish says how to get it back." }));
+  body.push(el("p", { className: "wb-lead", textContent: plan.notKept && plan.notKept.length
+    ? "A copy of the rest is kept for 30 days, and Finish says how to get it back."
+    : "A copy of them is kept for 30 days, and Finish says how to get it back." }));
   return wbDialog({
     title: "These go with the folder",
     lead: "The branch keeps your commits, but not these. Finishing removes them.",
@@ -7316,12 +7352,10 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
   try { plan = await window.delphi.workbench.discardPlan(wbId); } catch (error) { notifyError(error); return; }
   // A folder git cannot read is left alone by Discard, which is right: there
   // is no way to keep a copy of what cannot be read. Said, with nothing to type.
-  if (plan.unreadable) {
-    await wbDialog({
-      title: `Task ${taskId}'s Workbench cannot be discarded now`,
-      lead: plan.unreadable,
-      actions: [{ label: "OK", value: null, kind: "primary" }],
-    });
+  const blocked = plan.blocked || (plan.unreadable ? { message: plan.unreadable } : null);
+  if (blocked) {
+    await wbStop(`Task ${taskId}'s Workbench cannot be discarded now`, blocked.message,
+      plan.nested && plan.nested.length ? plan.nested : []);
     return;
   }
   const count = (n, one, many) => el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(n) }), n === 1 ? one : many);
@@ -7332,8 +7366,13 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
   const body = [];
   if (plan.folderGone) body.push(el("p", { className: "wb-lead", textContent: `The folder is already gone (${plan.path}). Discard closes the Workbench and keeps the branch's commits.` }));
   if (plan.operation) body.push(el("p", { className: "wb-lead", textContent: `The folder is in the middle of ${plan.operation}. Its state as it is now is what gets kept.` }));
+  // What the copy cannot hold goes first: the one part of a Discard that
+  // is not coming back.
+  body.push(notKeptGroup(plan.notKept));
+  const hidden = new Set(plan.hidden || []);
   if (plan.unsaved.length) body.push(el("div", { className: "grp" }, count(plan.unsaved.length, "unsaved change", "unsaved changes"),
-    wbList(plan.unsaved, (f) => el("span", { className: "mono", textContent: f }))));
+    wbList(plan.unsaved, (f) => [el("span", { className: "mono", textContent: f }),
+      hidden.has(f) ? el("span", { className: "hint", textContent: "hidden from git status" }) : null])));
   if (plan.commits.length) body.push(el("div", { className: "grp" }, count(plan.commits.length, "commit that exists only here", "commits that exist only here"),
     wbList(plan.commits, commitRow)));
   const detached = plan.detached || [];
@@ -7351,9 +7390,6 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
         " is on the remote as ", el("span", { className: "mono", textContent: plan.remote }), ", so it is kept.")
     : el("p", { className: "wb-lead" }, "The branch ", el("span", { className: "mono", textContent: plan.branch }),
         " was never pushed, so it goes, with the rest kept in the copy."));
-  // What the copy cannot hold, by name, before the number is typed: the one
-  // part of a Discard that is not coming back.
-  body.push(notKeptGroup(plan.notKept));
   if (plan.recover) {
     body.push(el("p", { className: "wb-lead" }, "Kept until ", el("strong", { textContent: plan.until }), "; to get it back:"), recoverBlock(plan.recover));
   }
@@ -7370,7 +7406,9 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
   };
   const choice = await wbDialog({
     title: `Discard the Workbench for task ${taskId}?`,
-    lead: "This deletes the folder. Everything in it is copied aside first, so it can be got back for a while.",
+    lead: plan.notKept && plan.notKept.length
+      ? "This deletes the folder. Everything in it except what is marked gone for good is copied aside first, so it can be got back for a while."
+      : "This deletes the folder. Everything in it is copied aside first, so it can be got back for a while.",
     body,
     actions: [
       { label: "Cancel", value: null },
@@ -7379,10 +7417,15 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
   });
   if (choice !== "discard") return;
   try {
-    const r = await window.delphi.workbench.discard(wbId, input.value);
+    const r = await window.delphi.workbench.discard(wbId, input.value, plan.confirm ? { confirm: plan.confirm } : {});
     // The Sheet has the same sentence, from the module's own note.
     notify(`Discarded.${keptWords(r)}`);
-  } catch (error) { notifyError(error); }
+  } catch (error) {
+    // The folder changed since the plan was read, so what was agreed to is
+    // not what is there. Said, then asked again from a fresh plan.
+    notifyError(error);
+    if (error.code === "IGNORED") return discardWorkbench(wbId, taskId, { after });
+  }
   if (after) await after();
 }
 
@@ -7412,10 +7455,12 @@ async function repoWorkbenchSettings(repo) {
       body: [
         row(base, "Base branch", repo.base_branch ? null : "detected",
           "Where every Workbench branch starts from, and what Update brings in. Empty means detect: origin's default branch, then main, then master."),
-        row(setup, "Setup command", repo.setup_cmd == null ? "detected at Start" : null,
+        row(setup, "Setup command", repo.setup_cmd == null ? "detected at Start" : Number(repo.setup_cmd_detected) === 1 ? "detected" : null,
           repo.setup_cmd == null
             ? "Runs in a new Workbench once its folder exists. Delphi looks at the lockfiles at the first Start and writes what it finds here."
-            : "Runs in a new Workbench once its folder exists, as the first Start found it or as last edited. Empty runs nothing."),
+            : Number(repo.setup_cmd_detected) === 1
+              ? "Runs in a new Workbench once its folder exists. This is what Delphi found; edit it and it is yours. Empty runs nothing."
+              : "Runs in a new Workbench once its folder exists, as last set. Empty runs nothing."),
         row(copy, "Files to copy", repo.copy_files == null ? "default" : null,
           "Untracked files copied from the main checkout into each new Workbench, comma separated. Never overwrites, and only files inside the repository."),
         refused ? el("div", { className: "err-msg", role: "alert", textContent: refused }) : null,

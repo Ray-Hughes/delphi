@@ -165,7 +165,10 @@ const BUILTINS = [
     // "Invalid JSON: expected value at line 1 column 1".
     mcp_style: "flag:--additional-mcp-config|@",
     args: [
-      "-p", "{prompt}",
+      // Attached, not "-p" then the prompt: as a separate argument, a message
+      // that starts with '-' could be read as a flag. seedHarnesses brings an
+      // untouched row up to this and leaves an edited one alone.
+      "--prompt={prompt}",
       "--output-format", "json",
       "--no-color",
       ["--model", "{model}"],
@@ -327,8 +330,13 @@ function mcpFlags(style, context) {
   const entry = name === "--additional-mcp-config" ? { ...launch, tools: ["*"] } : launch;
   const dir = path.join(os.tmpdir(), "delphi-mcp");
   fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `session-${context.sessionId || "adhoc"}.json`);
-  fs.writeFileSync(file, JSON.stringify({ mcpServers: { delphi: entry } }, null, 2));
+  // One file per launch, never per session: two turns on the same task at
+  // once (a chat in the terminal and one in the Sheet) would otherwise share a
+  // name, the later write would give the earlier agent the later one's
+  // identity, and the first to finish would delete the file under the other.
+  const tag = String(context.tag || context.sessionId || "adhoc").replace(/[^A-Za-z0-9._-]/g, "_");
+  const file = path.join(dir, `session-${tag}-${process.pid}-${require("crypto").randomBytes(6).toString("hex")}.json`);
+  fs.writeFileSync(file, JSON.stringify({ mcpServers: { delphi: entry } }, null, 2), { mode: 0o600 });
   return { flags: [name, `${prefix}${file}`], file };
 }
 

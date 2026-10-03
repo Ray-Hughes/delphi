@@ -191,7 +191,7 @@ async function main() {
     "1 .M N... 100644 100644 100644 aaa bbb has space.txt\0" +
     "2 R. N... 100644 100644 100644 aaa bbb R100 new name.txt\0old name.txt\0" +
     "u UU N... 100644 100644 100644 100644 aaa bbb ccc clash.txt\0? new.txt\0"),
-    { files: ["has space.txt", "new name.txt", "clash.txt", "new.txt"], conflicted: ["clash.txt"] });
+    { files: ["has space.txt", "new name.txt", "clash.txt", "new.txt"], conflicted: ["clash.txt"], untracked: ["new.txt"] });
   check("github compare", wgit.compareUrl("git@github.com:me/app.git", "main", "ray/1-x"), "https://github.com/me/app/compare/main...ray/1-x?expand=1");
   check("github https", wgit.compareUrl("https://github.com/me/app", "main", "b"), "https://github.com/me/app/compare/main...b?expand=1");
   check("gitlab", /^https:\/\/gitlab\.com\/g\/s\/app\/-\/merge_requests\/new\?/.test(wgit.compareUrl("ssh://git@gitlab.com/g/s/app.git", "main", "b")), true);
@@ -364,7 +364,7 @@ async function main() {
   check("the Sheet records what went, and how to get it back", notes(td.id).pop(),
     `discarded workbench with 1 unsaved file (loose.txt), 1 local commit; the branch ${wd.branch} was deleted. ` +
     `Everything in it is kept until ${gone.until} as refs/delphi/discarded/${td.id}-${wd.id}. To get it back: ` +
-    `git -C ${fs.realpathSync(app)} worktree add -b ${wd.branch}-recovered ${wd.path} refs/delphi/discarded/${td.id}-${wd.id}`);
+    `git -C ${fs.realpathSync(app)} worktree add -b ${wd.branch}-recovered-${wd.id} ${wd.path}-recovered-${wd.id} refs/delphi/discarded/${td.id}-${wd.id}`);
 
   const tp = task("Throw away pushed");
   const wp = (await benches.start(tp.id, { runSetup: false })).workbench;
@@ -592,7 +592,7 @@ function cli() {
   const offRow = (run(["work", String(off.id), "--path"]), store.live(off.id));
   fs.rmSync(offRow.path, { recursive: true, force: true });
   const st = run(["status", String(off.id)]);
-  check("status runs housekeeping and shows Missing", /Missing/.test(st.out), true);
+  check("status runs housekeeping and shows Missing, once", [/Missing/.test(st.out), /missing, Missing/i.test(st.out)], [true, false]);
   check("work puts a missing folder back", [run(["work", String(off.id), "--path"]).code, exists(offRow.path), store.live(off.id).state], [0, true, "active"]);
 }
 

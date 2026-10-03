@@ -91,7 +91,8 @@ WRAPPERS = [re.compile(p) for p in (
     r"timeout(?:\s+-\S+)*\s+\S+\s+",
     r"stdbuf(?:\s+-\S+)*\s+",
     r"caffeinate(?:\s+-\S+)*\s+",
-    r"unbuffer\s+",
+    r"unbuffer(?:\s+-\S+)*\s+",
+    r"spawn(?:\s+-\S+)*\s+",                       # expect's spawn
     r"xargs(?:\s+-\S+)*\s+",
     r"xargs(?:\s+-\S+(?:\s+[^-\s]\S*)?)*\s+",
     r"script(?:\s+-[a-zA-Z]+)*\s+",                 # Linux: script -qc "cmd" file
@@ -126,6 +127,29 @@ def runs_discard(rest: str, depth: int = 0) -> bool:
     return False
 
 
+def unmask(cmd: str) -> str:
+    """The command with the cheap disguises taken off.
+
+    A backslash before a letter (\\delphi skips aliases and still runs it), an
+    empty pair of quotes inside a word (de""lphi), and a variable assigned in
+    the same command and then run ($D after D=delphi) all spell delphi to the
+    shell, so they are spelled delphi here before anything is matched.
+    """
+    out = re.sub(r"\\(?=[A-Za-z])", "", cmd)
+    out = re.sub(r"(?<=\w)(?:''|\"\")|(?:''|\"\")(?=\w)", "", out)
+    for name, value in re.findall(r"(?:^|[\s;&|(])(\w+)=[\"']?(\S*delphi(?:\.js)?)[\"']?(?=[\s;&|)]|$)", out):
+        out = re.sub(r"\$\{?" + re.escape(name) + r"\b\}?", value, out)
+    return out
+
+
+# delphi discard started from a program rather than a shell: an argument
+# list with "delphi" and then "discard" in it (python's pty.spawn and
+# subprocess, node's spawn), which no shell word order can see.
+ARGV_DISCARD = re.compile(
+    r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']discard["']"""
+)
+
+
 def is_delphi_discard(cmd: str) -> bool:
     """Whether delphi discard is run anywhere in this segment, in command position.
 
@@ -134,6 +158,9 @@ def is_delphi_discard(cmd: str) -> bool:
     su -c), which runs it. A quoted mention anywhere else (a commit message, a
     grep pattern, a Sheet entry) is not in command position and is allowed.
     """
+    cmd = unmask(cmd)
+    if ARGV_DISCARD.search(cmd):
+        return True
     starts = [0]
     starts += [m.end() for m in re.finditer(r"\$\(|<\(|`|\(|\{\s", cmd)]
     starts += [m.end() for m in re.finditer(r"\s-[a-zA-Z]*c\s+[\"']", cmd)]
@@ -255,7 +282,9 @@ def check_bash(command: str):
             "Download it, look at it, then run it."
         )
 
-    for segment in segments(command):
+    # Unmasked on the whole line first, because a variable assigned in one
+    # segment (D=delphi;) is run in another ($D discard).
+    for segment in segments(unmask(command)):
         reason = check_segment(segment)
         if reason:
             return reason

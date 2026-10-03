@@ -96,7 +96,7 @@ const HELP = {
   ],
   done: ["delphi done <task>", "Mark a task done. If it still has a Workbench, offers to finish that too."],
   chat: [
-    "delphi chat <task> [--agent claude|copilot] [--auto] [--allow-unguarded] [\"<message>\"]",
+    "delphi chat <task> [--agent claude|copilot] [--auto] [--allow-unguarded] [\"<message>\" | -- <message...>]",
     "Talk to an agent on a task's Sheet. What it says, the commands it runs and the files it edits are written",
     "onto the Sheet as it goes, as the agent. A later delphi chat on the same task picks the conversation up again.",
     "With a message, or with text piped in, it runs that one turn and stops; otherwise it asks for each line.",
@@ -325,20 +325,35 @@ async function finishFlow(client, taskId) {
     }
   }
   // Files git does not keep (an edited .env, notes in build/) are named, and
-  // go only on a yes. Without a person the server's refusal names them.
-  let ignoredOk = false;
+  // go only on a person's yes to that exact list. Removing them is a
+  // person's call, so it runs here, in this process, as Discard does, and
+  // the server only records it (workbench_finished). Without a person the
+  // server's own Finish refuses and names them.
+  let done = null;
   if (person) {
     const left = await client.call("workbench_finish_plan", { task_id: taskId });
+    if (left.blocked) { warn(left.blocked.message); return 1; }
     if (left.needsConfirm) {
       say("The folder has files git does not keep, which finishing removes:");
       for (const g of left.ignored.slice(0, 20)) say(`  ${g.dir}  (${plural(g.count, "file", "files")})`);
       if (left.ignored.length > 20) say(`  and ${left.ignored.length - 20} more`);
       for (const f of left.changedCopies) say(`  ${f} differs from the main checkout's copy`);
-      if (!(await yes("These can go? A copy is kept for 30 days."))) { say("Nothing was finished."); return 1; }
-      ignoredOk = true;
+      if (left.notKept.length) {
+        say("These cannot be kept even in a copy, and would be gone for good:");
+        for (const n of left.notKept.slice(0, 20)) say(`  ${n.path}  (${n.why})`);
+        if (left.notKept.length > 20) say(`  and ${left.notKept.length - 20} more`);
+      }
+      const question = left.notKept.length ? "These can go, including the ones that cannot be kept?" : "These can go? A copy is kept for 30 days.";
+      if (!(await yes(question))) { say("Nothing was finished."); return 1; }
+      const bench = require("../workbench/workbench");
+      const { workbench: wb } = await benchOf(client, taskId);
+      const made = await bench.finishFolder(wb, { confirm: left.confirm });
+      await client.call("workbench_finished", { task_id: taskId, ref: made.ref || undefined, not_kept: made.notKept });
+      const task = await client.call("get_task", { id: taskId });
+      done = { branch: made.branch, recover: made.recover, task_status: task.status };
     }
   }
-  const done = await client.call("workbench_finish", { task_id: taskId, ignored_ok: ignoredOk });
+  if (!done) done = await client.call("workbench_finish", { task_id: taskId });
   say(`Finished. The folder is put away and the branch ${done.branch} is kept.`);
   if (done.recover) say(done.recover);
   if (person && done.task_status === "doing" && await yes(`Mark task ${taskId} done?`)) {
@@ -541,8 +556,13 @@ const COMMANDS = {
     const controller = new AbortController();
     let control = null;
     const onInterrupt = () => (control ? control.interrupt() : controller.abort());
-    const onHangup = () => control && control.kill("SIGHUP");
-    const onTerm = () => control && control.kill("SIGTERM");
+    // A signal that lands before the command has started (while the guard is
+    // still being asked) is kept and delivered the moment it starts, rather
+    // than dropped and the command left to run with nobody waiting for it.
+    let pendingKill = null;
+    const ending = (sig) => () => { if (control) control.kill(sig); else pendingKill = pendingKill || sig; };
+    const onHangup = ending("SIGHUP");
+    const onTerm = ending("SIGTERM");
     const quiet = () => {};
     process.on("SIGINT", onInterrupt);
     process.on("SIGHUP", onHangup);
@@ -555,7 +575,7 @@ const COMMANDS = {
       entry = await runEntry({
         store, taskId: resolved.task.id, command, cwd, logDir: resolved.log_dir,
         signal: controller.signal,
-        onStart: (c) => { control = c; },
+        onStart: (c) => { control = c; if (pendingKill) c.kill(pendingKill); },
         onChunk: (chunk) => { try { process.stdout.write(chunk); } catch {} },
       });
     } finally {
@@ -671,8 +691,8 @@ const COMMANDS = {
             if (code) await pause();
           },
           // /agent: plain text typed in the Sheet goes to the agent as well.
-          attachAgent: (name, resolved, { allowUnguarded = false, onEntry } = {}) => require("../sheet/chat").createChatSession({
-            adapter: name, personClient: client, openAgentClient: connectAgent, resolved, allowUnguarded, onEntry,
+          attachAgent: (name, resolved, { allowUnguarded = false, onEntry, onError } = {}) => require("../sheet/chat").createChatSession({
+            adapter: name, personClient: client, openAgentClient: connectAgent, resolved, allowUnguarded, onEntry, onError,
           }),
         },
       });
@@ -683,7 +703,7 @@ const COMMANDS = {
     return 0;
   },
 
-  async chat(client, { positional, flags }) {
+  async chat(client, { positional, flags, rest }) {
     const { createChatSession } = require("../sheet/chat");
     const resolved = await resolve(client, positional[0], "chat");
     const taskId = resolved.task.id;
@@ -697,17 +717,35 @@ const COMMANDS = {
       onEntry: tty ? printChatEntry : () => {},
       onError: (error) => warn(`could not write to the Sheet: ${error.message}`),
     });
+    if (session.notice) warn(session.notice);
     if (session.resume && tty) warn(`picking up ${session.row.label}'s conversation on task ${taskId}.`);
 
     // Ctrl-C belongs to the turn: the agent is in its own process group, so
     // the terminal's interrupt reaches only this process, which stops the
     // agent and records what it left running as fail:130.
     const onInterrupt = () => { if (!session.stop()) process.exit(130); };
+    // A closed terminal (SIGHUP) or a kill (SIGTERM) does not reach the agent
+    // in its own process group, so it is passed on: the agent is stopped, what
+    // it left running is finished saying why, and then this exits. chat.js
+    // kills any agent still alive at exit as well, in case this never runs.
+    let ending = null;
+    const endCode = () => (ending === "SIGHUP" ? 129 : 143);
+    const onEnd = (sig) => () => {
+      ending = sig;
+      process.stdout.on("error", () => {});
+      process.stderr.on("error", () => {});
+      if (!session.stop(sig)) { session.close(); process.exit(endCode()); }
+    };
+    const onHangup = onEnd("SIGHUP");
+    const onTerm = onEnd("SIGTERM");
     process.on("SIGINT", onInterrupt);
+    process.on("SIGHUP", onHangup);
+    process.on("SIGTERM", onTerm);
     const turn = async (message) => {
       const mine = await client.call("sheet_append", { task_id: taskId, kind: "say", body: message });
       if (tty) say(fmt.formatEntry(mine, { clean: true }));
       const result = await session.send(message, { skip: [mine.id] });
+      if (ending) return endCode();
       if (result.interrupted) { warn("stopped."); return 130; }
       if (result.code !== 0 && !result.written.length) {
         warn(`${session.row.label} exited ${result.code === null ? "without starting" : result.code} and said nothing.` +
@@ -718,7 +756,8 @@ const COMMANDS = {
       return 0;
     };
     try {
-      const given = positional.slice(1).join(" ");
+      // After --, a message that starts with a dash is still a message.
+      const given = [...positional.slice(1), ...(rest || [])].join(" ");
       const piped = !given && !process.stdin.isTTY ? fs.readFileSync(0, "utf8") : "";
       if ((given || piped).trim()) return await turn((given || piped).trim());
       if (!interactive()) throw new UsageError("Give the message, or pipe it in: there is no terminal to ask at.", "chat");
@@ -734,11 +773,14 @@ const COMMANDS = {
         // Not paused: readline holds the terminal in raw mode, and a paused
         // one would not see the Ctrl-C that stops the turn.
         await turn(String(next.value).trim());
+        if (ending) { rl.close(); return endCode(); }
       }
       rl.close();
       return 0;
     } finally {
       process.removeListener("SIGINT", onInterrupt);
+      process.removeListener("SIGHUP", onHangup);
+      process.removeListener("SIGTERM", onTerm);
       session.close();
     }
   },
@@ -776,7 +818,9 @@ const COMMANDS = {
     const read = await client.call("workbench_status", { task_id: task.id });
     if (!read.workbench) { say(`Task ${task.id} has no Workbench.`); return 0; }
     const wb = read.workbench;
-    say(`#${task.id}  ${wb.state === "active" ? "" : `${wb.state}, `}${read.status.words}`);
+    // The row's state only when the words do not already say it ("Missing").
+    const said = wb.state === "active" || read.status.words.toLowerCase().startsWith(wb.state);
+    say(`#${task.id}  ${said ? "" : `${wb.state}, `}${read.status.words}`);
     if (tty) {
       say(`      ${wb.branch}  ${wb.path}`);
       if (read.status.state === "missing") say(`      The folder is gone. delphi work ${task.id} puts it back.`);
@@ -815,7 +859,7 @@ const COMMANDS = {
     const bench = require("../workbench/workbench");
     const { workbench: wb } = await benchOf(client, task.id);
     const plan = await bench.discardPlanFor(wb);
-    if (plan.unreadable) { warn(plan.unreadable); return 1; }
+    if (plan.blocked) { warn(plan.blocked.message); return 1; }
     const list = (items, show) => {
       for (const item of items.slice(0, 20)) say(`    ${show(item)}`);
       if (items.length > 20) say(`    and ${items.length - 20} more`);
@@ -843,15 +887,17 @@ const COMMANDS = {
       : `The branch ${plan.branch} never reached a remote, so it will be deleted.`);
     say(`${plan.recover}`);
     if (plan.notKept.length) {
-      say(`  These are not kept:`);
+      say(`  These cannot be kept, and would be gone for good:`);
       list(plan.notKept, (n) => `${n.path}  (${n.why})`);
     }
     const typed = (await ask(`Type ${task.id} to confirm: `)).trim();
     if (typed !== String(task.id)) { say("Nothing was thrown away."); return 1; }
-    const result = await bench.discardFolder(wb);
+    // The plan's token: if what cannot be kept changed since it was listed
+    // above, this refuses rather than lose files nobody was shown.
+    const result = await bench.discardFolder(wb, { confirm: plan.confirm });
     await client.call("workbench_discarded", {
       task_id: task.id, ref: result.ref, unsaved: result.unsaved, files: result.files, commits: result.commits,
-      detached: result.detached, ignored: result.ignored, branch_deleted: result.branchDeleted,
+      detached: result.detached, ignored: result.ignored, branch_deleted: result.branchDeleted, not_kept: result.notKept,
     });
     say(result.keptRemote
       ? `Discarded. The branch is still on the remote as ${result.keptRemote}.`

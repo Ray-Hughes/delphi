@@ -100,6 +100,48 @@ sheets.append({ taskId: talked.id, kind: "say", body: "and one more thing" });
 vault.exportAll(db, out);
 check("it is in the file", fs.readFileSync(path.join(out, "Vault Test", "sheets", `${talked.id}-fix the DLQ.sheet`), "utf8").trimEnd().endsWith("@ claude-code:7: and one more thing"), true);
 
+section("G4: a project's name cannot write outside the vault");
+{
+  const dots = db.createProject({ key: "dd", name: ".." });
+  const hidden = db.createProject({ key: "hd", name: ".hidden" });
+  for (const p of [dots, hidden]) {
+    const t = db.createTask({ projectId: p.id, title: "x" });
+    person.append({ taskId: t.id, kind: "say", body: "hello" });
+  }
+  vault.exportAll(db, out);
+  check("nothing beside the vault", fs.existsSync(path.join(dir, "sheets")), false);
+  check("'..' becomes a folder inside it", fs.existsSync(path.join(out, "__", "sheets")), true);
+  check("a leading dot does not hide the folder", fs.existsSync(path.join(out, "_hidden", "sheets")), true);
+}
+
+section("G4: the sweep leaves a person's own .sheet files alone");
+{
+  const mine = [path.join(out, "mine.sheet"), path.join(out, "Vault Test", "kept.sheet"), path.join(out, "Vault Test", "sheets", "my-notes.sheet")];
+  for (const f of mine) fs.writeFileSync(f, "a person's own sheet\n");
+  const stale = path.join(out, "Vault Test", "sheets", "12345-gone.sheet");
+  fs.writeFileSync(stale, "stale\n");
+  vault.exportAll(db, out);
+  check("only <project>/sheets/<id>-*.sheet that it did not write goes", [fs.existsSync(stale), ...mine.map((f) => fs.existsSync(f))], [false, true, true, true]);
+}
+
+section("G4: a vault file imports back exactly, with --clean");
+{
+  const { spawnSync } = require("child_process");
+  const source = db.createTask({ projectId: project.id, title: "braces that are text" });
+  const tricky = ["the config is literally  {x}", "a quoted sheet line: $ ls  {id:1 ok}", "ends in a block  {id:7 by:ray +}"];
+  for (const body of tricky) person.append({ taskId: source.id, kind: "say", body });
+  vault.exportAll(db, out);
+  const file = path.join(out, "Vault Test", "sheets", `${source.id}-braces that are text.sheet`);
+  const target = db.createTask({ projectId: project.id, title: "imported" });
+  const r = spawnSync(process.execPath, [path.join(__dirname, "..", "bin", "delphi"), "import", String(target.id), file, "--clean"], {
+    encoding: "utf8", env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", DELPHI_ACTOR: "ray", DELPHI_AUTHOR_TYPE: "human" },
+  });
+  check("import exits 0", [r.status, r.stderr.trim()], [0, `delphi: imported 3 entries into task ${target.id}`]);
+  check("every body comes back whole, braces and all", person.sheet(target.id).entries.map((e) => e.body), tricky);
+  const back = fmt.format({ entries: person.sheet(target.id).entries }, { clean: true });
+  check("and its clean text is the vault file's", back, fs.readFileSync(file, "utf8").split("\n").slice(6).join("\n"));
+}
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

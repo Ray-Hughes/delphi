@@ -141,9 +141,10 @@ async function main() {
     check("the plan lists the ignored files by folder, not node_modules",
       plan.ignored.map((g) => [g.dir, g.count]).sort(), [[".env", 1], ["build/", 2]]);
     check("and says what is too big to keep", plan.notKept.map((n) => n.path), ["build/big.bin"]);
-    check("and how to recover, before anyone confirms", /^Everything in it is kept until \d{4}-\d\d-\d\d as refs\/delphi\/discarded\//.test(plan.recover), true);
+    check("and how to recover, naming what is not kept, before anyone confirms",
+      /^Everything in it except build\/big\.bin \(not kept.*\) is kept until \d{4}-\d\d-\d\d as refs\/delphi\/discarded\//.test(plan.recover), true);
     check("the plan never carries the internal path list", [plan.keepPaths, plan.top], [undefined, undefined]);
-    const done = await benches.discard(wb.id, String(t.id));
+    const done = await benches.discard(wb.id, String(t.id), { confirm: plan.confirm });
     const ref = `refs/delphi/discarded/${t.id}-${wb.id}`;
     check("discarded, folder gone, branch gone, copy named", [done.ref, exists(wb.path), gitOk(r.app, "rev-parse", "--verify", `refs/heads/${wb.branch}`), gitOk(r.app, "rev-parse", "--verify", ref)],
       [ref, false, false, true]);
@@ -152,10 +153,12 @@ async function main() {
     // The printed command, run as printed.
     const cmd = done.recover.slice(done.recover.indexOf("git -C "));
     execFileSync("/bin/sh", ["-c", cmd.replace(/^git /, `${GIT} `)], { stdio: "ignore" });
+    // Into a folder of its own, beside where the Workbench was.
+    const back = `${wb.path}-recovered-${wb.id}`;
     check("the recovery command brings back the committed, uncommitted and ignored work",
-      [read(path.join(wb.path, "precious.txt")), read(path.join(wb.path, "draft.txt")), read(path.join(wb.path, ".env")), read(path.join(wb.path, "build/notes.txt"))],
+      [read(path.join(back, "precious.txt")), read(path.join(back, "draft.txt")), read(path.join(back, ".env")), read(path.join(back, "build/notes.txt"))],
       ["a day of work\n", "uncommitted\n", "SECRET=edited-in-the-workbench\n", "hours of work\n"]);
-    check("but not the reproducible or the too big", [exists(path.join(wb.path, "node_modules/x/index.js")), exists(path.join(wb.path, "build/big.bin"))], [false, false]);
+    check("but not the reproducible or the too big", [exists(path.join(back, "node_modules/x/index.js")), exists(path.join(back, "build/big.bin"))], [false, false]);
   }
 
   // -------------------------------------------------------------------------
@@ -232,11 +235,13 @@ async function main() {
     check("nor does node_modules", (await benches.finishPlan(wb.id)).needsConfirm, false);
     write(path.join(wb.path, ".env"), "API_KEY=only-copy-of-this\n");
     write(path.join(wb.path, "build/notes.txt"), "hours of work\n");
-    const err = await rejects("finish refuses, naming them", benches.finish(wb.id), /\.env.*build\/ .*these can go/, "IGNORED");
+    const err = await rejects("finish refuses, naming them", benches.finish(wb.id), /\.env.*build\/ .*these exact files can go/, "IGNORED");
     check("the refusal carries the list for a window to show",
       [err && err.details.changedCopies, err && err.details.ignored.map((g) => g.dir).sort()], [[".env"], [".env", "build/"]]);
     check("and nothing went", [read(path.join(wb.path, ".env")), exists(path.join(wb.path, "build/notes.txt"))], ["API_KEY=only-copy-of-this\n", true]);
-    const done = await benches.finish(wb.id, { ignoredOk: true });
+    check("the refusal carries the token for that exact list", err && err.details.confirm, (await benches.finishPlan(wb.id)).confirm);
+    await rejects("a wrong token is no confirmation", benches.finish(wb.id, { confirm: "not-the-token" }), /these exact files/, "IGNORED");
+    const done = await benches.finish(wb.id, { confirm: err.details.confirm });
     const ref = `refs/delphi/finished/${t.id}-${wb.id}`;
     check("with these-can-go it finishes and keeps a copy", [done.finished, done.ref, exists(wb.path)], [true, ref, false]);
     check("the copy has them", [git(r.app, "show", `${ref}:.env`), git(r.app, "show", `${ref}:build/notes.txt`)], ["API_KEY=only-copy-of-this", "hours of work"]);
@@ -356,6 +361,151 @@ async function main() {
     check("a run may carry them", sheets.append({ taskId: t.id, kind: "run", body: "true", meta: { state: "ok", code: 0, out: "" } }).kind, "run");
   }
 
+  // -------------------------------------------------------------------------
+  section("G4 1. What cannot be kept goes only with a yes to that exact list");
+  {
+    const r = makeRepo("g4big");
+    const { t, wb } = await bench(r, "big");
+    write(path.join(wb.path, "build/notes.txt"), "notes\n");
+    fs.writeFileSync(path.join(wb.path, "build/dataset.bin"), Buffer.alloc(keep.PER_FILE_MAX + 1, 7));
+    const plan = await benches.finishPlan(wb.id);
+    check("finishPlan names what cannot be kept", plan.notKept.map((n) => n.path), ["build/dataset.bin"]);
+    const err = await rejects("finish without a confirm refuses, naming it", benches.finish(wb.id), /gone for good: build\/dataset\.bin \(larger than 10 MB\)/, "IGNORED");
+    check("its details carry notKept and the token", [err.details.notKept.map((n) => n.path), err.details.confirm], [["build/dataset.bin"], plan.confirm]);
+    write(path.join(wb.path, "build/later.txt"), "added after the plan\n");
+    await rejects("a list that changed since the plan refuses", benches.finish(wb.id, { confirm: plan.confirm }), /these exact files/, "IGNORED");
+    check("and nothing went", [exists(path.join(wb.path, "build/dataset.bin")), exists(path.join(wb.path, "build/later.txt"))], [true, true]);
+    const fresh = await benches.finishPlan(wb.id);
+    const done = await benches.finish(wb.id, { confirm: fresh.confirm });
+    check("with the current token it finishes", [done.finished, exists(wb.path)], [true, false]);
+    check("and the recovery text names what was not kept, never 'everything'",
+      [/^Everything in it except build\/dataset\.bin \(not kept/.test(done.recover), /^Everything in it is kept/.test(done.recover)], [true, false]);
+    check("the copy has the rest", git(r.app, "show", `${done.ref}:build/notes.txt`), "notes");
+
+    const r2 = makeRepo("g4bigd", { remote: false });
+    const d = await bench(r2, "big discard");
+    fs.mkdirSync(path.join(d.wb.path, "build"));
+    fs.writeFileSync(path.join(d.wb.path, "build/huge.bin"), Buffer.alloc(keep.PER_FILE_MAX + 1, 1));
+    const dplan = await benches.discardPlan(d.wb.id);
+    await rejects("discard with something not kept wants the plan's token too", benches.discard(d.wb.id, String(d.t.id)), /these exact files/, "IGNORED");
+    check("folder untouched", exists(path.join(d.wb.path, "build/huge.bin")), true);
+    const gone = await benches.discard(d.wb.id, String(d.t.id), { confirm: dplan.confirm });
+    check("with it, discard goes and says what was not kept", [gone.discarded, /except build\/huge\.bin/.test(gone.recover), gone.notKept], [true, true, ["build/huge.bin"]]);
+  }
+
+  // -------------------------------------------------------------------------
+  section("G4 2. A repository inside the folder stops Finish and Discard");
+  {
+    const r = makeRepo("g4nest");
+    const u = await bench(r, "untracked repo");
+    const sub = path.join(u.wb.path, "spike");
+    fs.mkdirSync(sub);
+    git(sub, "init", "-q");
+    write(path.join(sub, "a.txt"), "c\n");
+    git(sub, "add", "-A");
+    git(sub, "commit", "-qm", "x");
+    write(path.join(sub, "uncommitted.txt"), "hours\n");
+    const e1 = await rejects("discard refuses an untracked repository", benches.discard(u.wb.id, String(u.t.id)), /git repository inside this folder: spike\//, "NESTED");
+    check("naming it in details", e1 && e1.details.nested, ["spike/"]);
+    check("the plan says so before anyone confirms", (await benches.discardPlan(u.wb.id)).blocked.code, "NESTED");
+    await rejects("finish refuses too", benches.finish(u.wb.id), /git repository inside/, "NESTED");
+    check("its work is untouched", read(path.join(sub, "uncommitted.txt")), "hours\n");
+
+    const i = await bench(r, "ignored repo");
+    write(path.join(i.wb.path, "build/lib/x.txt"), "y\n");
+    git(path.join(i.wb.path, "build/lib"), "init", "-q");
+    check("finishPlan reports it as blocked", [(await benches.finishPlan(i.wb.id)).blocked.code, (await benches.finishPlan(i.wb.id)).nested], ["NESTED", ["build/lib/"]]);
+    await rejects("an ignored repository stops discard", benches.discard(i.wb.id, String(i.t.id)), /build\/lib\//, "NESTED");
+    check("still there", exists(path.join(i.wb.path, "build/lib/x.txt")), true);
+  }
+
+  // -------------------------------------------------------------------------
+  section("G4 3. Hidden changes (assume-unchanged, skip-worktree) are unsaved, and kept");
+  {
+    const r = makeRepo("g4hidden");
+    for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
+      const { t, wb } = await bench(r, `hidden ${flag}`);
+      git(wb.path, "update-index", flag, "README.md");
+      write(path.join(wb.path, "README.md"), "a local edit worth keeping\n");
+      const st = await benches.status(wb.id, { fresh: true });
+      check(`status says hidden (${flag})`, [st.words, st.state, st.hidden], ["1 hidden change", "unsaved", ["README.md"]]);
+      await rejects(`finish refuses (${flag})`, benches.finish(wb.id), /hidden change/, "UNSAVED");
+      const done = await benches.discard(wb.id, String(t.id));
+      check(`discard's copy holds the edit (${flag})`, git(r.app, "show", `${done.ref}:README.md`), "a local edit worth keeping");
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  section("G4 low. Unreadable paths refuse before anything is removed");
+  if (process.getuid && process.getuid() !== 0) {
+    const r = makeRepo("g4perm");
+    for (const kind of ["file", "dir"]) {
+      const { t, wb } = await bench(r, `perm ${kind}`);
+      const f = path.join(wb.path, kind === "file" ? "secret.txt" : "locked/inner.txt");
+      write(f, "work\n");
+      write(path.join(wb.path, "other.txt"), "other work\n");
+      const closed = kind === "file" ? f : path.dirname(f);
+      fs.chmodSync(closed, 0o000);
+      try {
+        await rejects(`discard refuses an unreadable ${kind}`, benches.discard(wb.id, String(t.id)), /cannot read .*permissions/, "UNREADABLE");
+        check(`and is all or nothing (${kind})`, [exists(path.join(wb.path, "other.txt")), store.get(wb.id).state], [true, "active"]);
+      } finally {
+        fs.chmodSync(closed, 0o755);
+      }
+    }
+    check("plain: a local file git cannot open is not a credentials problem",
+      wgit.plain({ stderr: "error: open(\"secret.txt\"): Permission denied\n" }), "Delphi cannot read secret.txt in this folder (its permissions do not allow it), so nothing was changed.");
+  }
+
+  // -------------------------------------------------------------------------
+  section("G4 7. The recovery command works after the task is started again");
+  {
+    const r = makeRepo("g4rec");
+    const t = task(r.project, "rec");
+    const wb = (await benches.start(t.id, { runSetup: false })).workbench;
+    write(path.join(wb.path, "w.txt"), "w\n");
+    // A copy of the same name left by an older database: never replaced.
+    git(r.app, "update-ref", `refs/delphi/discarded/${t.id}-${wb.id}`, git(r.app, "rev-parse", "HEAD"));
+    const first = await benches.discard(wb.id, String(t.id));
+    check("a name already taken gets a suffix", first.ref, `refs/delphi/discarded/${t.id}-${wb.id}-2`);
+    check("and the row is recorded against it", store.get(wb.id).state, "discarded");
+    const wb2 = (await benches.start(t.id, { runSetup: false })).workbench;
+    check("the task's folder is back in use", wb2.path, wb.path);
+    const cmd = first.recover.slice(first.recover.indexOf("git -C "));
+    const out = spawnSync("/bin/sh", ["-c", cmd.replace(/^git /, `${GIT} `)], { encoding: "utf8" });
+    check("the printed command still works", out.status, 0);
+    check("into its own folder", read(path.join(`${wb.path}-recovered-${wb.id}`, "w.txt")), "w\n");
+    write(path.join(wb2.path, "w2.txt"), "w2\n");
+    const second = await benches.discard(wb2.id, String(t.id));
+    const cmd2 = second.recover.slice(second.recover.indexOf("git -C "));
+    check("a second discard of the task recovers beside the first", spawnSync("/bin/sh", ["-c", cmd2.replace(/^git /, `${GIT} `)]).status, 0);
+  }
+
+  // -------------------------------------------------------------------------
+  section("Smaller G4 items");
+  {
+    const r = makeRepo("g4setup");
+    store.updateRepo(store.adoptRepo({ projectId: r.project.id, path: r.app, name: "g4setup" }).id, { setup_cmd: null });
+    const { wb } = await bench(r, "setup flag");
+    const row = () => db.handle().prepare("SELECT setup_cmd, setup_cmd_detected FROM repos WHERE id = ?").get(wb.repo_id);
+    check("a detected setup command is marked detected", row().setup_cmd_detected, 1);
+    store.updateRepo(wb.repo_id, { setup_cmd: "make deps" });
+    check("one a person sets is not", [row().setup_cmd, row().setup_cmd_detected], ["make deps", 0]);
+
+    const t = task(r.project, "poll");
+    sheets.append({ taskId: t.id, kind: "say", body: "first" });
+    // The cursor is inclusive of its own second, so the poll after the one
+    // that saw "first" is the first that can find nothing.
+    await new Promise((res) => setTimeout(res, 1100));
+    const seen = sheets.read(t.id, { mode: "full" }).cursor;
+    await new Promise((res) => setTimeout(res, 1100));
+    const cursor = sheets.read(t.id, { mode: "full", afterId: seen.after_id, since: seen.since }).cursor;
+    const quiet = sheets.quietRead(t.id, { afterId: cursor.after_id, since: cursor.since });
+    check("an idle poll is answered by the one query", quiet && [quiet.total, quiet.cursor.after_id], [1, cursor.after_id]);
+    sheets.append({ taskId: t.id, kind: "say", body: "second" });
+    check("and hands over to a full read when anything changed", sheets.quietRead(t.id, { afterId: cursor.after_id, since: quiet.cursor.since }), null);
+  }
+
   await viaServer();
   fs.rmSync(dir, { recursive: true, force: true });
   console.log(`\n${checks - failures}/${checks} checks passed`);
@@ -372,6 +522,17 @@ async function main() {
       await rejects("the recorder will not mark a folder that is still there",
         agent.call("workbench_discarded", { task_id: vt.t.id, ref: `refs/delphi/discarded/${vt.t.id}-${vt.wb.id}` }), /still there/);
       check("nothing happened", [exists(path.join(vt.wb.path, "uncommitted.txt")), store.get(vt.wb.id).state], [true, "active"]);
+      // G4: an agent cannot remove ignored files by passing ignored_ok.
+      const ar = makeRepo("g4agent");
+      const at = task(ar.project, "agent finish");
+      const awb = (await benches.start(at.id, { runSetup: false })).workbench;
+      fs.mkdirSync(path.join(awb.path, "build"));
+      fs.writeFileSync(path.join(awb.path, "build/model.ckpt"), Buffer.alloc(keep.PER_FILE_MAX + 2, 1));
+      db.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      await rejects("workbench_finish ignores ignored_ok and refuses, naming the file", agent.call("workbench_finish", { task_id: at.id, ignored_ok: true, confirm: "x" }), /model\.ckpt/);
+      check("the file is still there", exists(path.join(awb.path, "build/model.ckpt")), true);
+      const list = (await agent.request("tools/list", {})).tools.find((x) => x.name === "workbench_finish");
+      check("and the tool offers no way to say yes", Object.keys(list.inputSchema.properties), ["task_id"]);
       // Not a safety rule, but the same server: list_agents carries the launch
       // fields sheet/chat.js reads (plan 6.6).
       db.seedHarnesses(require("../harness").BUILTINS);

@@ -270,6 +270,35 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     };
   }
 
+  /**
+   * The answer to a poll that finds nothing, in one query: whether anything
+   * on the task is new or changed since the cursor and, when nothing is,
+   * everything read() would have put around its empty list. null means
+   * something changed, or the cursor or the task is not one this can answer
+   * for: read() as usual. On the sqlite3 route each query is a process, and a
+   * terminal polls twice a second, so this is the difference between one
+   * spawn and eight for every idle poll.
+   */
+  function quietRead(taskId, { afterId = null, since = null } = {}) {
+    const after = Number(afterId);
+    if (!Number.isSafeInteger(after) || after < 0 || since === null || since === undefined || since === "") return null;
+    const id = idOf(taskId, "task_id");
+    const row = sql(
+      `SELECT t.id AS id, t.title AS title, t.status AS status, p.key AS project, datetime('now') AS now,
+              (SELECT COUNT(*) FROM comments c WHERE c.task_id = :p1 AND (c.id > :p2 OR c.updated_at >= :p3)) AS changed,
+              (SELECT COUNT(*) FROM comments c WHERE c.task_id = :p1) AS total,
+              (SELECT COUNT(*) FROM comments c WHERE c.task_id = :p1 AND ${LEDGER_WHERE}) AS ledger
+         FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+        WHERE t.id = :p1`, [id, after, String(since)])[0];
+    if (!row || Number(row.changed) > 0) return null;
+    return {
+      header: { task: Number(row.id), title: row.title, project: row.project || null, status: row.status },
+      total: Number(row.total) || 0,
+      ledger_count: Number(row.ledger) || 0,
+      cursor: { after_id: after, since: row.now },
+    };
+  }
+
   function sheet(taskId, { mode = "full" } = {}) {
     return { header: header(taskId), entries: entries(taskId, { mode }) };
   }
@@ -541,7 +570,7 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
   }
 
   return {
-    resolveTask, header, entries, read, ledger, context, append, update, promote, file, ask,
+    resolveTask, header, entries, read, quietRead, ledger, context, append, update, promote, file, ask,
     decide: decideAsk, get, sheet, prunable, sweepLost,
   };
 }

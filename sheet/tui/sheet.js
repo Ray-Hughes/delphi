@@ -33,6 +33,13 @@ const scr = require("./screen");
 const keys = require("./keys");
 
 const POLL_MS = 500;
+// How long a call to Delphi's server may take before the Sheet says so.
+const CALL_MS = 15000;
+// Bringing in the latest from a remote, which crosses a network.
+const UPDATE_MS = 120000;
+// The most one yank puts on the clipboard. A run's log can be gigabytes, and
+// a terminal handed that much over OSC 52 stalls or drops it.
+const YANK_MAX = 1024 * 1024;
 // Workbench status shells out to git; the server caches it for ten seconds,
 // so asking more often would only repeat the answer.
 const WORKBENCH_MS = 10000;
@@ -412,7 +419,7 @@ function workbenchChip(read) {
  *   paint     (role, text) => text, or null for plain frames
  *   size      () => { cols, rows }
  */
-function createSheetApp({ client, resolved, io = {}, paint = null, size = () => ({ cols: 80, rows: 24 }) } = {}) {
+function createSheetApp({ client, resolved, io = {}, paint = null, size = () => ({ cols: 80, rows: 24 }), callMs = CALL_MS } = {}) {
   const state = {
     resolved,
     task: { id: resolved.task.id, title: resolved.task.title, status: resolved.task.status, project: resolved.project ? resolved.project.key : null },
@@ -448,6 +455,24 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
   let redrawTimer = null;
 
   const redraw = () => { if (io.redraw) io.redraw(); };
+
+  /**
+   * A call to Delphi's server with a time limit. The person is watching the
+   * screen: a server that stopped answering is said in the status line after
+   * CALL_MS rather than shown as a Sheet that has frozen. The limit is asked of
+   * the client too, so it gives up on the request, and enforced here as well,
+   * for a client that does not take one.
+   */
+  function ask(tool, args, ms = callMs) {
+    let timer;
+    const late = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(
+        `Delphi's server did not answer within ${Math.round(ms / 1000)}s (${tool}). Nothing new was saved; try again, or q to leave.`)), ms);
+      if (timer.unref) timer.unref();
+    });
+    const answer = Promise.resolve().then(() => client.call(tool, args, { timeoutMs: ms + 1000 }));
+    return Promise.race([answer, late]).finally(() => clearTimeout(timer));
+  }
   const soonRedraw = () => {
     if (redrawTimer) return;
     redrawTimer = setTimeout(() => { redrawTimer = null; redraw(); }, 40);
@@ -465,7 +490,7 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
   }
 
   async function load() {
-    const read = await client.call("sheet_read", { task_id: state.task.id, mode: "full" });
+    const read = await ask("sheet_read", { task_id: state.task.id, mode: "full" });
     state.entries = [];
     merge(read.entries);
     state.task = { ...state.task, ...read.task };
@@ -480,7 +505,7 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
       const args = { task_id: state.task.id, mode: "full" };
       if (state.cursor) { args.after_id = state.cursor.after_id; args.since = state.cursor.since; }
       const taskId = state.task.id;
-      const read = await client.call("sheet_read", args);
+      const read = await ask("sheet_read", args);
       // A switch to another task while this was in flight makes it stale.
       if (taskId !== state.task.id) return;
       merge(read.entries);
@@ -489,7 +514,7 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
       refreshOutputs();
       if (read.entries && read.entries.length) redraw();
     } catch (error) {
-      say(`Could not read the Sheet: ${error.message}`, "fail");
+      say(`Could not read the Sheet: ${plainError(error)}`, "fail");
       redraw();
     } finally {
       polling = false;
@@ -498,7 +523,7 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
 
   async function refreshWorkbench() {
     try {
-      state.workbench = await client.call("workbench_status", { task_id: state.task.id });
+      state.workbench = await ask("workbench_status", { task_id: state.task.id });
     } catch {
       state.workbench = null;
     }
@@ -547,20 +572,29 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
 
   // --- writes ----------------------------------------------------------------------
 
-  async function call(tool, args) {
+  async function call(tool, args, ms) {
     try {
-      return await client.call(tool, args);
+      return await ask(tool, args, ms);
     } catch (error) {
-      say(error.message, "fail");
+      say(plainError(error), "fail");
       return null;
     }
+  }
+
+  /** A failed call, in words for the person at the Sheet. */
+  function plainError(error) {
+    const text = String(error && error.message || error);
+    if (/^MCP server (exited|stopped reading|could not start)/.test(text)) {
+      return `Delphi's server has stopped (${text}). Nothing new can be saved; q leaves, and delphi open starts it again.`;
+    }
+    return text;
   }
 
   async function startRun(command) {
     const runEntry = io.runEntry || require("../run").runEntry;
     const store = {
-      append: (f) => client.call("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
-      update: (id, f) => client.call("sheet_update", { id, meta: f.meta, body: f.body }),
+      append: (f) => ask("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
+      update: (id, f) => ask("sheet_update", { id, meta: f.meta, body: f.body }),
     };
     // Tracked from before the entry exists, so a Ctrl-C while the guard is
     // still being asked stops the run instead of being lost.
@@ -725,7 +759,8 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
         if (!state.workbench || !state.workbench.workbench) { say(`Task ${state.task.id} has no Workbench to update.`, "fail"); return; }
         say("Bringing in the latest...", "running");
         redraw();
-        const result = await call("workbench_update", { task_id: state.task.id });
+        // Fetching from the remote can honestly take a while.
+        const result = await call("workbench_update", { task_id: state.task.id }, UPDATE_MS);
         if (result) say(result.words, result.ok ? "ok" : "fail");
         await refreshWorkbench();
         return;
@@ -746,7 +781,9 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
           chat = await io.hooks.attachAgent(which, state.resolved, {
             allowUnguarded: flags.includes("--allow-unguarded"),
             onEntry: (entry) => { merge([entry]); soonRedraw(); },
+            onError: (error) => { say(`Could not write ${which}'s entry: ${error.message}`, "fail"); soonRedraw(); },
           });
+          if (chat.notice) say(chat.notice, "running");
           say(`${chat.row.label} is listening${chat.resume ? ", picking up where it left off" : ""}. What you type now goes to it too. /agent off detaches.`, "ok");
         } catch (error) {
           chat = null;
@@ -770,20 +807,27 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
     const parsed = parseInput(text);
     if (parsed.kind === "empty") return;
     if (parsed.kind === "error") { say(parsed.message, "fail"); return; }
-    state.history.push(text);
-    state.historyAt = null;
-    state.input = "";
-    state.caret = 0;
-    state.follow = true;
+    const done = () => {
+      state.history.push(text);
+      state.historyAt = null;
+      // Only what was typed is cleared, in case more was typed while the
+      // write was on its way.
+      if (state.input === text) { state.input = ""; state.caret = 0; }
+      state.follow = true;
+    };
     const task = state.task.id;
-    if (parsed.kind === "command") return command(parsed);
-    if (parsed.kind === "run") { await startRun(parsed.command); return; }
+    if (parsed.kind === "command") { done(); return command(parsed); }
+    if (parsed.kind === "run") { done(); await startRun(parsed.command); return; }
+    // A remark stays at the prompt until it is saved: if the server does not
+    // take it, the person still has what they wrote.
     let written = null;
     if (parsed.kind === "say") written = await call("sheet_append", { task_id: task, kind: "say", body: parsed.body });
     else if (parsed.kind === "note") written = await call("sheet_append", { task_id: task, kind: "note", body: parsed.body });
     else if (parsed.kind === "ask") written = await call("sheet_ask", { task_id: task, question: parsed.question, options: parsed.options });
-    if (written) merge([written]);
-    if (written && parsed.kind === "say" && chat) sendToAgent(parsed.body, written.id);
+    if (!written) return;
+    done();
+    merge([written]);
+    if (parsed.kind === "say" && chat) sendToAgent(parsed.body, written.id);
   }
 
   /**
@@ -813,33 +857,56 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
     return chatQueue;
   }
 
-  async function detachAgent() {
+  /** reason: null for a person's /agent off or quit, or the signal the process is ending on. */
+  async function detachAgent(reason = null) {
     const session = chat;
     if (!session) return;
     chat = null;
-    session.stop();
+    session.stop(reason);
     await chatQueue.catch(() => {});
     session.close();
+  }
+
+  /**
+   * The process is ending (SIGHUP, SIGTERM, a crash): the agent and every
+   * command started here are stopped and their entries finished, so nothing
+   * is left running with nobody reading it.
+   */
+  async function shutdown(reason) {
+    await Promise.all([detachAgent(reason || "SIGTERM"), abortRuns(reason)]);
   }
 
   async function yank(withOutput) {
     const list = selected();
     if (!list.length) { say("Nothing to yank.", "fail"); return; }
     const logs = {};
+    let cut = false;
     if (withOutput && io.readLog) {
       for (const e of list) {
         if (e.kind !== "run") continue;
         const live = runOf(e.id);
-        try { logs[e.id] = io.readLog(e); } catch {}
+        // Only the end of a log is read: the clipboard takes YANK_MAX at most.
+        try { logs[e.id] = io.readLog(e, { tail: true, bytes: YANK_MAX }); } catch {}
+        try { if (io.logSize && io.logSize(e) > YANK_MAX) cut = true; } catch {}
         if ((logs[e.id] === null || logs[e.id] === undefined) && live) logs[e.id] = live.lines.join("\n");
       }
     }
-    const text = yankText(list, { withOutput, logs });
+    let text = yankText(list, { withOutput, logs });
+    if (Buffer.byteLength(text) > YANK_MAX) {
+      // The command is kept whole and the end of the output, where the
+      // answer usually is, fills the rest.
+      const head = list.length === 1 && list[0].kind === "run" ? `${fmt.runCommand(list[0])}\n` : "";
+      let tail = Buffer.from(text).subarray(-(YANK_MAX - Buffer.byteLength(head))).toString("utf8");
+      tail = tail.slice(tail.indexOf("\n") + 1);
+      text = head + tail;
+      cut = true;
+    }
     let via = null;
     try { via = io.clip ? (await io.clip(text)).via : null; } catch {}
     state.anchor = null;
     const what = list.length === 1 ? `entry ${list[0].id}` : `${list.length} entries`;
-    if (via) say(`Copied ${what}${withOutput ? " with output" : ""}, clean (${via}).`, "ok");
+    if (via && cut) say(`Copied ${what} with the last ${Math.round(YANK_MAX / 1024 / 1024)} MB of its output, clean (${via}); o shows the whole log.`, "ok");
+    else if (via) say(`Copied ${what}${withOutput ? " with output" : ""}, clean (${via}).`, "ok");
     else say("No clipboard to copy to: this terminal ignores OSC 52 and no pbcopy, wl-copy or xclip was found.", "fail");
   }
 
@@ -1076,9 +1143,33 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
   }
 
   let chain = Promise.resolve();
-  /** Keys in order, each finished before the next, whatever it awaited. */
+  let busy = 0;
+  let stuckCtrlC = false;
+  /**
+   * Keys in order, each finished before the next, whatever it awaited. Except
+   * Ctrl-C while something is still in flight: queued, it would wait behind the
+   * very call it is meant to get the person out of. It interrupts what can be
+   * interrupted at once, and a second one leaves.
+   */
   function enqueue(k) {
-    chain = chain.then(() => key(k)).catch((error) => { say(error.message, "fail"); redraw(); });
+    if (k && k.ctrl && k.name === "c" && busy) {
+      const target = state.mode === "walk" && current() && runOf(current().id) ? current().id : null;
+      if (interrupt(target)) { redraw(); return chain; }
+      if (chat && agentBusy && chat.stop()) { say(`Stopping ${chat.row.label}. Ctrl-C again kills it.`, "running"); redraw(); return chain; }
+      if (stuckCtrlC) { finish(); return chain; }
+      // Armed, and also queued: if what is ahead finishes, this Ctrl-C does
+      // what it always does; if it does not, the next one leaves.
+      stuckCtrlC = true;
+      const notice = setTimeout(() => {
+        if (busy && stuckCtrlC) { say("Still waiting on Delphi's server. Ctrl-C again leaves the Sheet.", "running"); redraw(); }
+      }, 300);
+      if (notice.unref) notice.unref();
+    }
+    // Counted from the moment it is queued, not when it starts: keys that
+    // arrived in one read are all queued before the first has begun.
+    busy++;
+    chain = chain.then(() => key(k)).catch((error) => { say(error.message, "fail"); redraw(); })
+      .finally(() => { busy--; if (!busy) stuckCtrlC = false; });
     return chain;
   }
 
@@ -1219,7 +1310,9 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
   }
 
   return {
-    state, runs, done, load, poll, start, render, feed, key: enqueue, abortRuns, finish,
+    state, runs, done, load, poll, start, render, feed, key: enqueue, abortRuns, finish, shutdown,
+    /** Settles when every key and every agent turn so far has been handled. */
+    idle: () => Promise.all([chain, chatQueue]).then(() => {}),
     get chain() { return chain; },
   };
 }
@@ -1269,7 +1362,7 @@ async function openSheet({
     if (stopKeys) { stopKeys(); stopKeys = null; }
     screen.leave();
   };
-  const unguard = scr.guardTerminal(restore, { beforeExit: (reason) => (app ? app.abortRuns(reason) : null) });
+  const unguard = scr.guardTerminal(restore, { beforeExit: (reason) => (app ? app.shutdown(reason) : null) });
 
   const draw = () => {
     if (!screen.active || !app) return;
@@ -1292,7 +1385,10 @@ async function openSheet({
   };
 
   const TAIL_BYTES = 256 * 1024;
-  const readLog = (entry, { tail = false } = {}) => {
+  const logSize = (entry) => {
+    try { return fs.statSync(logPathFor(app.state.resolved.log_dir, entry.task_id, entry.id)).size; } catch { return 0; }
+  };
+  const readLog = (entry, { tail = false, bytes = TAIL_BYTES } = {}) => {
     const file = logPathFor(app.state.resolved.log_dir, entry.task_id, entry.id);
     let stat;
     try { stat = fs.statSync(file); } catch { return null; }
@@ -1302,11 +1398,11 @@ async function openSheet({
     if (Number.isFinite(created) && stat.mtimeMs < created - 2000) return null;
     let data;
     try {
-      if (tail && stat.size > TAIL_BYTES) {
+      if (tail && stat.size > bytes) {
         const fd = fs.openSync(file, "r");
         try {
-          data = Buffer.alloc(TAIL_BYTES);
-          fs.readSync(fd, data, 0, TAIL_BYTES, stat.size - TAIL_BYTES);
+          data = Buffer.alloc(bytes);
+          fs.readSync(fd, data, 0, bytes, stat.size - bytes);
         } finally {
           fs.closeSync(fd);
         }
@@ -1324,6 +1420,7 @@ async function openSheet({
   const io = {
     clip: (text) => clipboard(text, { out: stdout }),
     readLog,
+    logSize,
     redraw: draw,
     suspend,
     hooks,

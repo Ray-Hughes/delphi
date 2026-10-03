@@ -647,7 +647,7 @@ async function main() {
       const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
       child.on("close", (code, sig) => { clearTimeout(timer); resolve({ out, code, sig }); });
     });
-    for (const [how, signal, code] of [["crash", null, 1], ["reject", null, 1], ["exit", null, 3], ["wait", "SIGINT", 130], ["wait", "SIGTERM", 143], ["wait", "SIGHUP", 129]]) {
+    for (const [how, signal, code] of [["crash", null, 1], ["reject", null, 1], ["exit", null, 3], ["wait", "SIGINT", 130], ["wait", "SIGTERM", 143], ["wait", "SIGHUP", 129], ["wait", "SIGQUIT", 131]]) {
       const r = await runChild(how, signal);
       const label = signal || how;
       check(`${label}: entered the alternate screen`, r.out.startsWith(scr.ENTER), true);
@@ -705,6 +705,75 @@ async function main() {
       reader.close();
       check("what was typed is on the Sheet, as the person", read.entries.map((e) => [e.author, e.body]), [["pty-person", "said in a real terminal 中文"]]);
     }
+  }
+
+  section("G4: Ctrl-C gets out while a call hangs");
+  {
+    const resolved = { task: { id: 1, title: "t", status: "todo" }, project: null, cwd: dir, log_dir: dir };
+    const hung = { call: (tool) => (tool === "sheet_append" ? new Promise(() => {}) : Promise.resolve({ entries: [], cursor: null, workbench: null })) };
+    const app = tui.createSheetApp({ client: hung, resolved });
+    await app.load();
+    app.feed("hi\r");
+    app.feed("\x03");
+    app.feed("\x03");
+    const out = await Promise.race([app.done.then(() => "quit"), wait(2000).then(() => "stuck")]);
+    check("two Ctrl-C leave even though a write never answers", out, "quit");
+  }
+
+  section("G4: a call that does not answer says so, and keeps what was typed");
+  {
+    const resolved = { task: { id: 1, title: "t", status: "todo" }, project: null, cwd: dir, log_dir: dir };
+    const hung = { call: (tool) => (tool === "sheet_append" ? new Promise(() => {}) : Promise.resolve({ entries: [], cursor: null, workbench: null })) };
+    const app = tui.createSheetApp({ client: hung, resolved, callMs: 100 });
+    await app.load();
+    await app.feed("a careful remark\r");
+    check("the status line says the server did not answer", /did not answer within 0s \(sheet_append\)/.test(app.state.message.text), true);
+    check("the remark is still at the prompt", app.state.input, "a careful remark");
+    check("and not in history as if sent", app.state.history, []);
+    const dead = { call: (tool) => (tool === "sheet_append" ? Promise.reject(new Error("MCP server exited (SIGKILL)")) : Promise.resolve({ entries: [], cursor: null, workbench: null })) };
+    const app2 = tui.createSheetApp({ client: dead, resolved });
+    await app2.load();
+    await app2.feed("kept\r");
+    check("a stopped server is said plainly", [app2.state.input, /Delphi's server has stopped/.test(app2.state.message.text)], ["kept", true]);
+  }
+
+  section("G4: Y on a huge log is capped");
+  {
+    const { app, seen } = await makeApp({ io: {
+      readLog: (e, opts = {}) => (e.id === 808 ? `${"x".repeat(1023)}\n`.repeat(opts.tail ? opts.bytes / 1024 : 4096) : null),
+      logSize: (e) => (e.id === 808 ? 4 * 1024 * 1024 : 0),
+    } });
+    await app.feed("\x1b");
+    app.state.walk = 808;
+    await app.feed("Y");
+    const copied = seen.clip.pop();
+    check("at most 1 MB goes to the clipboard", Buffer.byteLength(copied) <= 1024 * 1024, true);
+    check("the command first, whole", copied.startsWith(seed()[2].body + "\n"), true);
+    check("and the status says it was cut", /last 1 MB of its output/.test(app.state.message.text), true);
+  }
+
+  section("G4: the clipboard");
+  {
+    let envSeen = null;
+    await clip.copy("na\u00efve", { out: { isTTY: false }, env: { PATH: "/usr/bin" }, platform: "darwin", run: async (argv, text, opts) => { envSeen = opts.env; return true; } });
+    check("pbcopy is told the text is UTF-8", [envSeen.LANG, envSeen.LC_CTYPE, envSeen.LC_ALL], ["en_US.UTF-8", "en_US.UTF-8", "en_US.UTF-8"]);
+    const written = [];
+    const r = await clip.copy("x".repeat(2 * 1024 * 1024), { out: { isTTY: true, write: (t) => written.push(t) }, env: {}, platform: "none", run: async () => false });
+    check("OSC 52 is not pushed megabytes", [written.length, r.via], [0, null]);
+  }
+
+  section("G4: keys and width");
+  {
+    check("CR LF is one Enter", names(keys.decode("a\r\nb")), ["a", "enter", "b"]);
+    check("Ctrl-C ends a paste that never closes", names(keys.decode("\x1b[200~oops\x03q")), ["paste", "C-c", "q"]);
+    const got = [];
+    const d = keys.createDecoder({ escMs: 20, pasteMs: 80, onKeys: (ks) => got.push(...ks) });
+    got.push(...d.push(Buffer.from("\x1b[200~no end")));
+    await wait(200);
+    got.push(...d.push(Buffer.from("j")));
+    check("an unclosed paste times out, and keys are keys again", got.map((k) => k.name === "paste" ? `paste:${k.text}` : k.name), ["paste:no end", "j"]);
+    check("a ZWJ between letters is no wider", scr.displayWidth("ab\u200dcd"), 4);
+    check("a joined emoji is still two", scr.displayWidth("\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67"), 2);
   }
 
   section("delphi open with no terminal refuses cleanly");

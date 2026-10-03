@@ -64,6 +64,14 @@ MUST_BLOCK = [
   "DELPHI_CLIENT=delphi-cli node agent/mcp_server.js",
   "export DELPHI_CLIENT=delphi-cli", "env DELPHI_CLIENT=delphi-cli node agent/mcp_server.js",
   "printf '{}' | DELPHI_CLIENT=delphi-cli node agent/mcp_server.js",
+  # G4 review: programs that start it from an argument list, and disguises.
+  "python3 -c 'import pty; pty.spawn([\"delphi\",\"discard\",\"42\"])'",
+  "python3 -c 'import subprocess; subprocess.run([\"/usr/local/bin/delphi\", \"discard\", \"42\"])'",
+  "node -e 'require(\"child_process\").spawnSync(\"delphi\",[\"discard\",\"42\"],{stdio:\"inherit\"})'",
+  "expect -c 'spawn delphi discard 42; send \"42\\r\"; interact'",
+  "echo 42 | unbuffer -p delphi discard 42",
+  "D=delphi; $D discard 42", "D=/usr/local/bin/delphi && ${D} discard 42",
+  "\\delphi discard 42", "de\"\"lphi discard 42", "delphi dis''card 42",
 ]
 
 MUST_ALLOW = [
@@ -92,6 +100,11 @@ MUST_ALLOW = [
   "sh script.sh discard", "echo $(delphi status 42)", "(cd app && delphi finish 42)",
   "git commit -m 'env delphi discard is refused now'", "grep -rn DELPHI_CLIENT agent/",
   "echo \"$DELPHI_CLIENT\"",
+  # Near misses for the G4 forms.
+  "python3 -c 'import pty; pty.spawn([\"delphi\",\"status\",\"42\"])'",
+  "expect -c 'spawn delphi finish 42'", "unbuffer -p delphi open 42",
+  "D=delphi; $D status 42", "X=discard; echo $X", "printf '%s\\n' \"\" discard",
+  "git commit -m 'guard: catch \\delphi and de\"\"lphi forms'",
 ]
 
 fails = []

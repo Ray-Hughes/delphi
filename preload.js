@@ -74,12 +74,13 @@ contextBridge.exposeInMainWorld("delphi", {
     commit: (id, message) => call("workbench:commit", id, message),
     push: (id) => call("workbench:push", id),
     pr: (id, opts) => call("workbench:pr", id, opts),
-    // opts: { ignoredOk: true } once a person has said the files listed by
-    // finishPlan, or by an IGNORED refusal's details, can go.
+    // opts: { confirm } with the token from finishPlan, or from an IGNORED
+    // refusal's details, once a person has said those exact files can go.
     finishPlan: (id) => call("workbench:finishPlan", id),
     finish: (id, opts) => call("workbench:finish", id, opts),
     discardPlan: (id) => call("workbench:discardPlan", id),
-    discard: (id, typed) => call("workbench:discard", id, typed),
+    // opts: { confirm } with the plan's token, needed when plan.notKept is not empty.
+    discard: (id, typed, opts) => call("workbench:discard", id, typed, opts),
     recreate: (id) => call("workbench:recreate", id),
     forget: (id) => call("workbench:forget", id),
     list: (opts) => call("workbench:list", opts),

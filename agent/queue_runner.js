@@ -299,6 +299,17 @@ async function prepareWorkbench(server, taskId) {
   return { workbench: wb, created: made.created };
 }
 
+/** Whether the task's latest release note already says exactly this. */
+async function lastReleaseWas(server, taskId, reason) {
+  try {
+    const read = await server.call("sheet_read", { task_id: taskId, mode: "tail", n: 20 });
+    const last = (read.entries || []).filter((e) => /^Released: /.test(e.body || "")).pop();
+    return Boolean(last) && last.body === `Released: ${reason}`;
+  } catch {
+    return false;
+  }
+}
+
 // --- running one task --------------------------------------------------------
 
 const MAX_CAPTURE = 400000;   // per stream, before the child is considered runaway
@@ -453,6 +464,10 @@ async function main() {
   }
 
   const held = new Set();
+  // Tasks this run set aside because their Workbench needs a person. One
+  // coming back (a person set it to todo without sorting it) is not given the
+  // same long note again, and the worker backs off rather than spinning on it.
+  const skipped = new Set();
   const killers = new Set();
   let stopping = false;
   let started = 0;
@@ -497,12 +512,23 @@ async function main() {
       if (options.workbenches) {
         const prepared = await prepareWorkbench(server, id);
         if (prepared.refuse) {
-          await server.call("queue_release", { task_id: id, reason: clip(prepared.refuse, MAX_SUMMARY) });
-          warn(`released ${id}: ${prepared.refuse}`);
-          // Counted as finding nothing, so the worker backs off: the same
-          // task is at the top of the pool again, and only a person changes that.
+          // queue_next cannot be told to pass a task over, and released it
+          // is at the top of the pool again at the next poll: a runner would
+          // claim and release it all day, burying the Sheet in identical notes
+          // and starving everything behind it. So it is taken out of the pool
+          // as blocked, which queue_next never hands out, with the reason
+          // promoted where a person will see it, and the runner moves on.
+          const repeat = skipped.has(id);
+          skipped.add(id);
+          await server.call("update_task", { id, status: "blocked" });
+          const full = `${prepared.refuse} Marked blocked so the queue moves on; set it back to todo when that is sorted.`;
+          const reason = repeat || await lastReleaseWas(server, id, full)
+            ? "Still blocked for the reason released with above."
+            : full;
+          await server.call("queue_release", { task_id: id, reason: clip(reason, MAX_SUMMARY) });
+          warn(`set ${id} aside: ${prepared.refuse}`);
           started--;
-          return false;
+          return repeat ? false : "skipped";
         }
         workbench = prepared.workbench;
         log(`task ${id} works in ${workbench.path} on ${workbench.branch}${prepared.created ? " (new)" : ""}`);
@@ -571,6 +597,8 @@ async function main() {
         continue;
       }
       if (worked) idleFor = options.idle;
+      // A task set aside is not a pass: the next one is still there to take.
+      if (worked === "skipped") continue;
       if (options.once) break;
       if (options.max && started >= options.max) break;
       if (worked) continue;

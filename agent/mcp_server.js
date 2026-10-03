@@ -364,6 +364,10 @@ const benches = createWorkbench({
   settings: () => readSettings(),
 });
 
+// When sheet_read last swept a task for lost runs. See sheet_read.
+const SWEEP_EVERY_MS = 30000;
+const swept = new Map();
+
 /** A task's live Workbench, or a sentence saying it has none. */
 function benchFor(taskId) {
   const wb = benchStore.live(taskId);
@@ -1034,8 +1038,24 @@ const TOOLS = {
     run: (a) => {
       const mode = a.mode || "tail";
       // A run whose runner died is finished as fail:lost before anyone reads
-      // it as still going. Cheap: one indexed query for this task's runs.
-      try { sheets.sweepLost({ taskId: a.task_id, host: os.hostname(), isAlive: pidAlive }); } catch {}
+      // it as still going. Every plain read sweeps; a cursor poll at most
+      // every SWEEP_EVERY_MS per task, because a terminal polls twice a
+      // second and on the sqlite3 route every query is a process.
+      const key = String(a.task_id);
+      const polling = a.after_id != null && Boolean(a.since);
+      if (!polling || Date.now() - (swept.get(key) || 0) >= SWEEP_EVERY_MS) {
+        swept.set(key, Date.now());
+        try { sheets.sweepLost({ taskId: a.task_id, host: os.hostname(), isAlive: pidAlive }); } catch {}
+      }
+      // A poll that finds nothing new costs one query (sheets.quietRead).
+      const quiet = a.after_id != null && a.since ? sheets.quietRead(a.task_id, { afterId: a.after_id, since: a.since }) : null;
+      if (quiet) {
+        return {
+          task: { id: quiet.header.task, title: quiet.header.title, status: quiet.header.status, project: quiet.header.project },
+          mode, entries: [], text: sheetFormat.format({ header: quiet.header, entries: [] }),
+          total: quiet.total, ledger_count: quiet.ledger_count, cursor: quiet.cursor,
+        };
+      }
       const read = sheets.read(a.task_id, { mode, n: a.n, afterId: a.after_id, since: a.since });
       const header = sheets.header(a.task_id);
       return {
@@ -1201,17 +1221,12 @@ const TOOLS = {
 
   workbench_finish: {
     description:
-      "Put a task's Workbench away once its work is committed and pushed: the folder is removed and the branch is kept. Refuses, saying why, when anything is unsaved or not pushed, when a rebase or merge is part way through, or when the folder holds files git does not keep (an edited .env, notes in build/); it never forces and never stashes. ignored_ok is a person saying those files can go, and only a person says it: ask in the Sheet. Usually a person does this after reviewing. There is no tool to throw a Workbench away: that is a person's decision.",
-    schema: {
-      type: "object",
-      required: ["task_id"],
-      properties: {
-        task_id: { type: "number" },
-        ignored_ok: { type: "boolean", description: "A person has seen the files git does not keep and said they can go. A copy is kept for 30 days all the same." },
-      },
-    },
+      "Put a task's Workbench away once its work is committed and pushed: the folder is removed and the branch is kept. Refuses, saying why, when anything is unsaved (hidden changes included) or not pushed, when a rebase or merge is part way through, when there is a git repository inside the folder, or when the folder holds files git does not keep (an edited .env, notes in build/): removing those is a person's decision, so say in the Sheet what is there and leave it to them. It never forces and never stashes. There is no tool to throw a Workbench away either: that is a person's decision too.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    // No confirm here, on purpose: through this server Finish only goes
+    // ahead when nothing at all would be removed that git does not keep.
     run: async (a) => {
-      const done = await benches.finish(benchFor(a.task_id).id, { ignoredOk: a.ignored_ok === true });
+      const done = await benches.finish(benchFor(a.task_id).id);
       return { finished: true, task_status: done.taskStatus, branch: done.branch, ref: done.ref || null, recover: done.recover || null };
     },
   },
@@ -1267,6 +1282,15 @@ const TOOLS = {
     schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
     run: (a) => benches.finishPlan(benchFor(a.task_id).id),
   },
+  workbench_finished: {
+    description: "Record a Finish the command line has already done. Refuses unless the folder is gone and, when a copy was made (ref), the copy is in its repository.",
+    schema: {
+      type: "object",
+      required: ["task_id"],
+      properties: { task_id: { type: "number" }, ref: { type: "string" }, not_kept: { type: "array", items: { type: "string" } } },
+    },
+    run: (a) => benches.markFinished(benchFor(a.task_id).id, { ref: a.ref || null, notKept: a.not_kept }),
+  },
   workbench_discarded: {
     description: "Record a Discard the command line has already done. Refuses unless the folder is gone and the Workbench's kept copy (ref) is in its repository.",
     schema: {
@@ -1276,12 +1300,12 @@ const TOOLS = {
         task_id: { type: "number" }, ref: { type: "string" },
         unsaved: { type: "number" }, files: { type: "array", items: { type: "string" } },
         commits: { type: "number" }, detached: { type: "number" }, ignored: { type: "number" },
-        branch_deleted: { type: "boolean" },
+        branch_deleted: { type: "boolean" }, not_kept: { type: "array", items: { type: "string" } },
       },
     },
     run: (a) => benches.markDiscarded(benchFor(a.task_id).id, {
       ref: a.ref, unsaved: a.unsaved, files: a.files, commits: a.commits, detached: a.detached,
-      ignored: a.ignored, branchDeleted: a.branch_deleted === true,
+      ignored: a.ignored, branchDeleted: a.branch_deleted === true, notKept: a.not_kept,
     }),
   },
   workbench_recreate: {
@@ -1841,7 +1865,7 @@ const TOOLS = {
 // above workbench_park.
 const INTERNAL_TOOLS = new Set([
   "workbench_park", "workbench_resume", "workbench_update", "workbench_commit", "workbench_push",
-  "workbench_pr", "workbench_finish_plan", "workbench_discarded", "workbench_recreate",
+  "workbench_pr", "workbench_finish_plan", "workbench_finished", "workbench_discarded", "workbench_recreate",
   "workbench_forget", "workbench_housekeep", "workbench_advanced",
 ]);
 const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";

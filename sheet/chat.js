@@ -40,7 +40,9 @@ const CONTEXT_TAIL = 20;
 const MAX_CONTEXT = 24000;
 
 const ADAPTERS = {
-  claude: { name: "claude", harnessKey: "claude-code", label: "Claude Code", mapper: claudeSheetMapper },
+  // promptOnStdin: claude -p reads the prompt from stdin when none follows it,
+  // which keeps a message that starts with '-' from being read as a flag.
+  claude: { name: "claude", harnessKey: "claude-code", label: "Claude Code", mapper: claudeSheetMapper, promptOnStdin: true },
   copilot: { name: "copilot", harnessKey: "copilot", label: "GitHub Copilot", mapper: copilotSheetMapper },
 };
 
@@ -279,6 +281,9 @@ function createSheetWriter({ client, taskId, adapter, cwd, logDir, onEntry = () 
   async function apply(action) {
     switch (action.type) {
       case "session":
+        // Only an id shaped like one is ever kept, or written where the next
+        // chat will read it back.
+        if (!SESSION_ID.test(String(action.id))) return;
         session = action.id;
         if (firstSay && !sessionWritten) {
           sessionWritten = true;
@@ -387,15 +392,37 @@ async function sheetContext(client, taskId, { skip = [] } = {}) {
   return { task: tail.task, text: fmt.format({ entries }, { clean: true }) };
 }
 
-/** The session to resume: the latest entry this harness wrote with one. */
-async function findSession(client, taskId, harnessKey) {
+// A harness session id as Claude Code and Copilot make them (uuids and the
+// like). Anything else is refused, above all a leading '-', since the value is
+// handed to the CLI as the argument after --resume or --session-id.
+const SESSION_ID = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
+
+/**
+ * The session to resume: from the latest entry this chat's own actor wrote
+ * with one, and nobody else's. Any MCP writer can put meta.session on an
+ * entry, so an id another agent or person wrote is never trusted, and one
+ * that is not shaped like an id is not either. Returns { session, ignored },
+ * ignored saying why a session that was there was not used.
+ */
+async function findSession(client, taskId, harnessKey, actor) {
   const read = await client.call("sheet_read", { task_id: taskId, mode: "full" });
   const entries = read.entries || [];
+  let ignored = null;
   for (let i = entries.length - 1; i >= 0; i--) {
-    const meta = entries[i].meta || {};
-    if (meta.agent === harnessKey && meta.session) return String(meta.session);
+    const e = entries[i];
+    const meta = e.meta || {};
+    if (meta.agent !== harnessKey || !meta.session) continue;
+    if (e.author !== actor) {
+      ignored = ignored || `a session id on entry ${e.id} was written by ${e.author}, not by this chat`;
+      continue;
+    }
+    const id = String(meta.session);
+    if (!SESSION_ID.test(id)) {
+      return { session: null, ignored: `the session id on entry ${e.id} is not one a harness makes` };
+    }
+    return { session: id, ignored };
   }
-  return null;
+  return { session: null, ignored };
 }
 
 // --- the harness row -------------------------------------------------------------------
@@ -437,6 +464,16 @@ function resolveCommand(command) {
  * onStart({ stop }) hands over the way to interrupt it: SIGINT to the agent's
  * process group, then SIGTERM, then SIGKILL, the same escalation a run gets.
  */
+let turns = 0;
+// Every agent process group this process started and has not seen end. A
+// backstop for every way out that skips the polite stop: whatever is still
+// here when the process exits is killed, so a chat never leaves an agent
+// running with nobody reading it.
+const live = new Set();
+process.on("exit", () => {
+  for (const pid of live) { try { process.kill(-pid, "SIGKILL"); } catch {} }
+});
+
 function chatTurn({
   adapter, harness: row, prompt, cwd, resume = null, autoAllow = false, agentClient, taskId, projectId = null,
   actor, logDir, onEntry, onError, onStart = () => {}, env = {},
@@ -445,10 +482,17 @@ function chatTurn({
   if (!command) {
     return Promise.reject(new Error(`${row.label || adapter.label} is not installed, or is not on PATH (looked for ${row.command || "nothing"}).`));
   }
+  if (resume !== null && resume !== undefined && !SESSION_ID.test(String(resume))) {
+    return Promise.reject(new Error(`Refusing to resume a session id that is not one: ${JSON.stringify(String(resume).slice(0, 40))}.`));
+  }
+  turns++;
   const mcp = harness.mcpFlags(row.mcp_style, {
-    dbPath: process.env.DELPHI_DB || undefined, projectId, sessionId: `chat-${taskId}`, actor,
+    dbPath: process.env.DELPHI_DB || undefined, projectId, tag: `chat-${taskId}`, actor,
   });
-  const argv = harness.expand(row.args, { prompt, resume, cwd, autoAllow, mcpFlags: mcp.flags });
+  // Claude Code reads the prompt from stdin when -p has none after it, so it
+  // goes there: a message starting with '-' in argv would be read as a flag.
+  const onStdin = Boolean(adapter.promptOnStdin);
+  const argv = harness.expand(row.args, { prompt: onStdin ? undefined : prompt, resume, cwd, autoAllow, mcpFlags: mcp.flags });
   const writer = createSheetWriter({ client: agentClient, taskId, adapter, cwd, logDir, onEntry, onError });
   const mapper = adapter.mapper((action) => writer.apply(action));
   const childEnv = { ...process.env, ...env, DELPHI_ACTOR: actor, DELPHI_AUTHOR_TYPE: "agent" };
@@ -462,59 +506,76 @@ function chatTurn({
     try {
       child = spawn(command, argv, {
         cwd: cwd || undefined,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [onStdin ? "pipe" : "ignore", "pipe", "pipe"],
         // Its own process group, so Ctrl-C at the terminal reaches only us, and
         // we decide what it means; and so stopping it stops what it started.
         detached: !windows,
         env: childEnv,
       });
     } catch (error) {
+      if (mcp.file) { try { fs.unlinkSync(mcp.file); } catch {} }
       resolve({ code: null, sessionId: null, interrupted: false, stderr: error.message, written: [] });
       return;
     }
+    if (child.pid && !windows) live.add(child.pid);
+    if (onStdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(String(prompt));
+    }
     let stderr = "";
-    let interrupted = 0;
+    let stops = 0;
+    let stoppedFor = null;
     const timers = [];
     const signal = (sig) => {
       try { if (windows) child.kill(); else process.kill(-child.pid, sig); } catch {}
     };
-    const stop = () => {
-      interrupted++;
-      if (interrupted === 1) {
-        signal("SIGINT");
-        timers.push(setTimeout(() => signal("SIGTERM"), 3000), setTimeout(() => signal("SIGKILL"), 6000));
-        for (const t of timers) if (t.unref) t.unref();
-      } else {
-        signal("SIGKILL");
-      }
+    /**
+     * Ctrl-C (no reason): SIGINT, then SIGTERM, then SIGKILL, the escalation
+     * a run gets, and its commands end as fail:130. A reason (SIGHUP,
+     * SIGTERM: the terminal closed, or this process is being ended) goes
+     * straight to SIGTERM and then SIGKILL, and the commands say why.
+     */
+    const stop = (reason = null) => {
+      stops++;
+      if (reason && !stoppedFor) stoppedFor = reason;
+      if (stops > 1) { signal("SIGKILL"); return; }
+      signal(reason ? "SIGTERM" : "SIGINT");
+      if (!reason) timers.push(setTimeout(() => signal("SIGTERM"), 3000));
+      timers.push(setTimeout(() => signal("SIGKILL"), reason ? 2000 : 6000));
+      for (const t of timers) if (t.unref) t.unref();
     };
     try { onStart({ stop, pid: child.pid }); } catch {}
 
+    const reader = harnessLineReader(mapper);
     child.stdout.setEncoding("utf8");
-    child.stdout.on("data", harnessLineReader(mapper));
+    child.stdout.on("data", reader);
     child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (d) => { if (stderr.length < 64 * 1024) stderr += d; });
+    // The end of it, where the reason a CLI gave up is.
+    child.stderr.on("data", (d) => { stderr = (stderr + d).slice(-64 * 1024); });
 
     let finished = false;
     const finish = async (code) => {
       if (finished) return;
       finished = true;
+      live.delete(child.pid);
       for (const t of timers) clearTimeout(t);
+      // A last line with no newline after it is still a line.
+      reader.end();
       mapper.flush();
-      writer.finishOpen(interrupted ? 130 : "lost");
+      writer.finishOpen(stops ? (stoppedFor || 130) : "lost");
       await writer.idle();
       if (mcp.file) { try { fs.unlinkSync(mcp.file); } catch {} }
-      resolve({ code, sessionId: writer.session, interrupted: interrupted > 0, stderr, written: writer.written });
+      resolve({ code, sessionId: writer.session, interrupted: stops > 0, stoppedFor, stderr, written: writer.written });
     };
     child.on("error", (error) => { stderr += error.message; finish(null); });
     child.on("close", (code) => finish(code));
   });
 }
 
-/** harness.js's line splitter, which keeps a partial line until the rest comes. */
+/** harness.js's line splitter, which keeps a partial line until the rest comes; end() takes what is left. */
 function harnessLineReader(onLine) {
   let buffer = "";
-  return (chunk) => {
+  const read = (chunk) => {
     buffer += chunk;
     let cut;
     while ((cut = buffer.indexOf("\n")) !== -1) {
@@ -523,6 +584,12 @@ function harnessLineReader(onLine) {
       if (line) onLine(line);
     }
   };
+  read.end = () => {
+    const line = buffer.trim();
+    buffer = "";
+    if (line) onLine(line);
+  };
+  return read;
 }
 
 // --- a session ------------------------------------------------------------------------------
@@ -589,7 +656,11 @@ async function createChatSession({
   }
   const taskId = resolved.task.id;
   const actor = `${adapter.harnessKey}:chat-${taskId}`;
-  let resume = await findSession(personClient, taskId, adapter.harnessKey);
+  const found = await findSession(personClient, taskId, adapter.harnessKey, actor);
+  let resume = found.session;
+  // Said, because a person who expected the conversation to carry on should
+  // know why the agent does not remember it.
+  const notice = found.ignored && !found.session ? `Starting a fresh conversation: ${found.ignored}.` : null;
   const agentClient = await openAgentClient(actor);
   let first = true;
   let current = null;
@@ -620,16 +691,17 @@ async function createChatSession({
     }
     current = null;
     first = false;
-    if (result.sessionId) resume = result.sessionId;
+    if (result.sessionId && SESSION_ID.test(result.sessionId)) resume = result.sessionId;
     return result;
   }
 
   return {
-    adapter, actor, row, cwd,
+    adapter, actor, row, cwd, notice,
     get resume() { return resume; },
     get busy() { return Boolean(current); },
     send,
-    stop() { if (current) { current.stop(); return true; } return false; },
+    /** Stops the turn in flight. reason: see chatTurn's stop. */
+    stop(reason = null) { if (current) { current.stop(reason); return true; } return false; },
     close() { try { agentClient.close(); } catch {} },
   };
 }

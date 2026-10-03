@@ -157,7 +157,7 @@ section("off by default");
   check("--help says it is off by default", /Off by default in this release/.test(runRunner(["--help"]).stdout), true);
 }
 
-section("a parked Workbench goes back to a person");
+section("a parked Workbench is set aside, and the queue moves on");
 {
   const d = db.createTask({ projectId: project.id, title: "parked one", priority: "high" });
   db.sqlP("UPDATE tasks SET queue = NULL");
@@ -167,13 +167,24 @@ section("a parked Workbench goes back to a person");
   db.sqlP("UPDATE tasks SET status = 'todo', queue = 'ready' WHERE id = :p1", [d.id]);
   db.sqlP("UPDATE workbenches SET state = 'parked' WHERE task_id = :p1", [d.id]);
   fs.rmSync(path.join(agentLogs, `${d.id}.json`));
+  // A task behind it, lower down the queue: it must not be starved.
+  const behind = db.createTask({ projectId: project.id, title: "behind the parked one", priority: "low" });
+  db.setQueue(behind.id, "ready");
   const again = runRunner([...base, "--workbenches", "--max", "1", "--once", "--cwd", app]);
   check("exits cleanly", again.status, 0);
-  check("the agent was not started", fs.existsSync(path.join(agentLogs, `${d.id}.json`)), false);
-  check("the task is released", db.sqlP("SELECT status, claimed_by FROM tasks WHERE id = :p1", [d.id])[0], { status: "todo", claimed_by: null });
-  const why = db.sqlP("SELECT body FROM comments WHERE task_id = :p1 ORDER BY id DESC LIMIT 1", [d.id])[0].body;
-  check("saying why", /^Released: Its Workbench is parked/.test(why), true);
-  check("and the Workbench is still parked", db.sqlP("SELECT state FROM workbenches WHERE task_id = :p1", [d.id])[0].state, "parked");
+  check("the agent was not started for the parked one", fs.existsSync(path.join(agentLogs, `${d.id}.json`)), false);
+  check("it is taken out of the pool, unclaimed", db.sqlP("SELECT status, claimed_by FROM tasks WHERE id = :p1", [d.id])[0], { status: "blocked", claimed_by: null });
+  const notes = () => db.sqlP("SELECT body, promoted FROM comments WHERE task_id = :p1 AND body LIKE 'Released:%' ORDER BY id", [d.id]);
+  check("with one promoted note saying why", [notes().length, notes()[0].promoted, /^Released: Its Workbench is parked.*Marked blocked/.test(notes()[0].body)], [1, 1, true]);
+  check("and the task behind it was worked in the same run", [fs.existsSync(path.join(agentLogs, `${behind.id}.json`)), db.sqlP("SELECT status FROM tasks WHERE id = :p1", [behind.id])[0].status], [true, "done"]);
+  check("the parked Workbench is untouched", db.sqlP("SELECT state FROM workbenches WHERE task_id = :p1", [d.id])[0].state, "parked");
+  // A person sets it back to todo without resuming the Workbench: set aside
+  // again, but the same long note is not written twice in a row.
+  db.sqlP("UPDATE tasks SET status = 'todo' WHERE id = :p1", [d.id]);
+  runRunner([...base, "--workbenches", "--max", "1", "--once", "--cwd", app]);
+  const bodies = notes().map((n) => n.body);
+  check("blocked again, with a short note rather than the same one", [db.sqlP("SELECT status FROM tasks WHERE id = :p1", [d.id])[0].status, bodies.length, bodies[1]],
+    ["blocked", 2, "Released: Still blocked for the reason released with above."]);
 }
 
 fs.rmSync(dir, { recursive: true, force: true });

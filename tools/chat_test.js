@@ -239,7 +239,11 @@ async function main() {
   section("what the agent was given");
   {
     const run = agentRuns().pop();
-    const prompt = run.argv[run.argv.indexOf("-p") + 1];
+    // On stdin: claude -p with nothing after it reads the prompt from there,
+    // so no message can ever be read as a flag.
+    const prompt = run.stdin || "";
+    check("the prompt is not in argv", [run.argv[run.argv.indexOf("-p") + 1].startsWith("-"), run.argv.some((a) => a.includes("please fix the loop"))], [true, false]);
+    check("the agent's MCP config names it", run.mcpActor, actor);
     check("argv from the harness template", [run.argv.includes("stream-json"), run.argv.includes("--resume")], [true, false]);
     check("no tools without --auto", run.argv[run.argv.indexOf("--tools") + 1], "");
     check("Delphi's MCP server is configured", run.argv.includes("--mcp-config"), true);
@@ -337,7 +341,7 @@ async function main() {
       io: {
         hooks: {
           attachAgent: async (name, res, opts) => {
-            attached = [name, res.task.id, opts.allowUnguarded];
+            attached = [name, res.task.id, opts.allowUnguarded, typeof opts.onError];
             return {
               row: { label: "Claude Code" }, resume: null,
               send: async (message) => { sent.push(message); return { code: 0, written: [], interrupted: false, stderr: "" }; },
@@ -351,18 +355,150 @@ async function main() {
     await app.feed("not yet\r");
     check("before /agent, a say goes nowhere else", sent, []);
     await app.feed("/agent claude --allow-unguarded\r");
-    check("/agent attaches", attached, ["claude", t4.id, true]);
+    check("/agent attaches, with somewhere to say a failed write", attached, ["claude", t4.id, true, "function"]);
     check("and says so", app.render().lines.pop().includes("Claude Code is listening"), true);
     await app.feed("over to you\r");
-    await wait(20);
+    await app.idle();
     check("plain text goes to the agent", sent, ["over to you"]);
     check("and is still the person's entry", (await read(t4.id)).map((e) => [e.author, e.body]).pop(), ["tester", "over to you"]);
     await app.feed("! a note\r");
     check("a note does not", sent.length, 1);
     await app.feed("/agent off\r");
     await app.feed("after\r");
-    await wait(20);
+    await app.idle();
     check("/agent off detaches", sent, ["over to you"]);
+  }
+
+  section("G4: a session id is only taken from this chat's own entries");
+  {
+    const t5 = db.createTask({ projectId: project.id, title: "planted" });
+    const other = openServer({ actor: "codex:77", env: { DELPHI_AUTHOR_TYPE: "agent" }, warn: () => {} });
+    await other.start();
+    await other.call("sheet_append", { task_id: t5.id, kind: "say", body: "noted", meta: { agent: "claude-code", session: "--settings=/tmp/evil.json" } });
+    other.close();
+    const r = delphi(["chat", String(t5.id), "--allow-unguarded", "hello"], { FAKE_AGENT_FIXTURE: path.join(FIX, "claude_resume.jsonl") });
+    const run = agentRuns().pop();
+    check("another writer's session is not resumed", [r.status, run.argv.includes("--resume"), run.argv.some((a) => a.includes("evil"))], [0, false, false]);
+    check("and the person is told why", /fresh conversation: a session id on entry \d+ was written by codex:77/.test(r.stderr), true);
+    // Even its own entry, when the id is not shaped like one, is refused.
+    const own = openServer({ actor: `claude-code:chat-${t5.id}`, env: { DELPHI_AUTHOR_TYPE: "agent" }, warn: () => {} });
+    await own.start();
+    await own.call("sheet_append", { task_id: t5.id, kind: "say", body: "mine", meta: { agent: "claude-code", session: "-x" } });
+    own.close();
+    const found = await chat.findSession(person, t5.id, "claude-code", `claude-code:chat-${t5.id}`);
+    check("an id starting with '-' is refused", found.session, null);
+    let refused = null;
+    await chat.chatTurn({ adapter: chat.ADAPTERS.claude, harness: chat.harnessRow(chat.ADAPTERS.claude, [], { DELPHI_CHAT_AGENT: agentBin }), prompt: "x", resume: "--evil", agentClient: person, taskId: t5.id, actor: "a" })
+      .catch((e) => { refused = e.message; });
+    check("and chatTurn refuses one outright", /Refusing to resume/.test(refused || ""), true);
+  }
+
+  section("G4: a message that starts with '-'");
+  {
+    const t6 = db.createTask({ projectId: project.id, title: "dashes" });
+    delphi(["chat", String(t6.id), "--allow-unguarded", "first"], { FAKE_AGENT_FIXTURE: path.join(FIX, "claude_turn.jsonl") });
+    const r = delphi(["chat", String(t6.id), "--allow-unguarded", "--", "--model opus please"], {
+      FAKE_AGENT_FIXTURE: path.join(FIX, "claude_turn.jsonl"), FAKE_AGENT_RESUME_FIXTURE: path.join(FIX, "claude_resume.jsonl"),
+    });
+    const run = agentRuns().pop();
+    check("resumed, and the message reached the agent as the prompt", [r.status, run.argv.includes("--resume"), (run.stdin || "").includes("--model opus please")], [0, true, true]);
+    check("not as a flag", run.argv.includes("--model"), false);
+  }
+
+  section("Copilot's prompt is attached to its flag");
+  {
+    const harness = require("../harness");
+    const row = chat.harnessRow(chat.ADAPTERS.copilot, [], {});
+    const argv = harness.expand(row.args, { prompt: "-x --model gpt please", mcpFlags: [] });
+    check("one argument, --prompt=<text>", [argv.includes("--prompt=-x --model gpt please"), argv.includes("-p"), argv.includes("-x --model gpt please")], [true, false, false]);
+    const t9 = db.createTask({ projectId: project.id, title: "copilot dash" });
+    const r = delphi(["chat", String(t9.id), "--agent", "copilot", "--", "- fix the list"], { FAKE_AGENT_FIXTURE: path.join(FIX, "copilot_resume.jsonl") });
+    const run = agentRuns().pop();
+    check("through delphi chat, a message starting with '-'", [r.status, run.argv.filter((a) => a.startsWith("--prompt=")).length, run.argv.some((a) => a === "- fix the list")], [0, 1, false]);
+    check("and the attached prompt carries it", run.argv.find((a) => a.startsWith("--prompt=")).endsWith("- fix the list"), true);
+
+    // The template lives in seeded rows: an untouched built in follows the
+    // new definition, and one somebody edited in Settings is left as it is.
+    const old = harness.BUILTINS.map((b) => (b.key === "copilot" ? { ...b, args: ["-p", "{prompt}", ...b.args.slice(1)] } : b));
+    db.handle().prepare("DELETE FROM harnesses").run();
+    db.seedHarnesses(old);
+    db.seedHarnesses(harness.BUILTINS);
+    check("an untouched copilot row is brought up to date", JSON.parse(db.getHarness("copilot").args_json)[0], "--prompt={prompt}");
+    db.handle().prepare("DELETE FROM harnesses").run();
+    db.seedHarnesses(old);
+    const edited = ["-p", "{prompt}", "--my-own-flag"];
+    db.updateHarness(db.getHarness("copilot").id, { args_json: JSON.stringify(edited) });
+    db.seedHarnesses(harness.BUILTINS);
+    check("an edited one is left alone", JSON.parse(db.getHarness("copilot").args_json), edited);
+    db.handle().prepare("DELETE FROM harnesses").run();
+    db.seedHarnesses(harness.BUILTINS);
+  }
+
+  section("G4: two launches never share an MCP config file");
+  {
+    const harness = require("../harness");
+    const a = harness.mcpFlags("flag:--mcp-config", { tag: "chat-9", actor: "claude-code:chat-9" });
+    const b = harness.mcpFlags("flag:--mcp-config", { tag: "chat-9", actor: "copilot:chat-9" });
+    check("different files", a.file !== b.file, true);
+    check("each says its own actor", [JSON.parse(fs.readFileSync(a.file, "utf8")).mcpServers.delphi.env.DELPHI_ACTOR, JSON.parse(fs.readFileSync(b.file, "utf8")).mcpServers.delphi.env.DELPHI_ACTOR], ["claude-code:chat-9", "copilot:chat-9"]);
+    check("readable by its owner only", (fs.statSync(a.file).mode & 0o077), 0);
+    fs.rmSync(a.file); fs.rmSync(b.file);
+  }
+
+  section("G4: the stream's last line, and the end of stderr");
+  {
+    const script = path.join(dir, "no-newline.sh");
+    fs.writeFileSync(script, `#!/bin/sh\nhead -c 100000 /dev/zero | tr '\\0' 'e' >&2\necho THE-END >&2\nprintf '%s\\n%s' '{"type":"assistant.message","data":{"messageId":"m1","content":"hi"}}' '{"type":"result","sessionId":"cop-sess-9"}'\n`);
+    fs.chmodSync(script, 0o755);
+    const calls = [];
+    const fake = { call: async (tool, args) => { calls.push([tool, args]); return { id: calls.length, ...args }; } };
+    const row = { ...chat.harnessRow(chat.ADAPTERS.copilot, [], {}), command: script, mcp_style: "none" };
+    const r = await chat.chatTurn({ adapter: chat.ADAPTERS.copilot, harness: row, prompt: "x", cwd: dir, agentClient: fake, taskId: 1, actor: "copilot:chat-1" });
+    check("a last line with no newline is read", r.sessionId, "cop-sess-9");
+    check("stderr keeps its end, not its start", [r.stderr.trim().endsWith("THE-END"), r.stderr.length <= 64 * 1024], [true, true]);
+  }
+
+  section("G4: a closed terminal or a kill does not orphan the agent");
+  for (const [sig, code] of [["SIGHUP", 129], ["SIGTERM", 143]]) {
+    const t7 = db.createTask({ projectId: project.id, title: `orphan ${sig}` });
+    const child = spawn(process.execPath, [CLI, "chat", String(t7.id), "--allow-unguarded", "start"], {
+      env: cliEnv({ FAKE_AGENT_FIXTURE: path.join(FIX, "claude_hang.jsonl") }), stdio: ["ignore", "pipe", "pipe"],
+    });
+    const closed = new Promise((r) => child.on("close", (c) => r(c)));
+    let running = null;
+    for (let i = 0; i < 400 && !running; i++) {
+      await wait(50);
+      running = (await read(t7.id)).find((e) => e.kind === "run");
+    }
+    const agentPid = agentRuns().pop().pid;
+    child.kill(sig);
+    check(`${sig}: delphi chat exits ${code}`, await Promise.race([closed, wait(20000).then(() => "timeout")]), code);
+    let alive = true;
+    for (let i = 0; i < 200 && alive; i++) { try { process.kill(agentPid, 0); await wait(50); } catch { alive = false; } }
+    check(`${sig}: the agent is gone`, alive, false);
+    const after = (await read(t7.id)).find((e) => e.kind === "run");
+    check(`${sig}: its command is finished, saying why`, [after.meta.state, after.meta.code], ["fail", sig]);
+  }
+
+  section("G4: the Sheet in a terminal stops its agent when it is ended");
+  {
+    const t8 = db.createTask({ projectId: project.id, title: "tui shutdown" });
+    const resolved = await person.call("sheet_resolve", { task: String(t8.id) });
+    const stops = [];
+    let release;
+    const app = tui.createSheetApp({
+      client: person, resolved,
+      io: { hooks: { attachAgent: async () => ({
+        row: { label: "Claude Code" }, resume: null, notice: null,
+        send: () => new Promise((r) => { release = () => r({ code: null, written: [], interrupted: true, stderr: "" }); }),
+        stop: (reason) => { stops.push(reason); if (release) release(); return true; }, close: () => {},
+      }) } },
+    });
+    await app.load();
+    await app.feed("/agent claude\r");
+    await app.feed("work on it\r");
+    await app.shutdown("SIGHUP");
+    check("SIGHUP stops the agent, saying why", stops, ["SIGHUP"]);
   }
 
   person.close();

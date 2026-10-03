@@ -220,6 +220,9 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
       const v = fields.setup_cmd == null ? null : String(fields.setup_cmd).trim();
       if (v && (v.length > 1000 || /[\r\n]/.test(v))) throw new Error("The setup command must be one line, under 1000 characters. Put anything longer in a script.");
       params.push(v); sets.push(`setup_cmd = :p${params.length}`);
+      // Whoever sets it through here is a person, unless the caller says it
+      // is Delphi filling in what it detected (workbench.js start).
+      sets.push(`setup_cmd_detected = ${fields.setup_cmd_detected === true ? 1 : 0}`);
     }
     if (fields.copy_files !== undefined) {
       const v = fields.copy_files == null ? null

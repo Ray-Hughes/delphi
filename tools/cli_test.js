@@ -228,22 +228,48 @@ async function review(delphi) {
   check("plain words stay plain", (delphi(["run", id, "--", "echo", "a-b", "c/d"]), lastRun().body), "echo a-b c/d");
 
   section("item 3: a closed terminal finishes the run");
+  // Unique to this run. pgrep sees every process on the machine, and another
+  // run of this test (another worktree, another agent) has the same commands:
+  // matching those was the flake, with theirs alive when ours was not.
+  const RUNTAG = `${process.pid}-${Date.now()}`;
   {
+    // The hangup arriving before the command has even started (while the
+    // guard is asked) is kept and delivered, not dropped.
     const { spawn } = require("child_process");
-    const child = spawn(process.execPath, [CLI, "run", id, "--", "sleep 27; echo finished"], {
+    const child = spawn(process.execPath, [CLI, "run", id, "--", `sleep 31; echo early-${RUNTAG}`], {
       env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }, stdio: ["ignore", "pipe", "pipe"],
     });
-    await new Promise((r) => setTimeout(r, 2500));
+    const closed = new Promise((r) => child.on("close", (c) => r(c)));
+    const until = async (test, ms) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await new Promise((r) => setTimeout(r, 20)); return test(); };
+    await until(() => { const r = lastRun(); return r && r.body === `sleep 31; echo early-${RUNTAG}`; }, 20000);
     child.kill("SIGHUP");
-    const code = await new Promise((r) => child.on("close", (c) => r(c)));
+    await closed;
+    const row = lastRun();
+    check("a hangup before the command starts still ends it", [row.body, row.meta.state], [`sleep 31; echo early-${RUNTAG}`, "fail"]);
+    check("and nothing is left running", await until(() => spawnSync("pgrep", ["-f", ` -c sleep 31; echo early-${RUNTAG}`], { encoding: "utf8" }).stdout.trim() === "", 10000), true);
+  }
+  {
+    const { spawn } = require("child_process");
+    const child = spawn(process.execPath, [CLI, "run", id, "--", `sleep 27; echo finished-${RUNTAG}`], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    // Waited for, not slept for: a fixed pause was the flake. Under load the
+    // command had sometimes not started when the hangup came, and the reap
+    // had sometimes not happened a second after it.
+    const closed = new Promise((r) => child.on("close", (c) => r(c)));
+    // The shell running it, matched by its -c: the delphi process's own
+    // command line holds the same text, and matching that was the other flake.
+    const alive = () => spawnSync("pgrep", ["-f", ` -c sleep 27; echo finished-${RUNTAG}`], { encoding: "utf8" }).stdout.trim();
+    const until = async (test, ms) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await new Promise((r) => setTimeout(r, 50)); return test(); };
+    check("the command started", await until(() => alive() !== "", 20000), true);
+    child.kill("SIGHUP");
+    const code = await closed;
     const row = lastRun();
     check("the entry is finished, saying why", [row.meta.state, row.meta.code], ["fail", "SIGHUP"]);
     check("the CLI exited", typeof code, "number");
-    // A moment for the killed shell to be reaped: an unreaped zombie still
-    // matches pgrep, and is not a running command.
-    await new Promise((r) => setTimeout(r, 1000));
-    const pids = spawnSync("pgrep", ["-f", "sleep 27; echo finished"], { encoding: "utf8" }).stdout.trim();
-    check("and the command did not outlive it", pids, "");
+    // An unreaped zombie still matches pgrep for a moment, and is not a
+    // running command; a live one would still be there after ten seconds.
+    check("and the command did not outlive it", await until(() => alive() === "", 10000), true);
   }
 
   section("item 6: a log belongs to its entry only");

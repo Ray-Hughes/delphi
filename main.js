@@ -1255,19 +1255,21 @@ handle("workbench:update", benchWrite((id) => benches.update(id)));
 handle("workbench:commit", (id, message) => benches.commit(id, message));
 handle("workbench:push", (id) => benches.push(id));
 handle("workbench:pr", (id, opts = {}) => benches.pr(id, { create: Boolean(opts && opts.create) }));
-// opts.ignoredOk is the person's "these can go", given after the window has
-// shown them what finishPlan (or an IGNORED refusal's details) listed.
+// opts.confirm is the person's "these exact files can go": the token from
+// finishPlan (or an IGNORED refusal's details), passed back as given. A list
+// that changed since it was shown refuses with IGNORED again.
 handle("workbench:finishPlan", (id) => benches.finishPlan(id));
-handle("workbench:finish", benchWrite((id, opts = {}) => benches.finish(id, { ignoredOk: Boolean(opts && opts.ignoredOk === true) })));
+handle("workbench:finish", benchWrite((id, opts = {}) => benches.finish(id, { confirm: opts && typeof opts.confirm === "string" ? opts.confirm : null })));
 handle("workbench:discardPlan", (id) => benches.discardPlan(id));
 // Checked here as well as in the module: the typed number is the whole of
 // Discard's protection, and it costs nothing to ask twice.
-handle("workbench:discard", benchWrite((id, typed) => {
+// opts.confirm: the plan's token, needed only when something would not be kept.
+handle("workbench:discard", benchWrite((id, typed, opts = {}) => {
   const wb = benchStore.get(id);
   if (String(typed == null ? "" : typed).trim() !== String(wb.task_id)) {
     throw new Error(`Type ${wb.task_id}, the task's number, to confirm. Nothing was thrown away.`);
   }
-  return benches.discard(id, typed);
+  return benches.discard(id, typed, { confirm: opts && typeof opts.confirm === "string" ? opts.confirm : null });
 }));
 handle("workbench:recreate", benchWrite((id) => benches.recreate(id)));
 handle("workbench:forget", benchWrite((id) => benches.forget(id)));
@@ -1276,7 +1278,8 @@ handle("workbench:list", (opts = {}) => benches.list({
   includeClosed: Boolean(opts && opts.includeClosed),
 }));
 handle("workbench:advanced", (id) => benches.advanced(id));
-handle("repos:update", (id, fields) => benchStore.updateRepo(id, fields || {}));
+// setup_cmd_detected is Delphi's to set, never the window's: an edit is a person's.
+handle("repos:update", (id, fields) => { const { setup_cmd_detected: _ignored, ...mine } = fields || {}; return benchStore.updateRepo(id, mine); });
 
 handle("notes:list", (projectId) => db.listNotes(projectId));
 handle("notes:create", (payload) => { const r = db.createNote(payload); scheduleVaultExport(); return r; });
@@ -1826,7 +1829,10 @@ handle("audit:undoLast", (n) => db.undoLast(n));
 handle("search", (q) => db.search(q));
 handle("stats", () => db.stats());
 
-handle("settings:get", () => settings);
+// workbenchBranchPrefixDefault is read only: the prefix a branch gets when
+// workbenchBranchPrefix is empty (the OS username, as workbench/naming.js
+// makes it), which the window cannot find out for itself.
+handle("settings:get", () => ({ ...settings, workbenchBranchPrefixDefault: require("./workbench/naming").defaultPrefix() }));
 handle("settings:set", (fields) => {
   if (fields.panelMode !== undefined) {
     const next = fields.panelMode === true;

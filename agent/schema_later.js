@@ -84,6 +84,9 @@ const LATER_COLUMNS = [
   ["repos", "base_branch", "TEXT"],
   ["repos", "setup_cmd", "TEXT"],
   ["repos", "copy_files", "TEXT"],
+  // 1 when setup_cmd holds what Delphi detected from the lock files, 0 once a
+  // person has set it, so Settings can say which it is showing.
+  ["repos", "setup_cmd_detected", "INTEGER NOT NULL DEFAULT 0"],
 ];
 
 // The same text as schema.sql. A table is created here too, rather than left to

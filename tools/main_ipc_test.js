@@ -219,6 +219,11 @@ async function main() {
     check("a one line command copies as its body", await call("sheet:copy", single.id), "echo one");
   }
 
+  section("settings");
+  const got = await call("settings:get");
+  check("the default branch prefix is there to show, and is naming.js's",
+    got.workbenchBranchPrefixDefault, require("../workbench/naming").defaultPrefix());
+
   section("refusals keep their code");
   const loose = db.createTask({ projectId: null, title: "in no project" });
   const coded = await handlers.get("workbench:start")({}, loose.id, {});

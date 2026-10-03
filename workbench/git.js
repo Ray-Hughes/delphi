@@ -291,6 +291,7 @@ async function forgetRegistration(repo, dir) {
 function parseStatusFiles(out) {
   const files = [];
   const conflicted = [];
+  const untracked = [];
   const records = String(out).split("\0");
   for (let i = 0; i < records.length; i++) {
     const record = records[i];
@@ -304,9 +305,56 @@ function parseStatusFiles(out) {
     const file = record.slice(at);
     files.push(file);
     if (kind === "u") conflicted.push(file);
+    if (kind === "?") untracked.push(file);
     if (kind === "2") i++;   // the original path of a rename is its own record
   }
-  return { files, conflicted };
+  return { files, conflicted, untracked };
+}
+
+/**
+ * The index entries git has been told not to look at (assume-unchanged,
+ * lower case tags, and skip-worktree, S), and the gitlinks (mode 160000:
+ * submodules), from one `ls-files -v -s`.
+ */
+function parseIndexFlags(out) {
+  const flagged = [];
+  const gitlinks = [];
+  for (const record of String(out).split("\0")) {
+    if (!record) continue;
+    const m = /^(\S) (\d{6}) ([0-9a-f]+) \d\t([\s\S]*)$/.exec(record);
+    if (!m) continue;
+    const [, tag, mode, sha, file] = m;
+    if (mode === "160000") gitlinks.push(file);
+    const assume = tag !== tag.toUpperCase();
+    const skip = tag.toUpperCase() === "S";
+    if (assume || skip) flagged.push({ file, sha, assume, skip });
+  }
+  return { flagged, gitlinks };
+}
+
+/**
+ * Changes git does not report because it was told not to look: a file
+ * marked assume-unchanged or skip-worktree whose content is no longer what
+ * the index says. status never lists them, worktree remove deletes them, and
+ * a snapshot taken from the real index would leave them out, so they are
+ * found here by hashing the files themselves. A skip-worktree file that is
+ * simply absent is a sparse checkout doing its job, not a change.
+ */
+async function hiddenChanges(dir, flagged) {
+  const present = [];
+  const hidden = [];
+  for (const f of flagged) {
+    let exists = false;
+    try { exists = fs.lstatSync(path.join(dir, f.file)).isFile(); } catch {}
+    if (exists) present.push(f);
+    else if (f.assume && !f.skip) hidden.push(f.file);
+  }
+  if (present.length) {
+    const r = await runWith(dir, ["hash-object", "--stdin-paths"], { input: present.map((f) => f.file).join("\n") + "\n", timeout: WRITE_TIMEOUT });
+    const shas = r.ok ? r.stdout.split("\n").map((l) => l.trim()) : [];
+    present.forEach((f, i) => { if (shas[i] !== f.sha) hidden.push(f.file); });
+  }
+  return hidden;
 }
 
 /**
@@ -324,7 +372,15 @@ async function status(dir) {
   const result = await run(dir, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]);
   if (!result.ok) return { ok: false, reason: plain(result, UNREADABLE, { strict: true }) };
   const head = core.parseStatus(result.stdout);
-  const { files, conflicted } = parseStatusFiles(result.stdout);
+  const { files, conflicted, untracked } = parseStatusFiles(result.stdout);
+  const index = await run(dir, ["ls-files", "-v", "-s", "-z"]);
+  if (!index.ok) return { ok: false, reason: plain(index, UNREADABLE, { strict: true }) };
+  const { flagged, gitlinks } = parseIndexFlags(index.stdout);
+  const hidden = flagged.length ? await hiddenChanges(dir, flagged) : [];
+  // Folders git could not open are skipped with only a warning, and status
+  // still succeeds: what is in them is unknown, which is not the same as
+  // nothing. Kept, so Finish and Discard can refuse rather than guess.
+  const unreadable = [...String(result.stderr).matchAll(/could not open directory '([^']+)'/g)].map((m) => m[1]);
   return {
     ok: true,
     branch: head.branch,
@@ -332,9 +388,14 @@ async function status(dir) {
     upstream: head.upstream,
     ahead: head.ahead,
     behind: head.behind,
-    files,
+    files: [...files, ...hidden.filter((f) => !files.includes(f))],
     conflicted,
-    unsaved: files.length,
+    untracked,
+    hidden,
+    flagged: flagged.map((f) => f.file),
+    gitlinks,
+    unreadable,
+    unsaved: files.length + hidden.filter((f) => !files.includes(f)).length,
   };
 }
 
@@ -578,6 +639,8 @@ const PLAIN = [
   [/index\.lock|could not lock|cannot lock ref/i, () => "Another git command is busy in this repository. Wait for it to finish and try again."],
   [/could not resolve host|unable to access|network is unreachable|connection (?:refused|timed out)|could not read from remote/i,
     () => "Could not reach the remote. Check the network or VPN and try again."],
+  [/open\("([^"]+)"\): Permission denied|could not open directory '([^']+)'|unable to (?:index|read|stat) file '?([^'\n]+)/i,
+    (m) => `Delphi cannot read ${(m[1] || m[2] || m[3] || "a file").trim()} in this folder (its permissions do not allow it), so nothing was changed.`],
   [/permission denied|authentication failed|could not read username|403/i,
     () => "The remote refused your credentials. Sign in to git for this remote and try again."],
   [/\[rejected\]|non-fast-forward|fetch first|updates were rejected/i,
@@ -609,7 +672,7 @@ module.exports = {
   toplevel, mainCheckout, isBare, isLinkedWorktree, hasSubmodules, hasRemote, refExists, defaultBranch, baseRef,
   fetch, fetchBranch, remoteUrl,
   parseWorktrees, worktreeList, branchState, worktreeAdd, worktreeRemove, worktreePrune, forgetRegistration,
-  parseStatusFiles, status, operation, lonelyCommits, ignoredPaths, countCommits, localOnlyCommits,
+  parseStatusFiles, parseIndexFlags, status, operation, lonelyCommits, ignoredPaths, countCommits, localOnlyCommits,
   commitAll, push, pullRebase, deleteBranch,
   compareUrl, gh, prCreate, plain,
 };

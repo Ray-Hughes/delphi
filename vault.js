@@ -28,6 +28,10 @@ function slug(text) {
     .replace(/[\/\\:*?"<>|]/g, "-")   // characters filesystems reject
     .replace(/\s+/g, " ")
     .trim()
+    // A name of only dots is a path, not a name: a project called ".." would
+    // write beside the vault instead of in it. A leading dot hides the file
+    // from the very editors the vault is for.
+    .replace(/^\.+/, (dots) => "_".repeat(dots.length))
     .slice(0, 120) || "untitled";
 }
 
@@ -213,13 +217,21 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
   }
 
   // Remove files for notes, pads and Sheets that were deleted in the app.
+  // A .sheet only where this writes them, <project>/sheets/<id>-<title>.sheet:
+  // anywhere else in the vault it is the person's own file (an export, a
+  // copy kept on purpose), not a stale mirror, and is left alone.
   let removed = 0;
+  const ours = (full) => {
+    const rel = path.relative(vault, full).split(path.sep);
+    return rel.length === 3 && rel[1] === "sheets" && /^\d+-.*\.sheet$/.test(rel[2]);
+  };
   const sweep = (dir) => {
     if (!fs.existsSync(dir)) return;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) sweep(full);
-      else if ((entry.name.endsWith(".md") || entry.name.endsWith(".sheet")) && !written.has(path.resolve(full))) {
+      else if (written.has(path.resolve(full))) continue;
+      else if (entry.name.endsWith(".md") || (entry.name.endsWith(".sheet") && ours(full))) {
         fs.unlinkSync(full);
         removed++;
       }

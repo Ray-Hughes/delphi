@@ -167,9 +167,11 @@ function graphemes(text) {
     const cps = Array.from(g, (c) => c.codePointAt(0));
     let w = codeWidth(cps[0]);
     if (cps.length > 1) {
-      // Emoji presentation asked for, or a joined sequence, or a flag.
-      if (cps.includes(0xfe0f) || cps.includes(0x200d) || (cps[0] >= 0x1f1e6 && cps[0] <= 0x1f1ff)) w = 2;
-      else if (w === 0) w = Math.max(...cps.map(codeWidth));
+      // Emoji presentation asked for, or a flag, is two cells. A joiner is
+      // two only when what it joins is: a ZWJ between plain letters (which a
+      // segmenter glues to the letter before it) leaves that letter one cell.
+      if (cps.includes(0xfe0f) || (cps[0] >= 0x1f1e6 && cps[0] <= 0x1f1ff)) w = 2;
+      else w = Math.max(...cps.map(codeWidth));
     } else if (cps[0] >= 0x1f1e6 && cps[0] <= 0x1f1ff) {
       w = 1;
     }
@@ -337,6 +339,9 @@ function guardTerminal(restore, { beforeExit = null, log = (t) => process.stderr
     SIGINT: () => { if (!childHasTerminal) end("SIGINT", 130); },
     SIGTERM: () => end("SIGTERM", 143),
     SIGHUP: () => end("SIGHUP", 129),
+    // Ctrl-\ at a terminal not in raw mode, or kill -QUIT: the default would
+    // dump core and leave the terminal raw.
+    SIGQUIT: () => end("SIGQUIT", 131),
   };
   const onCrash = (error) => end("crash", 1, `delphi: ${error && error.stack ? error.stack : error}`);
   for (const [sig, fn] of Object.entries(handlers)) process.on(sig, fn);

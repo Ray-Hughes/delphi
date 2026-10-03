@@ -233,7 +233,8 @@ CREATE TABLE IF NOT EXISTS repos (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   base_branch  TEXT,   -- null = detect (origin/HEAD, then main, then master)
   setup_cmd    TEXT,   -- null = not detected yet; '' = detected, nothing to run
-  copy_files   TEXT    -- null = '.env,.env.local'; comma separated, untracked, never overwritten
+  copy_files   TEXT,   -- null = '.env,.env.local'; comma separated, untracked, never overwritten
+  setup_cmd_detected INTEGER NOT NULL DEFAULT 0   -- 1 = setup_cmd is what Delphi detected, 0 = a person set it (or nothing yet)
 );
 CREATE INDEX IF NOT EXISTS idx_repos_project ON repos(project_id);
 

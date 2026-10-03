@@ -16,10 +16,22 @@ const fs = require("fs");
 
 const argv = process.argv.slice(2);
 const resuming = argv.includes("--resume") || argv.includes("--session-id");
+// The prompt as claude -p takes it when none follows the flag: on stdin.
+// Read only when it is a pipe, so a harness that gives no stdin is not waited on.
+let stdin = null;
+try { if (fs.fstatSync(0).isFIFO() || fs.fstatSync(0).isSocket()) stdin = fs.readFileSync(0, "utf8"); } catch {}
 if (process.env.FAKE_AGENT_LOG) {
   const env = {};
   for (const k of ["DELPHI_ACTOR", "DELPHI_AUTHOR_TYPE", "DELPHI_DB"]) env[k] = process.env[k];
-  fs.appendFileSync(process.env.FAKE_AGENT_LOG, JSON.stringify({ argv, cwd: process.cwd(), env }) + "\n");
+  // The MCP config it was handed, read now, the way a CLI reads it at start.
+  let mcpActor = null;
+  for (const a of argv) {
+    const file = a.replace(/^@/, "");
+    if (/delphi-mcp/.test(file) && fs.existsSync(file)) {
+      try { mcpActor = JSON.parse(fs.readFileSync(file, "utf8")).mcpServers.delphi.env.DELPHI_ACTOR; } catch {}
+    }
+  }
+  fs.appendFileSync(process.env.FAKE_AGENT_LOG, JSON.stringify({ argv, stdin, cwd: process.cwd(), env, mcpActor, pid: process.pid }) + "\n");
 }
 if (resuming && process.env.FAKE_AGENT_FAIL_RESUME === "1") {
   process.stderr.write("No conversation found with that session ID\n");
