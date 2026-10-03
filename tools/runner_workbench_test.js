@@ -187,6 +187,33 @@ section("a parked Workbench is set aside, and the queue moves on");
     ["blocked", 2, "Released: Still blocked for the reason released with above."]);
 }
 
+section("a Workbench being put away is set aside once, not looped on");
+{
+  const e = db.createTask({ projectId: project.id, title: "closing one", priority: "high" });
+  db.sqlP("UPDATE tasks SET queue = NULL");
+  db.setQueue(e.id, "ready");
+  check("first pass works it", runRunner([...base, "--workbenches", "--max", "1", "--once", "--cwd", app]).status, 0);
+  // A Discard interrupted part way: workbench_start refuses it with CLOSING.
+  db.sqlP(`UPDATE workbenches SET state = 'closing', closing_mode = 'discard', closing_at = datetime('now'), closing_actor = 'tester'
+           WHERE task_id = :p1`, [e.id]);
+  db.sqlP("UPDATE tasks SET status = 'todo', queue = 'ready' WHERE id = :p1", [e.id]);
+  fs.rmSync(path.join(agentLogs, `${e.id}.json`));
+  const entriesBefore = db.sqlP("SELECT COUNT(*) AS n FROM comments WHERE task_id = :p1", [e.id])[0].n;
+  // Not --once: left running with a one second poll, the old runner claimed
+  // and released this every second. It is stopped after a few polls.
+  const ran = spawnSync(process.execPath, [RUNNER, ...base, "--workbenches", "--idle", "1", "--max-idle", "1", "--cwd", app], {
+    encoding: "utf8", timeout: 8000, killSignal: "SIGINT", env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+  });
+  const log = `${ran.stdout}${ran.stderr}`;
+  const claims = (log.match(new RegExp(`claimed ${e.id}:`, "g")) || []).length;
+  check("claimed once, not every poll", claims, 1);
+  check("the agent was never started", fs.existsSync(path.join(agentLogs, `${e.id}.json`)), false);
+  check("taken out of the pool", db.sqlP("SELECT status, claimed_by FROM tasks WHERE id = :p1", [e.id])[0], { status: "blocked", claimed_by: null });
+  const added = db.sqlP("SELECT body, promoted FROM comments WHERE task_id = :p1 ORDER BY id", [e.id]).slice(entriesBefore);
+  check("one promoted note saying why", [added.length, added[0] && added[0].promoted, /^Released: Its Workbench (is being put away|could not be started)/.test(added[0] ? added[0].body : "")], [1, 1, true]);
+  check("the Workbench is left as it was", db.sqlP("SELECT state FROM workbenches WHERE task_id = :p1", [e.id])[0].state, "closing");
+}
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

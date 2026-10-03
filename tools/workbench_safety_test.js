@@ -751,7 +751,9 @@ async function main() {
     check("and says once where it is", anyNote(f.t.id, /cannot vouch for/), 1);
     await benches.housekeep();
     check("not twice", anyNote(f.t.id, /cannot vouch for/), 1);
-    await rejects("Forget refuses while it is there", benches.forget(f.wb.id), /moved to .*\.trash/, "IN_TRASH");
+    // Forget is a person's explicit choice: it goes ahead, deletes nothing,
+    // and names the folder it did not recognise.
+    check("Forget works, deletes nothing, and names the folder", [(await benches.forget(f.wb.id)).forgotten, exists(forged), notes(f.t.id).pop().includes(forged)], [true, true, true]);
     fs.renameSync(`${f.wb.path}.away`, f.wb.path);
     check("the real folder is untouched when it comes back", read(path.join(f.wb.path, "work.txt")), "real work\n");
     fs.rmSync(forged, { recursive: true, force: true });
@@ -799,9 +801,9 @@ async function main() {
         // recorded from the row, as housekeeping's doing.
         check(`${how}: recorded from the row's intent by housekeeping`, [hk.reconciled.includes(x.wb.id), store.get(x.wb.id).state, /finished by housekeeping/.test(notes(x.t.id).pop())], [true, "discarded", true]);
       } else {
-        check(`${how}: nothing recorded, the folder kept`, [hk.reconciled.includes(x.wb.id), exists(path.join(xd.trash, "w.txt"))], [false, true]);
+        check(`${how}: nothing recorded, the row is Missing, the folder kept`, [hk.reconciled.includes(x.wb.id), store.get(x.wb.id).state, exists(path.join(xd.trash, "w.txt"))], [false, "missing", true]);
         check(`${how}: the Sheet says where it is`, notes(x.t.id).some((t) => t.includes(xd.trash)), true);
-        await rejects(`${how}: Forget refuses`, benches.forget(x.wb.id), /being put away/, "CLOSING");
+        check(`${how}: and Forget then works`, (await benches.forget(x.wb.id)).forgotten, true);
       }
     }
 
@@ -889,6 +891,63 @@ async function main() {
     let dup = null;
     try { old.exec("INSERT INTO workbenches (task_id, repo_id, path, branch, base, state) VALUES (1, 1, '/b', 'b', 'main', 'active')"); } catch (e) { dup = e.message; }
     check("so a second live row beside a closing one is refused", /UNIQUE/.test(String(dup)), true);
+  }
+
+  // -------------------------------------------------------------------------
+  section("G9. Every closing row has a way out");
+  {
+    const W = require("../workbench/workbench");
+    const r = makeRepo("g9");
+    const crash = async (label) => {
+      const x = await bench(r, label);
+      write(path.join(x.wb.path, "w.txt"), "w\n");
+      const done = await W.discardFolder(store.get(x.wb.id), benches.intent(x.wb.id));   // the process dies here
+      return { ...x, done };
+    };
+    // The moved folder written into after the copy.
+    const a = await crash("changed");
+    write(path.join(a.done.trash, "late.txt"), "written after the copy\n");
+    const ha = await benches.housekeep();
+    check("changed after the copy: recorded from the row's copy, by housekeeping", [ha.reconciled.includes(a.wb.id), store.get(a.wb.id).state], [true, "discarded"]);
+    check("and the folder kept for good, with a note saying what changed and where", [exists(path.join(a.done.trash, "late.txt")), exists(`${a.done.trash}.kept`), /late\.txt in it changed after the copy.*Nothing is lost/.test(notes(a.t.id).pop())], [true, true, true]);
+    await benches.housekeep();
+    check("which later housekeeping leaves alone", exists(path.join(a.done.trash, "late.txt")), true);
+    check("and the task can have a Workbench again", (await benches.start(a.t.id, { runSetup: false })).created, true);
+
+    // The person deleted the moved folder.
+    const b = await crash("deleted");
+    fs.rmSync(b.done.trash, { recursive: true, force: true });
+    const hb = await benches.housekeep();
+    check("folder deleted by hand: recorded from the copy, saying it was gone", [hb.reconciled.includes(b.wb.id), store.get(b.wb.id).state, /already gone/.test(notes(b.t.id).pop())], [true, "discarded", true]);
+    check("its work is in the copy", git(r.app, "show", `${b.done.ref}:w.txt`), "w");
+
+    // The copy is gone.
+    const c = await crash("no copy");
+    git(r.app, "update-ref", "-d", c.done.ref);
+    const hc = await benches.housekeep();
+    check("copy gone: back to Missing, with a note pointing at the folder", [hc.unstuck, store.get(c.wb.id).state, notes(c.t.id).pop().includes(c.done.trash)], [[c.wb.id], "missing", true]);
+    check("Forget then works", (await benches.forget(c.wb.id)).forgotten, true);
+    check("and the task can have a Workbench again", (await benches.start(c.t.id, { runSetup: false })).created, true);
+
+    // Forget on a closing row whose moved folder is gone, before housekeeping.
+    const d = await crash("forget closing");
+    await rejects("Forget refuses while the moved folder is there", benches.forget(d.wb.id), /being put away/, "CLOSING");
+    fs.rmSync(d.done.trash, { recursive: true, force: true });
+    check("and works once it is gone", [(await benches.forget(d.wb.id)).forgotten, store.get(d.wb.id).state], [true, "discarded"]);
+
+    // The refusal promises only what housekeeping does.
+    const e = await crash("words");
+    const err = await rejects("a closing row refuses Start", benches.start(e.t.id, { runSetup: false }), /being put away/, "CLOSING");
+    check("in words that promise nothing housekeeping will not do", [/in a moment/.test(err.message), /records it, reopens it, or marks it Missing/.test(err.message)], [false, true]);
+    // delphi status shows the words once.
+    const CLI = path.join(__dirname, "..", "bin", "delphi");
+    db.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    // Its lock held, as if a Discard were still finishing it, so the
+    // housekeeping that delphi status runs first leaves it closing.
+    const hold = keep.takeLock(e.done.trash);
+    const out = spawnSync(process.execPath, [CLI, "status", String(e.t.id)], { encoding: "utf8", env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", DELPHI_ACTOR: "ray" } });
+    hold();
+    check("delphi status says Being put away, once", [/Being put away/.test(out.stdout), /closing, /.test(out.stdout)], [true, false]);
   }
 
   await viaServer();

@@ -70,7 +70,7 @@ function refusal(message, code, extra = {}) {
 
 /** A Workbench part way through a Finish or Discard: nothing else may start on it. */
 function closingRefusal(wb) {
-  return refusal(`Task ${wb.task_id}'s Workbench is being put away (a ${wb.closing ? wb.closing.mode : "Finish or Discard"} is in progress). Try again in a moment; if it stays like this, housekeeping finishes or undoes it.`,
+  return refusal(`Task ${wb.task_id}'s Workbench is being put away (a ${wb.closing ? wb.closing.mode : "Finish or Discard"} is in progress). If that stopped part way, the next housekeeping (when the app starts, or delphi status) records it, reopens it, or marks it Missing, and the Sheet says which.`,
     "CLOSING", { details: { closing: wb.closing || null } });
 }
 
@@ -1169,14 +1169,17 @@ function createWorkbench({
   async function forgetBench(id) {
     const wb = store.get(id);
     if (wb.state === "finished" || wb.state === "discarded") return { forgotten: true };
-    if (wb.state === "closing") throw closingRefusal(wb);
-    // Its folder may only have been moved aside by a Finish or Discard that
-    // did not finish; forgetting it would leave that folder unexplained.
-    const aside = trashFor(wb);
-    if (aside.length) {
-      throw refusal(`This Workbench's folder was moved to ${aside[0].trash} by a Finish or Discard that did not complete. Look through it first; Forget leaves it alone until it is gone.`,
-        "IN_TRASH", { details: { trash: aside.map((e) => e.trash) } });
+    // A closing one may be forgotten once its moved folder is gone too: a
+    // person's explicit choice, recorded as theirs. While the moved folder
+    // is there, housekeeping records it from its copy instead.
+    if (wb.state === "closing") {
+      const c = wb.closing || {};
+      if ((c.trash && fs.existsSync(c.trash)) || isDir(wb.path)) throw closingRefusal(wb);
+      store.cancelClosing(wb.id, "missing");
     }
+    // Forgetting never deletes a folder a Finish or Discard moved aside; the
+    // note says where it is, so it is not left unexplained.
+    const aside = trashFor(wb).map((e) => e.trash);
     if (isDir(wb.path) && !isEmptyDir(wb.path)) {
       throw refusal(`The folder is still there (${wb.path}). Finish it or discard it instead, so nothing in it is lost by accident.`, "NOT_MISSING");
     }
@@ -1184,7 +1187,7 @@ function createWorkbench({
     if (top) await git.forgetRegistration(top, wb.path);
     drop(wb.path);
     store.setState(wb.id, "discarded");
-    await note(wb.task_id, `forgot workbench; the branch ${wb.branch} was left as it is`);
+    await note(wb.task_id, `forgot workbench; the branch ${wb.branch} was left as it is${aside.length ? `. A folder it was moved to is still at ${aside.join(", ")}; delete it yourself when you are sure` : ""}`);
     store.audit(wb.task_id, "forgot workbench");
     return { forgotten: true };
   }
@@ -1289,9 +1292,8 @@ function createWorkbench({
    */
   async function settleStuckClosing(row, report) {
     const c = row.closing || {};
-    const aside = c.trash && fs.existsSync(c.trash);
-    if (aside) return;
-    if (isDir(row.path)) {
+    const aside = Boolean(c.trash && fs.existsSync(c.trash));
+    if (!aside && isDir(row.path)) {
       if (store.cancelClosing(row.id, "active")) {
         drop(row.path);
         await note(row.task_id, `a ${c.mode || "Finish or Discard"} of this Workbench did not get as far as moving the folder, so it is open again, as it was`, { by: "housekeeping" });
@@ -1299,12 +1301,78 @@ function createWorkbench({
       }
       return;
     }
-    if (c.mode === "discard" && !c.trash) {
+    // Without its copy there is nothing to record a Finish or Discard from:
+    // the row goes back to Missing, which Recreate or Forget can take from
+    // there, and the Sheet says where the moved folder is.
+    const top = await repoTopOf(row);
+    const kind = c.mode === "finish" ? "finished" : "discarded";
+    const good = Boolean(top && c.ref && await git.refExists(top, c.ref) && await isOwnCopy(git, top, row, c.ref, kind));
+    if (!good) {
+      if (store.cancelClosing(row.id, "missing")) {
+        drop(row.path);
+        if (aside) { try { fs.writeFileSync(`${c.trash}.noted`, "the copy is gone\n"); } catch {} }
+        await note(row.task_id, `a ${c.mode || "Finish or Discard"} of this Workbench stopped part way and its copy (${c.ref || "none"}) is gone, so nothing was recorded. ` +
+          (aside ? `The folder is at ${c.trash}: look through it, then Recreate or Forget this Workbench.` : "Its folder is gone too: Forget this Workbench, or Recreate it from its branch."), { by: "housekeeping" });
+        report.unstuck = [...(report.unstuck || []), row.id];
+      }
+      return;
+    }
+    // The person deleted the moved folder: the copy holds everything that
+    // was in it, so the Finish or Discard is recorded from that.
+    if (!aside) {
+      const hint = c.trash ? hintFor(row, keep.readManifest(c.trash)) : {};
       try {
-        const r = await markDiscarded(row.id, { ref: c.ref }, { by: "housekeeping" });
-        if (!r.already) report.reconciled.push(row.id);
+        const r = c.mode === "finish"
+          ? await markFinished(row.id, { ref: c.ref, notKept: hint.notKept, removedIgnored: hint.removedIgnored }, { by: "housekeeping" })
+          : await markDiscarded(row.id, { ...hint.summary, ref: c.ref, notKept: hint.notKept, branchToDelete: hint.tip ? { tip: hint.tip } : null }, { by: "housekeeping" });
+        if (!r.already) {
+          report.reconciled.push(row.id);
+          if (c.trash) await note(row.task_id, `the moved folder (${c.trash}) was already gone, so the record above is from the copy ${c.ref}, which holds what was in it`, { by: "housekeeping" });
+        }
+        if (c.trash) { try { fs.unlinkSync(`${c.trash}.json`); } catch {} }
       } catch {}
     }
+  }
+
+  /** What a manifest adds, when it names this row: never the repository, branch or folder. */
+  function hintFor(row, m) {
+    const ok = m && Number(m.workbench) === Number(row.id) && Number(m.task_id) === Number(row.task_id)
+      && m.folder && (m.folder === row.path || git.samePath(m.folder, row.path));
+    if (!ok) return {};
+    return {
+      notKept: Array.isArray(m.notKept) ? m.notKept.map(String) : [],
+      removedIgnored: m.removedIgnored === true,
+      tip: m.branchToDelete && typeof m.branchToDelete.tip === "string" ? m.branchToDelete.tip : null,
+      summary: { unsaved: m.unsaved, files: m.files, commits: m.commits, detached: m.detached, ignored: m.ignored },
+    };
+  }
+
+  /**
+   * A closing row whose moved folder cannot be emptied (it changed after
+   * the copy, or does not match it): the Finish or Discard is recorded from
+   * the row's own copy, signed housekeeping, and the folder kept for good,
+   * since the copy and the folder together hold everything.
+   */
+  async function recordAndKeep(row, trash, why, report, done = null) {
+    const c = row.closing || {};
+    const hint = hintFor(row, keep.readManifest(trash));
+    try { fs.writeFileSync(`${trash}.kept`, `Kept: ${why}\n`); } catch {}
+    let r;
+    try {
+      r = c.mode === "finish"
+        ? await markFinished(row.id, { ref: c.ref, notKept: hint.notKept, removedIgnored: hint.removedIgnored }, { by: "housekeeping" })
+        : await markDiscarded(row.id, { ...hint.summary, ref: c.ref, notKept: hint.notKept, branchToDelete: hint.tip ? { tip: hint.tip } : null }, { by: "housekeeping" });
+    } catch {
+      return false;
+    }
+    if (!r.already) {
+      report.reconciled.push(row.id);
+      report.keptTrash.push(trash);
+      await note(row.task_id, `kept the old folder at ${trash}: ${why}, so it was not deleted. Nothing is lost: the copy ${c.ref} and this folder together hold everything. ` +
+        "It is cut loose from git (its .git file is now .git.was); compare it with the copy put back beside it, then delete it yourself.", { by: "housekeeping" });
+    }
+    void done;
+    return true;
   }
 
   /**
@@ -1364,17 +1432,21 @@ function createWorkbench({
         }
         const trust = await recognise(row, entry.trash, keep.readManifest(entry.trash));
         if (!trust.ok) {
+          // A closing row whose copy is good (settleStuckClosing has already
+          // dealt with one whose copy is not) is recorded from that copy and
+          // the folder kept, never deleted: the two together hold everything.
+          if (row.state === "closing" && await recordAndKeep(row, entry.trash, trust.why, report)) continue;
           await unrecognised(row, entry.trash, trust.why);
           report.unrecognised = [...(report.unrecognised || []), entry.trash];
           continue;
         }
         const done = trust.done;
         if (open) {
-          // Recorded only when the moved folder is exactly the copy: a
-          // folder that changed after it is not one this can vouch for.
+          // Emptied only when the moved folder is exactly the copy. One that
+          // changed after it is recorded all the same, and kept.
           const changed = await keep.changedSince(git, { repo: done.top, trash: done.trash, tree: done.tree, since: done.since, notKept: done.notKept, copy: done.copy });
           if (changed.length) {
-            await unrecognised(row, entry.trash, `${someOf(changed)} in it ${changed.length === 1 ? "differs" : "differ"} from the copy`);
+            await recordAndKeep(row, entry.trash, `${someOf(changed)} in it changed after the copy was made`, report, done);
             continue;
           }
           try {

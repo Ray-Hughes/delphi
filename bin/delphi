@@ -854,7 +854,7 @@ const COMMANDS = {
     if (!read.workbench) { say(`Task ${task.id} has no Workbench.`); return 0; }
     const wb = read.workbench;
     // The row's state only when the words do not already say it ("Missing").
-    const said = wb.state === "active" || read.status.words.toLowerCase().startsWith(wb.state);
+    const said = wb.state === "active" || wb.state === "closing" || read.status.words.toLowerCase().startsWith(wb.state);
     say(`#${task.id}  ${said ? "" : `${wb.state}, `}${read.status.words}`);
     if (tty) {
       say(`      ${wb.branch}  ${wb.path}`);

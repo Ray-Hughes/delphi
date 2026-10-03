@@ -273,12 +273,30 @@ function buildBrief(claim, { workbench = null } = {}) {
  * than inside the server's tool call, so its output goes to a log like any
  * other run and a slow npm ci does not hold one MCP request for minutes.
  */
+// The runner's own link to the server failing. That is not the task's fault
+// and says nothing about its Workbench, so it is thrown on, to the backoff.
+const TRANSPORT = /^MCP server |did not answer/;
+
 async function prepareWorkbench(server, taskId) {
-  const made = await server.call("workbench_start", { task_id: taskId, run_setup: false });
+  let made;
+  try {
+    made = await server.call("workbench_start", { task_id: taskId, run_setup: false });
+  } catch (error) {
+    if (TRANSPORT.test(error.message)) throw error;
+    // Every refusal workbench_start makes (being put away, a folder or branch
+    // in the way, no repository, a bare one, no base branch) needs a person,
+    // and the races it can lose it already retries itself. Thrown on, it
+    // would release the task to the top of the pool and be claimed again at
+    // the next poll, forever. Refused, it is set aside once, like a parked one.
+    return { refuse: `Its Workbench could not be started: ${error.message}` };
+  }
   for (const line of made.warnings || []) warn(`task ${taskId}: ${line}`);
   const wb = made.workbench;
   if (wb.state === "parked") {
     return { refuse: `Its Workbench is parked: a person set it aside. Resuming it (delphi work ${taskId}) lets agents at it again.` };
+  }
+  if (wb.state === "closing") {
+    return { refuse: `Its Workbench is being put away (a Finish or Discard is in progress or was interrupted). A person decides what happens to it.` };
   }
   if (wb.state === "missing") {
     return { refuse: `Its Workbench folder (${wb.path}) is gone. A person can put it back with delphi work ${taskId}.` };
