@@ -1305,8 +1305,12 @@ function createWorkbench({
     // the row goes back to Missing, which Recreate or Forget can take from
     // there, and the Sheet says where the moved folder is.
     const top = await repoTopOf(row);
+    // A repository that cannot be reached right now (a disk not mounted, a
+    // share that is down) says nothing about the copy: this row waits for
+    // the next run rather than being judged on an absence.
+    if (!top) return;
     const kind = c.mode === "finish" ? "finished" : "discarded";
-    const good = Boolean(top && c.ref && await git.refExists(top, c.ref) && await isOwnCopy(git, top, row, c.ref, kind));
+    const good = Boolean(c.ref && await git.refExists(top, c.ref) && await isOwnCopy(git, top, row, c.ref, kind));
     if (!good) {
       if (store.cancelClosing(row.id, "missing")) {
         drop(row.path);

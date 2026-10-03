@@ -929,6 +929,20 @@ async function main() {
     check("Forget then works", (await benches.forget(c.wb.id)).forgotten, true);
     check("and the task can have a Workbench again", (await benches.start(c.t.id, { runSetup: false })).created, true);
 
+    // The repository unreachable for one run (its disk unplugged), back the next.
+    const away = makeRepo("g9away");
+    const aw = await bench(away, "repo away");
+    write(path.join(aw.wb.path, "w.txt"), "w\n");
+    const awDone = await W.discardFolder(store.get(aw.wb.id), benches.intent(aw.wb.id));
+    fs.rmSync(awDone.trash, { recursive: true, force: true });   // so only the copy is left to judge by
+    fs.renameSync(away.app, `${away.app}.unplugged`);
+    const before = notes(aw.t.id).length;
+    await benches.housekeep();
+    check("repository away: the row waits, closing, with no note", [store.get(aw.wb.id).state, notes(aw.t.id).length], ["closing", before]);
+    fs.renameSync(`${away.app}.unplugged`, away.app);
+    await benches.housekeep();
+    check("back the next run: the Discard is recorded from its copy", [store.get(aw.wb.id).state, /already gone/.test(notes(aw.t.id).pop())], ["discarded", true]);
+
     // Forget on a closing row whose moved folder is gone, before housekeeping.
     const d = await crash("forget closing");
     await rejects("Forget refuses while the moved folder is there", benches.forget(d.wb.id), /being put away/, "CLOSING");
