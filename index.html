@@ -82,14 +82,20 @@
        the task colours carry. Repeated in both dark blocks below. */
     --kind-say:    #5f6156;
     --kind-agent:  #7b4bd1;
-    --kind-run:    #0f7a80;
-    --kind-ask:    #8a6a00;
+    --kind-run:    #0b6a70;
+    --kind-ask:    #7a5d00;
     --kind-decide: #25754c;
     --kind-note:   #c2410c;
     --kind-ledger: #c2410c;
-    --run-ok:      #1a7a48;
+    --run-ok:      #166a3f;
     --run-fail:    #b4283f;
-    --run-busy:    #94600a;
+    --run-busy:    #845508;
+    /* Ink on a solid --kind-decide fill. White passes on the light fill and
+       fails on the dark one, which is a light green, so each theme says. */
+    --on-decide:   #fff;
+    /* The scrim a dialog puts over the task panel: dim enough to separate
+       them, light enough that the panel still says which task it is. */
+    --scrim:       rgba(16, 20, 14, 0.22);
 
     /* Spacing scale. Everything uses these, so rhythm stays consistent
        rather than being decided per component. */
@@ -168,7 +174,8 @@
 
       --kind-say: #a4a69d; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
       --kind-decide: #4fb477; --kind-note: #f4762e; --kind-ledger: #f4762e;
-      --run-ok: #96e3a6; --run-fail: #e2685f; --run-busy: #e0a458;
+      --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
+      --on-decide: #141517; --scrim: rgba(0, 0, 0, 0.38);
 
       --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     }
@@ -219,7 +226,8 @@
 
     --kind-say: #a4a69d; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
     --kind-decide: #4fb477; --kind-note: #f4762e; --kind-ledger: #f4762e;
-    --run-ok: #96e3a6; --run-fail: #e2685f; --run-busy: #e0a458;
+    --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
+      --on-decide: #141517; --scrim: rgba(0, 0, 0, 0.38);
 
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   }
@@ -2055,9 +2063,9 @@
     color: var(--ink); border-color: var(--kind-decide);
     background: color-mix(in srgb, var(--kind-decide) 8%, var(--surface));
   }
-  .ts-ask-opts.decided .ts-opt.chosen .ts-opt-key { color: #fff; background: var(--kind-decide); }
+  .ts-ask-opts.decided .ts-opt.chosen .ts-opt-key { color: var(--on-decide); background: var(--kind-decide); }
   .ts-decide-head { margin-top: 2px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--ink); }
-  .ts-decide-head .ts-opt-key { color: #fff; background: var(--kind-decide); }
+  .ts-decide-head .ts-opt-key { color: var(--on-decide); background: var(--kind-decide); }
   .ts-decide-head + .md { margin-top: 3px; }
   .ts-ref { font-size: 11.5px; color: var(--ink-faint); }
   .ts-linkbtn.ts-ref { color: var(--ink-faint); text-align: left; }
@@ -2097,11 +2105,11 @@
   .wb-chip .wb-act:disabled { color: var(--ink-faint); text-decoration: none; }
   .wb .btn.sm { height: 26px; display: inline-flex; align-items: center; gap: 6px; }
   .wb .icon-btn { width: 26px; height: 26px; }
-  .wb .icon-btn:disabled, .wb .btn:disabled { opacity: .55; }
+  .wb .icon-btn:disabled, .wb .btn:disabled, .wb.busy .btn, .wb.busy .icon-btn { opacity: .55; }
   .wb-split { display: inline-flex; }
   .wb-split .btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
   .wb-split .btn + .btn { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; padding: 3px 6px; }
-  .wb-split .btn.primary + .btn.primary { border-left-color: color-mix(in srgb, #fff 35%, var(--accent)); }
+  .wb-split .btn.primary + .btn.primary { border-left-color: color-mix(in srgb, var(--btn-fg) 35%, var(--accent)); }
   .wb-split svg { width: 10px; height: 10px; }
   .ctx.wb-menu:focus { outline: none; }
   .wb-menu .ctx-item { display: flex; align-items: center; gap: var(--s3); }
@@ -2128,7 +2136,7 @@
 
   /* A question asked over the task panel leaves the panel visible behind it,
      so it is plain which task it is about. */
-  .overlay ~ .overlay { background: color-mix(in srgb, black 22%, transparent); }
+  .overlay ~ .overlay { background: var(--scrim); }
   .repo-path { overflow-wrap: anywhere; }
   .repo-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .repo-acts:empty { display: none; }
@@ -2169,6 +2177,9 @@
   .wb-dialog .destroy-choice .mono { display: block; margin-top: 2px; overflow-wrap: anywhere; }
 
   .wb-row-title { font-size: 13.5px; color: var(--ink); }
+  .wb-row-open { display: block; max-width: 100%; border: 0; background: none; padding: 0; text-align: left; cursor: default; font: inherit; font-size: 13.5px; color: var(--ink); }
+  .wb-row-open:hover { color: var(--accent-ink); }
+  .wb-row-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
   .wb-row-sub { display: flex; align-items: center; gap: var(--s2); margin-top: 2px; min-width: 0; }
   .wb-row-sub .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wb-flag { flex: 0 0 auto; font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; padding: 1px 6px; border-radius: 4px; color: var(--run-ok); border: 1px solid color-mix(in srgb, var(--run-ok) 50%, transparent); }

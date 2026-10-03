@@ -1308,16 +1308,24 @@ async function renderOverview(root) {
     benchCard.body.remove();
     const flush = el("div", { className: "card-body flush" });
     for (const wb of benches) {
-      const row = el("div", { className: "list-row clickable wb-row", tabIndex: 0, role: "button" });
-      row.setAttribute("aria-label", `${wb.task_title}, ${wbLook(wb).words}`);
+      // The title is the row's one way in for the keyboard, a button of its
+      // own, so Update beside it is a separate control and not a button
+      // inside a button. A click anywhere else on the row still opens it.
+      const row = el("div", { className: "list-row clickable wb-row" });
+      const open = el("button", { className: "wb-row-title wb-row-open", type: "button", textContent: wb.task_title });
+      open.setAttribute("aria-label", `Open task ${wb.task_id}, ${wb.task_title}: ${wbLook(wb).words}`);
+      open.onclick = (e) => { e.stopPropagation(); openTaskSheet(wb.task_id); };
       row.append(el("div", { className: "grow" },
-        el("div", { className: "wb-row-title", textContent: wb.task_title }),
+        open,
         el("div", { className: "wb-row-sub" },
           el("span", { className: "mono", textContent: wb.branch }),
           wb.task_status === "done" ? el("span", { className: "wb-flag", textContent: "task is done" }) : null)),
-        wbChip(wb, async (act) => { act.disabled = true; await wbUpdate(wb); refresh(); }));
-      row.onclick = () => openTaskSheet(wb.task_id);
-      row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTaskSheet(wb.task_id); } };
+        wbChip(wb, async (act) => {
+          act.disabled = true;
+          await wbGuard(wb.task_id, () => wbUpdate(wb));
+          refresh();
+        }));
+      row.onclick = (e) => { if (!e.target.closest("button")) openTaskSheet(wb.task_id); };
       flush.append(row);
     }
     benchCard.card.append(flush);
@@ -7001,11 +7009,19 @@ function notify(text, { error = false } = {}) {
 }
 const notifyError = (error) => notify(error, { error: true });
 
+// Open dialogs, newest last. Each listens on the document, so without this
+// one Enter or Escape would answer every dialog stacked on the screen.
+const dialogStack = [];
+
 /**
  * A question with buttons. Resolves to the chosen action's value, or to
- * cancelValue on Escape or a click outside. Enter picks the primary action, so
- * the safe answer is never the one a stray keypress gives unless it is also
- * the primary one.
+ * cancelValue on Escape or a click outside.
+ *
+ * Enter does what it does on the focused control: a focused button presses
+ * itself, so tabbing to Cancel and pressing Enter cancels. Only in a text
+ * field does Enter mean the primary action, and only when it is enabled,
+ * which is what keeps a typed-confirm Discard from going early. Focus stays
+ * inside while it is open and goes back where it was when it closes.
  */
 function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, className = "" }) {
   return new Promise((resolve) => {
@@ -7013,12 +7029,23 @@ function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, 
     const box = el("div", { className: `ask wb-dialog ${className}`.trim(), role: "dialog" });
     box.setAttribute("aria-modal", "true");
     box.setAttribute("aria-label", title);
+    const returnTo = document.activeElement;
+    const me = { box };
     let settled = false;
     const finish = (value) => {
       if (settled) return;
       settled = true;
       document.removeEventListener("keydown", onKey, true);
+      const at = dialogStack.indexOf(me);
+      if (at >= 0) dialogStack.splice(at, 1);
       overlay.remove();
+      // The control that opened it may have been redrawn meanwhile (the
+      // Workbench header is, after most verbs); its data-act finds the new one.
+      let back = returnTo && returnTo.isConnected ? returnTo : null;
+      if (!back && returnTo && returnTo.dataset && returnTo.dataset.act) {
+        back = document.querySelector(`.wb [data-act="${CSS.escape(returnTo.dataset.act)}"]`);
+      }
+      if (back && typeof back.focus === "function") back.focus({ preventScroll: true });
       resolve(value);
     };
     const buttons = actions.map((a) => {
@@ -7028,17 +7055,32 @@ function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, 
       return b;
     });
     const primary = buttons[actions.findIndex((a) => a.kind === "primary" || a.kind === "danger")] || null;
+    const focusables = () => [...box.querySelectorAll("button, input, select, textarea, [tabindex]")]
+      .filter((n) => !n.disabled && n.tabIndex >= 0 && n.offsetParent !== null);
     const onKey = (event) => {
+      if (dialogStack[dialogStack.length - 1] !== me) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
         finish(cancelValue);
       } else if (event.key === "Enter" && !event.isComposing) {
-        event.preventDefault();
         event.stopPropagation();
-        if (primary && !primary.disabled) primary.click();
+        const t = event.target;
+        const typing = t && t.tagName === "INPUT" && !["checkbox", "radio", "button", "submit"].includes(t.type);
+        if (typing) {
+          event.preventDefault();
+          if (primary && !primary.disabled) primary.click();
+        }
+        // Anything else keeps its own Enter: a button presses itself.
+      } else if (event.key === "Tab") {
+        const list = focusables();
+        if (!list.length) { event.preventDefault(); return; }
+        const at = list.indexOf(document.activeElement);
+        if (event.shiftKey && (at <= 0)) { event.preventDefault(); list[list.length - 1].focus(); }
+        else if (!event.shiftKey && (at === -1 || at === list.length - 1)) { event.preventDefault(); list[0].focus(); }
       }
     };
+    dialogStack.push(me);
     document.addEventListener("keydown", onKey, true);
     box.append(el("h3", { textContent: title }));
     if (lead) box.append(el("p", { className: "wb-lead", textContent: lead }));
@@ -7102,6 +7144,24 @@ function wbChip(wb, onUpdate) {
   return chip;
 }
 
+// Tasks whose Workbench has a verb running, from any surface: the task
+// panel, a done prompt, the Overview. One flag per task, so a double click,
+// or a Finish from a prompt while the panel has one going, starts nothing.
+const wbBusyTasks = new Set();
+
+/** Runs fn unless this task's Workbench is already busy; resolves to its result, or undefined when skipped. */
+async function wbGuard(taskId, fn) {
+  const key = Number(taskId);
+  if (wbBusyTasks.has(key)) return undefined;
+  wbBusyTasks.add(key);
+  const repaint = () => { if (openSheet && openSheet.taskId === key && openSheet.wbRepaint) openSheet.wbRepaint(); };
+  repaint();
+  try { return await fn(); } finally {
+    wbBusyTasks.delete(key);
+    repaint();
+  }
+}
+
 /** Update from base, said in the module's own words whichever way it went. */
 async function wbUpdate(wb) {
   try {
@@ -7120,7 +7180,11 @@ async function wbUpdate(wb) {
  * asking at every step, so the folder is only removed once its work is safe on
  * the remote. Every step can be cancelled and nothing is done behind a dialog.
  */
-async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) {
+function finishWorkbench(wbId, taskId, opts = {}) {
+  return wbGuard(taskId, () => finishFlow(wbId, taskId, opts));
+}
+
+async function finishFlow(wbId, taskId, { title = "", after = null } = {}) {
   const done = async () => { if (after) await after(); };
   const wbApi = window.delphi.workbench;
   try {
@@ -7347,7 +7411,11 @@ function recoverBlock(text) {
  * go, from the module's own plan, and stays disabled until the task's number
  * is typed exactly.
  */
-async function discardWorkbench(wbId, taskId, { after = null } = {}) {
+function discardWorkbench(wbId, taskId, opts = {}) {
+  return wbGuard(taskId, () => discardFlow(wbId, taskId, opts));
+}
+
+async function discardFlow(wbId, taskId, { after = null } = {}) {
   let plan;
   try { plan = await window.delphi.workbench.discardPlan(wbId); } catch (error) { notifyError(error); return; }
   // A folder git cannot read is left alone by Discard, which is right: there
@@ -7424,7 +7492,7 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
     // The folder changed since the plan was read, so what was agreed to is
     // not what is there. Said, then asked again from a fresh plan.
     notifyError(error);
-    if (error.code === "IGNORED") return discardWorkbench(wbId, taskId, { after });
+    if (error.code === "IGNORED") return discardFlow(wbId, taskId, { after });
   }
   if (after) await after();
 }
@@ -7518,7 +7586,17 @@ window.delphi.onWorkbenchEvent((e) => {
 
 // Done prompts Finish. Not now changes nothing: the task stays done and the
 // Workbench stays as it is.
-window.delphi.onWorkbenchPrompt(async (p) => {
+// One at a time: marking several tasks done at once sends one prompt each,
+// and stacked they would all be answered by the first keypress. Each waits
+// for the one before it, and is skipped if its Workbench went meanwhile.
+let promptQueue = Promise.resolve();
+window.delphi.onWorkbenchPrompt((p) => {
+  promptQueue = promptQueue.then(() => donePrompt(p)).catch((error) => notifyError(error));
+});
+
+async function donePrompt(p) {
+  const still = await window.delphi.workbench.forTask(p.taskId).catch(() => null);
+  if (!still || still.id !== p.workbenchId) return;
   const go = await wbDialog({
     title: "Finish the Workbench too?",
     lead: `Task ${p.taskId} is done, and its Workbench is still open.`,
@@ -7533,7 +7611,7 @@ window.delphi.onWorkbenchPrompt(async (p) => {
     title: p.taskTitle,
     after: async () => { if (openSheet && openSheet.live) await openSheet.live(); refresh(); },
   });
-});
+}
 
 // ---------------------------------------------------------------------------
 // Composer runs: live output
@@ -7793,22 +7871,30 @@ async function openTaskSheet(taskId) {
   // The advanced disclosure, when More has asked for it: { id, data }.
   let wbAdv = null;
   const advHost = el("div");
-  // Set while a verb is running, so a second click cannot start a second one.
-  let wbBusy = false;
+  // Whether a verb is running on this task's Workbench, here or from a
+  // done prompt: the one flag every entry point checks (see wbGuard).
+  const busyNow = () => wbBusyTasks.has(taskId);
+  // The advanced section as the person left it: collapsed stays collapsed.
+  let wbAdvOpen = true;
 
   const wbAfter = async () => { await reload(); refresh(); };
 
   /** Runs one Workbench verb with the cluster disabled, and says what went wrong in the module's words. */
   async function wbDo(fn) {
-    if (wbBusy) return;
-    wbBusy = true;
-    paintWorkbench();
-    try { await fn(); } catch (error) { notifyError(error); }
-    wbBusy = false;
-    await wbAfter();
+    const ran = await wbGuard(taskId, async () => {
+      try { await fn(); } catch (error) { notifyError(error); }
+      return true;
+    });
+    if (ran) await wbAfter();
   }
 
-  async function wbStart() {
+  function wbStart() {
+    // Guarded from the first click, before the candidates are even asked
+    // for, so a double click cannot open two pickers or start twice.
+    return wbGuard(taskId, wbStartNow);
+  }
+
+  async function wbStartNow() {
     let opts = {};
     try {
       const list = await window.delphi.workbench.candidates(taskId);
@@ -7832,20 +7918,37 @@ async function openTaskSheet(taskId) {
     await wbAfter();
   }
 
-  /** A menu under a button, right edges aligned, the way the mockup hangs them. */
-  function wbMenu(button, items) {
+  /**
+   * A menu under a button, right edges aligned, the way the mockup hangs
+   * them. Keyboard handling is openFileMenu's: focus moves in, the arrows
+   * move through it, Escape closes only the menu and hands focus back to its
+   * button, and Tab leaves.
+   */
+  function wbMenu(button, items, fromKeyboard = false) {
     const box = button.getBoundingClientRect();
     button.setAttribute("aria-expanded", "true");
     const menu = rowMenu(box.left, box.bottom + 4, items, {
       className: "wb-menu",
-      onClose: () => button.setAttribute("aria-expanded", "false"),
+      // Focus goes back to the button the menu hangs from, so a dialog an
+      // item opens has somewhere to return focus to when it closes.
+      onClose: () => {
+        button.setAttribute("aria-expanded", "false");
+        if (button.isConnected && (!document.activeElement || document.activeElement === document.body)) button.focus({ preventScroll: true });
+      },
     });
     menu.setAttribute("role", "menu");
     menu.style.left = `${Math.max(8, box.right - menu.offsetWidth)}px`;
-    for (const c of menu.querySelectorAll(".ctx-item")) c.setAttribute("role", "menuitem");
+    const choices = [...menu.querySelectorAll(".ctx-item")];
+    for (const c of choices) c.setAttribute("role", "menuitem");
     menu.addEventListener("keydown", (e) => {
+      const at = choices.indexOf(document.activeElement);
       if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); closeRowMenu(); button.focus(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); choices[(at + 1) % choices.length].focus(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); choices[(at - 1 + choices.length) % choices.length].focus(); }
+      else if (e.key === "Tab") closeRowMenu();
     });
+    if (fromKeyboard) choices[0]?.focus();
+    else { menu.tabIndex = -1; menu.focus(); }
     return menu;
   }
 
@@ -7866,17 +7969,43 @@ async function openTaskSheet(taskId) {
   async function wbShowAdvanced(wb) {
     try {
       wbAdv = { id: wb.id, data: await window.delphi.workbench.advanced(wb.id) };
+      wbAdvOpen = true;
     } catch (error) { notifyError(error); return; }
     paintAdvanced();
     advHost.scrollIntoView({ block: "nearest", behavior: motionOff() ? "auto" : "smooth" });
   }
 
+  // What the cluster was last drawn from. A refresh that changes none of it
+  // leaves the buttons alone, so focus and an open menu stay where they are.
+  let wbSig = null;
   function paintWorkbench() {
+    const wb0 = detail.workbench;
+    const st0 = (wb0 && wb0.status) || {};
+    const sig = JSON.stringify([wb0 && { ...wb0, status: { ...st0, checkedAt: null } }, wbStarting.get(taskId) || null,
+      busyNow(), detail.project ? detail.project.id : null, detail.task.status]);
+    if (sig === wbSig) return;
+    wbSig = sig;
+    const hadFocus = wbSlot.contains(document.activeElement) ? document.activeElement.dataset.act : null;
+    buildWorkbench();
+    if (hadFocus) {
+      const again = wbSlot.querySelector(`[data-act="${hadFocus}"]`);
+      if (again && !again.disabled) again.focus({ preventScroll: true });
+    }
+  }
+
+  function buildWorkbench() {
     wbSlot.textContent = "";
+    // Busy is aria-disabled rather than disabled: a disabled button drops
+    // focus to the page, and the verb that made it busy is about to open a
+    // dialog that hands focus back here. A second press is a no-op anyway,
+    // since every verb goes through wbGuard.
+    wbSlot.classList.toggle("busy", busyNow());
+    wbSlot.setAttribute("aria-busy", String(busyNow()));
     const wb = detail.workbench;
     const starting = wbStarting.get(taskId);
     const btn = (label, cls, run, title) => {
-      const b = el("button", { className: `btn sm ${cls}`.trim(), textContent: label, type: "button", disabled: wbBusy });
+      const b = el("button", { className: `btn sm ${cls}`.trim(), textContent: label, type: "button" });
+      b.dataset.act = label;
       if (title) b.title = title;
       b.onclick = run;
       return b;
@@ -7929,7 +8058,8 @@ async function openTaskSheet(taskId) {
     const parked = wb.state === "parked";
     const tone = parked ? "" : "primary";
     const open = btn("Open", tone, () => wbOpen(wb, "editor"), "Open in your editor");
-    const caret = el("button", { className: `btn sm ${tone}`.trim(), type: "button", title: "Editor, Terminal or Folder", disabled: wbBusy });
+    const caret = el("button", { className: `btn sm ${tone}`.trim(), type: "button", title: "Editor, Terminal or Folder" });
+    caret.dataset.act = "open-in";
     caret.setAttribute("aria-haspopup", "menu");
     caret.setAttribute("aria-expanded", "false");
     caret.setAttribute("aria-label", "Open in");
@@ -7941,7 +8071,7 @@ async function openTaskSheet(taskId) {
         wbMenuItem("Editor", "code", () => wbOpen(wb, "editor")),
         wbMenuItem("Terminal", "Terminal", () => wbOpen(wb, "terminal")),
         wbMenuItem("Folder", mac ? "Finder" : "files", () => wbOpen(wb, "folder")),
-      ]);
+      ], e.detail === 0);
     };
     const split = el("span", { className: "wb-split" }, open, caret);
 
@@ -7951,16 +8081,12 @@ async function openTaskSheet(taskId) {
         flash("resumed");
       })), split);
     } else {
-      wbSlot.append(split, btn("Finish", "", () => {
-        if (wbBusy) return;
-        wbBusy = true;
-        paintWorkbench();
-        finishWorkbench(wb.id, taskId, { title: detail.task.title, after: reload })
-          .finally(async () => { wbBusy = false; await wbAfter(); });
-      }, "Save, share and put the folder away. The branch is kept."));
+      wbSlot.append(split, btn("Finish", "", () => finishWorkbench(wb.id, taskId, { title: detail.task.title, after: reload }),
+        "Save, share and put the folder away. The branch is kept."));
     }
 
-    const more = el("button", { className: "icon-btn", type: "button", title: "More", disabled: wbBusy });
+    const more = el("button", { className: "icon-btn", type: "button", title: "More" });
+    more.dataset.act = "more";
     more.setAttribute("aria-haspopup", "menu");
     more.setAttribute("aria-expanded", "false");
     more.setAttribute("aria-label", "More Workbench actions");
@@ -7981,7 +8107,7 @@ async function openTaskSheet(taskId) {
         }),
         "-",
         wbMenuItem("Discard...", null, () => discardWorkbench(wb.id, taskId, { after: wbAfter }), true),
-      ]);
+      ], e.detail === 0);
     };
     wbSlot.append(more);
   }
@@ -7991,9 +8117,16 @@ async function openTaskSheet(taskId) {
    * branch and folder, and the git commands each button stands for. Only from
    * More, never in the way.
    */
+  let advSig = null;
   function paintAdvanced() {
-    advHost.textContent = "";
     const wb = detail.workbench;
+    // Redrawn only when what it shows changes, so a refresh keeps focus on a
+    // copy button and never reopens a section the person collapsed.
+    const st1 = (wb && wb.status) || {};
+    const sig = JSON.stringify([wbAdv, wb ? wb.id : null, st1.state, st1.message, st1.words, st1.operation]);
+    if (sig === advSig) return;
+    advSig = sig;
+    advHost.textContent = "";
     // The module's explanation, where it can be read, when the folder is
     // unreadable or stopped in the middle of something.
     const st = (wb && wb.status) || {};
@@ -8014,7 +8147,8 @@ async function openTaskSheet(taskId) {
       };
       return b;
     };
-    const adv = el("details", { className: "wb-adv", open: true });
+    const adv = el("details", { className: "wb-adv", open: wbAdvOpen });
+    adv.addEventListener("toggle", () => { wbAdvOpen = adv.open; });
     const tw = el("span", { className: "tw", textContent: "▶" });
     tw.setAttribute("aria-hidden", "true");
     adv.append(el("summary", {}, tw, "Workbench, advanced", el("span", { className: "grow" }),
@@ -8534,7 +8668,13 @@ async function openTaskSheet(taskId) {
       const code = meta.code === null || meta.code === undefined ? "" : `:${meta.code}`;
       line.append(el("span", { className: `ts-run-state ${state}`, textContent: state === "fail" ? `fail${code}` : state }));
     }
-    if (state === "running") line.append(el("span", { textContent: `${elapsed(entry.created_at)} so far` }));
+    if (state === "running") {
+      // Ticked in place by the rail clock, never by rebuilding the row: a
+      // rebuild a second would swallow a click on Stop and drop a selection.
+      const clock = el("span", { className: "ts-run-clock", textContent: `${elapsed(entry.created_at)} so far` });
+      clock.dataset.from = String(entry.created_at);
+      line.append(clock);
+    }
     // Only a run this window started can be stopped from it: the main process
     // holds its process group, and nobody else's run is this window's to end.
     const live = state === "running" ? runBuffers.get(entry.id) || null : null;
@@ -8776,7 +8916,7 @@ async function openTaskSheet(taskId) {
       // Everything a row draws from, so an unchanged row is never rebuilt.
       // The time words are in it, which is what keeps "5m ago" honest.
       const sig = JSON.stringify([entry, ledgerIds.has(entry.id), answer ? [answer.id, answer.body, answer.meta, answer.author, gap(answer.created_at)] : null,
-        gap(entry.created_at), isRunning(entry) ? elapsed(entry.created_at) : null, outputOpen.has(entry.id),
+        isRunning(entry) ? "now" : gap(entry.created_at), outputOpen.has(entry.id),
         runBuffers.has(entry.id), runKills.get(entry.id) || 0, outputText.get(entry.id) || null,
         entry.ref_id ? (entryById(entry.ref_id) || {}).body : null, detail.project ? detail.project.name : null]);
       const cached = rowCache.get(entry.id);
@@ -8818,15 +8958,19 @@ async function openTaskSheet(taskId) {
     railPainted = true;
   }
 
-  // The rail's clocks. A running entry's elapsed time ticks every second;
-  // otherwise "5m ago" only needs keeping honest, once a minute. The repaint
-  // is the reconciling one, so a tick rebuilds the rows whose words changed
-  // and nothing else.
+  // The rail's clocks. A running entry's elapsed time ticks every second,
+  // written into its own text node; "5m ago" only needs keeping honest once
+  // a minute, by the reconciling repaint, which rebuilds only the rows whose
+  // words changed.
   let tickCount = 0;
   const railClock = setInterval(() => {
     if (!overlay.isConnected) { clearInterval(railClock); return; }
     tickCount += 1;
-    if (detail.comments.some(isRunning) || tickCount % 60 === 0) paintRail();
+    for (const clock of railList.querySelectorAll(".ts-run-clock")) {
+      const text = `${elapsed(clock.dataset.from)} so far`;
+      if (clock.firstChild && clock.firstChild.data !== text) clock.firstChild.data = text;
+    }
+    if (tickCount % 60 === 0) paintRail();
   }, 1000);
 
   // --- composer ---
@@ -8876,12 +9020,18 @@ async function openTaskSheet(taskId) {
     composerKind.append(el("span", { className: "ts-sigil", textContent: SIGILS[c.kind] }), error || c.say);
     composer.classList.toggle("mono-in", c.kind === "run");
     send.textContent = c.label;
-    send.disabled = !c.ok;
+    send.disabled = !c.ok || sending;
   }
 
+  // Set from the moment a send starts until it has landed, so Enter held
+  // down or a double click cannot post twice or run a command twice.
+  let sending = false;
   const post = async () => {
+    if (sending) return;
     const c = composed();
     if (!c.ok) return;
+    sending = true;
+    send.disabled = true;
     try {
       if (c.kind === "run") {
         // Resolves once the command has started, or been refused by the
@@ -8895,9 +9045,11 @@ async function openTaskSheet(taskId) {
       } else if (c.kind === "ask") await window.delphi.sheets.ask(taskId, c.question, c.options);
       else await window.delphi.sheets.append(taskId, { kind: c.kind, body: c.body });
     } catch (error) {
+      sending = false;
       senseComposer(String(error.message || error));
       return;
     }
+    sending = false;
     composer.value = "";
     senseComposer();
     detail = await window.delphi.tasks.detail(taskId) || detail;
@@ -8985,6 +9137,7 @@ async function openTaskSheet(taskId) {
   overlay.onclick = (e) => { if (e.target === overlay) closeSheet(); };
   const handle = {
     overlay, close: closeSheet, live, taskId,
+    wbRepaint: () => paintWorkbench(),
     // A Start phase for this task: redraw the chip, and once it is over, the
     // whole panel, since the Workbench row now exists.
     wbEvent: (e) => { paintWorkbench(); if (e.phase === "ready" || e.phase === "failed") reload(); },
@@ -10473,6 +10626,11 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
+  if (e.key === "Escape" && openMenu) {
+    // A menu is innermost of all: Escape closes it and nothing behind it.
+    closeRowMenu();
+    return;
+  }
   if (e.key === "Escape") {
     // The sheet is the innermost thing open, so it closes first. Without this,
     // Escape would hide the whole window and lose unsaved edits.
