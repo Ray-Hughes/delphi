@@ -7319,7 +7319,8 @@ async function finishFlow(wbId, taskId, { title = "", after = null } = {}) {
         confirm = error.details.confirm;
       }
     }
-    notify(`Finished. The folder is gone and the branch ${r.branch} is kept.${keptWords(r)}`);
+    notify(`Finished. The folder is gone and the branch ${r.branch} is kept.${keptWords(r)}${cleanupWords(r)}`);
+    noticeKept(r);
     await done();
 
     if (r.taskStatus === "doing") {
@@ -7334,7 +7335,8 @@ async function finishFlow(wbId, taskId, { title = "", after = null } = {}) {
       }
     }
   } catch (error) {
-    notifyError(error);
+    if (error.code === "BUSY") await showBusy(taskId, error);
+    else notifyError(error);
     await done();
   }
 }
@@ -7348,6 +7350,79 @@ function keptWords(r) {
   if (!r || !r.recover) return "";
   const until = r.until || (/until (\S+)/.exec(r.recover) || [])[1];
   return ` A copy is kept${until ? ` until ${until}` : ""}; the Sheet says how to get it back.`;
+}
+
+/** The old folder is emptied in the background; said in passing, never waited on. */
+function cleanupWords(r) {
+  return r && r.cleanup && r.cleanup.pending ? " Removing the old folder in the background." : "";
+}
+
+/**
+ * Something changed in the old folder after the copy was made, so it was
+ * kept rather than deleted. Not an error, nothing was lost, but it is a
+ * folder the person now has to look through, so it gets its own dialog
+ * with where it is. The Sheet has the module's note too.
+ */
+function noticeKept(r) {
+  const c = r && r.cleanup;
+  if (!c || !c.kept) return;
+  const changed = Array.isArray(c.changed) ? c.changed : [];
+  wbDialog({
+    title: "The old folder was kept",
+    lead: `${changed.length ? `${changed.length === 1 ? "A file" : "Some files"} changed after the copy was made` : "Something changed after the copy was made"}, so the folder was not deleted. Look through it, then delete it yourself.`,
+    body: [
+      el("p", { className: "wb-lead" }, "It is at ", el("span", { className: "mono", textContent: String(c.kept) })),
+      changed.length ? el("div", { className: "grp" }, el("div", { className: "grp-h" }, "Changed after the copy"),
+        wbList(changed, (f) => el("span", { className: "mono", textContent: f }))) : null,
+    ],
+    actions: [{ label: "OK", value: null, kind: "primary" }],
+  });
+}
+
+/**
+ * BUSY because something is running in the folder: the module's sentence,
+ * and each thing it names. A `$` run on this task can be shown or stopped
+ * from here; anything else (an agent's claim, another task's run) is
+ * listed so the person knows what to wait for.
+ */
+async function showBusy(taskId, error) {
+  const running = (error.details && Array.isArray(error.details.running)) ? error.details.running : [];
+  if (!running.length) { notifyError(error); return; }
+  let mine = new Set();
+  try {
+    const d = await window.delphi.tasks.detail(taskId);
+    mine = new Set(((d && d.comments) || []).filter(isRunning).map((c) => c.id));
+  } catch {}
+  let jump = null;
+  const rows = running.map((text) => {
+    const m = /\(entry (\d+)\)\s*$/.exec(String(text));
+    const id = m ? Number(m[1]) : null;
+    const li = el("li", {}, el("span", { className: "mono", textContent: String(text) }));
+    if (id != null && mine.has(id)) {
+      const show = el("button", { className: "ts-linkbtn", type: "button", textContent: "Show" });
+      show.onclick = () => { jump = id; li.closest(".wb-dialog").querySelector(".ask-actions .btn").click(); };
+      const stop = el("button", { className: "ts-linkbtn ts-stop", type: "button", textContent: "Stop" });
+      stop.onclick = async () => {
+        try {
+          await window.delphi.sheets.interrupt(id);
+          stop.textContent = "Stopping";
+          stop.disabled = true;
+        } catch (e) { notifyError(e); }
+      };
+      li.append(el("span", { className: "wb-li-acts" }, show, stop));
+    }
+    return li;
+  });
+  await wbDialog({
+    title: "Something is still running in the folder",
+    lead: error.message,
+    body: [el("div", { className: "grp" }, el("ul", {}, rows))],
+    actions: [{ label: "OK", value: null, kind: "primary" }],
+  });
+  if (jump != null) {
+    if (!(openSheet && openSheet.taskId === Number(taskId))) await openTaskSheet(taskId);
+    if (openSheet && openSheet.showEntry) openSheet.showEntry(jump);
+  }
 }
 
 /** A byte count as a person reads it. */
@@ -7507,8 +7582,10 @@ async function discardFlow(wbId, taskId, { after = null } = {}) {
   try {
     const r = await window.delphi.workbench.discard(wbId, input.value, plan.confirm ? { confirm: plan.confirm } : {});
     // The Sheet has the same sentence, from the module's own note.
-    notify(`Discarded.${keptWords(r)}`);
+    notify(`Discarded.${keptWords(r)}${cleanupWords(r)}`);
+    noticeKept(r);
   } catch (error) {
+    if (error.code === "BUSY") { await showBusy(taskId, error); if (after) await after(); return; }
     // The folder changed since the plan was read, so what was agreed to is
     // not what is there. Said, then asked again from a fresh plan.
     notifyError(error);
@@ -9167,6 +9244,17 @@ async function openTaskSheet(taskId) {
   const handle = {
     overlay, close: closeSheet, live, taskId,
     wbRepaint: () => paintWorkbench(),
+    // From a BUSY refusal: bring a running entry into view with its output open.
+    showEntry: (id) => {
+      outputOpen.add(id);
+      paintRail();
+      const row = railList.querySelector(`.ts-entry[data-id="${id}"]`);
+      if (!row) return;
+      row.scrollIntoView({ block: "center", behavior: motionOff() ? "auto" : "smooth" });
+      row.classList.add("flash");
+      setTimeout(() => row.classList.remove("flash"), 1400);
+      row.querySelector("[data-act=stop], button")?.focus({ preventScroll: true });
+    },
     // A Start phase for this task: redraw the chip, and once it is over, the
     // whole panel, since the Workbench row now exists.
     wbEvent: (e) => { paintWorkbench(); if (e.phase === "ready" || e.phase === "failed") reload(); },
