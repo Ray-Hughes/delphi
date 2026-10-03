@@ -7022,7 +7022,24 @@ function notify(text, { error = false } = {}) {
   const ms = Math.min(14000, 3000 + words.length * 45);
   toastTimer = setTimeout(() => toast.remove(), ms);
 }
-const notifyError = (error) => notify(error, { error: true });
+const notifyError = (error) => {
+  // A CLOSING refusal that has gone on for minutes is probably an interrupted
+  // Finish or Discard, and the Sheet's note says where the folder went.
+  const closing = error && error.code === "CLOSING" && error.details ? error.details.closing : null;
+  const hint = closing && closingLong(closing) ? " The Sheet says where the folder is." : "";
+  notify(`${error && error.message ? error.message : error}${hint}`, { error: true });
+};
+
+// Long enough that a Finish or Discard is not just slow but was interrupted.
+const CLOSING_LONG_MS = 3 * 60 * 1000;
+
+/** Whether a closing began more than a few minutes ago. at is SQLite's UTC "YYYY-MM-DD HH:MM:SS". */
+function closingLong(closing) {
+  if (!closing || !closing.at) return false;
+  const text = String(closing.at);
+  const at = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(text) ? text : text.replace(" ", "T") + "Z");
+  return Number.isFinite(at) && Date.now() - at > CLOSING_LONG_MS;
+}
 
 
 /**
@@ -7129,6 +7146,9 @@ function wbLook(wb) {
   // A folder that is there but cannot be read: drawn like Missing, in the
   // module's own words, because Finish and Discard both refuse it. Asked
   // first, since the folder decides and not the row.
+  // Mid Finish or Discard, or interrupted in one: nothing may be done to it
+  // until that ends, so it is drawn plainly and offers nothing.
+  if (wb.state === "closing" || st.state === "closing") return { cls: "closing", words: "Being put away", closing: wb.closing || st.closing || null };
   if (st.state === "unreadable") return { cls: "missing", words: st.words || "Unreadable", unreadable: true };
   if (wb.state === "missing" || st.state === "missing") return { cls: "missing", words: "Missing" };
   if (wb.state === "parked") return { cls: "parked", words: "Parked" };
@@ -7147,15 +7167,20 @@ function wbChip(wb, onUpdate) {
   // out again on hover and on each refresh, so "Checked 4s ago" stays true
   // without the chip being rebuilt; wbTitle takes the newest status.
   let latest = st;
+  const closing = wbLook(wb).closing;
   chip.wbTitle = (next) => {
     if (next) latest = next;
+    if (cls === "closing") {
+      chip.title = `A ${closing ? closing.mode : "Finish or Discard"} is in progress${closing && closing.actor ? `, begun by ${closing.actor}` : ""}.${closingLong(closing) ? " The Sheet says where the folder is." : ""}`;
+      return;
+    }
     const checked = latest.checkedAt ? `Checked ${agoWords(latest.checkedAt)}` : "";
     chip.title = (cls === "parked" || cls === "missing") && latest.words && latest.words !== words ? `${latest.words}. ${checked}`
       : latest.message ? `${latest.message} ${checked}` : `${words}. ${checked}`;
   };
   chip.wbTitle();
   chip.addEventListener("mouseenter", () => chip.wbTitle());
-  if (onUpdate && st.behind > 0 && cls !== "parked" && cls !== "missing") {
+  if (onUpdate && st.behind > 0 && cls !== "parked" && cls !== "missing" && cls !== "closing") {
     const act = el("button", { className: "wb-act", textContent: "Update", type: "button" });
     act.title = `Bring in the latest ${st.base || wb.base}`;
     act.onclick = (e) => { e.stopPropagation(); onUpdate(act); };
@@ -8136,6 +8161,10 @@ async function openTaskSheet(taskId) {
     if (busyNow()) chip.querySelector(".wb-act")?.setAttribute("aria-disabled", "true");
     wbSlot.append(chip);
 
+    if (look.cls === "closing") {
+      if (closingLong(look.closing)) wbSlot.append(el("span", { className: "hint", textContent: "The Sheet says where the folder is" }));
+      return;
+    }
     if (look.unreadable) {
       // No Recreate, Finish or Discard: the folder is there and may be full
       // of work. Opening it is the one useful thing, and the banner says why.
@@ -8229,7 +8258,7 @@ async function openTaskSheet(taskId) {
     // Redrawn only when what it shows changes, so a refresh keeps focus on a
     // copy button and never reopens a section the person collapsed.
     const st1 = (wb && wb.status) || {};
-    const sig = JSON.stringify([wbAdv, wb ? wb.id : null, st1.state, st1.message, st1.words, st1.operation]);
+    const sig = JSON.stringify([wbAdv, wb ? wb.id : null, st1.state, st1.message, st1.words, st1.operation, wb ? wb.closing : null]);
     if (sig === advSig) return;
     advSig = sig;
     advHost.textContent = "";
@@ -8238,6 +8267,20 @@ async function openTaskSheet(taskId) {
     const st = (wb && wb.status) || {};
     if (st.state === "unreadable" && st.message) {
       advHost.append(el("div", { className: "wb-banner err", role: "status", textContent: st.message }));
+    } else if (wb && (wb.state === "closing" || st.state === "closing")) {
+      // Shown without asking, since More is not offered while it lasts.
+      const c = wb.closing || st.closing || {};
+      const grid = el("div", { className: "wb-adv-grid" });
+      for (const [k, v] of [["Doing", c.mode === "discard" ? "Discard" : c.mode === "finish" ? "Finish" : ""],
+        ["Begun by", c.actor || ""], ["At", c.at ? `${c.at} UTC` : ""], ["Folder now at", c.trash || ""], ["Copy", c.ref || ""]]) {
+        if (v) grid.append(el("span", { className: "k", textContent: k }), el("span", { className: "v", textContent: v }), el("span"));
+      }
+      advHost.append(el("div", { className: "wb-adv wb-closing" },
+        el("div", { className: "wb-adv-body", style: "padding-top:var(--s3)" },
+          el("p", { className: "wb-lead", textContent: closingLong(c)
+            ? "Being put away for a while now, so it was probably interrupted. Housekeeping finishes or undoes it; the Sheet says where the folder is."
+            : "Being put away. Nothing can be done to it until that ends." }),
+          grid)));
     } else if (st.state === "busy" && st.operation) {
       advHost.append(el("div", { className: "wb-banner", role: "status",
         textContent: `${st.words}. Finish and Update wait until it is finished or stopped in the folder.` }));
