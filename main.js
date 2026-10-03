@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage, nativeTheme, Notification, dialog, safeStorage } = require("electron");
+const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage, nativeTheme, Notification, dialog, safeStorage, clipboard } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
@@ -721,7 +721,12 @@ function checkForExternalWrites() {
       // Codex" into Codex actually starting, within seconds rather than at the
       // next sweep.
       dispatchHandoffs();
-      if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
+      if (win && !win.isDestroyed()) {
+        win.webContents.send("alerts-changed");
+        // So an open task panel shows an agent's Sheet entries as they land,
+        // rather than when the person next clicks something.
+        win.webContents.send("db-changed");
+      }
     }
   } catch (error) {
     console.error("could not check the database for external writes", error);
@@ -843,6 +848,91 @@ handle("tasks:comment", (taskId, body, author) => {
   return r;
 });
 handle("tasks:uncomment", (id) => db.deleteComment(id));
+
+// ---------------------------------------------------------------------------
+// The Sheet. The same store the MCP server uses, handed db.sqlP, so an entry
+// written here obeys exactly the rules one written by an agent does. Nothing
+// here takes an author from the renderer: the app's writes are the person's.
+
+const { makeSheetStore } = require("./sheet/store");
+const sheetFormat = require("./sheet/format");
+const sheetRun = require("./sheet/run");
+const sheets = makeSheetStore({ sql: db.sqlP, actor: "you", authorType: "human" });
+const SHEET_LOG_DIR = path.join(paths.DATA_DIR, "sheets");
+// The tail of a log the rail will show. A build log can be hundreds of
+// megabytes, and the end is where the error is.
+const SHEET_LOG_LIMIT = 200 * 1024;
+
+/**
+ * An entry's log, read from where this app would have written it rather than
+ * from meta.log. meta is written by agents, and a path taken from it would let
+ * any of them have the window display an arbitrary file.
+ */
+function readSheetLog(entry) {
+  const file = sheetRun.logPathFor(SHEET_LOG_DIR, entry.task_id, entry.id);
+  let size;
+  try { size = fs.statSync(file).size; } catch { return { path: null, text: (entry.meta && entry.meta.out) || "", truncated: false }; }
+  const start = Math.max(0, size - SHEET_LOG_LIMIT);
+  const buffer = Buffer.alloc(size - start);
+  const fd = fs.openSync(file, "r");
+  try { fs.readSync(fd, buffer, 0, buffer.length, start); } finally { fs.closeSync(fd); }
+  return { path: file, text: sheetFormat.stripAnsi(buffer.toString("utf8")), truncated: start > 0 };
+}
+
+/**
+ * What copying one entry gives: its source, not its formatted line, so a
+ * pasted reply is byte for byte what was said. The command for a run, with
+ * its output after it when asked for.
+ */
+function entryCopyText(entry, { withOutput = false } = {}) {
+  if (entry.kind === "ask") {
+    const options = (entry.meta && Array.isArray(entry.meta.options)) ? entry.meta.options : [];
+    return [entry.body, ...options.map((o) => `[${o.key}] ${o.label}`)].join("\n");
+  }
+  if (entry.kind === "run" && withOutput) {
+    const output = sheetFormat.normaliseBody(readSheetLog(entry).text);
+    return output ? `${entry.body}\n${output}` : entry.body;
+  }
+  return entry.body;
+}
+
+handle("sheet:read", (taskId, opts = {}) => {
+  const mode = (opts && opts.mode) || "full";
+  const read = sheets.read(taskId, { mode, n: opts && opts.n });
+  const header = sheets.header(taskId);
+  return {
+    task: { id: header.task, title: header.title, status: header.status, project: header.project },
+    entries: read.entries,
+    text: sheetFormat.format({ header, entries: read.entries }, { clean: true }),
+    ledger_count: read.ledger_count,
+    total: read.total,
+    cursor: read.cursor,
+  };
+});
+handle("sheet:append", (taskId, payload = {}) => {
+  const kind = (payload && payload.kind) || "say";
+  // A run entry written without running anything would be a record of
+  // something that never happened.
+  if (kind !== "say" && kind !== "note") throw new Error("The app writes say and note entries here. Use sheets.ask for a question.");
+  const r = sheets.append({ taskId, kind, body: payload.body, refId: payload.refId ?? null, promote: payload.promote === true });
+  scheduleVaultExport();
+  return r;
+});
+handle("sheet:promote", (id, on) => { const r = sheets.promote(id, on !== false); scheduleVaultExport(); return r; });
+handle("sheet:file", (id, kind, title) => { const r = sheets.file(id, kind, title || null); scheduleVaultExport(); return r; });
+handle("sheet:ask", (taskId, question, options) => { const r = sheets.ask(taskId, question, options); scheduleVaultExport(); return r; });
+handle("sheet:decide", (askId, choice, why) => { const r = sheets.decide(askId, choice, why || null); scheduleVaultExport(); return r; });
+handle("sheet:log", (id) => readSheetLog(sheets.get(id)));
+handle("sheet:copy", (id, opts = {}) => {
+  const text = entryCopyText(sheets.get(id), opts || {});
+  clipboard.writeText(text);
+  return text;
+});
+handle("sheet:copyAll", (taskId, opts = {}) => {
+  const text = sheetFormat.format(sheets.sheet(taskId, { mode: opts && opts.ledger ? "ledger" : "full" }), { clean: true });
+  clipboard.writeText(text);
+  return text;
+});
 
 handle("notes:list", (projectId) => db.listNotes(projectId));
 handle("notes:create", (payload) => { const r = db.createNote(payload); scheduleVaultExport(); return r; });

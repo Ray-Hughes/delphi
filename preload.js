@@ -31,6 +31,19 @@ contextBridge.exposeInMainWorld("delphi", {
     comment: (id, body, author) => call("tasks:comment", id, body, author),
     uncomment: (id) => call("tasks:uncomment", id),
   },
+  // A task's Sheet: its comments, each with a kind. Entries come back in one
+  // shape whichever side wrote them; see sheet/store.js toEntry.
+  sheets: {
+    read: (taskId, opts) => call("sheet:read", taskId, opts),
+    append: (taskId, payload) => call("sheet:append", taskId, payload),
+    promote: (id, on) => call("sheet:promote", id, on),
+    file: (id, kind, title) => call("sheet:file", id, kind, title),
+    ask: (taskId, question, options) => call("sheet:ask", taskId, question, options),
+    decide: (askId, choice, why) => call("sheet:decide", askId, choice, why),
+    log: (id) => call("sheet:log", id),
+    copy: (id, opts) => call("sheet:copy", id, opts),
+    copyAll: (taskId, opts) => call("sheet:copyAll", taskId, opts),
+  },
   notes: {
     list: (projectId) => call("notes:list", projectId),
     create: (payload) => call("notes:create", payload),
@@ -173,6 +186,8 @@ contextBridge.exposeInMainWorld("delphi", {
   onShown: (fn) => ipcRenderer.on("shown", fn),
   onMode: (fn) => ipcRenderer.on("mode", (_e, payload) => fn(payload)),
   onAlertsChanged: (fn) => ipcRenderer.on("alerts-changed", fn),
+  // Another process (an agent, the command line) wrote to the database.
+  onDbChanged: (fn) => ipcRenderer.on("db-changed", () => fn()),
   onFocusTask: (fn) => ipcRenderer.on("focus-task", (_e, payload) => fn(payload)),
   // A reply and command output both arrive a piece at a time, because the
   // renderer can neither make the request nor spawn the process. Register these

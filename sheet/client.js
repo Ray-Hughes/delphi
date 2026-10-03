@@ -39,15 +39,31 @@ function openServer({
   verbose = false,
   log = () => {},
   warn = console.error,
+  // Its own process group. The command line asks for this so that Ctrl-C at
+  // the terminal reaches only the command it is running, and the server stays
+  // up long enough to record that the command was interrupted. The server
+  // still exits when this process does, because its stdin closes.
+  detached = false,
+  // How long one request may take, in milliseconds, before it is given up on.
+  // Off by default, because some tools wait on purpose (a queue poll, a
+  // Workbench fetch over a slow link). The command line turns it on: a person
+  // at a terminal is better told the server stopped answering than left
+  // staring at nothing.
+  timeoutMs = 0,
 } = {}) {
   if (!fs.existsSync(server)) {
     throw new Error(`No MCP server at ${server}. Pass --server or set DELPHI_MCP_SERVER.`);
   }
   const childEnv = { ...process.env, DELPHI_CLIENT: clientName, ...env };
+  // Under Electron, process.execPath is the app. Without this the default
+  // command opens a window instead of running the server, and only clients
+  // that happened to inherit the variable worked.
+  if (process.versions.electron && command === process.execPath) childEnv.ELECTRON_RUN_AS_NODE = "1";
   if (actor !== undefined && actor !== null) childEnv.DELPHI_ACTOR = actor;
   const child = spawn(command, [server], {
     stdio: ["pipe", "pipe", "pipe"],
     env: childEnv,
+    detached,
   });
 
   const pending = new Map();
@@ -68,6 +84,7 @@ function openServer({
       const waiter = pending.get(message.id);
       if (!waiter) continue;
       pending.delete(message.id);
+      clearTimeout(waiter.timer);
       if (message.error) waiter.reject(new Error(message.error.message || "MCP error"));
       else waiter.resolve(message.result);
     }
@@ -78,20 +95,32 @@ function openServer({
 
   const fail = (reason) => {
     dead = dead || new Error(reason);
-    for (const waiter of pending.values()) waiter.reject(dead);
+    for (const waiter of pending.values()) { clearTimeout(waiter.timer); waiter.reject(dead); }
     pending.clear();
   };
   child.on("error", (error) => fail(`MCP server could not start: ${error.message}`));
-  child.on("exit", (code, signal) => fail(`MCP server exited (${signal || code})`));
+  // close rather than exit: exit can fire while the last answer is still in
+  // the stdout pipe, and rejecting then loses a reply that was sent. close
+  // waits for stdout to drain, so every answer is read before anything fails.
+  child.on("close", (code, signal) => fail(`MCP server exited (${signal || code})`));
   // A server that died between requests closes the pipe under us. Without a
   // listener that is an unhandled error event and takes the client down with it,
   // rather than failing the one request that hit it.
   child.stdin.on("error", (error) => fail(`MCP server stopped reading: ${error.message}`));
 
-  const request = (method, params) => new Promise((resolve, reject) => {
+  const request = (method, params, { timeoutMs: limit = timeoutMs } = {}) => new Promise((resolve, reject) => {
     if (dead) return reject(dead);
     const id = nextId++;
-    pending.set(id, { resolve, reject });
+    const waiter = { resolve, reject, timer: null };
+    if (limit > 0) {
+      waiter.timer = setTimeout(() => {
+        // A late answer to this id is then ignored, which is all a timeout can
+        // promise: the server may still have done the work.
+        pending.delete(id);
+        reject(new Error(`The MCP server did not answer ${method}${params && params.name ? ` (${params.name})` : ""} within ${limit / 1000}s.`));
+      }, limit);
+    }
+    pending.set(id, waiter);
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
   });
 
@@ -100,9 +129,9 @@ function openServer({
       return request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: clientName, version: "1" } });
     },
     /** Calls a tool and unwraps the JSON the server packs into its text content. */
-    async call(tool, args = {}) {
+    async call(tool, args = {}, options = {}) {
       if (verbose) log(`mcp ${tool}`, JSON.stringify(args));
-      const result = await request("tools/call", { name: tool, arguments: args });
+      const result = await request("tools/call", { name: tool, arguments: args }, options);
       const text = result && result.content && result.content[0] && result.content[0].text;
       if (typeof text !== "string") return null;
       try { return JSON.parse(text); } catch { return text; }

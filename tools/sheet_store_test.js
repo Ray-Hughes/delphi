@@ -93,6 +93,11 @@ const twinA = db.createTask({ projectId: project.id, title: "twin a", ref: "DUP-
 const twinB = db.createTask({ projectId: project.id, title: "twin b", ref: "dup-1" });
 const orphan = db.createTask({ title: "no project" });
 
+section("placeholder counts");
+throws("sqlP refuses a placeholder with no value", () => db.sqlP("SELECT :p1 AS a, :p2 AS b", [1]), /:p2 has no value/);
+throws("sqlP refuses a spare value", () => db.sqlP("SELECT :p1 AS a", [1, 2]), /2 values given for 1 placeholders/);
+check("sqlP binds a repeated placeholder", db.sqlP("SELECT :p1 AS a, :p1 AS b", [7]), [{ a: 7, b: 7 }]);
+
 const shapes = {};
 
 for (const [route, sql] of [["sqlP", db.sqlP], ["sqlite3 binary", binarySql]]) {
@@ -175,10 +180,31 @@ for (const [route, sql] of [["sqlP", db.sqlP], ["sqlite3 binary", binarySql]]) {
   throws("a choice that is not offered", () => store.decide(ask.id, "c"), /Choose one of a, b/);
   throws("deciding something that is not a question", () => store.decide(say.id, "a"), /not a question/);
 
+  throws("append refuses an ask", () => store.append({ taskId: task.id, kind: "ask", body: "q" }), /Use ask\(\)/);
+  throws("append refuses a decide", () => store.append({ taskId: task.id, kind: "decide", body: "a" }), /Use decide\(\)/);
+  throws("an ask edited to two lines", () => store.update(ask.id, { body: "q\nmore" }), /one line/);
+  throws("an ask edited to hold the option marker", () => store.update(ask.id, { body: "x: [a] y" }), /cannot contain/);
+  throws("an ask's options cannot change", () => store.update(ask.id, { meta: { options: [] } }), /cannot change/);
+  check("an ask's question can be reworded", store.update(ask.id, { body: "retry strategy" }).body, "retry strategy");
+  throws("a decide's choice cannot change", () => store.update(decision.id, { meta: { choice: "b" } }), /cannot change/);
+  check("only the why of a decide is editable",
+        store.update(decision.id, { body: "b\nbecause" }).body, "a\nb\nbecause");
+  check("restating the choice keeps it once",
+        store.update(decision.id, { body: "a\nsimpler to reason about" }).body, "a\nsimpler to reason about");
+
   const ledger = store.ledger(task.id);
   check("the ledger is promoted entries plus the question a decision answers",
         ledger.map((e) => e.id), [kept.id, ask.id, decision.id]);
   check("entries in ledger mode agree", store.entries(task.id, { mode: "ledger" }).map((e) => e.id), ledger.map((e) => e.id));
+  // The spec: "plus every resolved decision". Unpromoting a decision does not
+  // take it, or its question, out of the ledger.
+  store.promote(decision.id, false);
+  check("an unpromoted decision stays in the ledger, with its question",
+        store.ledger(task.id).map((e) => e.id), [kept.id, ask.id, decision.id]);
+  check("in ledger mode too", store.entries(task.id, { mode: "ledger" }).map((e) => e.id), [kept.id, ask.id, decision.id]);
+  check("and in what an agent is handed", [ask.id, decision.id].every((id) => store.context(task.id).entries.some((e) => e.id === id)), true);
+  check("and in ledger_count", store.read(task.id).ledger_count, 3);
+  store.promote(decision.id, true);
 
   section(`${route}: filing`);
 
@@ -261,6 +287,11 @@ for (const [route, sql] of [["sqlP", db.sqlP], ["sqlite3 binary", binarySql]]) {
     `update task promoted entry ${kept.id} (by claude-code:7)`,
     'update task asked "retry strategy" (by claude-code:7)',
     `update task decided a on ${ask.id} (by claude-code:7)`,
+    `update task edited entry ${ask.id} (by claude-code:7)`,
+    `update task edited entry ${decision.id} (by claude-code:7)`,
+    `update task edited entry ${decision.id} (by claude-code:7)`,
+    `update task unpromoted entry ${decision.id} (by claude-code:7)`,
+    `update task promoted entry ${decision.id} (by claude-code:7)`,
     `update task filed entry ${kept.id} as gotcha (by claude-code:7)`,
     "create note created (by claude-code:7)",
     `update task filed entry ${decision.id} as decision (by claude-code:7)`,

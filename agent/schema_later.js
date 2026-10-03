@@ -155,10 +155,31 @@ function addLaterColumns(query) {
     // No rows means the table does not exist yet, which is a brand new database.
     // schema.sql is about to create it with the column already in place.
     if (!columns.length || columns.includes(column)) continue;
-    query(`ALTER TABLE ${plainName(table)} ADD COLUMN ${column} ${definition}`);
+    alterOrRaced(query, table, column, `ALTER TABLE ${plainName(table)} ADD COLUMN ${column} ${definition}`);
     added.push(`${table}.${column}`);
   }
   return added;
+}
+
+/**
+ * Runs an ALTER that adds a column, and treats "someone else just added it" as
+ * success.
+ *
+ * The app and any number of MCP servers can open one old database at once,
+ * and each looks before it alters. Between the look and the ALTER another
+ * process can win, and the loser gets "duplicate column name". The column is
+ * there, which is all anyone wanted, so the table is read again and only a
+ * column that is still missing counts as a failure. Without this the app
+ * refused to open the database at all.
+ */
+function alterOrRaced(query, table, column, statement) {
+  try {
+    query(statement);
+  } catch (error) {
+    let now = [];
+    try { now = columnsOf(query, table); } catch {}
+    if (!now.includes(column)) throw error;
+  }
 }
 
 /**
@@ -218,7 +239,7 @@ function apply(query) {
     if (!have || have.includes(column)) continue;
     const statement = `ALTER TABLE ${plainName(table)} ADD COLUMN ${column} ${definition}`;
     attempt(statement, () => {
-      query(statement);
+      alterOrRaced(query, table, column, statement);
       have.push(column);
       altered.push([table, column, statement]);
     });

@@ -357,6 +357,32 @@ function openWithApp(dataDir) {
   check("and a third has nothing to do", schemaLater.apply((s) => q(partial, s)),
         { added: [], created: [], indexed: [], errors: [] });
 
+  section("another process adds the column between the look and the ALTER");
+  // The app and several servers can open one old database together. Each
+  // looks, then alters, and the one that loses gets "duplicate column name".
+  // The column is there, so that is success, not a database that will not open.
+  for (const [label, run] of [["apply", (fn) => schemaLater.apply(fn)], ["addLaterColumns", (fn) => schemaLater.addLaterColumns(fn)]]) {
+    const raced = path.join(dir, `raced-${label}`, "delphi.db");
+    freshFixture(raced);
+    let beaten = 0;
+    const racing = (statement) => {
+      if (/^ALTER TABLE \w+ ADD COLUMN/.test(statement)) { q(raced, statement); beaten++; }
+      return q(raced, statement);
+    };
+    let result = null;
+    try { result = run(racing); } catch (error) { result = { threw: error.message }; }
+    check(`${label}: lost every race and still did not fail`, [beaten > 0, result.threw, result.errors || []], [true, undefined, []]);
+    check(`${label}: and every column is there`, NEW_COMMENT_COLUMNS.filter((c) => !columns(raced, "comments").includes(c)), []);
+  }
+  const broken = path.join(dir, "raced-broken", "delphi.db");
+  freshFixture(broken);
+  const refusing = (statement) => {
+    if (/ADD COLUMN kind /.test(statement)) throw new Error("duplicate column name: kind");
+    return q(broken, statement);
+  };
+  check("an ALTER that failed and left the column missing is still an error",
+        schemaLater.apply(refusing).errors.map((e) => e.message), ["duplicate column name: kind"]);
+
   console.log(`\n${checks - failures}/${checks} checks passed`);
   fs.rmSync(dir, { recursive: true, force: true });
   process.exit(failures ? 1 : 0);

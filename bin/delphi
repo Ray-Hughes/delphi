@@ -1,0 +1,363 @@
+#!/usr/bin/env node
+/**
+ * delphi: a task's Sheet from the shell.
+ *
+ * Talks to agent/mcp_server.js over stdio rather than opening the database
+ * itself, for the reasons the queue runner does: the Sheet's rules and the
+ * audit trail live in one place, and this runs under any Node, with or
+ * without node:sqlite. One server per invocation.
+ *
+ * Writes are attributed to DELPHI_ACTOR, which defaults to the OS username, so
+ * History says which person (or which agent, when an agent shells out to this)
+ * did what.
+ *
+ * Output is for two readers. At a terminal it carries the {} metadata, entry
+ * ids above all, because those are what the next command needs. Piped, it is
+ * clean text, so `delphi cat 42 | pbcopy` pastes anywhere without noise.
+ */
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawn } = require("child_process");
+
+// Literal relative paths, so tools/package_test.js can follow them and fail
+// when one is left out of extraResources.
+const { openServer } = require("../sheet/client");
+const fmt = require("../sheet/format");
+const { runEntry, logPathFor } = require("../sheet/run");
+const { splitCommand } = require("../agent/launch");
+
+const HELP = {
+  cat: [
+    "delphi cat <task> [--ledger] [--tail N] [--raw] [--clean]",
+    "Print a task's Sheet. --ledger is only what was promoted; --tail N the last N entries.",
+    "At a terminal the {} metadata (entry ids, run results) is shown; piped, the text is clean.",
+    "--raw forces the metadata on, --clean forces it off.",
+  ],
+  say: ["delphi say <task> \"<text>\"", "Add a remark to a task's Sheet."],
+  note: ["delphi note <task> \"<text>\" [--promote]", "Add a short note. --promote puts it in the ledger the next agent reads first."],
+  run: [
+    "delphi run <task> [--cwd DIR] -- <command...>",
+    "Run a shell command and record it on the Sheet with its result. Everything after -- is the command.",
+    "The guard is asked first, for every command; a refused one is recorded with the reason and never run.",
+    "There is no override. If it genuinely needs doing, run it yourself in a normal terminal.",
+    "Runs in the project's folder unless --cwd says otherwise. Output goes to a log; see delphi out.",
+    "Ctrl-C interrupts the command and records it as fail:130.",
+  ],
+  ask: ["delphi ask <task> \"<question>\" <option> <option> [<option> <option>]", "Ask a question with two to four answers, keyed a to d."],
+  decide: ["delphi decide <entry> <a|b|c|d> [--why \"<text>\"]", "Answer a question. The decision is promoted automatically."],
+  promote: ["delphi promote <entry> [--off]", "Put an entry in its task's ledger, or take it out with --off."],
+  file: [
+    "delphi file <entry> decision|gotcha|reference|note [--title \"<title>\"]",
+    "Turn an entry into a project note, so search and the graph find it from other tasks.",
+  ],
+  out: ["delphi out <entry> [--raw]", "Show a run's full output, through $PAGER at a terminal. Piped, colour codes are stripped unless --raw."],
+  import: [
+    "delphi import <task> <file.sheet> [--clean]",
+    "Append the entries in a Sheet text file to a task. Append only: every entry gets a new id and is",
+    "attributed to you, not to whoever the file says wrote it. --clean reads clean text (a vault file).",
+  ],
+  help: ["delphi help [<command>]", "This, or the detail for one command."],
+};
+
+const TASKS = "A <task> is its id, its legacy id (T-17) or its ticket ref (ABC-1234). An <entry> is an entry id.";
+
+function usage(command) {
+  if (command && HELP[command]) return `${HELP[command].join("\n")}\n`;
+  const lines = ["delphi: a task's Sheet from the shell", ""];
+  for (const key of Object.keys(HELP)) lines.push(`  ${HELP[key][0]}`);
+  lines.push("", TASKS, "Writes are attributed to DELPHI_ACTOR, or your username when it is not set.", "");
+  return lines.join("\n");
+}
+
+// --- arguments -----------------------------------------------------------------
+
+const VALUE_FLAGS = new Set(["--tail", "--cwd", "--why", "--title"]);
+
+function parseArgs(argv) {
+  const positional = [];
+  const flags = {};
+  let rest = null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--") { rest = argv.slice(i + 1); break; }
+    if (arg.startsWith("--") && arg.length > 2) {
+      const eq = arg.indexOf("=");
+      const name = eq > 0 ? arg.slice(0, eq) : arg;
+      if (VALUE_FLAGS.has(name)) {
+        const value = eq > 0 ? arg.slice(eq + 1) : argv[++i];
+        if (value === undefined) throw new Error(`${name} needs a value.`);
+        flags[name.slice(2)] = value;
+      } else {
+        flags[name.slice(2)] = true;
+      }
+      continue;
+    }
+    positional.push(arg);
+  }
+  return { positional, flags, rest };
+}
+
+function need(value, what, command) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    throw new UsageError(`${what} is missing.`, command);
+  }
+  return value;
+}
+
+class UsageError extends Error {
+  constructor(message, command) { super(message); this.command = command; }
+}
+
+function entryId(value, command) {
+  const text = String(need(value, "The entry id", command)).replace(/^#/, "");
+  if (!/^\d+$/.test(text)) throw new UsageError(`An entry is its id, a whole number, not '${value}'.`, command);
+  return Number(text);
+}
+
+// --- output --------------------------------------------------------------------
+
+const tty = Boolean(process.stdout.isTTY);
+
+function say(text) { process.stdout.write(text.endsWith("\n") ? text : `${text}\n`); }
+
+/** A written entry: the formatted line at a terminal, the bare id in a pipe so scripts can capture it. */
+function report(entry) {
+  if (tty) say(fmt.formatEntry(entry));
+  else say(String(entry.id));
+}
+
+// --- the server ----------------------------------------------------------------
+
+function actorEnv() {
+  if (process.env.DELPHI_ACTOR) return { actor: process.env.DELPHI_ACTOR, env: {} };
+  let name = "you";
+  try { name = os.userInfo().username || name; } catch {}
+  // Defaulted to a person's name, so the entry is a person's: the name alone
+  // might match the agent pattern (a user called "bot", say) and be drawn as one.
+  return { actor: name, env: process.env.DELPHI_AUTHOR_TYPE ? {} : { DELPHI_AUTHOR_TYPE: "human" } };
+}
+
+function connect() {
+  const { actor, env } = actorEnv();
+  const client = openServer({
+    server: process.env.DELPHI_MCP_SERVER || undefined,
+    actor,
+    env,
+    clientName: "delphi-cli",
+    detached: process.platform !== "win32",
+    // Every call this makes is a quick read or write; the command itself runs
+    // here, not in the server. A minute is generous and still ends a hang.
+    timeoutMs: 60000,
+    warn: (...parts) => process.stderr.write(`${parts.join(" ")}\n`),
+  });
+  return client;
+}
+
+// --- commands ------------------------------------------------------------------
+
+async function resolve(client, ref, command) {
+  return client.call("sheet_resolve", { task: String(need(ref, "The task", command)) });
+}
+
+const COMMANDS = {
+  async cat(client, { positional, flags }) {
+    const { task } = await resolve(client, positional[0], "cat");
+    const mode = flags.ledger ? "ledger" : flags.tail !== undefined ? "tail" : "full";
+    const args = { task_id: task.id, mode };
+    if (mode === "tail") {
+      const n = Number(flags.tail);
+      if (!Number.isInteger(n) || n < 1) throw new UsageError("--tail needs a whole number of entries.", "cat");
+      args.n = n;
+    }
+    const read = await client.call("sheet_read", args);
+    const clean = flags.raw ? false : flags.clean ? true : !tty;
+    const header = { task: read.task.id, title: read.task.title, project: read.task.project, status: read.task.status };
+    process.stdout.write(fmt.format({ header, entries: read.entries }, { clean }));
+    return 0;
+  },
+
+  async say(client, { positional }) {
+    const { task } = await resolve(client, positional[0], "say");
+    const body = need(positional.slice(1).join(" "), "The text", "say");
+    report(await client.call("sheet_append", { task_id: task.id, kind: "say", body }));
+    return 0;
+  },
+
+  async note(client, { positional, flags }) {
+    const { task } = await resolve(client, positional[0], "note");
+    const body = need(positional.slice(1).join(" "), "The text", "note");
+    report(await client.call("sheet_append", { task_id: task.id, kind: "note", body, promote: Boolean(flags.promote) }));
+    return 0;
+  },
+
+  async run(client, { positional, flags, rest }) {
+    const resolved = await resolve(client, positional[0], "run");
+    if (!rest || !rest.length) throw new UsageError("Put the command after --, as in: delphi run 42 -- npm test", "run");
+    const command = rest.join(" ");
+    const cwd = flags.cwd ? path.resolve(flags.cwd) : resolved.cwd || process.cwd();
+    const store = {
+      append: (f) => client.call("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
+      update: (id, f) => client.call("sheet_update", { id, meta: f.meta, body: f.body }),
+    };
+    // Ctrl-C belongs to the command. It is in its own process group, so the
+    // terminal's interrupt reaches only this process, which passes it on and
+    // stays alive to record the result.
+    const controller = new AbortController();
+    const onInterrupt = () => controller.abort();
+    process.on("SIGINT", onInterrupt);
+    let entry;
+    try {
+      entry = await runEntry({
+        store, taskId: resolved.task.id, command, cwd, logDir: resolved.log_dir,
+        signal: controller.signal,
+        onChunk: (chunk) => process.stdout.write(chunk),
+      });
+    } finally {
+      process.removeListener("SIGINT", onInterrupt);
+    }
+    const meta = entry.meta || {};
+    if (meta.code === "guard" || meta.code === "error") {
+      process.stderr.write(`${meta.out || "Not run."}\n`);
+    }
+    const summary = meta.state === "ok" ? "ok" : `fail:${meta.code}`;
+    const timing = meta.dur_ms !== undefined ? ` in ${(meta.dur_ms / 1000).toFixed(1)}s` : "";
+    process.stderr.write(`delphi: entry ${entry.id} on task ${entry.task_id}: ${summary}${timing}\n`);
+    if (meta.state === "ok") return 0;
+    if (meta.code === "guard") return 2;
+    return Number.isInteger(meta.code) && meta.code > 0 && meta.code < 256 ? meta.code : 1;
+  },
+
+  async ask(client, { positional }) {
+    const { task } = await resolve(client, positional[0], "ask");
+    const question = need(positional[1], "The question", "ask");
+    const options = positional.slice(2);
+    if (options.length < 2 || options.length > 4) throw new UsageError("An ask needs two to four options.", "ask");
+    report(await client.call("sheet_ask", { task_id: task.id, question, options }));
+    return 0;
+  },
+
+  async decide(client, { positional, flags }) {
+    const id = entryId(positional[0], "decide");
+    const choice = String(need(positional[1], "The choice", "decide")).toLowerCase();
+    report(await client.call("sheet_decide", { ask_id: id, choice, why: flags.why }));
+    return 0;
+  },
+
+  async promote(client, { positional, flags }) {
+    const id = entryId(positional[0], "promote");
+    report(await client.call("sheet_promote", { id, on: !flags.off }));
+    return 0;
+  },
+
+  async file(client, { positional, flags }) {
+    const id = entryId(positional[0], "file");
+    const kind = need(positional[1], "The kind (decision, gotcha, reference or note)", "file");
+    const result = await client.call("sheet_file", { id, kind, title: flags.title });
+    if (tty) say(`Filed entry ${result.entry.id} as ${result.note.kind} note ${result.note.id}: ${result.note.title}`);
+    else say(String(result.note.id));
+    return 0;
+  },
+
+  async out(client, { positional, flags }) {
+    const id = entryId(positional[0], "out");
+    const entry = await client.call("sheet_get", { id });
+    const { log_dir: logDir } = await client.call("sheet_resolve", { task: String(entry.task_id) });
+    // Where this machine would have written it, not meta.log: meta is written
+    // by whoever wrote the entry, and this should only ever open a run log.
+    const file = logPathFor(logDir, entry.task_id, entry.id);
+    if (!fs.existsSync(file)) {
+      const out = entry.meta && entry.meta.out;
+      if (!out) throw new Error(`Entry ${entry.id} has no output recorded.`);
+      say(out);
+      return 0;
+    }
+    if (!tty) {
+      const data = fs.readFileSync(file);
+      process.stdout.write(flags.raw ? data : fmt.stripAnsi(data.toString("utf8")));
+      return 0;
+    }
+    const pager = splitCommand(process.env.PAGER || "less -R");
+    if (!pager.length) { process.stdout.write(fs.readFileSync(file)); return 0; }
+    return new Promise((done) => {
+      const child = spawn(pager[0], [...pager.slice(1), file], { stdio: "inherit" });
+      child.on("error", () => { process.stdout.write(fs.readFileSync(file)); done(0); });
+      child.on("close", (code) => done(code || 0));
+    });
+  },
+
+  async import(client, { positional, flags }) {
+    const { task } = await resolve(client, positional[0], "import");
+    const file = need(positional[1], "The file", "import");
+    const parsed = fmt.parse(fs.readFileSync(file, "utf8"), { clean: Boolean(flags.clean) });
+    const newIds = new Map();
+    let added = 0;
+    const skipped = [];
+    for (const entry of parsed.entries) {
+      let written = null;
+      if (entry.kind === "raw") { skipped.push("text that is not an entry"); continue; }
+      if (entry.kind === "ask") {
+        const options = (entry.meta && entry.meta.options) || [];
+        if (options.length < 2) { skipped.push(`a question with no options ("${entry.body}")`); continue; }
+        written = await client.call("sheet_ask", { task_id: task.id, question: entry.body, options: options.map((o) => o.label) });
+        if (entry.promoted) written = await client.call("sheet_promote", { id: written.id });
+      } else if (entry.kind === "decide") {
+        const askId = entry.ref_id !== null ? newIds.get(entry.ref_id) : undefined;
+        if (!askId) { skipped.push("an answer whose question is not in the file"); continue; }
+        const [choice, ...why] = entry.body.split("\n");
+        written = await client.call("sheet_decide", { ask_id: askId, choice: choice.trim(), why: why.join("\n") || undefined });
+      } else {
+        const meta = entry.kind === "run" ? (entry.meta || null) : null;
+        written = await client.call("sheet_append", {
+          task_id: task.id, kind: entry.kind, body: entry.body, meta, promote: Boolean(entry.promoted),
+        });
+      }
+      if (entry.id !== null && entry.id !== undefined) newIds.set(entry.id, written.id);
+      added++;
+    }
+    process.stderr.write(`delphi: imported ${added} ${added === 1 ? "entry" : "entries"} into task ${task.id}` +
+      `${skipped.length ? `, skipped ${skipped.length}: ${skipped.join("; ")}` : ""}\n`);
+    return 0;
+  },
+};
+
+// --- main ----------------------------------------------------------------------
+
+async function main(argv) {
+  const [command, ...args] = argv;
+  if (!command || command === "help" || command === "--help" || command === "-h") {
+    process.stdout.write(usage(args[0]));
+    return 0;
+  }
+  const handler = COMMANDS[command];
+  if (!handler) {
+    process.stderr.write(`delphi: no command '${command}'.\n\n${usage()}`);
+    return 1;
+  }
+  let parsed;
+  try {
+    parsed = parseArgs(args);
+  } catch (error) {
+    process.stderr.write(`delphi: ${error.message}\n\n${usage(command)}`);
+    return 1;
+  }
+  if (parsed.flags.help) { process.stdout.write(usage(command)); return 0; }
+
+  const client = connect();
+  try {
+    await client.start();
+    return await handler(client, parsed);
+  } catch (error) {
+    process.stderr.write(`delphi: ${error.message}\n`);
+    if (error instanceof UsageError) process.stderr.write(`\n${usage(error.command)}`);
+    return 1;
+  } finally {
+    client.close();
+  }
+}
+
+main(process.argv.slice(2)).then(
+  (code) => process.stdout.write("", () => process.exit(code || 0)),
+  (error) => { process.stderr.write(`delphi: ${error.stack || error}\n`); process.exit(1); }
+);

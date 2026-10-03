@@ -131,7 +131,17 @@ const run = (sql, params = {}) => open().prepare(sql).run(params);
  * a string is turned into one rather than refused.
  */
 function sqlP(query, params = []) {
-  const statement = String(query).replace(/:p(\d+)/g, (_, n) => `?${n}`);
+  // The same count rule as the server's sql(): node:sqlite would bind a
+  // missing value as NULL and ignore a spare one, and the server's route
+  // would do neither the same way, so a mismatch throws on both.
+  let highest = 0;
+  const statement = String(query).replace(/:p(\d+)/g, (match, n) => {
+    const index = Number(n);
+    if (index < 1 || index > params.length) throw new Error(`sqlP(): ${match} has no value (${params.length} given)`);
+    if (index > highest) highest = index;
+    return `?${n}`;
+  });
+  if (highest !== params.length) throw new Error(`sqlP(): ${params.length} values given for ${highest} placeholders`);
   const values = params.map((v) => {
     if (v === null || v === undefined) return null;
     if (typeof v === "number") return Number.isFinite(v) ? v : null;
@@ -1240,6 +1250,20 @@ function completeClaim(id, { agent = null, note = null } = {}) {
 const listComments = (taskId) =>
   all("SELECT * FROM comments WHERE task_id = :taskId ORDER BY id", { taskId });
 
+/**
+ * The task's comments as Sheet entries: kind, meta parsed, author type
+ * resolved, the filed note's kind joined. The same shape sheet/store.js hands
+ * the MCP tools, built by the same toEntry, so the rail and an agent read one
+ * thing. listComments stays as it was for the vault and undo, which want rows.
+ */
+function sheetEntries(taskId) {
+  const { toEntry } = require("./sheet/store");
+  return all(
+    `SELECT c.*, n.kind AS note_kind FROM comments c LEFT JOIN notes n ON n.id = c.note_id
+      WHERE c.task_id = :taskId ORDER BY c.id`, { taskId }
+  ).map(toEntry);
+}
+
 function createComment({ taskId, body, author = "you" }) {
   if (!body || !String(body).trim()) throw new Error("A comment needs something in it");
   const r = run(
@@ -1295,7 +1319,7 @@ function taskDetail(id) {
     // change of epic without a second call. The sheet opens from All work and
     // from search too, where the project's organizers are not already loaded.
     organizers: task.project_id ? listOrganizers(task.project_id) : [],
-    comments: listComments(id),
+    comments: sheetEntries(id),
     events: statusEvents(id),
     subtasks: subtasks(id),
   };

@@ -44,7 +44,7 @@ const PKG = require(path.join(ROOT, "package.json"));
 // lead the code. Remove an entry once its file lands; after that, missing is a
 // failure like anything else.
 const PENDING = new Set([
-  "agent/schema_later.js", "agent/launch.js", "sheet", "workbench", "bin/delphi",
+  "workbench",
 ]);
 
 let checks = 0;

@@ -215,6 +215,20 @@ function openDatabase() {
 
 const DATABASE = openDatabase();
 
+// Every insert the Sheet makes uses RETURNING, which the sqlite3 command only
+// understands from 3.35. An older one (some long-term-support Linux releases
+// still ship one) fails each write with a syntax error that says nothing about
+// versions, so this says it once, up front, in words.
+if (DATABASE.kind !== "node:sqlite") {
+  try {
+    const version = String(DATABASE.query("SELECT sqlite_version() AS v;")[0].v);
+    const [major, minor] = version.split(".").map(Number);
+    if (major < 3 || (major === 3 && minor < 35)) {
+      process.stderr.write(`delphi: ${DATABASE.kind} is SQLite ${version}; Sheets need 3.35 or newer, so writes to them will fail. Install a newer sqlite3 or set DELPHI_SQLITE to one.\n`);
+    }
+  } catch {}
+}
+
 /**
  * Brings the database up to date before the first request, once.
  *
@@ -258,12 +272,23 @@ function sql(query, params = []) {
   // spliced pieces of the query into itself. The regex is greedy on digits,
   // which is also what stops :p10 being read as :p1.
   //
-  // A placeholder with no value is left exactly as written, so SQLite reports
-  // it as the error it is rather than it quietly becoming NULL.
+  // The highest placeholder must be the last value, no more and no fewer. A
+  // placeholder with no value used to be left in the text, where SQLite reads
+  // it as an unbound parameter and quietly makes it NULL; a spare value usually
+  // means a condition dropped its placeholder and kept its argument. Both are
+  // bugs at the call site, so both throw. db.js sqlP holds the same rule.
+  let highest = 0;
   const statement = String(query).replace(/:p(\d+)/g, (match, n) => {
-    const index = Number(n) - 1;
-    return index >= 0 && index < params.length ? literal(params[index]) : match;
+    const index = Number(n);
+    if (index < 1 || index > params.length) {
+      throw new Error(`sql(): ${match} has no value (${params.length} given)`);
+    }
+    if (index > highest) highest = index;
+    return literal(params[index - 1]);
   });
+  if (highest !== params.length) {
+    throw new Error(`sql(): ${params.length} values given for ${highest} placeholders`);
+  }
 
   return DATABASE.query(statement.endsWith(";") ? statement : statement + ";");
 }
@@ -313,6 +338,60 @@ function resolveProjectId(a) {
 // Shipped beside this file by electron-builder's extraResources, for the same
 // reason the server itself is: a plain Node process cannot read inside app.asar.
 const pads = require("../pads");
+
+// The Sheet's rows. Shared with the app rather than twinned: the store is SQL
+// text and rules and is handed this file's sql(), so it works on either route
+// and the two sides cannot disagree about what a valid entry is. See the head
+// of sheet/store.js.
+const { makeSheetStore } = require("../sheet/store");
+const sheetFormat = require("../sheet/format");
+const AUTHOR_TYPE = ["human", "agent", "tool"].includes(process.env.DELPHI_AUTHOR_TYPE)
+  ? process.env.DELPHI_AUTHOR_TYPE : null;
+const sheets = makeSheetStore({ sql, actor: ACTOR, authorType: AUTHOR_TYPE });
+// Run logs live beside the database, which is DATA_DIR in the app's terms, so
+// they inherit its "never in git" rule.
+const SHEET_LOG_DIR = path.join(path.dirname(DB), "sheets");
+
+/** What an agent is shown of a task's Sheet: the ledger plus the recent tail. */
+function sheetContext(taskId) {
+  const context = sheets.context(taskId);
+  return {
+    // The three fields comments always had are kept, so a client written
+    // against the old shape (queue_runner's brief, for one) still reads it.
+    comments: context.entries.map((e) => ({
+      id: e.id, kind: e.kind, author: e.author, author_type: e.author_type,
+      body: e.body, promoted: e.promoted, created_at: e.created_at,
+    })),
+    sheet: context.text,
+    comments_total: context.total,
+    comments_shown: context.shown,
+  };
+}
+
+/**
+ * The folder a command for this task should run in, and where that came from.
+ *
+ * The primary repo first, then the project's primary workspace folder, then the
+ * project's own folder. repos is empty in most real databases, which is why the
+ * other two count. A Workbench will come first once it exists.
+ */
+function resolveTaskFolder(task) {
+  if (task.project_id == null) return { cwd: null, cwd_source: null };
+  const exists = (p) => { try { return Boolean(p) && fs.statSync(p).isDirectory(); } catch { return false; } };
+  const repos = sql("SELECT path FROM repos WHERE project_id = :p1 ORDER BY is_primary DESC, id", [task.project_id]);
+  for (const r of repos) if (exists(r.path)) return { cwd: r.path, cwd_source: "repo" };
+  const spaces = sql(
+    `SELECT w.path FROM project_workspaces pw JOIN workspaces w ON w.id = pw.workspace_id
+      WHERE pw.project_id = :p1 ORDER BY pw.is_primary DESC, w.sort_order, w.id`, [task.project_id]);
+  for (const w of spaces) if (exists(w.path)) return { cwd: w.path, cwd_source: "folder" };
+  const project = sql("SELECT path FROM projects WHERE id = :p1", [task.project_id])[0];
+  if (project && exists(project.path)) return { cwd: project.path, cwd_source: "folder" };
+  return { cwd: null, cwd_source: null };
+}
+
+const PROMOTE_DIRECTIVE =
+  "Promote (promote: true) anything that changes what the next agent should do: a finding, a dead end, a decision. " +
+  "If it would matter on a different task too, call sheet_file on it as well, so it becomes a project note the graph and search can find.";
 
 const audit = (action, entity, entityId, summary, label) =>
   sql(
@@ -677,7 +756,7 @@ const TOOLS = {
              ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
              LIMIT 1)
           RETURNING *`,
-        [ACTOR, minutes, queue, projectId]
+        projectId == null ? [ACTOR, minutes, queue] : [ACTOR, minutes, queue, projectId]
       )[0];
 
       if (!claimed) {
@@ -705,7 +784,7 @@ const TOOLS = {
           ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [claimed.project_id])[0]
           : null,
         subtasks: sql("SELECT id, title, status FROM tasks WHERE parent_id = :p1 ORDER BY id", [claimed.id]),
-        comments: sql("SELECT author, body, created_at FROM comments WHERE task_id = :p1 ORDER BY id", [claimed.id]),
+        ...sheetContext(claimed.id),
         next_steps:
           "Work it, comment what you did with add_comment, then queue_complete. " +
           "If you cannot finish it, queue_release with a reason so someone else can pick it up.",
@@ -730,8 +809,11 @@ const TOOLS = {
       sql(`UPDATE tasks SET claimed_by = NULL, claim_expires = NULL,
              status = CASE WHEN status = 'doing' THEN 'todo' ELSE status END,
              updated_at = datetime('now') WHERE id = :p1`, [a.task_id]);
-      sql("INSERT INTO comments (task_id, author, body) VALUES (:p1, :p2, :p3)",
-          [a.task_id, ACTOR, `Released: ${a.reason}`]);
+      // Promoted, because why the last agent gave up is the first thing the
+      // next one needs, and the ledger is what it reads first.
+      sql(`INSERT INTO comments (task_id, author, body, kind, author_type, promoted)
+           VALUES (:p1, :p2, :p3, 'say', :p4, 1)`,
+          [a.task_id, ACTOR, `Released: ${a.reason}`, AUTHOR_TYPE]);
       const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
       if (after.status !== before.status) {
         sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
@@ -776,7 +858,7 @@ const TOOLS = {
 
   queue_complete: {
     description:
-      "Finish a claimed task. The summary is left as a comment and is what the next person or agent reads to know what actually happened, so write it for them rather than for a changelog.",
+      "Finish a claimed task. The summary is left as a comment and is what the next person or agent reads to know what actually happened, so write it for them rather than for a changelog. Your summary is promoted into the task's ledger automatically, so the next agent reads it first. If you learned something that matters beyond this task, sheet_file it.",
     schema: {
       type: "object",
       required: ["task_id", "summary"],
@@ -788,8 +870,11 @@ const TOOLS = {
     run: (a) => {
       const before = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
       if (!before) throw new Error(`No task ${a.task_id}`);
-      sql("INSERT INTO comments (task_id, author, body) VALUES (:p1, :p2, :p3)",
-          [a.task_id, ACTOR, a.summary]);
+      // Promoted, so every finished run lands in the ledger: it is the one
+      // entry the next person or agent always wants.
+      sql(`INSERT INTO comments (task_id, author, body, kind, author_type, promoted)
+           VALUES (:p1, :p2, :p3, 'say', :p4, 1)`,
+          [a.task_id, ACTOR, a.summary, AUTHOR_TYPE]);
       sql(`UPDATE tasks SET status = 'done', completed_at = datetime('now'),
              claimed_by = NULL, claim_expires = NULL, queue = NULL,
              updated_at = datetime('now') WHERE id = :p1`, [a.task_id]);
@@ -826,7 +911,7 @@ const TOOLS = {
               AND (claimed_by IS NULL OR claim_expires < datetime('now'))
               ${mine}
             ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id`,
-          [queue, projectId]
+          projectId == null ? [queue] : [queue, projectId]
         ),
         in_flight: sql(
           `SELECT id, title, project_id, claimed_by, claim_expires FROM tasks
@@ -834,7 +919,7 @@ const TOOLS = {
               AND claimed_by IS NOT NULL AND claim_expires >= datetime('now')
               ${mine}
             ORDER BY claim_expires`,
-          [queue, projectId]
+          projectId == null ? [queue] : [queue, projectId]
         ),
       };
     },
@@ -842,7 +927,7 @@ const TOOLS = {
 
   get_task: {
     description:
-      "Everything about one task: its detail, subtasks, the discussion on it, and every status it has been through. Read this before starting work on a task, because the last agent probably left you something.",
+      "Everything about one task: its detail, subtasks, the discussion on it, and every status it has been through. Read this before starting work on a task, because the last agent probably left you something. The discussion is the task's Sheet: its ledger (what was promoted as mattering) plus the last 20 entries, as entries in comments and as text in sheet. comments_total says how many there are in all; call sheet_read with mode full when you need the rest.",
     schema: {
       type: "object",
       required: ["id"],
@@ -857,7 +942,7 @@ const TOOLS = {
           ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [task.project_id])[0]
           : null,
         subtasks: sql("SELECT id, title, status FROM tasks WHERE parent_id = :p1 ORDER BY id", [a.id]),
-        comments: sql("SELECT author, body, created_at FROM comments WHERE task_id = :p1 ORDER BY id", [a.id]),
+        ...sheetContext(a.id),
         history: sql("SELECT status, actor, at FROM status_events WHERE task_id = :p1 ORDER BY at, id", [a.id]),
       };
     },
@@ -878,10 +963,163 @@ const TOOLS = {
       const task = sql("SELECT id, title FROM tasks WHERE id = :p1", [a.task_id])[0];
       if (!task) throw new Error(`No task ${a.task_id}`);
       if (!a.body || !String(a.body).trim()) throw new Error("A comment needs something in it");
-      const row = sql("INSERT INTO comments (task_id, author, body) VALUES (:p1, :p2, :p3) RETURNING *",
-                      [a.task_id, ACTOR, String(a.body).trim()])[0];
+      const row = sql(`INSERT INTO comments (task_id, author, body, kind, author_type)
+                       VALUES (:p1, :p2, :p3, 'say', :p4) RETURNING *`,
+                      [a.task_id, ACTOR, String(a.body).trim(), AUTHOR_TYPE])[0];
       audit("update", "task", a.task_id, "commented", task.title);
       return row;
+    },
+  },
+
+  // --- the Sheet ---------------------------------------------------------------
+  //
+  // A task's Sheet is its comments, each with a kind. These tools never take an
+  // author: every entry is DELPHI_ACTOR's, so History cannot be told otherwise.
+
+  sheet_read: {
+    description:
+      "Read a task's Sheet: its entries as JSON and as text. mode tail (the default) is the last n entries, ledger is only what was promoted as mattering, full is everything. To poll, pass back the cursor you were given as after_id and since; you then get only entries that are new or changed, and should dedupe by id.",
+    schema: {
+      type: "object",
+      required: ["task_id"],
+      properties: {
+        task_id: { type: "number" },
+        mode: { type: "string", enum: ["ledger", "tail", "full"], description: "Defaults to tail." },
+        n: { type: "number", description: "How many entries in tail mode. Defaults to 20, at most 500." },
+        after_id: { type: "number", description: "Only entries with a higher id (or changed since `since`)." },
+        since: { type: "string", description: "Server time from a previous cursor. Inclusive." },
+      },
+    },
+    run: (a) => {
+      const mode = a.mode || "tail";
+      const read = sheets.read(a.task_id, { mode, n: a.n, afterId: a.after_id, since: a.since });
+      const header = sheets.header(a.task_id);
+      return {
+        task: { id: header.task, title: header.title, status: header.status, project: header.project },
+        mode,
+        entries: read.entries,
+        text: sheetFormat.format({ header, entries: read.entries }),
+        total: read.total,
+        ledger_count: read.ledger_count,
+        cursor: read.cursor,
+      };
+    },
+  },
+
+  sheet_get: {
+    description: "One Sheet entry by its id, with its task id. For when you have an entry id and need what it says.",
+    schema: { type: "object", required: ["id"], properties: { id: { type: "number" } } },
+    run: (a) => sheets.get(a.id),
+  },
+
+  sheet_append: {
+    description:
+      "Write an entry on a task's Sheet. kind say is a remark or finding, note is a short marker of something that happened (a file edited, a deploy done), run records a shell command (one line) with meta {state, code, cwd, out}. Questions and answers have their own tools, sheet_ask and sheet_decide. " +
+      PROMOTE_DIRECTIVE,
+    schema: {
+      type: "object",
+      required: ["task_id", "kind", "body"],
+      properties: {
+        task_id: { type: "number" },
+        kind: { type: "string", enum: ["say", "run", "note"] },
+        body: { type: "string", description: "Markdown for say and note. The command itself for run." },
+        meta: { type: "object", description: "Kind specific. For run: state (running, ok, fail), code, cwd, out." },
+        ref_id: { type: "number", description: "An entry on the same task this one answers or follows." },
+        promote: { type: "boolean", description: "Put it in the ledger, which every later agent reads first." },
+      },
+    },
+    run: (a) => {
+      if (a.kind === "ask" || a.kind === "decide") throw new Error(`Use sheet_${a.kind} for that, not sheet_append.`);
+      return sheets.append({ taskId: a.task_id, kind: a.kind, body: a.body, meta: a.meta ?? null,
+                             refId: a.ref_id ?? null, promote: a.promote === true });
+    },
+  },
+
+  sheet_update: {
+    description:
+      "Change an entry's meta, its body, or both. Meta is merged one level deep. This is how a run entry is finished: pass meta {state: ok or fail, code, dur_ms, lines}. An ask's options and a decision's choice cannot change.",
+    schema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        id: { type: "number" },
+        meta: { type: "object" },
+        body: { type: "string" },
+      },
+    },
+    run: (a) => sheets.update(a.id, { meta: a.meta, body: a.body }),
+  },
+
+  sheet_promote: {
+    description:
+      "Put an entry in its task's ledger (on: true, the default) or take it out. The ledger is what the next agent reads first, so promote what changes what they should do: a finding, a dead end, a decision.",
+    schema: {
+      type: "object",
+      required: ["id"],
+      properties: { id: { type: "number" }, on: { type: "boolean", description: "Defaults to true." } },
+    },
+    run: (a) => sheets.promote(a.id, a.on !== false),
+  },
+
+  sheet_file: {
+    description:
+      "Turn a Sheet entry into a project note (decision, gotcha, reference or note), so the graph and search find it from other tasks. Also promotes it. Filing twice returns the first note. Use it for anything that would matter on a different task.",
+    schema: {
+      type: "object",
+      required: ["id", "kind"],
+      properties: {
+        id: { type: "number" },
+        kind: { type: "string", enum: ["decision", "gotcha", "reference", "note"] },
+        title: { type: "string", description: "Defaults to the entry's first line." },
+      },
+    },
+    run: (a) => sheets.file(a.id, a.kind, a.title ?? null),
+  },
+
+  sheet_ask: {
+    description:
+      "Ask a question on a task's Sheet with two to four answers, keyed a to d. Use it when a person (or another agent) has to choose before work can go on. The question is one line; put background in a say entry first.",
+    schema: {
+      type: "object",
+      required: ["task_id", "question", "options"],
+      properties: {
+        task_id: { type: "number" },
+        question: { type: "string" },
+        options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 4 },
+      },
+    },
+    run: (a) => sheets.ask(a.task_id, a.question, a.options),
+  },
+
+  sheet_decide: {
+    description:
+      "Answer a question asked with sheet_ask. The decision is promoted into the ledger automatically, since it is what the next agent most needs. Say why when it is not obvious.",
+    schema: {
+      type: "object",
+      required: ["ask_id", "choice"],
+      properties: {
+        ask_id: { type: "number" },
+        choice: { type: "string", enum: ["a", "b", "c", "d"] },
+        why: { type: "string" },
+      },
+    },
+    run: (a) => sheets.decide(a.ask_id, a.choice, a.why ?? null),
+  },
+
+  sheet_resolve: {
+    description:
+      "Find a task from whatever you have: its id, its legacy id, or its ticket ref. Also says which folder a command for it should run in, and where run logs go.",
+    schema: {
+      type: "object",
+      required: ["task"],
+      properties: { task: { type: "string", description: "e.g. 42, T-17 or ABC-1234" } },
+    },
+    run: (a) => {
+      const task = sheets.resolveTask(a.task);
+      const project = task.project_id != null
+        ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [task.project_id])[0] || null
+        : null;
+      return { task, project, workbench: null, ...resolveTaskFolder(task), log_dir: SHEET_LOG_DIR };
     },
   },
 
@@ -1382,8 +1620,12 @@ const TOOLS = {
 
       // Expand through the graph: entities mentioned by the best matches, and
       // what those entities travel with. This is the part plain search cannot do.
+      // The graph's tables are made by the app (oracle.sql), so a database an
+      // agent reached before the app ever opened it has none. That is no reason
+      // to lose the matches already found.
       const seedIds = notes.slice(0, 4).map((n) => n.id);
-      const connected = seedIds.length ? sql(
+      const graphed = schemaLater.hasTable((s) => DATABASE.query(s), "edges");
+      const connected = seedIds.length && graphed ? sql(
         `SELECT DISTINCT e2.kind, e2.name, e2.mentions FROM edges ed
          JOIN entities e2 ON e2.id = ed.target_id
          WHERE ed.source_type = 'note' AND ed.relation = 'mentions'
@@ -1509,6 +1751,10 @@ let buffer = "";
 // Requests still being answered. A client that writes its last request and
 // closes stdin straight away is entitled to the answer, so the exit waits.
 const inFlight = new Set();
+// Decoded as a stream, not chunk by chunk. A pipe read can end in the middle of
+// a multibyte character, and decoding each half alone stored "caf\u00e9" as two
+// replacement characters.
+process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
   let index;

@@ -36,6 +36,17 @@ const ENTRY_COLUMNS = `c.id, c.task_id, c.kind, c.author, c.author_type, c.body,
        c.ref_id, c.note_id, n.kind AS note_kind, c.created_at, c.updated_at`;
 const ENTRY_FROM = "FROM comments c LEFT JOIN notes n ON n.id = c.note_id";
 
+// What is in a task's ledger, as a condition on comments aliased c with the
+// task id at :p1. The spec's rule: promoted entries, plus every resolved
+// decision, plus the question each answers. A decision is in whatever its
+// promoted flag says, because unpromoting one would otherwise leave the next
+// agent reopening a question that was settled; the question comes too, so an
+// answer is never shown without it.
+const LEDGER_WHERE = `(c.promoted = 1
+   OR (c.kind = 'decide' AND c.ref_id IS NOT NULL)
+   OR c.id IN (SELECT d.ref_id FROM comments d
+                WHERE d.task_id = :p1 AND d.kind = 'decide' AND d.ref_id IS NOT NULL))`;
+
 const clip = (text, limit) => {
   const value = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
   return value.length <= limit ? value : `${value.slice(0, limit - 3)}...`;
@@ -151,18 +162,11 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     return { task: Number(task.id), title: task.title, project: project ? project.key : null, status: task.status };
   }
 
-  /** Promoted entries, and any ask a promoted decide answers, so the answer is never shown without its question. */
+  /** The ledger: see LEDGER_WHERE. */
   function ledger(taskId) {
     const task = requireTask(taskId);
-    return sql(
-      `SELECT ${ENTRY_COLUMNS} ${ENTRY_FROM}
-        WHERE c.task_id = :p1
-          AND (c.promoted = 1 OR c.id IN (
-                SELECT d.ref_id FROM comments d
-                 WHERE d.task_id = :p1 AND d.kind = 'decide' AND d.promoted = 1 AND d.ref_id IS NOT NULL))
-        ORDER BY c.id`,
-      [task.id]
-    ).map(toEntry);
+    return sql(`SELECT ${ENTRY_COLUMNS} ${ENTRY_FROM} WHERE c.task_id = :p1 AND ${LEDGER_WHERE} ORDER BY c.id`, [task.id])
+      .map(toEntry);
   }
 
   /**
@@ -191,11 +195,7 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
       cursor.push(`c.updated_at >= :p${params.length}`);
     }
     if (cursor.length) where.push(`(${cursor.join(" OR ")})`);
-    if (mode === "ledger") {
-      where.push(`(c.promoted = 1 OR c.id IN (
-        SELECT d.ref_id FROM comments d
-         WHERE d.task_id = :p1 AND d.kind = 'decide' AND d.promoted = 1 AND d.ref_id IS NOT NULL))`);
-    }
+    if (mode === "ledger") where.push(LEDGER_WHERE);
     if (mode === "tail" && !cursor.length) {
       const limit = Math.max(1, Math.min(MAX_READ, Math.floor(Number(n)) || LEDGER_TAIL));
       params.push(limit);
@@ -219,9 +219,7 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     const list = sql(
       `SELECT ${ENTRY_COLUMNS} ${ENTRY_FROM}
         WHERE c.task_id = :p1
-          AND (c.promoted = 1
-               OR c.id IN (SELECT d.ref_id FROM comments d
-                            WHERE d.task_id = :p1 AND d.kind = 'decide' AND d.promoted = 1 AND d.ref_id IS NOT NULL)
+          AND (${LEDGER_WHERE}
                OR c.id IN (SELECT t.id FROM comments t WHERE t.task_id = :p1 ORDER BY t.id DESC LIMIT :p2))
         ORDER BY c.id`,
       [task.id, LEDGER_TAIL]
@@ -232,6 +230,29 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
       text: fmt.format({ header: header(task.id), entries: list }, { clean: true }),
       total,
       shown: list.length,
+    };
+  }
+
+  /**
+   * One read of a Sheet, as sheet_read and the sheet:read channel both serve
+   * it. The cursor's since is the database's own clock, taken before the
+   * read, so a poller passing it back cannot miss a write that landed while
+   * this one ran; since is inclusive and pollers dedupe by id.
+   */
+  function read(taskId, { mode = "tail", n = LEDGER_TAIL, afterId = null, since = null } = {}) {
+    const task = requireTask(taskId);
+    const now = sql("SELECT datetime('now') AS now")[0].now;
+    const list = entries(task.id, { mode, n, afterId, since });
+    const counts = sql(
+      `SELECT COUNT(*) AS total, SUM(CASE WHEN ${LEDGER_WHERE} THEN 1 ELSE 0 END) AS ledger
+         FROM comments c WHERE c.task_id = :p1`, [task.id])[0];
+    const last = list.length ? list[list.length - 1].id : null;
+    const after = afterId === null || afterId === undefined || afterId === "" ? 0 : Number(afterId);
+    return {
+      entries: list,
+      total: Number(counts.total) || 0,
+      ledger_count: Number(counts.ledger) || 0,
+      cursor: { after_id: Math.max(after, last || 0), since: now },
     };
   }
 
@@ -270,17 +291,24 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     return get(row.id);
   }
 
+  /**
+   * Writes a say, run or note. author and authorType are for trusted in
+   * process callers (an import, the chat mapper); the MCP tools and the IPC
+   * handlers never pass them through from their input, so an entry is always
+   * attributed to whoever the store was made for.
+   */
   function append({ taskId, kind = "say", body, meta = null, refId = null, promote = false, author = null, authorType: type = null } = {}) {
-    if (!KINDS.includes(kind)) throw new Error(`kind must be one of ${KINDS.join(", ")}, got '${kind}'.`);
+    if (kind === "ask" || kind === "decide") {
+      // Their rules (options, a choice that matches one) live in ask() and
+      // decide(); a raw append would skip them and write a question nothing
+      // can answer.
+      throw new Error(`Use ${kind}() for a${kind === "ask" ? "n ask" : " decide"} entry, not append().`);
+    }
+    if (!KINDS.includes(kind)) throw new Error(`kind must be one of say, run, note, got '${kind}'.`);
     const task = requireTask(taskId);
     const text = validateBody(kind, body);
     const entry = insert({ task, kind, body: text, meta, refId, promote, author, authorType: type });
-    const summary = kind === "run" ? `ran ${clip(text, 60)}`
-      : kind === "note" ? "noted"
-      : kind === "ask" ? `asked "${clip(text, 60)}"`
-      : kind === "decide" ? `decided ${String(text).split("\n")[0]}${entry.ref_id ? ` on ${entry.ref_id}` : ""}`
-      : "commented";
-    audit(task, summary);
+    audit(task, kind === "run" ? `ran ${clip(text, 60)}` : kind === "note" ? "noted" : "commented");
     return entry;
   }
 
@@ -294,8 +322,27 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     if (meta !== undefined && meta !== null && (typeof meta !== "object" || Array.isArray(meta))) {
       throw new Error("meta must be an object.");
     }
+    const changes = (key) => meta && Object.prototype.hasOwnProperty.call(meta, key)
+      && JSON.stringify(meta[key]) !== JSON.stringify((before.meta || {})[key]);
+    let text = body === undefined ? before.body : validateBody(before.kind, body);
+    // An edit keeps the kind's rules, or it could make an entry that the text
+    // format, or an ask's answer, can no longer read.
+    if (before.kind === "ask") {
+      if (changes("options")) throw new Error("The options of a question cannot change once asked. Ask again instead.");
+      if (body !== undefined) text = validateQuestion(text);
+    }
+    if (before.kind === "decide") {
+      if (changes("choice") || changes("label")) {
+        throw new Error("A decision's choice cannot change. Answer the question again instead.");
+      }
+      if (body !== undefined) {
+        // Only the why is editable; the first line is the choice and stays it.
+        const why = text.split("\n")[0] === String(before.meta && before.meta.choice) ? text.split("\n").slice(1).join("\n") : text;
+        const reason = cleanBody(why);
+        text = reason ? `${before.meta.choice}\n${reason}` : String(before.meta.choice);
+      }
+    }
     const merged = meta === undefined ? before.meta : { ...(before.meta || {}), ...(meta || {}) };
-    const text = body === undefined ? before.body : validateBody(before.kind, body);
     sql(`UPDATE comments SET meta = :p1, body = :p2, updated_at = datetime('now') WHERE id = :p3`,
         [merged ? JSON.stringify(merged) : null, text, before.id]);
     const after = get(before.id);
@@ -366,11 +413,17 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
    * terminal answers with, e being edit. A label may not contain [x], since that
    * is how the text format finds where one option ends.
    */
-  function ask(taskId, question, options) {
+  function validateQuestion(question) {
     const q = cleanBody(question);
     if (!q.trim()) throw new Error("A question needs something in it.");
     if (q.includes("\n")) throw new Error("A question is one line. Put the background in a say entry first.");
     if (q.includes(": [a] ")) throw new Error("A question cannot contain ': [a] ', which is how the text format finds the options.");
+    return q;
+  }
+
+  function ask(taskId, question, options, { author = null } = {}) {
+    const task = requireTask(taskId);
+    const q = validateQuestion(question);
     if (!Array.isArray(options) || options.length < 2 || options.length > 4) {
       throw new Error("An ask needs two to four options.");
     }
@@ -382,7 +435,9 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
       if (/\[[A-Za-z]\]/.test(label)) throw new Error(`Option ${keys[i]} cannot contain [${keys[i]}]-style brackets.`);
       return { key: keys[i], label };
     });
-    return append({ taskId, kind: "ask", body: q, meta: { options: list } });
+    const entry = insert({ task, kind: "ask", body: q, meta: { options: list }, author });
+    audit(task, `asked "${clip(q, 60)}"`);
+    return entry;
   }
 
   /** Answers an ask. Promoted, because a decision is what the next agent most needs. */
@@ -396,12 +451,15 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
       throw new Error(`Choose one of ${options.map((o) => o.key).join(", ")} for entry ${askEntry.id}, not '${choice}'.`);
     }
     const reason = why === null || why === undefined ? "" : cleanBody(why);
-    return append({
-      taskId: askEntry.task_id, kind: "decide",
+    const task = requireTask(askEntry.task_id);
+    const entry = insert({
+      task, kind: "decide",
       body: reason ? `${option.key}\n${reason}` : option.key,
       meta: { choice: option.key, label: option.label },
       refId: askEntry.id, promote: true, author,
     });
+    audit(task, `decided ${option.key} on ${askEntry.id}`);
+    return entry;
   }
 
   /** Tasks done more than `days` ago, whose run logs can go. */
@@ -416,7 +474,7 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
   }
 
   return {
-    resolveTask, header, entries, ledger, context, append, update, promote, file, ask,
+    resolveTask, header, entries, read, ledger, context, append, update, promote, file, ask,
     decide: decideAsk, get, sheet, prunable,
   };
 }

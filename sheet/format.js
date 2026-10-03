@@ -17,7 +17,15 @@
  *   $ aws sqs get-queue-attributes --queue-url ...  {id:807 by:ray ok dur:1.2s lines:340}
  *
  * The promise is narrow on purpose: format(parse(t)) === t for anything format
- * produced, full or clean. Hand written text in another order or spacing is
+ * produced in full, and format(parse(c, { clean: true }), { clean: true }) === c
+ * for clean text. Clean text has no blocks, so it is parsed as having none: a
+ * quoted "  {id:1 ok}" at the end of a line is text there, never metadata.
+ *
+ * One known limit: a say whose author contains ": " does not come back, because
+ * the head is split at the first ": ". Actor names do not contain one; the test
+ * pins it so the limit stays a decision rather than a surprise.
+ *
+ * Hand written text in another order or spacing is
  * read as well as it can be, but not promised back byte for byte. Parsing is for
  * import and for tests, never a sync channel, so the grammar is free to be
  * strict where that keeps it unambiguous.
@@ -43,7 +51,13 @@ function inferAuthorType(author) {
 }
 
 /** One line of text, for places a newline would end the entry or the header. */
-const oneLine = (value) => String(value == null ? "" : value).replace(/\r\n|\r|\n/g, " ");
+// U+2028 and U+2029 too: a JavaScript "." does not cross them, so a header
+// value holding one would be cut short when it is read back.
+const oneLine = (value) => String(value == null ? "" : value).replace(/\r\n|[\r\n\u2028\u2029]/g, " ");
+
+// A number only when it prints back exactly as written. "007" or "-0" read as
+// numbers would be written as 7 and 0, and the text would not come back.
+const canonicalInt = (text) => /^-?\d+$/.test(text) && Number.isSafeInteger(Number(text)) && String(Number(text)) === text;
 
 /**
  * A body as it will be written: line endings made \n, and blank lines at either
@@ -56,6 +70,13 @@ function normaliseBody(body) {
   const blank = (line) => /^\s*$/.test(line);
   while (lines.length && blank(lines[0])) lines.shift();
   while (lines.length && blank(lines[lines.length - 1])) lines.pop();
+  return lines.join("\n");
+}
+
+/** Line endings made \n and trailing blank lines dropped; nothing else. */
+function trimTrailingBlank(text) {
+  const lines = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
+  while (lines.length && /^\s*$/.test(lines[lines.length - 1])) lines.pop();
   return lines.join("\n");
 }
 
@@ -94,7 +115,7 @@ function count(value) {
 
 /** An exit code as it was given: a number stays a number, a signal name a string. */
 function readCode(text) {
-  return /^-?\d+$/.test(text) && Number.isSafeInteger(Number(text)) ? Number(text) : text;
+  return canonicalInt(text) ? Number(text) : text;
 }
 
 function parseMetaObject(meta) {
@@ -228,7 +249,7 @@ function parseMeta(block) {
     } else if (VALUE_KEYS.has(key)) {
       if (value === undefined) return null;
       if (key === "id" || key === "ref" || key === "lines") {
-        if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) return null;
+        if (!canonicalInt(value) || value.startsWith("-")) return null;
         out[key] = Number(value);
       } else if (key === "dur") {
         if (!/^\d+(?:\.\d+)?s$/.test(value)) return null;
@@ -305,8 +326,13 @@ function formatEntry(entry, { clean = false } = {}) {
     // A command is one line, enforced where it is written. Should one arrive
     // with more, the extra lines are still shown rather than dropped, at the
     // cost of reading back as output.
-    const out = normaliseBody(parseMetaObject(e.meta).out);
-    rest = [...lines.slice(1), ...(out ? out.split("\n") : [])];
+    // Only trailing blank lines go, because the parser drops those. Leading
+    // ones are kept: a command that arrived with a blank second line is read
+    // back with that line at the top of its output, and must be written back
+    // the same way. run.js stores out already trimmed, so a real one is
+    // unaffected.
+    const out = trimTrailingBlank(parseMetaObject(e.meta).out);
+    rest = [...lines.slice(1), ...(out !== "" ? out.split("\n") : [])];
   } else if (kind === "ask") {
     sigil = SIGILS.ask;
     const options = askOptions(e.meta);
@@ -329,11 +355,13 @@ function formatEntry(entry, { clean = false } = {}) {
   const tokens = clean ? [] : metaTokens({ ...e, kind });
   if (tokens.length) {
     line += `  {${tokens.join(" ")}}`;
-  } else if (splitMeta(head)) {
+  } else if (!clean && splitMeta(head)) {
     // The text itself ends in something that reads as a block (a quoted Sheet
     // line, usually). With no block of our own after it, the parser would take
     // that one, so an empty block goes on the end to say "the block is here,
-    // and it is empty". The one place clean output carries braces.
+    // and it is empty". Full text only: clean text promises no braces that were
+    // not in the source, and is read back with parse(text, { clean: true }),
+    // which never looks for a block at all.
     line += "  {}";
   }
   return [line, ...rest.map((l) => (l === "" ? "" : `  ${l}`))].join("\n");
@@ -353,11 +381,11 @@ function format(sheet, { clean = false } = {}) {
 function parseHeader(lines) {
   const header = { task: null, title: "", project: null, status: "" };
   for (const line of lines) {
-    const m = /^([A-Za-z_]+): ?(.*)$/.exec(line);
+    const m = /^([A-Za-z_]+): ?([\s\S]*)$/.exec(line);
     if (!m) continue;
     const key = m[1].toLowerCase();
     const value = m[2];
-    if (key === "task") header.task = /^\d+$/.test(value) ? Number(value) : (value === "" ? null : value);
+    if (key === "task") header.task = canonicalInt(value) && !value.startsWith("-") ? Number(value) : (value === "" ? null : value);
     else if (key === "title") header.title = value;
     else if (key === "project") header.project = value === "" ? null : value;
     else if (key === "status") header.status = value;
@@ -370,7 +398,7 @@ const blankEntry = () => ({
   promoted: 0, ref_id: null, note_id: null, note_kind: null,
 });
 
-function buildEntry(head, continuation) {
+function buildEntry(head, continuation, { clean = false } = {}) {
   // Trailing empty lines belong to nobody: format never writes them.
   const cont = continuation.slice();
   while (cont.length && cont[cont.length - 1] === "") cont.pop();
@@ -381,7 +409,7 @@ function buildEntry(head, continuation) {
   }
 
   const body = cont.map((l) => l.replace(/^ {1,2}/, ""));
-  const split = splitMeta(head.slice(2));
+  const split = clean ? null : splitMeta(head.slice(2));
   const text = split ? split.text : head.slice(2);
   const block = split ? split.meta : null;
   const entry = blankEntry();
@@ -453,7 +481,7 @@ function buildEntry(head, continuation) {
  * end. Anything at column 0 that does not start one, before the first entry or
  * a stray "---", becomes a raw entry: kept and written back, never imported.
  */
-function parse(text) {
+function parse(text, { clean = false } = {}) {
   const lines = String(text == null ? "" : text).replace(/\r\n/g, "\n").split("\n");
   if (lines.length && lines[lines.length - 1] === "") lines.pop();
 
@@ -474,18 +502,22 @@ function parse(text) {
     const line = lines[i];
     const starts = ENTRY_START.test(line) || line === "---";
     if (starts || head === null) {
-      if (head !== null) entries.push(buildEntry(head, cont));
+      if (head !== null) entries.push(buildEntry(head, cont, { clean }));
       head = line;
       cont = [];
     } else {
       cont.push(line);
     }
   }
-  if (head !== null) entries.push(buildEntry(head, cont));
+  if (head !== null) entries.push(buildEntry(head, cont, { clean }));
   return { header, entries };
 }
 
-/** Clean text: every {} block stripped and nothing else. Idempotent. */
+/**
+ * Clean text from full text (or a sheet): every {} block stripped and nothing
+ * else. Its input is read as full text, so clean text goes back through
+ * parse(c, { clean: true }), not through this.
+ */
 function clean(textOrSheet) {
   const sheet = typeof textOrSheet === "string" ? parse(textOrSheet) : textOrSheet;
   return format(sheet, { clean: true });

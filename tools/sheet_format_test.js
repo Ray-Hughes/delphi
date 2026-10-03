@@ -44,8 +44,10 @@ for (const name of names) {
   const text = fixture(name);
   check(`${name}: format(parse(t)) === t`, fmt.format(fmt.parse(text)), text);
   const cleaned = fmt.clean(text);
-  check(`${name}: clean round trips`, fmt.format(fmt.parse(cleaned), { clean: true }), cleaned);
-  check(`${name}: clean is idempotent`, fmt.clean(cleaned), cleaned);
+  check(`${name}: clean round trips through the clean parse`,
+        fmt.format(fmt.parse(cleaned, { clean: true }), { clean: true }), cleaned);
+  check(`${name}: clean adds no braces of its own`,
+        (cleaned.match(/[{}]/g) || []).length <= (text.match(/[{}]/g) || []).length, true);
   check(`${name}: nothing but blocks is stripped`,
         cleaned.split("\n").length, text.split("\n").length);
   check(`${name}: no raw entries in anything format wrote`,
@@ -172,13 +174,27 @@ check("an empty block protects a quoted one",
       [fake.entries[2].body, fake.entries[2].id], ["a quoted sheet line: $ ls  {id:1 ok}", null]);
 check("a real block after a quoted one",
       [fake.entries[3].body, fake.entries[3].id], ["same, in an entry that has a block of its own  {id:1 ok}", 43]);
-check("clean keeps the protecting block, and only where it is needed", fmt.clean(fixture("fake-meta.sheet")).split("\n").slice(6, 11), [
+const fakeClean = fmt.clean(fixture("fake-meta.sheet"));
+check("clean strips every block and adds none", fakeClean.split("\n").slice(6, 11), [
   "> ray: the config is literally  {x}",
   "> ray: unknown keys are text  {colour:red}",
-  "! a quoted sheet line: $ ls  {id:1 ok}  {}",
-  "! same, in an entry that has a block of its own  {id:1 ok}  {}",
+  "! a quoted sheet line: $ ls  {id:1 ok}",
+  "! same, in an entry that has a block of its own  {id:1 ok}",
   "@ claude: two spaces inside a brace  { id:1}",
 ]);
+const quotedHead = fmt.parse(fakeClean, { clean: true }).entries[2];
+check("the clean parse reads a quoted block as text", [quotedHead.body, quotedHead.id], ["a quoted sheet line: $ ls  {id:1 ok}", null]);
+check("and it comes back byte for byte with no {}",
+      fmt.formatEntry(quotedHead, { clean: true }), "! a quoted sheet line: $ ls  {id:1 ok}");
+check("the full format still protects it with {}",
+      fmt.formatEntry({ ...quotedHead, id: null }), "! a quoted sheet line: $ ls  {id:1 ok}  {}");
+
+// Pinned limitation: the head of a say is split at the first ": ", so an author
+// containing one cannot come back. Actor names never do. If this starts passing
+// the other way, the header comment in format.js is out of date.
+const colonAuthor = fmt.parse(fmt.format({ header: null, entries: [{ kind: "say", author: "Ray: H", body: "hi" }] }));
+check("an author containing ': ' does not round trip (known limit)",
+      [colonAuthor.entries[0].author, colonAuthor.entries[0].body], ["Ray", "H: hi"]);
 
 // ---------------------------------------------------------------------------
 
@@ -302,6 +318,32 @@ const phrase = (n, allowNewline = true) => {
 };
 const authorFor = () => pick(["ray", "you", "claude-code:3", "Ray Hughes", "a{b}", 'q"x', "", "runner"]);
 
+section("round trips the fuzzer found");
+{
+  const LS = "\u2028";
+  const cases = [
+    ["U+2028 in a header title", { header: { task: 1, title: `a${LS}b`, status: "todo" }, entries: [] }],
+    ["U+2029 in a header title", { header: { task: 1, title: "a\u2029b", status: "todo" }, entries: [] }],
+    ["a header task of 007", { header: { task: "007", title: "t", status: "todo" }, entries: [] }],
+    ["a run body with a blank second line", { header: null, entries: [{ kind: "run", author: "ray", body: "cmd\n\nmore" }] }],
+    ["fail:01", { header: null, entries: [{ id: 1, kind: "run", author: "ray", body: "c", meta: { state: "fail", code: "01" } }] }],
+    ["fail:-0", { header: null, entries: [{ id: 1, kind: "run", author: "ray", body: "c", meta: { state: "fail", code: "-0" } }] }],
+    ["an ask with an empty question", { header: null, entries: [{ kind: "ask", author: "ray", body: "", meta: { options: [{ key: "a", label: "x" }] } }] }],
+    ["a U+2028 line in a body", { header: null, entries: [{ kind: "note", author: "ray", body: `x\n${LS}\ny` }] }],
+    ["NEL in a say", { header: null, entries: [{ kind: "say", author: "ray", body: "a\u0085b" }] }],
+  ];
+  for (const [name, sheet] of cases) {
+    for (const clean of [false, true]) {
+      const text = fmt.format(sheet, { clean });
+      check(`${name} (${clean ? "clean" : "full"})`, fmt.format(fmt.parse(text, { clean }), { clean }), text);
+    }
+  }
+  check("a header title keeps its words either side of U+2028", fmt.parse(fmt.format(cases[0][1])).header.title, "a b");
+  check("007 stays a string", fmt.parse("---\ntask: 007\ntitle: t\nstatus: x\n---\n").header.task, "007");
+  check("fail:01 keeps its zero", fmt.parseMeta("{fail:01}").code, "01");
+  check("an id with a leading zero is not a block", fmt.parseMeta("{id:007}"), null);
+}
+
 let fuzzFailures = 0;
 for (let n = 0; n < 4000; n++) {
   const kind = pick(["say", "say", "note", "run", "ask", "decide"]);
@@ -332,14 +374,15 @@ for (let n = 0; n < 4000; n++) {
   }
   for (const clean of [false, true]) {
     const text = fmt.format({ header: null, entries: [entry] }, { clean });
-    const back = fmt.parse(text);
+    const back = fmt.parse(text, { clean });
     const again = fmt.format(back, { clean });
     const got = back.entries[0] || {};
     const sameText = again === text;
     const sameBody = back.entries.length === 1 && got.body === fmt.normaliseBody(entry.body).replace(/\r/g, "\n");
     const sameAuthor = kind !== "say" || got.author === entry.author;
     const sameId = clean || got.id === entry.id;
-    const sameOut = kind !== "run" || clean || ((got.meta && got.meta.out) || "") === fmt.normaliseBody(entry.meta.out);
+    const trailing = (t) => String(t == null ? "" : t).replace(/\r\n?/g, "\n").replace(/(?:\n[ \t]*)+$/, "").replace(/^[ \t]+$/, "");
+    const sameOut = kind !== "run" || clean || ((got.meta && got.meta.out) || "") === trailing(entry.meta.out);
     if (!(sameText && sameBody && sameAuthor && sameId && sameOut)) {
       fuzzFailures++;
       if (fuzzFailures <= 5) {
