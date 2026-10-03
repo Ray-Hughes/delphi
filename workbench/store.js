@@ -190,6 +190,31 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
     return mine;
   }
 
+  /**
+   * What is running in a Workbench's folder right now, in words: `$ ` runs
+   * (the app's, the command line's, a chat's commands) whose cwd is inside
+   * it and whose runner is alive on this machine, and a queue runner's agent
+   * holding the task's claim. Finish and Discard refuse while any is.
+   */
+  function busyIn(wb) {
+    const { pidAlive } = require("../sheet/store");
+    const host = require("os").hostname();
+    const root = String(wb.path);
+    const inside = (p) => { const q = String(p || ""); return q === root || q.startsWith(root + "/") || q.startsWith(root + "\\"); };
+    const out = [];
+    for (const row of sql(`SELECT id, task_id, body, meta FROM comments WHERE kind = 'run' AND meta LIKE '%"state":"running"%'`, [])) {
+      let meta = null;
+      try { meta = JSON.parse(row.meta); } catch { continue; }
+      if (!meta || meta.state !== "running" || !inside(meta.cwd)) continue;
+      if (meta.runner_host === host && meta.runner_pid && !pidAlive(Number(meta.runner_pid))) continue;
+      out.push(`$ ${String(row.body).slice(0, 60)} (entry ${row.id})`);
+    }
+    const claim = sql(`SELECT claimed_by FROM tasks WHERE id = :p1 AND claimed_by IS NOT NULL
+                         AND claim_expires > datetime('now')`, [idOf(wb.task_id, "task_id")])[0];
+    if (claim) out.push(`an agent (${claim.claimed_by}) holding task ${wb.task_id}`);
+    return out;
+  }
+
   /** Every repo that has ever had a Workbench, for housekeeping, which leaves every other repo alone. */
   function reposInUse() {
     return sql("SELECT * FROM repos WHERE id IN (SELECT DISTINCT repo_id FROM workbenches) ORDER BY id", []);
@@ -245,7 +270,7 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
          VALUES ('update', 'task', :p1, :p2, :p3)`, [t.id, `${summary} (by ${writer})`, t.title]);
   }
 
-  return { find, get, task, live, byPath, list, insert, setState, touch, repoFolders, repo, adoptRepo, reposInUse, allRepos, updateRepo, audit, actor: writer };
+  return { busyIn, find, get, task, live, byPath, list, insert, setState, touch, repoFolders, repo, adoptRepo, reposInUse, allRepos, updateRepo, audit, actor: writer };
 }
 
 module.exports = { STATES, LIVE, CLOSED, HIDE_AFTER_DAYS, shape, makeWorkbenchStore };

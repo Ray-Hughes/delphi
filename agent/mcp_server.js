@@ -1283,13 +1283,21 @@ const TOOLS = {
     run: (a) => benches.finishPlan(benchFor(a.task_id).id),
   },
   workbench_finished: {
-    description: "Record a Finish the command line has already done. Refuses unless the folder is gone and, when a copy was made (ref), the copy is in its repository.",
+    description: "Record a Finish the command line has already done. Refuses unless the folder is gone and the Workbench's copy (ref) is in its repository.",
     schema: {
       type: "object",
-      required: ["task_id"],
-      properties: { task_id: { type: "number" }, ref: { type: "string" }, not_kept: { type: "array", items: { type: "string" } } },
+      required: ["task_id", "ref"],
+      properties: {
+        task_id: { type: "number" }, ref: { type: "string" }, not_kept: { type: "array", items: { type: "string" } },
+        removed_ignored: { type: "boolean" },
+      },
     },
-    run: (a) => benches.markFinished(benchFor(a.task_id).id, { ref: a.ref || null, notKept: a.not_kept }),
+    run: (a) => benches.markFinished(benchFor(a.task_id).id, { ref: a.ref || null, notKept: a.not_kept, removedIgnored: a.removed_ignored === true }),
+  },
+  workbench_busy: {
+    description: "What is running in a task's Workbench folder right now, in words. Finish and Discard refuse while anything is.",
+    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
+    run: (a) => ({ running: benchStore.busyIn(benchFor(a.task_id)) }),
   },
   workbench_discarded: {
     description: "Record a Discard the command line has already done. Refuses unless the folder is gone and the Workbench's kept copy (ref) is in its repository.",
@@ -1865,7 +1873,7 @@ const TOOLS = {
 // above workbench_park.
 const INTERNAL_TOOLS = new Set([
   "workbench_park", "workbench_resume", "workbench_update", "workbench_commit", "workbench_push",
-  "workbench_pr", "workbench_finish_plan", "workbench_finished", "workbench_discarded", "workbench_recreate",
+  "workbench_pr", "workbench_finish_plan", "workbench_finished", "workbench_busy", "workbench_discarded", "workbench_recreate",
   "workbench_forget", "workbench_housekeep", "workbench_advanced",
 ]);
 const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";

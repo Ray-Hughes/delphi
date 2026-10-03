@@ -197,7 +197,7 @@ function parseWorktrees(out) {
       else if (key === "branch") current.branch = value.replace(/^refs\/heads\//, "");
       else if (key === "bare") current.bare = true;
       else if (key === "detached") current.detached = true;
-      else if (key === "locked") current.locked = true;
+      else if (key === "locked") { current.locked = true; current.lockReason = value || null; }
       else if (key === "prunable") current.prunable = true;
     }
   }
@@ -341,18 +341,34 @@ function parseIndexFlags(out) {
  * simply absent is a sparse checkout doing its job, not a change.
  */
 async function hiddenChanges(dir, flagged) {
-  const present = [];
+  const files = [];
   const hidden = [];
   for (const f of flagged) {
-    let exists = false;
-    try { exists = fs.lstatSync(path.join(dir, f.file)).isFile(); } catch {}
-    if (exists) present.push(f);
-    else if (f.assume && !f.skip) hidden.push(f.file);
+    let stat = null;
+    try { stat = fs.lstatSync(path.join(dir, f.file)); } catch {}
+    if (!stat) {
+      if (f.assume && !f.skip) hidden.push(f.file);
+    } else if (stat.isSymbolicLink()) {
+      // A link is stored as its target's text, so that is what is hashed;
+      // hash-object would follow it and hash whatever it points at.
+      const body = Buffer.from(fs.readlinkSync(path.join(dir, f.file)));
+      const sha = require("crypto").createHash("sha1").update(`blob ${body.length}\0`).update(body).digest("hex");
+      if (sha !== f.sha) hidden.push(f.file);
+    } else if (stat.isFile()) {
+      files.push(f);
+    }
   }
-  if (present.length) {
-    const r = await runWith(dir, ["hash-object", "--stdin-paths"], { input: present.map((f) => f.file).join("\n") + "\n", timeout: WRITE_TIMEOUT });
+  // --stdin-paths reads one name per line, so a name with a newline in it is
+  // asked about on its own.
+  const plainNames = files.filter((f) => !/[\n\r]/.test(f.file));
+  if (plainNames.length) {
+    const r = await runWith(dir, ["hash-object", "--stdin-paths"], { input: plainNames.map((f) => f.file).join("\n") + "\n", timeout: WRITE_TIMEOUT });
     const shas = r.ok ? r.stdout.split("\n").map((l) => l.trim()) : [];
-    present.forEach((f, i) => { if (shas[i] !== f.sha) hidden.push(f.file); });
+    plainNames.forEach((f, i) => { if (shas[i] !== f.sha) hidden.push(f.file); });
+  }
+  for (const f of files.filter((x) => /[\n\r]/.test(x.file))) {
+    const r = await runWith(dir, ["hash-object", "--", f.file], { timeout: WRITE_TIMEOUT });
+    if (!r.ok || r.stdout.trim() !== f.sha) hidden.push(f.file);
   }
   return hidden;
 }
@@ -639,6 +655,8 @@ const PLAIN = [
   [/index\.lock|could not lock|cannot lock ref/i, () => "Another git command is busy in this repository. Wait for it to finish and try again."],
   [/could not resolve host|unable to access|network is unreachable|connection (?:refused|timed out)|could not read from remote/i,
     () => "Could not reach the remote. Check the network or VPN and try again."],
+  [/failed to (?:delete|remove|unlink) '([^']+)': (?:Permission denied|Operation not permitted|Directory not empty)|\bE(?:ACCES|PERM)\b/i,
+    (m) => `Delphi could not remove ${m[1] ? m[1] : "part of the folder"}: something in it is read-only or still in use. Nothing was lost.`],
   [/open\("([^"]+)"\): Permission denied|could not open directory '([^']+)'|unable to (?:index|read|stat) file '?([^'\n]+)/i,
     (m) => `Delphi cannot read ${(m[1] || m[2] || m[3] || "a file").trim()} in this folder (its permissions do not allow it), so nothing was changed.`],
   [/permission denied|authentication failed|could not read username|403/i,

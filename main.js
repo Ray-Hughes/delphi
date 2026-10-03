@@ -1133,6 +1133,9 @@ const benches = createWorkbench({
   runEntry: sheetRun.runEntry,
   logDir: SHEET_LOG_DIR,
   settings: () => settings,
+  // Deleting a moved-aside folder can take minutes; the Workbench is already
+  // recorded by then, so the window is not kept waiting for it.
+  trashInBackground: true,
   onEvent: (event) => {
     if (win && !win.isDestroyed()) win.webContents.send("workbench-event", event);
   },

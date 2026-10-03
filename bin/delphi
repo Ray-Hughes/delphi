@@ -288,6 +288,27 @@ async function benchOf(client, taskId) {
  * Every "no" stops with nothing finished, because a half finished Finish is
  * the one outcome nobody asked for.
  */
+/**
+ * The last step of a Finish or Discard done here: delete the folder that was
+ * moved aside, now that the server has recorded it. No time limit, since a
+ * big tree takes as long as it takes, and the Workbench is already safely
+ * recorded. Anything that changed after the copy keeps the folder, and the
+ * Sheet says where.
+ */
+async function emptyAside(client, taskId, bench, made) {
+  if (!made.trash) return;
+  if (tty) process.stderr.write("delphi: deleting the old folder... ");
+  const result = await bench.emptyMoved(made);
+  if (result.kept) {
+    if (tty) process.stderr.write("kept.\n");
+    const words = `kept the old folder at ${result.kept}: ${result.changed.slice(0, 5).join(", ")}${result.changed.length > 5 ? ", and more" : ""} changed after the copy was made, so it was not deleted. Look through it, then delete it yourself.`;
+    warn(words);
+    try { await client.call("sheet_append", { task_id: taskId, kind: "note", body: words }); } catch {}
+  } else if (tty) {
+    process.stderr.write(result.deleted ? "done.\n" : "not yet; housekeeping will try again.\n");
+  }
+}
+
 async function finishFlow(client, taskId) {
   const person = interactive();
   let { status } = await benchOf(client, taskId);
@@ -347,8 +368,10 @@ async function finishFlow(client, taskId) {
       if (!(await yes(question))) { say("Nothing was finished."); return 1; }
       const bench = require("../workbench/workbench");
       const { workbench: wb } = await benchOf(client, taskId);
-      const made = await bench.finishFolder(wb, { confirm: left.confirm });
-      await client.call("workbench_finished", { task_id: taskId, ref: made.ref || undefined, not_kept: made.notKept });
+      const { running } = await client.call("workbench_busy", { task_id: taskId });
+      const made = await bench.finishFolder(wb, { confirm: left.confirm, busy: running });
+      await client.call("workbench_finished", { task_id: taskId, ref: made.ref, not_kept: made.notKept, removed_ignored: made.removedIgnored });
+      await emptyAside(client, taskId, bench, made);
       const task = await client.call("get_task", { id: taskId });
       done = { branch: made.branch, recover: made.recover, task_status: task.status };
     }
@@ -894,11 +917,13 @@ const COMMANDS = {
     if (typed !== String(task.id)) { say("Nothing was thrown away."); return 1; }
     // The plan's token: if what cannot be kept changed since it was listed
     // above, this refuses rather than lose files nobody was shown.
-    const result = await bench.discardFolder(wb, { confirm: plan.confirm });
+    const { running } = await client.call("workbench_busy", { task_id: task.id });
+    const result = await bench.discardFolder(wb, { confirm: plan.confirm, busy: running });
     await client.call("workbench_discarded", {
       task_id: task.id, ref: result.ref, unsaved: result.unsaved, files: result.files, commits: result.commits,
       detached: result.detached, ignored: result.ignored, branch_deleted: result.branchDeleted, not_kept: result.notKept,
     });
+    await emptyAside(client, task.id, bench, result);
     say(result.keptRemote
       ? `Discarded. The branch is still on the remote as ${result.keptRemote}.`
       : result.branchDeleted ? "Discarded, and the branch deleted." : `Discarded. The branch ${result.branch} is kept.`);

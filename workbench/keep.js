@@ -167,11 +167,19 @@ async function ignoredReport(git, folder, { main = null, copy = [] } = {}) {
  */
 function nestedRepos(folder, { gitlinks = [], untracked = [], report = null } = {}) {
   const found = new Set();
+  const submodules = [];
   const hasGit = (rel) => { try { fs.lstatSync(path.join(folder, rel, ".git")); return true; } catch { return false; } };
-  for (const g of gitlinks) if (hasGit(g)) found.add(`${g.replace(/\/+$/, "")}/`);
+  for (const g of gitlinks) {
+    if (!hasGit(g)) continue;
+    const name = `${g.replace(/\/+$/, "")}/`;
+    found.add(name);
+    submodules.push(name);
+  }
   for (const u of untracked) if (u.endsWith("/") && hasGit(u)) found.add(u);
   for (const n of (report && report.nested) || []) found.add(n);
-  return [...found].sort();
+  // The list, with which of them are submodules alongside: those are put
+  // away with git submodule deinit, not moved.
+  return Object.assign([...found].sort(), { submodules: submodules.sort() });
 }
 
 /**
@@ -180,8 +188,11 @@ function nestedRepos(folder, { gitlinks = [], untracked = [], report = null } = 
  * recompute it and refuse on any difference, so a confirmation is never
  * stretched over files the person was not shown.
  */
-function confirmToken(report) {
-  const list = { files: (report.files || []).map((f) => f.path).sort(), notKept: (report.notKept || []).map((n) => n.path).sort() };
+function confirmToken(report, workbenchId = null) {
+  // The Workbench's id is in it too, so a "yes" given for one Workbench's
+  // files is never taken for another's that happens to list the same names.
+  const list = { workbench: workbenchId == null ? null : Number(workbenchId),
+    files: (report.files || []).map((f) => f.path).sort(), notKept: (report.notKept || []).map((n) => n.path).sort() };
   return crypto.createHash("sha256").update(JSON.stringify(list)).digest("hex").slice(0, 32);
 }
 
@@ -289,8 +300,13 @@ async function snapshot(git, { repo, folder = null, branch, ref: wanted, keep = 
       let r = await git.runWith(folder, ["add", "--all", "--", "."], { env: withIndex, timeout: 10 * 60000 });
       if (!r.ok) return { ok: false, reason: git.plain(r, "Could not read every file in the folder.", { strict: true }) };
       if (keep.length) {
+        // With core.precomposeunicode (macOS) git reads every name composed,
+        // so a name the walk found decomposed is only matched in NFC. A path
+        // list on stdin is not converted for us the way argv is.
+        const pre = await git.run(folder, ["config", "--bool", "core.precomposeunicode"]);
+        const names = pre.ok && pre.stdout.trim() === "true" ? keep.map((k) => k.normalize("NFC")) : keep;
         r = await git.runWith(folder, ["add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"],
-          { env: withIndex, input: `${keep.join("\0")}\0`, timeout: 10 * 60000 });
+          { env: withIndex, input: `${names.join("\0")}\0`, timeout: 10 * 60000 });
         if (!r.ok) return { ok: false, reason: git.plain(r, "Could not read the ignored files.", { strict: true }) };
       }
       r = await git.runWith(folder, ["write-tree"], { env: withIndex });
@@ -314,8 +330,11 @@ async function snapshot(git, { repo, folder = null, branch, ref: wanted, keep = 
       if (wantIn.length) {
         const listed = await git.runWith(folder, ["ls-tree", "-r", "-z", "--name-only", tree], { timeout: 10 * 60000 });
         if (!listed.ok) return { ok: false, reason: "Could not check the copy." };
-        const inTree = new Set(listed.stdout.split("\0").filter(Boolean));
-        const lost = wantIn.filter((p) => !inTree.has(p) && fs.existsSync(path.join(folder, p)));
+        // Compared in NFC on both sides: macOS hands back a name as it was
+        // written (often NFD, "café" as e + accent), git stores it composed,
+        // and the two are the same file.
+        const inTree = new Set(listed.stdout.split("\0").filter(Boolean).map((p) => p.normalize("NFC")));
+        const lost = wantIn.filter((p) => !inTree.has(p.normalize("NFC")) && fs.existsSync(path.join(folder, p)));
         if (lost.length) {
           return { ok: false, reason: `The copy would be missing ${lost.slice(0, 5).join(", ")}${lost.length > 5 ? `, and ${lost.length - 5} more` : ""}.` };
         }
@@ -361,7 +380,141 @@ async function expire(git, repo, { days = KEEP_DAYS, now = Date.now() } = {}) {
   return gone;
 }
 
+// ---------------------------------------------------------------------------
+// Moving a folder aside, then emptying it
+//
+// Removing a folder in place can fail half way (a read-only directory from a
+// Go module cache, a process still writing into it) and leave neither the
+// folder nor its registration nor any record of the copy. So a folder is
+// renamed aside first, which is one atomic step on one filesystem, the
+// Workbench is recorded as closed at once, and the slow delete comes last,
+// where failing costs nothing but disk space.
+
+const TRASH = ".trash";
+
+/** Where a Workbench folder is moved aside to: a sibling, so the move is a rename. */
+function trashPath(folder, id, now = Date.now()) {
+  return path.join(path.dirname(folder), TRASH, `${Number(id)}-${now}`);
+}
+
+/**
+ * Renames the folder aside and drops git's registration of it. Throws,
+ * having moved nothing, if the rename fails.
+ */
+async function moveAside(git, { repo, folder, id }) {
+  const to = trashPath(folder, id);
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  fs.renameSync(folder, to);
+  // The registration now points at a folder that is gone, which is exactly
+  // what forgetRegistration clears, for this folder only.
+  await git.forgetRegistration(repo, folder);
+  return to;
+}
+
+/** A git blob id computed here, for files in a folder git no longer knows. */
+function blobId(full, stat) {
+  const body = stat.isSymbolicLink() ? Buffer.from(fs.readlinkSync(full)) : fs.readFileSync(full);
+  return crypto.createHash("sha1").update(`blob ${body.length}\0`).update(body).digest("hex");
+}
+
+/**
+ * Files in the moved folder that are not in the copy as they are now: new
+ * since the copy, or changed. Only files touched since the copy began are
+ * hashed, so a large tree costs a walk, not a read. Reproducible output and
+ * the files a person agreed could go are not counted. A folder that cannot be
+ * read counts as changed: what is in it is unknown.
+ */
+async function changedSince(git, { repo, trash, tree, since, notKept = [], copy = [] }) {
+  const listed = await git.runWith(repo, ["ls-tree", "-r", "-z", tree], { timeout: 10 * 60000 });
+  if (!listed.ok) return ["(the copy could not be read back)"];
+  const inCopy = new Map();
+  for (const rec of listed.stdout.split("\0").filter(Boolean)) {
+    const tab = rec.indexOf("\t");
+    const [, , sha] = rec.slice(0, tab).split(" ");
+    inCopy.set(rec.slice(tab + 1).normalize("NFC"), sha);
+  }
+  const agreed = new Set(notKept.map((n) => String(n.path || n).normalize("NFC")));
+  const changed = [];
+  const walk = (rel) => {
+    let entries;
+    try { entries = fs.readdirSync(path.join(trash, rel), { withFileTypes: true }); } catch { changed.push(`${rel}/`); return; }
+    for (const e of entries) {
+      const child = rel ? `${rel}/${e.name}` : e.name;
+      if (!rel && e.name === ".git") continue;
+      if (reproducible(child)) continue;
+      const full = path.join(trash, child);
+      if (e.isDirectory()) { walk(child); continue; }
+      const key = child.normalize("NFC");
+      if (agreed.has(key)) continue;
+      let stat;
+      try { stat = fs.lstatSync(full); } catch { continue; }
+      if (Math.max(stat.mtimeMs, stat.ctimeMs) < since - 2000) continue;
+      const sha = inCopy.get(key);
+      // A copied file (.env) still the same as the main checkout's is one
+      // Start copies again, so it was never meant to be in the copy.
+      if (!sha && copy.includes(child) && sameFile(full, path.join(repo, child))) continue;
+      let now = null;
+      try { now = blobId(full, stat); } catch {}
+      if (!sha || sha !== now) changed.push(key);
+    }
+  };
+  walk("");
+  return changed;
+}
+
+/** Deletes a folder, making each directory writable first (read-only caches). */
+function deleteTree(root) {
+  const open = (dir) => {
+    try {
+      const st = fs.lstatSync(dir);
+      if (!st.isDirectory()) return;
+      if ((st.mode & 0o700) !== 0o700) fs.chmodSync(dir, st.mode | 0o700);
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) if (e.isDirectory()) open(path.join(dir, e.name));
+    } catch {}
+  };
+  open(root);
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 2 });
+}
+
+/**
+ * Empties a folder moved aside, unless anything in it changed after the copy
+ * was made: then it is kept where it is, a .kept marker beside it so
+ * housekeeping leaves it alone, and the caller tells the person.
+ */
+async function emptyTrash(git, { repo, trash, tree, since, notKept = [], copy = [] }) {
+  if (!trash || !fs.existsSync(trash)) return { deleted: true, kept: null, changed: [] };
+  const changed = await changedSince(git, { repo, trash, tree, since, notKept, copy });
+  if (changed.length) {
+    try { fs.writeFileSync(`${trash}.kept`, `Kept because these changed after the copy was made:\n${changed.join("\n")}\n`); } catch {}
+    return { deleted: false, kept: trash, changed };
+  }
+  try {
+    deleteTree(trash);
+    return { deleted: true, kept: null, changed: [] };
+  } catch (error) {
+    return { deleted: false, kept: null, changed: [], reason: String(error.code || error.message) };
+  }
+}
+
+/**
+ * Housekeeping's half: retries deleting what is in a .trash folder, and
+ * nothing else. An entry with a .kept marker was kept on purpose and is left.
+ */
+function sweepTrash(root) {
+  const dir = path.join(root, TRASH);
+  const gone = [];
+  let entries = [];
+  try { entries = fs.readdirSync(dir); } catch { return gone; }
+  for (const name of entries) {
+    if (name.endsWith(".kept") || !/^\d+-\d+$/.test(name)) continue;
+    if (fs.existsSync(path.join(dir, `${name}.kept`))) continue;
+    try { deleteTree(path.join(dir, name)); gone.push(path.join(dir, name)); } catch {}
+  }
+  return gone;
+}
+
 module.exports = {
+  TRASH, trashPath, moveAside, changedSince, deleteTree, emptyTrash, sweepTrash,
   KEEP_DAYS, PER_FILE_MAX, TOTAL_MAX, WALK_MAX, NAMESPACES, REPRODUCIBLE_DIRS,
   reproducible, ignoredReport, nestedRepos, confirmToken, refFor, freeNames, recoverText, recoverFor, untilDate, snapshot, expire,
 };

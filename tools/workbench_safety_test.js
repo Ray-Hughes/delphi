@@ -506,6 +506,134 @@ async function main() {
     check("and hands over to a full read when anything changed", sheets.quietRead(t.id, { afterId: cursor.after_id, since: quiet.cursor.since }), null);
   }
 
+  // -------------------------------------------------------------------------
+  section("G5 M. A removal never stops half way: the folder is moved aside, recorded, then deleted");
+  {
+    const r = makeRepo("g5ro");
+    for (const verb of ["discard", "finish"]) {
+      const { t, wb } = await bench(r, `ro ${verb}`);
+      const d = path.join(wb.path, verb === "finish" ? "build/cache/pkg" : "cache/pkg");
+      write(path.join(d, "a.txt"), "a\n");
+      fs.chmodSync(d, 0o555);   // as go mod, Bazel and nix leave their caches
+      const done = verb === "finish"
+        ? await benches.finish(wb.id, { confirm: (await benches.finishPlan(wb.id)).confirm })
+        : await benches.discard(wb.id, String(t.id));
+      check(`${verb}: a read-only folder inside goes, and the row and copy are recorded`,
+        [exists(wb.path), store.get(wb.id).state, gitOk(r.app, "rev-parse", "--verify", done.ref), done.cleanup.deleted],
+        [false, verb === "finish" ? "finished" : "discarded", true, true]);
+      check(`${verb}: no trash left behind`, fs.readdirSync(path.join(path.dirname(wb.path), keep.TRASH)).filter((n) => n.startsWith(`${wb.id}-`)), []);
+      check(`${verb}: git no longer lists the folder`, git(r.app, "worktree", "list", "--porcelain").includes(wb.path), false);
+    }
+
+    // A file written into the folder after the copy was made: the git half
+    // is run on its own so the write can land exactly between the copy and
+    // the delete, as a writer racing the Discard would.
+    const W = require("../workbench/workbench");
+    for (const how of ["a new file", "an appended file"]) {
+      const { t, wb } = await bench(r, `late ${how}`);
+      write(path.join(wb.path, "log.txt"), "one\n");
+      const done = await W.discardFolder(store.get(wb.id));
+      await benches.markDiscarded(wb.id, done);
+      check(`${how}: recorded before anything is deleted`, [store.get(wb.id).state, exists(done.trash)], ["discarded", true]);
+      if (how === "a new file") write(path.join(done.trash, "late.txt"), "written after the copy\n");
+      else fs.appendFileSync(path.join(done.trash, "log.txt"), "two\n");
+      const left = await W.emptyMoved(done);
+      check(`${how}: the moved folder is kept, not deleted`, [left.deleted, left.kept, left.changed], [false, done.trash, [how === "a new file" ? "late.txt" : "log.txt"]]);
+      check(`${how}: marked so housekeeping leaves it`, exists(`${done.trash}.kept`), true);
+      await benches.housekeep();
+      check(`${how}: and housekeeping did`, exists(done.trash), true);
+      fs.rmSync(done.trash, { recursive: true, force: true });
+      void t;
+    }
+
+    // Deleting fails outright (an immutable file): the Workbench is already
+    // recorded, and housekeeping deletes the rest later.
+    if (process.platform === "darwin") {
+      const { t, wb } = await bench(r, "undeletable");
+      write(path.join(wb.path, "stuck.txt"), "s\n");
+      const W2 = require("../workbench/workbench");
+      const done = await W2.discardFolder(store.get(wb.id));
+      await benches.markDiscarded(wb.id, done);
+      execFileSync("chflags", ["uchg", path.join(done.trash, "stuck.txt")]);
+      const left = await W2.emptyMoved(done);
+      check("a delete that fails leaves the Workbench recorded", [left.deleted, store.get(wb.id).state], [false, "discarded"]);
+      execFileSync("chflags", ["nouchg", path.join(done.trash, "stuck.txt")]);
+      const hk = await benches.housekeep();
+      check("housekeeping deletes it on a later run", [hk.trashed.includes(done.trash), exists(done.trash)], [true, false]);
+      void t;
+    }
+
+    // Something Delphi started is still running in the folder.
+    const { t: bt, wb: bwb } = await bench(r, "busy");
+    write(path.join(bwb.path, "w.txt"), "w\n");
+    const running = sheets.append({ taskId: bt.id, kind: "run", body: "npm run watch",
+      meta: { state: "running", cwd: bwb.path, runner_pid: process.pid, runner_host: os.hostname() } });
+    await rejects("discard refuses while a run is live in the folder", benches.discard(bwb.id, String(bt.id)), /still running in this folder: \$ npm run watch/, "BUSY");
+    await rejects("finish too", benches.finish(bwb.id), /unsaved|still running/);
+    sheets.update(running.id, { meta: { state: "ok", code: 0 } });
+    db.handle().prepare("UPDATE tasks SET claimed_by = 'claude-code:2', claim_expires = datetime('now', '+30 minutes') WHERE id = ?").run(bt.id);
+    await rejects("and while an agent holds the task", benches.discard(bwb.id, String(bt.id)), /an agent \(claude-code:2\) holding task/, "BUSY");
+    db.handle().prepare("UPDATE tasks SET claimed_by = NULL, claim_expires = NULL WHERE id = ?").run(bt.id);
+    check("nothing was touched", [exists(path.join(bwb.path, "w.txt")), store.get(bwb.id).state], [true, "active"]);
+    check("plain: a delete that failed is not a credentials problem",
+      wgit.plain({ stderr: "error: failed to delete '/x/y': Permission denied\n" }), "Delphi could not remove /x/y: something in it is read-only or still in use. Nothing was lost.");
+  }
+
+  // -------------------------------------------------------------------------
+  section("G5 low");
+  {
+    const r = makeRepo("g5low");
+    // 1. A decomposed (NFD) name among the kept ignored files.
+    const n = await bench(r, "nfd");
+    write(path.join(n.wb.path, "build", "re\u0301sume\u0301.txt"), "cv\n");
+    const nd = await benches.discard(n.wb.id, String(n.t.id));
+    check("an NFD ignored name is kept and verified", git(r.app, "show", `${nd.ref}:build/r\u00e9sum\u00e9.txt`), "cv");
+
+    // 2. Untouched assume-unchanged symlink and newline-named file: no false hidden changes.
+    fs.symlinkSync("README.md", path.join(r.app, "link"));
+    write(path.join(r.app, "x\ny"), "v1\n");
+    git(r.app, "add", "-A");
+    git(r.app, "commit", "-qm", "odd");
+    git(r.app, "push", "-q", "origin", "main");
+    const h = await bench(r, "hidden odd");
+    git(h.wb.path, "update-index", "--assume-unchanged", "--", "link");
+    git(h.wb.path, "update-index", "--assume-unchanged", "--", "x\ny");
+    check("no hidden change for an untouched symlink or newline name", (await benches.status(h.wb.id, { fresh: true })).hidden, []);
+    write(path.join(h.wb.path, "x\ny"), "v2\n");
+    check("but an edit to the newline name is one", (await benches.status(h.wb.id, { fresh: true })).hidden, ["x\ny"]);
+
+    // 3. markFinished needs the copy.
+    const m = await bench(r, "mark");
+    fs.renameSync(m.wb.path, `${m.wb.path}.away`);
+    await rejects("markFinished with no ref refuses", benches.markFinished(m.wb.id, {}), /recorded with its copy/, "NO_COPY");
+    fs.renameSync(`${m.wb.path}.away`, m.wb.path);
+    check("and records nothing", store.get(m.wb.id).state, "active");
+
+    // 4. A token is for one Workbench.
+    const a = await bench(r, "token a");
+    const b = await bench(r, "token b");
+    write(path.join(a.wb.path, "build/same.txt"), "a\n");
+    write(path.join(b.wb.path, "build/same.txt"), "a\n");
+    const ta = (await benches.finishPlan(a.wb.id)).confirm;
+    check("the same list in two Workbenches has two tokens", ta === (await benches.finishPlan(b.wb.id)).confirm, false);
+    await rejects("one Workbench's token does not finish another", benches.finish(b.wb.id, { confirm: ta }), /these exact files/, "IGNORED");
+
+    // 6. A submodule is named as one, with deinit.
+    const lib = makeRepo("g5sublib");
+    const sm = await bench(r, "submodule");
+    execFileSync(GIT, ["-C", sm.wb.path, "-c", "protocol.file.allow=always", "submodule", "add", "-q", lib.app, "vendor/lib"], { stdio: "ignore" });
+    git(sm.wb.path, "commit", "-qm", "add lib");
+    await rejects("a submodule stops discard and says deinit", benches.discard(sm.wb.id, String(sm.t.id)), /git submodule deinit vendor\/lib/, "NESTED");
+
+    // 5. Old repos rows are left at 0 (not detected): see schema_later.
+    const { DatabaseSync } = require("node:sqlite");
+    const old = new DatabaseSync(":memory:");
+    old.exec("CREATE TABLE tasks (id INTEGER PRIMARY KEY); CREATE TABLE repos (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, path TEXT, is_primary INTEGER, setup_cmd TEXT)");
+    old.exec("INSERT INTO repos (project_id, name, path, is_primary, setup_cmd) VALUES (1, 'x', '/x', 1, 'npm ci')");
+    require("../agent/schema_later").apply((q) => { const st = old.prepare(q); return /^\s*(SELECT|PRAGMA)/i.test(q) ? st.all() : (st.run(), []); });
+    check("an old row's setup command is not claimed as detected", old.prepare("SELECT setup_cmd_detected AS d FROM repos").get().d, 0);
+  }
+
   await viaServer();
   fs.rmSync(dir, { recursive: true, force: true });
   console.log(`\n${checks - failures}/${checks} checks passed`);
