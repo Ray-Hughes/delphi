@@ -508,6 +508,7 @@ tasks and findings as it goes rather than waiting to be asked.
 | `oracle_ask` | Meaning and connections together. The main way to ask what we know |
 | `recent_activity` | What changed, and which agent changed it |
 | `sheet_read` | A task's Sheet: the tail, the ledger, or all of it, with a cursor for polling |
+| `sheet_get` | One entry by its id |
 | `sheet_append` | Write on a Sheet: something said, a note, or a command and its result |
 | `sheet_update` | Finish a run entry, or edit an entry |
 | `sheet_promote` | Put an entry in the ledger, or take it out |

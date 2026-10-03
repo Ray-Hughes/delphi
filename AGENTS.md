@@ -41,6 +41,7 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `queue_release` | Give a claimed task back, with a reason |
 | `queue_extend` | Push your lease out because you are still working |
 | `sheet_read` | A task's Sheet: the tail, the ledger, or all of it. Pass the cursor back to poll |
+| `sheet_get` | One entry by its id, with its task id |
 | `sheet_append` | Write on a task's Sheet: `say` a finding, `note` something done, record a `run` |
 | `sheet_update` | Finish a run entry with its result, or edit an entry |
 | `sheet_promote` | Put an entry in the task's ledger, or take it out |

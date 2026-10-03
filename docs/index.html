@@ -283,6 +283,16 @@
   .shot-bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line); display: block; }
   .shot img { width: 100%; height: auto; display: block; }
   figure { margin: 26px 0; }
+  /* A tall, narrow capture (the Sheet rail) sits beside the prose it explains
+     rather than filling the column with a strip of screenshot. */
+  .beside { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 32px; align-items: start; }
+  .beside figure { margin-top: 6px; }
+  .shot.small { margin-top: 0; }
+  .shot.fit { max-width: 584px; }
+  @media (max-width: 1100px) {
+    .beside { grid-template-columns: 1fr; }
+    .beside figure { max-width: 320px; }
+  }
   figcaption { font-size: 13.5px; color: var(--ink-faint); margin-top: 10px; }
 
   /* Pieces ---------------------------------------------------------------- */
@@ -378,6 +388,7 @@
     <a href="#using">Projects and tasks</a>
     <a href="#memory">Memory notes</a>
     <a href="#search">Search and the Oracle</a>
+    <a href="#sheets">Sheets and Workbenches</a>
 
     <h4>AI agents</h4>
     <a href="#agents">Connect an agent</a>
@@ -616,6 +627,116 @@
       </p>
     </section>
 
+    <section id="sheets">
+      <h2>Sheets and Workbenches</h2>
+      <div class="beside">
+        <div>
+          <p>
+            Every task has a <strong>Sheet</strong>: the running record of the work on
+            it. Each line is an entry, and an entry is one of five things. Something a
+            person or an agent said, a command and its result, a question with two to
+            four answers, the answer, or a short note of something done.
+          </p>
+          <p>
+            A Sheet gets long, and the next agent does not need all of it. So the
+            entries that change what the next person should do are
+            <strong>promoted</strong> into the <strong>ledger</strong>: a finding, a
+            dead end, a decision. Decisions go in by themselves, with the question they
+            answer. An agent picking the task up reads the ledger plus the last twenty
+            entries, so it sees what mattered first and what just happened second.
+          </p>
+          <p>
+            An entry that would matter on another task too can be
+            <strong>filed</strong> as a project note, a decision, gotcha or reference,
+            so search and the graph find it from everywhere else.
+          </p>
+          <p>
+            There is one write path. The app, the command line and every agent go
+            through the same store and the same rules, so an entry looks the same
+            whoever wrote it, and every write lands in History under the name of the
+            person or agent that made it. Copying an entry gives clean text, without
+            the ids and run details, so it pastes anywhere.
+          </p>
+          <p>
+            A command run from a Sheet is shown to the safety guard first, a person's
+            or an agent's, and a refused one is recorded with the reason and never
+            run. Its output is kept in a log beside the database, never in git.
+          </p>
+        </div>
+        <figure>
+          <div class="shot small">
+            <img id="shot-sheet" src="shot-sheet-dark.png" width="722" height="2430"
+                 alt="A task's Sheet: a question from a person, an agent's finding being filed, two commands with their results, and a question answered by a decision." />
+          </div>
+          <figcaption>The Sheet beside a task. A plus marks what is in the ledger.</figcaption>
+        </figure>
+      </div>
+
+      <h3>From a terminal</h3>
+      <p>
+        The same Sheets work from a shell. From a checkout, <code>make cli</code>
+        puts a <code>delphi</code> command on your PATH. It talks to the same MCP
+        server agents use, so it follows the same rules and leaves the same History.
+      </p>
+      <pre><code>delphi cat 42                  the Sheet, clean when piped
+delphi say 42 "the retry storm starts at 09:00"
+delphi run 42 -- npm test      run it, record it, keep the log
+delphi ask 42 "retry or drop?" "retry" "drop to the DLQ"
+delphi decide 809 b --why "the alarm pages someone"
+delphi file 806 gotcha</code></pre>
+      <p>
+        <code>delphi open 42</code> is the Sheet full screen and live. Type to add
+        to it: plain text says something, <code>$</code> runs, <code>!</code> notes,
+        <code>?</code> asks. <kbd>Esc</kbd> walks the entries: <kbd>y</kbd> copies
+        one, <kbd>p</kbd> promotes, <kbd>f</kbd> files, <kbd>a</kbd> to
+        <kbd>d</kbd> answers a question, <kbd>q</kbd> quits.
+      </p>
+      <p>
+        <code>delphi chat 42</code> puts Claude Code or Copilot on the task. What it
+        says, the commands it runs and the files it edits are written onto the Sheet
+        as it goes, under its own name, and a later chat picks the same conversation
+        up.
+      </p>
+
+      <h3>Workbenches</h3>
+      <p>
+        A Workbench gives a task its own folder and its own branch, so two pieces of
+        work never share one checkout. Two agents can work two tasks in the same
+        repository side by side, and switching tasks is switching folders rather
+        than stashing.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Button</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td>Start working</td><td>Makes the folder and a branch named for the task, copies files git does not carry such as <code>.env</code>, and runs the project's setup</td></tr>
+            <tr><td>Open</td><td>Opens the folder in your editor, a terminal, or the file browser</td></tr>
+            <tr><td>Park</td><td>Sets it aside. Nothing on disk changes</td></tr>
+            <tr><td>Finish</td><td>Offers to commit and push what is left, then a pull request, then puts the folder away. The branch is always kept</td></tr>
+            <tr><td>Discard</td><td>Throws an attempt away, after listing what would go and asking you to type the task's number. Agents are never offered it</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Neither Finish nor Discard can lose work. Finish refuses, saying why, while
+        anything is unsaved or not pushed, and asks by name about files git does
+        not keep before they go. Discard first keeps a copy of everything in the
+        folder inside the repository, for thirty days, and the Sheet records the one
+        command that brings it back. A folder deleted by hand shows as Missing, with
+        Recreate, rather than being quietly forgotten.
+      </p>
+      <figure>
+        <div class="shot fit">
+          <img id="shot-workbench" src="shot-workbench-dark.png" width="584" height="372"
+               alt="A project's Workbenches card: five tasks, each with its branch and its state in words, such as 1 unsaved change, Missing, and behind main by 1 with an Update button." />
+        </div>
+        <figcaption>
+          A project's live Workbenches, in words rather than git's. Underneath it is a
+          git worktree; Show advanced has the real commands, for anyone who wants them.
+        </figcaption>
+      </figure>
+    </section>
+
     <section id="agents">
       <h2>Connect an AI agent</h2>
       <p>
@@ -644,28 +765,32 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
 
     <section id="tools">
       <h2>What agents can do</h2>
+      <p>The server offers 43 tools. Grouped by what they are for:</p>
       <div class="tablewrap">
         <table>
-          <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+          <thead><tr><th>For</th><th>Tools</th></tr></thead>
           <tbody>
-            <tr><td>list_projects</td><td>Projects with open task counts</td></tr>
-            <tr><td>add_project</td><td>Create a project when work fits none of the existing ones</td></tr>
-            <tr><td>list_tasks</td><td>Tasks, filtered by project or status</td></tr>
-            <tr><td>add_task</td><td>Create a task</td></tr>
-            <tr><td>update_task</td><td>Change status, priority, detail or project</td></tr>
-            <tr><td>add_note</td><td>Store a decision, gotcha or reference</td></tr>
-            <tr><td>search</td><td>Search tasks and notes</td></tr>
-            <tr><td>oracle_context</td><td>Everything connected to a ticket, service, repo, file or concept</td></tr>
-            <tr><td>oracle_entities</td><td>What the graph knows about, most referenced first</td></tr>
-            <tr><td>oracle_ask</td><td>Meaning and connections together. The main way to ask what we know</td></tr>
-            <tr><td>recent_activity</td><td>What changed, and which agent changed it</td></tr>
+            <tr><td>Projects and tasks</td><td>list_projects, add_project, list_tasks, add_task, update_task, get_task, add_comment</td></tr>
+            <tr><td>Taking work</td><td>queue_status, queue_next, queue_extend, queue_complete, queue_release</td></tr>
+            <tr><td>Sheets</td><td>sheet_read, sheet_get, sheet_append, sheet_update, sheet_promote, sheet_file, sheet_ask, sheet_decide, sheet_resolve</td></tr>
+            <tr><td>Workbenches</td><td>workbench_start, workbench_status, workbench_finish, workbench_list</td></tr>
+            <tr><td>Memory</td><td>add_note, search, oracle_context, oracle_entities, oracle_ask</td></tr>
+            <tr><td>Working documents</td><td>list_scratchpads, read_scratchpad, write_scratchpad, append_scratchpad, patch_scratchpad</td></tr>
+            <tr><td>Other agents</td><td>list_agents, handoff_send, handoff_status, lock_acquire, lock_release, lock_status, timer_set</td></tr>
+            <tr><td>History</td><td>recent_activity</td></tr>
           </tbody>
         </table>
       </div>
       <p>
-        Agents coordinate through shared state, not messages. One writes a task,
-        another sees it and picks it up, and both leave a trail. There is no
-        mechanism here for one agent to command another.
+        Agents mostly coordinate through shared state. One writes a task, another
+        sees it and picks it up, and both leave a trail. When one needs another
+        directly, <code>handoff_send</code> hands a piece of work to a different
+        agent and the reply wakes the sender with a fresh turn, so neither waits in
+        a loop. Locks stop two of them editing the same thing at once.
+      </p>
+      <p>
+        There is deliberately no tool to discard a Workbench. Throwing work away is
+        a person's decision.
       </p>
     </section>
 
@@ -898,6 +1023,8 @@ make start</code></pre>
     const suffix = current() === "dark" ? "dark" : "light";
     document.getElementById("shot-main").src = "shot-overview-" + suffix + ".png";
     document.getElementById("shot-memory").src = "shot-memory-" + suffix + ".png";
+    document.getElementById("shot-sheet").src = "shot-sheet-" + suffix + ".png";
+    document.getElementById("shot-workbench").src = "shot-workbench-" + suffix + ".png";
   }
   paintShots();
 
