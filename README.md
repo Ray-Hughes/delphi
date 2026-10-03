@@ -34,7 +34,7 @@ learns is still there for the next session.
 
 <br>
 
-[**Why**](#why) · [**Install**](#install) · [**Use**](#use) · [**Agents**](#connecting-an-ai-agent) · [**Graph**](#the-knowledge-graph) · [**Safety**](#safety-guard) · [**Data**](#your-data)
+[**Why**](#why) · [**Install**](#install) · [**Use**](#use) · [**Sheets**](#sheets) · [**Workbenches**](#workbenches) · [**Agents**](#connecting-an-ai-agent) · [**Graph**](#the-knowledge-graph) · [**Safety**](#safety-guard) · [**Data**](#your-data)
 
 </div>
 
@@ -149,6 +149,9 @@ side.
 | `make setup` | First run: dependencies, agents and Desktop icon |
 | `make mcp` | Connect the Oracle to Claude Code and Copilot |
 | `make desktop` | Put a Delphi icon on the Desktop |
+| `make test` | Every test, as CI runs them (`npm test`) |
+| `make cli` | Put the `delphi` command on your PATH |
+| `make prune-logs` | Delete run logs for tasks done over 30 days ago |
 
 Building the installers yourself needs `npm run dist:mac` or `npm run dist:win`.
 Each has to run on its own platform: a Windows installer built on macOS needs
@@ -175,6 +178,8 @@ choose Delphi. **Windows**: press <kbd>Win</kbd>+<kbd>R</kbd>, run
 | Move between projects | Hover a task and use the **move to** menu |
 | Store a finding | The **Memory** tab, per project |
 | Read what an agent is working on | The **Pads** tab, per project |
+| Talk, run and decide on a task | Its **Sheet**, the rail beside the task |
+| Work on a task in its own folder | **Start working** in the task panel |
 | Run Claude Code, Codex or Copilot | The **Chat** tab, then the agent's tab |
 | Read a note as prose | **Memory** tab, switch **Formatted** and **Raw markdown** |
 | Filter the task list | Click any count on a project's **Overview** |
@@ -240,6 +245,163 @@ dropped. And an unticked box does not drag a task out of **doing** or
 
 A pad that is a sketch rather than a plan can be switched to **Notes only**, and
 then nothing in it reaches the board.
+
+### Sheets
+
+Every task has a Sheet: the running record of the work on it. Each line is an
+entry, and an entry is one of five things, marked by its first character:
+
+```
+> ray: why is the DLQ filling up?                       a person says something
+@ claude-code:12: visibility timeout is under p95       an agent says something
+$ aws sqs get-queue-attributes --queue-url ...          a command, with its result
+? retry or drop?: [a] retry [b] drop to the DLQ         a question, two to four answers
+= b                                                     the answer, and why under it
+  the DLQ alarm pages someone
+! edited src/worker.js                                  a short note of something done
+```
+
+A Sheet gets long, and the next agent does not need all of it. So some entries
+are **promoted** into the **ledger**: what changes what the next person should
+do. A finding, a dead end, a decision. Decisions are in the ledger
+automatically, along with the question they answer. An agent picking the task up
+gets the ledger plus the last 20 entries, so it reads what mattered first and
+what just happened second.
+
+An entry that would matter on a different task too can be **filed** as a project
+note (a decision, gotcha, reference or note), so search and the graph find it
+from everywhere else. The Sheet keeps a link to the note.
+
+In the app the Sheet is the rail beside the task panel. **All** and **Ledger**
+switch between everything and what was promoted. Hover an entry to promote it,
+file it, or copy it. A `$ ` entry runs the command in the task's folder and
+records the result; the full output is kept in a log, and a short one is shown
+inline.
+
+Every command is shown to `agent/guard.py` before it runs, a person's or an
+agent's, and a refused one is recorded with the reason and never run. There is
+no override: if the guard blocks something that genuinely needs doing, run it
+yourself in a normal terminal.
+
+### The delphi command
+
+The same Sheets from a shell. `make cli` puts `delphi` on your PATH as a link
+into the checkout, so a `git pull` updates it. It talks to the MCP server rather
+than the database, so it follows the same rules and leaves the same History.
+
+```bash
+delphi cat 42                       # the Sheet, clean when piped
+delphi cat 42 --ledger              # only what was promoted
+delphi say 42 "the retry storm starts at 09:00"
+delphi note 42 "deployed to staging" --promote
+delphi run 42 -- npm test           # run it, record it, keep the log
+delphi out 807                      # that run's full output
+delphi ask 42 "retry or drop?" "retry" "drop to the DLQ"
+delphi decide 809 b --why "the alarm pages someone"
+delphi promote 806
+delphi file 806 gotcha --title "visibility timeout"
+```
+
+A task is its id, its legacy id (`T-17`) or its ticket ref (`ABC-1234`), and an
+entry is its id, which `delphi cat` shows at a terminal. Writes are attributed
+to `DELPHI_ACTOR`, or your username when that is not set. `delphi help` lists
+everything and `delphi help <command>` explains one.
+
+### The Sheet in a terminal
+
+`delphi open 42` is the Sheet full screen and live, so you can work a task
+without the app. You start in **Type** mode, where what you type is added:
+
+| Typed | Becomes |
+| --- | --- |
+| plain text | something you say |
+| `$ command` | a command, run and recorded |
+| `! text` | a note |
+| `? question \| a \| b` | a question with answers |
+| `/ledger`, `/status`, `/task` | ledger only, the task's status, its detail |
+| `/work`, `/finish`, `/park`, `/update` | the task's Workbench |
+| `/agent claude`, `/agent off` | attach an agent, or detach it |
+
+<kbd>Esc</kbd> switches to **Walk** mode, which moves between entries:
+
+| Key | Does |
+| --- | --- |
+| <kbd>j</kbd> <kbd>k</kbd>, arrows | move |
+| <kbd>y</kbd> / <kbd>Y</kbd> | copy the entry clean / with its output |
+| <kbd>v</kbd> then <kbd>y</kbd> | copy a range |
+| <kbd>p</kbd> | promote, or take out of the ledger |
+| <kbd>f</kbd> | file as a project note |
+| <kbd>Enter</kbd> | fold or unfold |
+| <kbd>a</kbd> to <kbd>d</kbd> | answer a question |
+| <kbd>r</kbd> / <kbd>e</kbd> / <kbd>o</kbd> | rerun / edit / page the output |
+| <kbd>L</kbd> | ledger only, and back |
+| <kbd>W</kbd> | open the Workbench folder |
+| <kbd>i</kbd> | back to typing |
+| <kbd>q</kbd> | quit |
+
+Copying works over SSH as well, through the terminal's own clipboard escape,
+with `pbcopy` and its relatives too whenever one is there.
+
+### delphi chat
+
+`delphi chat 42` puts Claude Code or Copilot on a task's Sheet. You type, the
+agent takes a turn, and what it says, the commands it runs and the files it edits
+are written onto the Sheet as it goes, under its own name. A later
+`delphi chat 42` picks the same conversation up.
+
+```bash
+delphi chat 42                            # Claude Code, asks for each line
+delphi chat 42 --agent copilot "why is the DLQ filling?"
+delphi chat 42 --auto                     # may run commands and edit files
+```
+
+Without `--auto`, Claude Code can only talk and use Delphi's tools, and Copilot
+asks before each tool. `--auto` lets the agent act without asking, and for Claude
+Code it needs the guard installed. The guard is a Claude Code hook and cannot see
+Copilot's commands, so Copilot with `--auto` also needs `--allow-unguarded`,
+which is you saying so out loud.
+
+### Workbenches
+
+A Workbench gives a task its own folder and its own branch, so two pieces of
+work never share one checkout. Two agents can work two tasks in the same
+repository side by side, and switching tasks is switching folders rather than
+stashing.
+
+There are five things to do with one:
+
+- **Start working** makes the folder and the branch, named for the task, copies
+  across files git does not carry such as `.env`, and runs the project's setup
+  (`npm ci` and the like) as a recorded command. An existing branch is reused.
+- **Open** opens the folder in your editor, a terminal, or the file browser.
+- **Park** sets it aside. Nothing on disk changes, and **Resume** picks it up.
+- **Finish** puts it away once the work is shared: it offers to commit and push
+  what is left, then a pull request, then removes the folder. The branch is
+  always kept. It refuses, saying why, while anything is unsaved or unpushed,
+  and asks by name about files git does not keep before they go.
+- **Discard**, under **More**, throws an attempt away. It lists exactly what
+  would go and asks you to type the task's number. Agents are never offered it.
+
+Neither one loses work. Discard first keeps a copy of everything in the folder
+inside the repository, and Finish does the same for any files git does not keep
+that it is told can go. Copies are kept for 30 days, and the Sheet records the
+one command that brings one back as a fresh folder:
+
+```bash
+git -C ~/src/app worktree add -b ray/42-dlq-recovered ~/src/app.workbenches/42-dlq refs/delphi/discarded/42-7
+```
+
+The folders live beside the repository, in `<repo>.workbenches/`, or wherever
+`DELPHI_WORKBENCH_DIR` says. A folder deleted by hand shows as **Missing**, with
+**Recreate** and **Forget**. **Show advanced** shows the real branch, path and
+git commands, for anyone who wants to learn what is underneath: it is a git
+worktree, and nothing else in Delphi calls it that.
+
+From a shell: `delphi work 42` opens a shell in the task's folder, starting one
+if needed. `delphi benches`, `delphi status 42`, `delphi update 42`,
+`delphi park 42`, `delphi finish 42` and `delphi discard 42` do the rest. The
+queue runner gives each task its own Workbench with `--workbenches`, which is
+off by default and is what makes `--concurrency` above 1 safe in one repository.
 
 ### Memory notes
 
@@ -345,6 +507,17 @@ tasks and findings as it goes rather than waiting to be asked.
 | `oracle_entities` | What the graph knows about, most referenced first |
 | `oracle_ask` | Meaning and connections together. The main way to ask what we know |
 | `recent_activity` | What changed, and which agent changed it |
+| `sheet_read` | A task's Sheet: the tail, the ledger, or all of it, with a cursor for polling |
+| `sheet_append` | Write on a Sheet: something said, a note, or a command and its result |
+| `sheet_update` | Finish a run entry, or edit an entry |
+| `sheet_promote` | Put an entry in the ledger, or take it out |
+| `sheet_file` | Turn an entry into a project note |
+| `sheet_ask` / `sheet_decide` | Ask a question with two to four answers, and answer it |
+| `sheet_resolve` | Find a task from an id or ref, and where its commands should run |
+| `workbench_start` | Give a task its own folder and branch, or return the one it has |
+| `workbench_status` | Unsaved, unshared or behind, in words |
+| `workbench_finish` | Put a Workbench away once its work is committed and pushed |
+| `workbench_list` | The live Workbenches, with their status |
 
 ### On delegation
 
@@ -367,7 +540,7 @@ concepts mentioned inside the text, plus edges between entities that appear
 together.
 
 Extraction is deterministic. Patterns match only shapes that cannot be mistaken
-for prose, and everything else comes from a curated vocabulary in `graph.js`. An
+for prose, and everything else comes from a curated vocabulary in `oracle.js`. An
 invented node is worse than a missing one: a missing node makes a query return
 less, a wrong node makes it return something false.
 
@@ -411,7 +584,13 @@ It stops recursive deletes of root and home paths, deletes of unexpanded variabl
 `.git`, `git clean` without a dry run, force pushes without `--force-with-lease`, repository deletion,
 `DROP TABLE`, `DELETE FROM` with no `WHERE`, namespace deletion, untargeted `terraform destroy`,
 piping a download into a shell, and disk-level commands. It also refuses edits to its own hook
-configuration.
+configuration, `delphi discard` (throwing a Workbench away is a person's call), and setting
+`DELPHI_CLIENT`, which is how an agent would pretend to be the `delphi` command to reach the tools
+only it is given.
+
+It is a Claude Code hook, so it sees the commands Claude Code runs and nothing else. Copilot and
+Codex do not run it. Every `$ ` command on a Sheet is checked against it whoever wrote it, and a
+Sheet run fails closed, refusing to run anything, when the guard or python3 cannot be found.
 
 It matches on intent rather than exact spelling, so flags written separately or with unusual spacing
 are still caught, and each command in a compound is judged on its own so a flag belonging to one is
@@ -477,6 +656,10 @@ is untracked; a markdown file next to it is not.
 The database uses write-ahead logging, so either quit the application first or copy `delphi.db-wal`
 alongside it.
 
+Command output from Sheet runs is kept as log files in a `sheets/` folder
+beside the database, never in git. `make prune-logs` deletes the logs of tasks
+done more than 30 days ago, and reads the database without writing to it.
+
 Every change is recorded with the row as it was before, which is what makes the History tab able to
 reverse any change rather than only the most recent one.
 
@@ -487,24 +670,38 @@ reverse any change rather than only the most recent one.
 | File | Role |
 | --- | --- |
 | `schema.sql` | Tables, applied on every open so it is safe to re-run |
-| `db.js` | All database access, main process only |
+| `db.js` | The app's database access, in the main process. `db.sqlP` is what the shared stores are handed |
 | `paths.js` | Where things live, which differs once packaged |
 | `main.js` | Window, tray, menu, global shortcut, IPC |
 | `preload.js` | The only bridge the interface has to the data |
 | `app.js` | The interface |
 | `embeddings.js` | Local vectors: Ollama when present, lexical when not |
 | `agent/mcp_server.js` | MCP server for AI agents |
+| `agent/schema_later.js` | Columns added since a database was made, applied by the app and the server alike |
+| `agent/launch.js` | Splitting command lines, finding binaries, and checking the guard is wired in |
+| `agent/queue_runner.js` | Works the queue unattended, one agent run per task |
 | `agent/guard.py` | Destructive command guard |
+| `pads.js` | The scratchpad grammar, shared by the app and the server |
+| `sheet/` | Sheets: the text format, the store, running commands, questions, and `delphi chat` |
+| `sheet/tui/` | The Sheet in a terminal, for `delphi open` |
+| `workbench/` | Workbenches: names, git, setup, the store, and keeping a copy before anything goes |
+| `bin/delphi` | The command line |
 | `install/mcp.sh`, `install/mcp.ps1` | Connects the server to Claude Code and Copilot |
 | `install/desktop.sh` | Builds the Desktop launcher for a checkout |
-| `electron-builder.yml` | How the installers are packaged |
+| `electron-builder.config.js` | How the installers are packaged, and what is copied outside the archive |
+| `tools/test_all.js` | Runs every test; it is what `npm test` runs |
 | `tools/make_icons.py` | Rebuilds every icon from the artwork in `build/source` |
 | `docs/` | The download page, served by GitHub Pages |
 
 Storage is SQLite through `node:sqlite`, which ships inside Electron. There is no native module to
 compile and nothing to rebuild when Electron updates, which is the usual reason small tools like this
 quietly stop working. The MCP server is the exception: it runs under whatever Node an editor launches
-it with, which may not have `node:sqlite`, so it shells out to the `sqlite3` binary instead.
+it with, so it uses `node:sqlite` when that Node has it and shells out to the `sqlite3` binary when it
+does not. That route needs sqlite3 3.35 or newer, and the server says so when it finds an older one.
+
+The Sheet and Workbench stores are shared by the app and the server rather than written twice. They
+are SQL text and rules that never open a database themselves: each side hands them its own way of
+running a query, so the rules about what a valid entry is cannot drift between the two.
 
 ---
 
@@ -512,7 +709,8 @@ it with, which may not have `node:sqlite`, so it shells out to the `sqlite3` bin
 
 Working today: projects, tasks, memory notes with markdown rendering, links, search,
 project dashboards with linked repositories, local vector search over project material,
-history with undo, light and dark themes, the MCP server and the safety guard. Signed
+history with undo, light and dark themes, the MCP server and the safety guard, Sheets in the
+app and the terminal, the `delphi` command, and Workbenches. Signed
 installers for macOS and Windows are the next thing, rather than a certificate being
 in place already.
 
@@ -523,7 +721,9 @@ Being built: desktop reminders with snooze, an agent activity view, and a skills
 Issues and pull requests are welcome. If you add a rule to the guard, add a case to `guard_test.py`
 on both sides: one command it must block, and one nearby command it must not.
 
-CI runs the guard suite, syntax-checks every script, and fails if a database file is ever tracked.
+CI runs `npm test`, which is every test in `tools/` and `agent/` including one that starts the MCP
+server from a copy of the packaged layout, then the guard suite on its own, a syntax check of every
+script, and a check that fails if a database file is ever tracked.
 That last check exists because a populated `delphi.db` reached a public repository once, through a
 `.gitignore` that still named the file by its old name.
 
