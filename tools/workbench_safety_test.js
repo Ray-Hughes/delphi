@@ -587,7 +587,11 @@ async function main() {
     const n = await bench(r, "nfd");
     write(path.join(n.wb.path, "build", "re\u0301sume\u0301.txt"), "cv\n");
     const nd = await benches.discard(n.wb.id, String(n.t.id));
-    check("an NFD ignored name is kept and verified", git(r.app, "show", `${nd.ref}:build/r\u00e9sum\u00e9.txt`), "cv");
+    // Found by whichever form the copy holds: composed where git precomposes
+    // names (macOS), the bytes as written where it does not (Linux).
+    const held = execFileSync(GIT, ["-C", r.app, "ls-tree", "-r", "-z", "--name-only", nd.ref], { encoding: "utf8" })
+      .split("\0").find((p) => p.normalize("NFC") === "build/r\u00e9sum\u00e9.txt");
+    check("an NFD ignored name is kept and verified", held ? git(r.app, "show", `${nd.ref}:${held}`) : "(not in the copy)", "cv");
 
     // 2. Untouched assume-unchanged symlink and newline-named file: no false hidden changes.
     fs.symlinkSync("README.md", path.join(r.app, "link"));

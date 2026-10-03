@@ -255,9 +255,12 @@ async function main() {
       await timed("bg_left", { command: `sleep 30 >/dev/null 2>&1 & echo $! > ${marker}; echo ok`, progressMs: 0 }, () => {});
       const pid = Number(fs.readFileSync(marker, "utf8").trim());
       await new Promise((r) => setTimeout(r, 200));
-      let alive = true;
-      try { process.kill(pid, 0); } catch { alive = false; }
-      check("a background job is killed with its run", alive, false);
+      // Killed means gone or a zombie: an orphan's zombie lingers until some
+      // init reaps it, and a container without one never does, though the
+      // process is as dead as it gets. ps says which (stat Z).
+      const ps = require("child_process").spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" });
+      const stat = (ps.stdout || "").trim();
+      check("a background job is killed with its run", stat !== "" && !stat.startsWith("Z"), false);
       fs.rmSync(marker, { force: true });
     }
     await timed("who", { command: "true", progressMs: 0 }, (e, _ms, store) => {
