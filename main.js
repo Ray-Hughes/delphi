@@ -28,11 +28,39 @@ const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
 const { isNewer } = require("./version");
+const locate = require("./agent/locate");
+const identity = require("./agent/identity");
 
 // Before anything reads it. Packaged, the name comes from the bundle, but running
 // from a checkout Electron falls back to its own name and the macOS menu bar reads
 // "Electron" instead of "Delphi".
 app.setName("Delphi");
+
+// One app per database.
+//
+// Two copies of Delphi on one database run two schedulers and two handoff
+// dispatchers, and a handoff then goes to whichever looks first; that is how
+// work vanished between a checkout's `npm start` and the installed app. So the
+// second launch hands over to the first (which comes forward) and quits.
+//
+// Electron's lock is per userData folder, so the folder is chosen to make the
+// lock per database: the per-user folder for the per-user database, set
+// explicitly so a checkout and the installed app share it, and a profile inside
+// the data folder when one is chosen by DELPHI_DATA_DIR or DELPHI_DB. That
+// keeps the lock rather than skipping it under an override, so a developer's
+// dev copy still cannot run twice, while a test's hidden app on its own temp
+// folder, or a dev copy beside the real one, never collides with the app in
+// use. It also stops those sharing the real app's cookies and local storage.
+// See agent/locate.js electronProfileDir.
+{
+  const profile = locate.electronProfileDir(paths.RESOLVED);
+  app.setPath("userData", profile || paths.RESOLVED.conventional);
+}
+const FIRST_INSTANCE = app.requestSingleInstanceLock();
+if (!FIRST_INSTANCE) {
+  console.log(`Delphi is already running against ${paths.DB_PATH}; bringing that one forward instead.`);
+  app.quit();
+}
 
 const db = require("./db");
 const vault = require("./vault");
@@ -87,6 +115,10 @@ let settings = {
   // What Workbench branches start with. null means the OS username, which is
   // what shows whose branch is whose on a shared remote.
   workbenchBranchPrefix: null,
+  // The checkout database the person has already been told is ignored, so the
+  // notice in Settings is shown once per file rather than on every visit.
+  // null means not yet acknowledged. See app:dataInfo.
+  checkoutNoticeSeen: null,
 };
 let schedulerTimer = null;
 let vaultTimer = null;
@@ -616,7 +648,16 @@ async function checkForUpdate({ quiet = true } = {}) {
   }
 }
 
+app.on("second-instance", () => {
+  if (!app.isReady() || SMOKE) return;
+  if (win && !win.isDestroyed() && win.isMinimized()) win.restore();
+  show();
+});
+
 app.whenReady().then(() => {
+  // The second launch does nothing but quit; app.quit() above is not
+  // synchronous, so this would otherwise still open a window and a scheduler.
+  if (!FIRST_INSTANCE) return;
   if (SMOKE) return smoke();
   loadSettings();
   // Before the database is opened for the first time, or the migration finds a
@@ -651,8 +692,12 @@ app.whenReady().then(() => {
   refreshMenu();
   registerHotkey(settings.hotkey);
   startScheduler();
+  startHeartbeat();
   watchForExternalWrites();
   scheduleVaultExport();
+  // Said once in the log as well as in Settings, for whoever started this from
+  // a terminal and is wondering why the board is not the one they had.
+  if (paths.RESOLVED.checkoutDbIgnored) console.log(locate.ignoredNotice(paths.RESOLVED));
 
   // A panel has no dock presence; a normal application does.
   if (app.dock && settings.panelMode === true) app.dock.hide();
@@ -675,7 +720,7 @@ app.whenReady().then(() => {
 
 // Windows and Linux keep the process alive with no windows, which for a tray app
 // is correct. Clicking the dock icon on macOS should still bring the panel back.
-app.on("activate", () => { if (!SMOKE) show(); });
+app.on("activate", () => { if (!SMOKE && FIRST_INSTANCE) show(); });
 
 // See DELPHI_SMOKE at the top of this file.
 function smoke() {
@@ -834,6 +879,31 @@ function watchForExternalWrites() {
   }
 }
 
+/**
+ * Tells agents a Delphi app is running against this database.
+ *
+ * A row in meta, rewritten every 30 seconds. whoami and handoff_send read it,
+ * so an agent handing work over is told whether anything will dispatch it now,
+ * instead of being promised a wake-up by an app that is not running. Its own
+ * timer rather than the scheduler's, whose interval is a setting a person can
+ * stretch to minutes. One small write; this app's own writes do not move
+ * PRAGMA data_version, so checkForExternalWrites does not react to it.
+ */
+let heartbeatTimer = null;
+function startHeartbeat() {
+  const beat = () => {
+    try {
+      db.appBeat({ version: app.getVersion() });
+    } catch (error) {
+      console.error("could not write the app heartbeat", error);
+    }
+  };
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  beat();
+  heartbeatTimer = setInterval(beat, identity.BEAT_MS);
+  if (heartbeatTimer.unref) heartbeatTimer.unref();
+}
+
 function startScheduler() {
   if (schedulerTimer) clearInterval(schedulerTimer);
   schedulerTimer = setInterval(() => {
@@ -875,6 +945,15 @@ app.on("before-quit", () => {
   appRuns.clear();
 });
 app.on("will-quit", () => globalShortcut.unregisterAll());
+// Taken away on the way out, so an agent is told at once that nothing is
+// dispatching. Only this app's own beat, and only by the instance that wrote
+// one: a second launch quitting must not erase the first's.
+app.on("will-quit", () => {
+  if (!heartbeatTimer) return;
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  try { db.appBeatClear(); } catch {}
+});
 
 // ---------------------------------------------------------------------------
 // IPC. Every handler is a thin wrapper so the renderer never touches the
@@ -1590,6 +1669,7 @@ async function runTurn({ sessionId, prompt, system = null, autoAllow, collect = 
       resume: session.native_id || null,
       autoAllow: autoAllow === true || session.auto_allow === 1,
       dbPath: db.DB_PATH,
+      dbId: db.identity().db_id,
       projectId: session.project_id,
       // What the audit trail will say. This is the point of the whole
       // arrangement: every row the agent writes is attributed to the tab it was
@@ -1882,6 +1962,23 @@ handle("stats", () => db.stats());
 // workbenchBranchPrefixDefault is read only: the prefix a branch gets when
 // workbenchBranchPrefix is empty (the OS username, as workbench/naming.js
 // makes it), which the window cannot find out for itself.
+// Where the data lives, for Settings: the database this window is really
+// using, its id (the same one whoami and delphi doctor print, which is how a
+// person checks an agent is on this database), and a checkout database that
+// exists and is being ignored, so that can be said rather than discovered.
+handle("app:dataInfo", () => {
+  const id = db.identity();
+  const ignored = paths.RESOLVED.checkoutDbIgnored;
+  return {
+    path: db.DB_PATH,
+    dbId: id.db_id,
+    createdAt: id.created_at,
+    dataDir: paths.DATA_DIR,
+    resolvedBy: paths.RESOLVED.source,
+    checkoutDbIgnored: ignored,
+    checkoutNoticeDue: Boolean(ignored) && settings.checkoutNoticeSeen !== ignored,
+  };
+});
 handle("settings:get", () => ({ ...settings, workbenchBranchPrefixDefault: require("./workbench/naming").defaultPrefix() }));
 handle("settings:set", (fields) => {
   if (fields.panelMode !== undefined) {
@@ -1911,6 +2008,16 @@ handle("settings:set", (fields) => {
   if (fields.scratchpadMode !== undefined) settings.scratchpadMode = fields.scratchpadMode === true;
 
   if (fields.animations !== undefined) settings.animations = fields.animations !== false;
+
+  // A path, and only ever the one app:dataInfo reported: anything else would
+  // acknowledge a notice nobody was shown.
+  if (fields.checkoutNoticeSeen !== undefined) {
+    const value = fields.checkoutNoticeSeen;
+    if (value !== null && value !== paths.RESOLVED.checkoutDbIgnored) {
+      throw new Error("checkoutNoticeSeen must be the ignored checkout database app:dataInfo reported, or null");
+    }
+    settings.checkoutNoticeSeen = value;
+  }
 
   if (fields.workbenchEditor !== undefined) {
     const value = fields.workbenchEditor == null ? "" : String(fields.workbenchEditor).trim();

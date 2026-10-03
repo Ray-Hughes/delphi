@@ -1,42 +1,24 @@
-// Where Delphi keeps things, which is not the same place before and after packaging.
+// Where Delphi keeps things.
 //
-// Run from a checkout, everything lives beside the source: that is what the
-// Makefile, the seeding scripts and every existing install expect, and moving it
-// would strand the database people already have.
+// The database, settings.json and the Sheet run logs live in one data folder,
+// and agent/locate.js is what decides which. It is shared with the MCP server
+// and the delphi command line, so all three resolve the same file the same way.
+// That folder is the per-user data folder whether or not the app is packaged:
+// it used to be the checkout when run from source, and that is how `npm start`
+// ended up reading one database while every agent wrote another. Developer
+// isolation is now explicit, through DELPHI_DATA_DIR.
 //
-// Run from an installer, the source directory is inside app.asar, which is a
-// read-only archive. Writing a database there does not fail politely; it fails at
-// the first write, on a machine belonging to someone who has no idea what an asar
-// is. So a packaged build uses the per-user data directory the operating system
-// already sets aside for exactly this.
-//
-// Electron is required lazily and optionally, because the MCP server has to
-// resolve the same database path while running under a plain Node that an editor
-// launched, where `require("electron")` is a path to a binary rather than a module.
+// Electron is required lazily and optionally, because defaultVault wants the
+// Documents folder and this file is also loaded by tools under a plain Node,
+// where `require("electron")` is a path to a binary rather than a module.
 
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const locate = require("./agent/locate");
 
-const APP_NAME = "Delphi";
-
-/**
- * The per-user data directory, worked out without Electron.
- *
- * These are the same locations `app.getPath("userData")` returns, which is what
- * lets a plain Node process find the database a packaged app is using.
- */
-function conventionalDataDir() {
-  if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", APP_NAME);
-  }
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-    return path.join(appData, APP_NAME);
-  }
-  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-  return path.join(configHome, APP_NAME);
-}
+const APP_NAME = locate.APP_NAME;
+const conventionalDataDir = locate.conventionalDataDir;
 
 /** The Electron app object, or null when this is not running under Electron. */
 function electronApp() {
@@ -50,41 +32,28 @@ function electronApp() {
   }
 }
 
-function resolveDataDir() {
-  // An explicit override wins over everything, which is what makes it possible to
-  // point a packaged build at a checkout's database, or run two copies side by
-  // side without them writing over each other.
-  if (process.env.DELPHI_DATA_DIR) return path.resolve(process.env.DELPHI_DATA_DIR);
-
-  const app = electronApp();
-  if (app && app.isPackaged) return app.getPath("userData");
-
-  // Not packaged: beside the source, exactly as before.
-  return __dirname;
-}
-
-const DATA_DIR = resolveDataDir();
-const DB_PATH = path.join(DATA_DIR, "delphi.db");
+const RESOLVED = locate.resolve();
+const DATA_DIR = RESOLVED.dataDir;
+const DB_PATH = RESOLVED.dbPath;
 const SETTINGS_PATH = path.join(DATA_DIR, "settings.json");
 
 /**
  * Where the markdown mirror goes.
  *
- * A packaged build puts it in Documents rather than in the data directory,
- * because the whole point of the mirror is that a person opens it in Obsidian or
- * an editor, and nobody browses to Application Support to do that.
+ * Documents rather than the data folder, because the whole point of the mirror
+ * is that a person opens it in Obsidian or an editor, and nobody browses to
+ * Application Support to do that. A data folder chosen by override keeps its
+ * vault inside it instead, so a test or a dev copy never writes over the
+ * mirror of the real database.
  */
 function defaultVault() {
   if (process.env.DELPHI_VAULT_DIR) return path.resolve(process.env.DELPHI_VAULT_DIR);
+  if (RESOLVED.source !== "default") return path.join(DATA_DIR, "vault");
   const app = electronApp();
-  if (app && app.isPackaged) {
-    try {
-      return path.join(app.getPath("documents"), APP_NAME);
-    } catch {
-      return path.join(DATA_DIR, "vault");
-    }
-  }
-  return path.join(__dirname, "vault");
+  try {
+    if (app) return path.join(app.getPath("documents"), APP_NAME);
+  } catch {}
+  return path.join(os.homedir(), "Documents", APP_NAME);
 }
 
 function ensureDataDir() {
@@ -101,12 +70,17 @@ function ensureDataDir() {
  * the database on purpose: recent rows can still be sitting in it, and copying
  * the database alone is how a migration silently loses the last session's work.
  *
- * Only ever runs when there is no database at the destination, so it cannot
- * overwrite anything, and a failure is logged rather than thrown: starting with
- * an empty tracker beats not starting.
+ * Only ever runs when there is no database at the destination, not even a
+ * stray -wal, so it can never put an old copy over a real one. Never when the
+ * folder was chosen by override: that is someone pointing at a database on
+ * purpose, a test's above all, and filling it with a legacy copy would be a
+ * surprise at best. The checkout this is running from is not a candidate; that
+ * one is reported (locate.ignoredNotice), never adopted. A failure is logged
+ * rather than thrown: starting with an empty tracker beats not starting.
  */
 function migrateLegacyDatabase() {
-  if (fs.existsSync(DB_PATH)) return null;
+  if (RESOLVED.source !== "default") return null;
+  if (fs.existsSync(DB_PATH) || fs.existsSync(DB_PATH + "-wal")) return null;
 
   const candidates = [
     path.join(os.homedir(), "delphi", "delphi.db"),        // what the README told people to clone into
@@ -116,9 +90,11 @@ function migrateLegacyDatabase() {
 
   for (const source of candidates) {
     try {
-      if (!fs.existsSync(source)) continue;
+      if (!fs.existsSync(source) || locate.samePath(source, DB_PATH)) continue;
       ensureDataDir();
-      fs.copyFileSync(source, DB_PATH);
+      // COPYFILE_EXCL as the last word on "never over a real one": if anything
+      // made the file between the check above and here, the copy fails.
+      fs.copyFileSync(source, DB_PATH, fs.constants.COPYFILE_EXCL);
       for (const suffix of ["-wal", "-shm"]) {
         if (fs.existsSync(source + suffix)) fs.copyFileSync(source + suffix, DB_PATH + suffix);
       }
@@ -131,4 +107,7 @@ function migrateLegacyDatabase() {
   return null;
 }
 
-module.exports = { APP_NAME, DATA_DIR, DB_PATH, SETTINGS_PATH, defaultVault, ensureDataDir, migrateLegacyDatabase, conventionalDataDir };
+module.exports = {
+  APP_NAME, DATA_DIR, DB_PATH, SETTINGS_PATH, RESOLVED,
+  defaultVault, ensureDataDir, migrateLegacyDatabase, conventionalDataDir,
+};

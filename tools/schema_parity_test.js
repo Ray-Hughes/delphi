@@ -10,7 +10,7 @@
 const fs = require("fs");
 const path = require("path");
 const { DatabaseSync } = require("node:sqlite");
-const { LATER_COLUMNS } = require("../agent/schema_later");
+const { LATER_COLUMNS, LATER_TABLES } = require("../agent/schema_later");
 
 const db = new DatabaseSync(":memory:");
 db.exec(fs.readFileSync(path.join(__dirname, "..", "schema.sql"), "utf8"));
@@ -26,5 +26,24 @@ for (const [table, column] of LATER_COLUMNS) {
   }
 }
 
-console.log(`\n${LATER_COLUMNS.length - failed}/${LATER_COLUMNS.length} checks passed`);
+// The same holds for a whole table. schema_later creates one only in a file
+// that already has tasks, so a fresh database gets it from schema.sql or not at
+// all, and the two definitions must agree column for column, or what a person's
+// table looks like depends on which version first opened their file.
+const later = new DatabaseSync(":memory:");
+const shape = (handle, table) =>
+  handle.prepare(`SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`).all(table);
+for (const [table, statement] of LATER_TABLES) {
+  later.exec(statement);
+  const got = shape(db, table);
+  if (got.length && JSON.stringify(got) === JSON.stringify(shape(later, table))) {
+    console.log(`  ok   table ${table} is in schema.sql with the same columns`);
+  } else {
+    failed++;
+    console.log(`  FAIL table ${table} is created by schema_later.js but schema.sql ${got.length ? "declares it differently" : "does not declare it"}`);
+  }
+}
+
+const total = LATER_COLUMNS.length + LATER_TABLES.length;
+console.log(`\n${total - failed}/${total} checks passed`);
 process.exit(failed ? 1 : 0);

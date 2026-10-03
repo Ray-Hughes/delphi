@@ -46,6 +46,8 @@ const OUTSIDE_TOO = [
   "harness.js",
   "agent/schema_later.js",
   "agent/launch.js",
+  "agent/locate.js",
+  "agent/identity.js",
   "sheet",
   "workbench",
 ];

@@ -487,7 +487,8 @@ function chatTurn({
   }
   turns++;
   const mcp = harness.mcpFlags(row.mcp_style, {
-    dbPath: process.env.DELPHI_DB || undefined, projectId, tag: `chat-${taskId}`, actor,
+    dbPath: process.env.DELPHI_DB || undefined, dbId: process.env.DELPHI_DB_ID || undefined,
+    projectId, tag: `chat-${taskId}`, actor,
   });
   // Claude Code reads the prompt from stdin when -p has none after it, so it
   // goes there: a message starting with '-' in argv would be read as a flag.

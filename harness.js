@@ -273,13 +273,17 @@ function serverPath() {
  * Electron's own binary in that mode is a Node that is certainly present and
  * can read inside app.asar besides.
  */
-function serverLaunch({ dbPath, projectId, sessionId, actor }) {
+function serverLaunch({ dbPath, dbId, projectId, sessionId, actor }) {
   return {
     command: process.execPath,
     args: [serverPath()],
     env: {
       ELECTRON_RUN_AS_NODE: "1",
       DELPHI_DB: dbPath,
+      // The id as well as the path. The server refuses to start when the file
+      // at the path is not this database, so an agent the app launched can
+      // never write anywhere the app is not looking.
+      ...(dbId ? { DELPHI_DB_ID: dbId } : {}),
       DELPHI_ACTOR: actor,
       ...(projectId ? { DELPHI_PROJECT: String(projectId) } : {}),
       ...(sessionId ? { DELPHI_SESSION: String(sessionId) } : {}),
@@ -551,7 +555,7 @@ const live = new Map();
 function start(options, emit) {
   const {
     harness, sessionId, cwd, prompt, model, system, resume,
-    autoAllow = false, dbPath, projectId, actor, env: extraEnv,
+    autoAllow = false, dbPath, dbId, projectId, actor, env: extraEnv,
   } = options;
 
   const command = harness.command && path.isAbsolute(harness.command)
@@ -566,7 +570,7 @@ function start(options, emit) {
 
   const sessionActor = actor || `${harness.key}:${sessionId || "adhoc"}`;
   const { flags, file } = mcpFlags(harness.mcp_style, {
-    dbPath, projectId, sessionId,
+    dbPath, dbId, projectId, sessionId,
     actor: sessionActor,
   });
   // The same identity in the agent's own environment, not only in its MCP
@@ -577,6 +581,7 @@ function start(options, emit) {
     DELPHI_ACTOR: sessionActor,
     DELPHI_AUTHOR_TYPE: "agent",
     ...(dbPath ? { DELPHI_DB: dbPath } : {}),
+    ...(dbId ? { DELPHI_DB_ID: dbId } : {}),
   };
 
   const template = typeof harness.args === "string" ? JSON.parse(harness.args) : harness.args;

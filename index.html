@@ -732,6 +732,14 @@
   .kv { display: grid; grid-template-columns: 108px 1fr; gap: var(--s3) var(--s4); align-items: baseline; }
   .kv dt { color: var(--ink-faint); font-size: 12px; }
   .kv dd { margin: 0; }
+  /* A path with its Copy button. Wraps anywhere, because a real data folder is
+     longer than the column and clipping it would hide the part that differs. */
+  .kv dd.data-path { display: flex; align-items: baseline; gap: var(--s2); min-width: 0; }
+  .kv dd.data-path .mono { overflow-wrap: anywhere; min-width: 0; }
+  .data-warn {
+    margin: var(--s3) 0 0; padding: var(--s2) var(--s3); font-size: 12px;
+    color: var(--warn); border: 1px solid var(--warn); border-radius: var(--r-sm);
+  }
 
   .field { width: 100%; padding: 7px 10px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--bg); outline: none; }
   .field:focus { border-color: var(--accent); background: var(--surface); }
@@ -2661,6 +2669,15 @@
   }
   .pp-sec .n { color: var(--ink-faint); font-weight: 400; font-family: var(--mono); }
   .pp-empty { color: var(--ink-faint); font-size: 11px; padding: 2px 4px 6px; line-height: 1.45; }
+  /* The projects in no workspace. Quieter than a section heading, because it
+     is a group inside the Projects section rather than a section of its own. */
+  .pp-group {
+    font-size: 10.5px; color: var(--ink-faint); padding: 12px 9px 4px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .pp-group .n { font-family: var(--mono); }
+  /* Rows are reached by Tab and by the arrow keys, so focus has to show. */
+  .gs:focus-visible { outline: none; border-color: var(--line); background: var(--raised); color: var(--c-ink); }
 
   /* The wordmark in the title bar, left of the search. */
   .titlebar .wordmark {
@@ -3032,6 +3049,9 @@
     </main>
   </div>
 
+  <!-- Before app.js, which reads window.delphiTime at load. Its own file so
+       tools/time_test.js can require the same code under Node. -->
+  <script src="timefmt.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

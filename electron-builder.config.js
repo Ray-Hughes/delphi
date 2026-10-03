@@ -27,6 +27,9 @@ module.exports = {
     "main.js",
     "preload.js",
     "app.js",
+    // Loaded by index.html with a script tag, not required, so no require
+    // walk finds it; tools/package_test.js follows the script tags instead.
+    "timefmt.js",
     "index.html",
     "db.js",
     "paths.js",
@@ -51,6 +54,10 @@ module.exports = {
     // requires, so a gap shows up in `npm test` rather than on someone's Mac.
     "agent/schema_later.js",
     "agent/launch.js",
+    // Where the database is and which one it is. paths.js and db.js require
+    // them inside the archive; the server and the CLI need them outside it.
+    "agent/locate.js",
+    "agent/identity.js",
     "sheet/",
     "workbench/",
     "schema.sql",
@@ -71,7 +78,8 @@ module.exports = {
   // file listed here and in `files` ends up outside the archive and missing from
   // it. That is how 1.6.0 shipped a main process that died on require("./pads")
   // before it could open a window. The modules both sides need (pads.js, git.js,
-  // harness.js, agent/schema_later.js, agent/launch.js, sheet/, workbench/) are
+  // harness.js, agent/schema_later.js, agent/launch.js, agent/locate.js,
+  // agent/identity.js, sheet/, workbench/) are
   // copied out by tools/after-pack.js instead, from its OUTSIDE_TOO list, after
   // the archive is written. tools/package_test.js reads both lists and the real
   // archive, so neither half can go missing again without a test failing.

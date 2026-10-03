@@ -618,3 +618,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_live
   ON workbenches(task_id, repo_id) WHERE state IN ('active', 'parked', 'missing', 'closing');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_path
   ON workbenches(path) WHERE state IN ('active', 'parked', 'missing', 'closing');
+
+-- What this file is, as opposed to what is in it. db_id is a uuid minted once,
+-- the first time a process that knows about this table opens the file (see
+-- agent/identity.js), and never changed: it is how the app, `delphi doctor`
+-- and an agent's whoami can tell two databases apart, and how a server the app
+-- launched refuses to write to any file but the one it was launched for. The
+-- app's heartbeat lives here too, so an agent can be told whether anything will
+-- dispatch its handoff. Key and value, because these are a handful of facts
+-- about the file, not rows of anything.
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);

@@ -224,6 +224,25 @@ async function main() {
   check("the default branch prefix is there to show, and is naming.js's",
     got.workbenchBranchPrefixDefault, require("../workbench/naming").defaultPrefix());
 
+  section("where the data lives");
+  const info = await call("app:dataInfo");
+  const locate = require("../agent/locate");
+  check("app:dataInfo names the database this process really opened, and its folder",
+    [info.path, info.dataDir, info.resolvedBy], [process.env.DELPHI_DB, process.env.DELPHI_DATA_DIR, "DELPHI_DB"]);
+  check("and its id, the same one the file holds", info.dbId, db.identity().db_id);
+  check("the id is a uuid", /^[0-9a-f-]{36}$/.test(String(info.dbId)), true);
+  check("an ignored checkout database is a path or null, never a boolean",
+    info.checkoutDbIgnored, locate.resolve().checkoutDbIgnored);
+  check("preload exposes it as delphi.app.dataInfo", /app: \{[\s\S]*?dataInfo: \(\) => call\("app:dataInfo"\)/.test(preload), true);
+  const notShown = await handlers.get("settings:set")({}, { checkoutNoticeSeen: "/somewhere/else.db" });
+  check("acknowledging a notice nobody was shown is refused", notShown.ok, false);
+  if (info.checkoutDbIgnored) {
+    await call("settings:set", { checkoutNoticeSeen: info.checkoutDbIgnored });
+    check("once acknowledged, the notice is no longer due", (await call("app:dataInfo")).checkoutNoticeDue, false);
+  }
+  const beat = require("../agent/identity").appState((s) => db.handle().prepare(s).all(), { isAlive: require("../sheet/store").pidAlive });
+  check("the app has written its heartbeat, so agents see it running", [beat.running, beat.pid], [true, process.pid]);
+
   section("refusals keep their code");
   const loose = db.createTask({ projectId: null, title: "in no project" });
   const coded = await handlers.get("workbench:start")({}, loose.id, {});

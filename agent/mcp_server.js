@@ -17,67 +17,25 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
-/** Where an installed copy keeps its data, worked out without Electron. */
-function installedDatabase() {
-  if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db");
-  }
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-    return path.join(appData, "Delphi", "delphi.db");
-  }
-  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-  return path.join(configHome, "Delphi", "delphi.db");
-}
-
 /**
- * Finds the database.
+ * Finds the database, by the one rule the app and the command line also use.
  *
- * A checkout keeps it beside the source, an installed copy keeps it in the
- * per-user data directory, and the same server file is used by both. This
- * duplicates paths.js on purpose, because that file ends up inside app.asar and a
- * plain Node process cannot read in there.
- *
- * The installed copy is preferred, and that ordering is the whole point. It used
- * to look beside the source first, on the reasoning that only a checkout has a
- * neighbouring database. True, but it assumed a checkout means you are *running*
- * from the checkout, and someone who has cloned the repository and also installed
- * the app has both. Their editor then registers the server by its path inside the
- * checkout, so the neighbour won, and the agent wrote to a database the app does
- * not read. Nothing errors: notes and tasks are written, and simply never appear.
- * Preferring the installed copy fixes it, and costs nothing for a developer
- * working purely from a checkout, who has no installed copy to prefer.
- *
- * DELPHI_DB still overrides both, which is the escape hatch for running the
- * server against a checkout on purpose.
+ * It used to be worked out here, as a twin of paths.js that preferred the
+ * installed copy, while paths.js preferred the checkout when run from source.
+ * Each was right alone and together they were the bug: the app read one file
+ * and every agent wrote the other, and nothing errored. agent/locate.js is now
+ * the only place this is decided. DELPHI_DB still names a file outright, which
+ * is what the app passes to every agent it launches.
  */
-function findDatabase() {
-  if (process.env.DELPHI_DB) return path.resolve(process.env.DELPHI_DB);
-
-  const installed = installedDatabase();
-  const beside = path.join(__dirname, "..", "delphi.db");
-
-  if (fs.existsSync(installed)) {
-    // Worth saying out loud. stderr goes to the client's MCP log rather than into
-    // the protocol stream on stdout, so it cannot corrupt a response.
-    if (fs.existsSync(beside)) {
-      process.stderr.write(
-        `delphi: two databases exist. Using the installed one at ${installed}. ` +
-        `The checkout copy at ${beside} is being ignored. ` +
-        `Set DELPHI_DB to override.\n`
-      );
-    }
-    return installed;
-  }
-
-  if (fs.existsSync(beside)) return beside;
-  return installed;
-}
-
-const DB = findDatabase();
+const locate = require("./locate");
+const RESOLVED = locate.resolve();
+const DB = RESOLVED.dbPath;
 
 const directives = require("./directives");
-const readSettings = directives.makeSettingsReader(directives.settingsBesideDatabase(DB));
+// settings.json lives in the data folder, which is the database's own folder
+// unless DELPHI_DATA_DIR says otherwise, exactly as the app reads it.
+const SETTINGS_FILE = path.join(RESOLVED.dataDir, "settings.json");
+const readSettings = directives.makeSettingsReader(SETTINGS_FILE);
 
 /**
  * The scratchpad setting, resolved against the projects that actually exist.
@@ -244,6 +202,51 @@ for (const failure of MIGRATED.errors) {
   process.stderr.write(`delphi: could not migrate (${failure.message}): ${failure.statement.split("\n")[0]}\n`);
 }
 
+/**
+ * The file's identity, minted if this is the first process to meet it since
+ * meta arrived. See agent/identity.js.
+ */
+const identity = require("./identity");
+let IDENTITY = { db_id: null, created_at: null };
+try {
+  IDENTITY = identity.ensure((statement) => DATABASE.query(statement));
+} catch (error) {
+  process.stderr.write(`delphi: could not read this database's identity (${error.message})\n`);
+}
+
+// An agent the app launched is told which database it is for, by id as well as
+// by path. A path can be right and the file behind it wrong: restored from a
+// backup, swapped for another copy, or a second checkout's. Writing on regardless
+// is how work disappears without an error, so this refuses to start at all, and
+// says why where the client's MCP log will show it. fs.writeSync rather than
+// process.stderr.write, because on macOS a pipe is written asynchronously and
+// process.exit does not wait for it.
+if (process.env.DELPHI_DB_ID && process.env.DELPHI_DB_ID !== IDENTITY.db_id) {
+  fs.writeSync(2,
+    `delphi: refusing to start. This server was launched for the database with id ${process.env.DELPHI_DB_ID}, ` +
+    `but ${DB} ${IDENTITY.db_id ? `has the id ${IDENTITY.db_id}` : "has no Delphi id at all"}. ` +
+    `Nothing was read or written. Start the agent again from the Delphi app that owns the database, ` +
+    `or unset DELPHI_DB_ID if this file is the one you meant.\n`);
+  process.exit(1);
+}
+
+// A checkout's own delphi.db is never used now, and that deserves saying once
+// rather than on every start: stderr from here reaches a person running the
+// delphi command on every command. "Once" is remembered in the database, per
+// checkout path, so a different checkout is still mentioned. Only when nothing
+// was overridden: with DELPHI_DB or DELPHI_DATA_DIR set, a file was chosen on
+// purpose and the checkout one is not being ignored by surprise.
+if (RESOLVED.source === "default" && RESOLVED.checkoutDbIgnored && IDENTITY.db_id) {
+  try {
+    const said = (DATABASE.query("SELECT value FROM meta WHERE key = 'checkout_db_noticed';")[0] || {}).value;
+    if (said !== RESOLVED.checkoutDbIgnored) {
+      process.stderr.write(`${locate.ignoredNotice(RESOLVED)} Run delphi doctor to see it again.\n`);
+      const quoted = `'${RESOLVED.checkoutDbIgnored.replace(/'/g, "''")}'`;
+      DATABASE.query(`INSERT INTO meta (key, value) VALUES ('checkout_db_noticed', ${quoted}) ON CONFLICT(key) DO UPDATE SET value = excluded.value;`);
+    }
+  } catch {}
+}
+
 // --- database ---------------------------------------------------------------
 
 /**
@@ -348,9 +351,9 @@ const sheetFormat = require("../sheet/format");
 const AUTHOR_TYPE = ["human", "agent", "tool"].includes(process.env.DELPHI_AUTHOR_TYPE)
   ? process.env.DELPHI_AUTHOR_TYPE : null;
 const sheets = makeSheetStore({ sql, actor: ACTOR, authorType: AUTHOR_TYPE });
-// Run logs live beside the database, which is DATA_DIR in the app's terms, so
-// they inherit its "never in git" rule.
-const SHEET_LOG_DIR = path.join(path.dirname(DB), "sheets");
+// Run logs live in the data folder, DATA_DIR in the app's terms, so they
+// inherit its "never in git" rule.
+const SHEET_LOG_DIR = path.join(RESOLVED.dataDir, "sheets");
 
 // Workbenches, from the same modules the app uses, for the same reason the
 // Sheet store is shared. Setup commands run through sheet/run.js so they are
@@ -594,7 +597,52 @@ function derivePad(padId) {
 
 // --- tools ------------------------------------------------------------------
 
+/** Whether a Delphi app is running against this database right now. See agent/identity.js. */
+const appState = () => identity.appState((statement) => DATABASE.query(statement), { isAlive: pidAlive });
+
+/**
+ * The project this server was scoped to by whatever launched it, or null.
+ *
+ * Looked up rather than trusted, and never thrown over: whoami is the call an
+ * agent makes when it is unsure of its footing, and it has to answer.
+ */
+function projectScope() {
+  const raw = process.env.DELPHI_PROJECT;
+  if (!raw) return null;
+  try {
+    const row = /^\d+$/.test(raw)
+      ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [Number(raw)])[0]
+      : sql("SELECT id, key, name FROM projects WHERE key = :p1", [raw])[0];
+    return row || { id: null, key: null, name: null, unknown: raw };
+  } catch {
+    return { id: null, key: null, name: null, unknown: raw };
+  }
+}
+
 const TOOLS = {
+  whoami: {
+    description:
+      "Which Delphi database you are connected to, who your writes are attributed to, and whether a Delphi app is running to dispatch handoffs. Call it when you are not sure your work is landing where the person can see it.",
+    schema: { type: "object", properties: {} },
+    run: () => {
+      const app = appState();
+      return {
+        db_path: DB,
+        db_id: IDENTITY.db_id,
+        db_created_at: IDENTITY.created_at,
+        data_dir: RESOLVED.dataDir,
+        resolved_by: RESOLVED.source,
+        actor: ACTOR,
+        author_type: AUTHOR_TYPE || "agent",
+        project_scope: projectScope(),
+        app_running: app.running,
+        app,
+        checkout_db_ignored: RESOLVED.checkoutDbIgnored,
+        sqlite_route: DATABASE.kind,
+      };
+    },
+  },
+
   list_projects: {
     description:
       "List every project with its open task count. Call this first to find the right project_id.",
@@ -1516,7 +1564,7 @@ const TOOLS = {
   handoff_send: {
     description:
       "Hand a piece of work to another agent. Use this when something is better done by a different tool, or by a second opinion: \"have Codex review this branch\", \"ask Claude to write the migration\".\n\n" +
-      "It returns immediately with a handoff id. Delphi runs the request in that agent's own session in this project, keeps the reply, and gives you a turn of your own with the answer when it lands. So do not wait, do not poll in a loop, and do not sleep: finish what you were doing and say you have handed it over. You will be woken.\n\n" +
+      "It returns immediately with a handoff id. A running Delphi app runs the request in that agent's own session in this project, keeps the reply, and gives you a turn of your own with the answer when it lands. So do not wait, do not poll in a loop, and do not sleep: finish what you were doing and say you have handed it over. The result says whether a Delphi app is running to dispatch it right now, and whether you can be woken; believe it.\n\n" +
       "Call list_agents first if you are not sure which agents this machine has.",
     schema: {
       type: "object",
@@ -1565,9 +1613,22 @@ const TOOLS = {
         ]
       )[0];
       audit("create", "handoff", row.id, `asked ${row.to_harness}`, row.request.slice(0, 80));
+      // Told honestly. Only a Delphi app's dispatcher ever runs a handoff, and
+      // only a session the app launched has a turn to be woken into, so an
+      // agent promised both when neither holds stops and waits for nothing.
+      const app = appState();
+      const wakeable = row.from_session_id != null && row.wake !== 0;
+      const when = app.running
+        ? "A Delphi app is running against this database and will dispatch it within a minute."
+        : `No Delphi app is running against this database, so nothing will dispatch it until one is started. ${app.reason}`;
+      const after = wakeable
+        ? (app.running ? " You will be woken with the reply." : " You will be woken with the reply once it has run.")
+        : " Nothing can wake you with the reply, because this session was not started by Delphi: read it later with handoff_status.";
       return {
         ...row,
-        note: "Queued. Delphi will run it and wake you with the reply. Do not wait for it here.",
+        dispatcher_running: app.running,
+        will_wake: wakeable,
+        note: `Queued. ${when}${after} Do not wait for it here.`,
       };
     },
   },
@@ -1974,7 +2035,7 @@ async function handle(req) {
  * write such as a theme change stays quiet.
  */
 function watchSettings() {
-  const settingsPath = directives.settingsBesideDatabase(DB);
+  const settingsPath = SETTINGS_FILE;
   let previous = JSON.stringify(scratchpadState());
   let timer = null;
 

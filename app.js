@@ -11,6 +11,8 @@ const state = {
   // filtering the whole list on every render would ask the database the same
   // question repeatedly.
   wsProjects: [],
+  // Workspace id to the ids of the projects in it, for the sidebar's tree.
+  wsMembers: new Map(),
   projectId: null,     // null means the All view
   view: "new",         // new | overview | tasks | notes | links | history | settings
   showDone: false,
@@ -106,8 +108,12 @@ const el = (tag, props = {}, ...kids) => {
   return node;
 };
 
-const today = () => new Date().toISOString().slice(0, 10);
-const isOverdue = (t) => t.due && t.status !== "done" && t.due < today();
+// Every stamp and day in this file goes through timefmt.js: stamps from the
+// store are UTC, a due date is a day on the local calendar, and parsing either
+// by hand is how "today" came to start at eight in the evening.
+const TIME = window.delphiTime;
+const today = () => TIME.localDay();
+const isOverdue = (t) => t.status !== "done" && TIME.dueState(t.due) === "overdue";
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 // The system half of the motion question, read once and then kept current by a
@@ -452,17 +458,7 @@ function renderMarkdown(source) {
 }
 
 /** "3 days ago" reads faster than a timestamp when scanning activity. */
-function ago(iso) {
-  if (!iso) return "";
-  const then = new Date(iso.replace(" ", "T"));
-  const mins = Math.round((Date.now() - then.getTime()) / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.round(hours / 24);
-  return days < 30 ? `${days}d ago` : then.toISOString().slice(0, 10);
-}
+const ago = (stamp) => TIME.ago(stamp);
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -471,8 +467,12 @@ function ago(iso) {
 async function refresh() {
   state.projects = await window.delphi.projects.list();
   state.workspaces = await window.delphi.workspaces.list();
+  // One call per workspace rather than a new IPC, because there are a handful of
+  // workspaces and the tree has to know which project sits under which.
+  const members = await Promise.all(state.workspaces.map((w) => window.delphi.workspaces.projects(w.id)));
+  state.wsMembers = new Map(state.workspaces.map((w, i) => [w.id, members[i].map((p) => p.id)]));
   state.wsProjects = state.workspaceId
-    ? await window.delphi.workspaces.projects(state.workspaceId)
+    ? members[state.workspaces.findIndex((w) => w.id === state.workspaceId)] || []
     : [];
   state.alerts = await loadAlerts();
 
@@ -576,6 +576,13 @@ function navigate(next) {
     state.draft = "";
   }
   Object.assign(state, next);
+  // Arriving at a project from a chip or a search result, outside the workspace
+  // that is open, leaves that workspace. Staying zoomed in would show a folder
+  // the project is not in, with no row for the project you are looking at.
+  if (state.projectId && state.workspaceId && !state.wsProjects.some((p) => p.id === state.projectId)) {
+    state.workspaceId = null;
+    state.wsProjects = [];
+  }
   const to = position();
   if (samePosition(from, to)) return Promise.resolve();
 
@@ -621,12 +628,15 @@ function goBack() {
 
 
 /**
- * The sidebar, which is now the open project's own panel.
+ * The sidebar: where you are, and every project you could go to.
  *
- * It used to list every project, which is what the rail does. Two lists of the
- * same thing side by side is one list too many, and it left nowhere for the
- * things belonging to a single project to live. So this is that: the project,
- * its folder, its sessions, and the way to start another.
+ * It used to list only the projects inside the open workspace, and a workspace
+ * is a folder. A project nobody had linked to a folder (every project an agent
+ * made over MCP, and every one older than workspaces) had no row anywhere, and
+ * could be reached only by clicking its chip on a task. So the picker is now a
+ * tree of every project: each workspace with its projects under it, then the
+ * projects that are in none. Zoomed into a workspace it narrows to that folder,
+ * as before, because that is the point of zooming in.
  */
 function renderSidebar() {
   renderRail();
@@ -634,35 +644,18 @@ function renderSidebar() {
   const foot = $("sidebar-foot");
   box.textContent = "";
   if (foot) foot.textContent = "";
+  box.onkeydown = sidebarArrows;
 
-  const workspace = state.workspaces.find((w) => w.id === state.workspaceId) || null;
+  // A project opened from a chip or Back may not be in the workspace that is
+  // zoomed in. Drawing that workspace would put its sessions under a folder they
+  // have nothing to do with, so the full tree is drawn instead, with it marked.
+  const zoomed = state.workspaces.find((w) => w.id === state.workspaceId) || null;
+  const workspace = zoomed && (!state.projectId || state.wsProjects.some((p) => p.id === state.projectId))
+    ? zoomed : null;
 
-  // --- the picker ----------------------------------------------------------
   if (!workspace) {
-    box.append(el("div", { className: "pp-sec" },
-      el("span", { textContent: "Workspaces" }),
-      el("span", { className: "n", textContent: String(state.workspaces.length) })));
-
-    if (!state.workspaces.length) {
-      box.append(el("div", { className: "pp-empty",
-        textContent: "None yet. Use + on the rail to add a folder." }));
-      return;
-    }
-
-    for (const w of state.workspaces) {
-      const row = el("div", { className: "ws-row", tabIndex: 0, role: "button", title: w.path });
-      row.append(el("span", { className: "ws-ico", textContent: w.icon || railLetter(w.name) }));
-      row.append(el("div", { className: "ws-txt" },
-        el("span", { className: "ws-nm", textContent: w.name }),
-        el("span", { className: "ws-p", textContent: w.path })));
-      if (w.project_count) {
-        row.append(el("span", { className: "count", textContent: String(w.project_count) }));
-      }
-      row.onclick = () => zoomInto(w.id);
-      row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); zoomInto(w.id); } };
-      row.oncontextmenu = (e) => { e.preventDefault(); workspaceMenu(w, e.clientX, e.clientY); };
-      box.append(row);
-    }
+    renderProjectTree(box);
+    projectFoot(foot);
     return;
   }
 
@@ -690,61 +683,7 @@ function renderSidebar() {
       textContent: "No projects in this workspace yet." }));
   }
 
-  for (const p of state.wsProjects) {
-    const on = p.id === state.projectId;
-    const row = el("div", { className: "gs" + (on ? " on" : ""), tabIndex: 0, role: "button" });
-    row.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }));
-    row.append(el("span", { className: "nm", textContent: p.name }));
-    if (p.open_count) row.append(el("span", { className: "kbd", textContent: String(p.open_count) }));
-    const open = () => navigate({ projectId: p.id, view: "chat" });
-    row.onclick = open;
-    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
-    row.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
-    box.append(row);
-
-    // The open project's sessions sit under it, indented, so the column reads as
-    // one tree rather than as two lists that happen to be stacked.
-    if (!on) continue;
-    const kids = el("div", { className: "gkids" });
-    const addSession = el("div", { className: "gs sub", tabIndex: 0, role: "button" },
-      el("span", { className: "nm dim", textContent: "+ New session" }));
-    const start = async () => { await newSession(); navigate({ view: "chat" }); };
-    addSession.onclick = start;
-    addSession.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); start(); } };
-    kids.append(addSession);
-
-    for (const sn of state.sessions) {
-      const srow = el("div", {
-        className: "gs sub" + (sn.id === state.sessionId && state.view === "chat" ? " on" : ""),
-        tabIndex: 0, role: "button", title: sn.title || "New session",
-      });
-      srow.append(
-        el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
-        el("span", { className: "nm", textContent: sn.title || "Session" })
-      );
-
-      const openS = async () => {
-        if (state.view !== "chat") { state.sessionId = sn.id; navigate({ view: "chat" }); return; }
-        await openSession(sn.id);
-      };
-
-      // Both actions were on the right click menu only, which is a place nobody
-      // looks. They are on the row now; the menu keeps them too.
-      const rename = el("button", { className: "srow-btn", title: "Rename", textContent: "✎" });
-      rename.onclick = (e) => { e.stopPropagation(); renameSession(sn); };
-
-      const close = el("button", { className: "srow-btn close", title: "Close this session", textContent: "×" });
-      close.onclick = (e) => { e.stopPropagation(); closeSession(sn); };
-
-      srow.append(el("span", { className: "srow-acts" }, rename, close));
-      srow.onclick = openS;
-      srow.ondblclick = (e) => { e.preventDefault(); renameSession(sn); };
-      srow.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openS(); } };
-      srow.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, e.clientX, e.clientY); };
-      kids.append(srow);
-    }
-    box.append(kids);
-  }
+  for (const p of state.wsProjects) box.append(...projectRows(p, () => navigate({ projectId: p.id, view: "chat" })));
 
   // The repository, under the sessions. Painted async and appended when it
   // answers, because asking git costs a spawn and the sidebar must not wait on
@@ -763,6 +702,155 @@ function renderSidebar() {
     settings.onclick = () => navigate({ view: state.projectId ? "project" : "workspace" });
     foot.append(settings);
   }
+}
+
+/**
+ * Every project, under the workspace it belongs to, then the rest.
+ *
+ * A project in two workspaces is listed under both, because each is a true
+ * answer to "what is in this folder". The counts are open tasks, the number
+ * that says whether a project needs looking at.
+ */
+function renderProjectTree(box) {
+  const counted = new Set();
+  const byId = new Map(state.projects.map((p) => [p.id, p]));
+
+  box.append(el("div", { className: "pp-sec" },
+    el("span", { textContent: "Projects" }),
+    el("span", { className: "n", textContent: String(state.projects.length) })));
+
+  if (!state.projects.length && !state.workspaces.length) {
+    box.append(el("div", { className: "pp-empty",
+      textContent: "None yet. Use + on the rail to add a folder, or file a task from an agent." }));
+    return;
+  }
+
+  for (const w of state.workspaces) {
+    const inside = (state.wsMembers.get(w.id) || []).map((id) => byId.get(id)).filter(Boolean);
+    const row = el("div", { className: "ws-row", tabIndex: 0, role: "button", title: `${w.path}\nOpen this workspace` });
+    row.append(el("span", { className: "ws-ico", textContent: w.icon || railLetter(w.name) }));
+    row.append(el("div", { className: "ws-txt" },
+      el("span", { className: "ws-nm", textContent: w.name }),
+      el("span", { className: "ws-p", textContent: w.path })));
+    if (inside.length) row.append(el("span", { className: "count", textContent: String(inside.length), title: "Projects" }));
+    row.onclick = () => zoomInto(w.id);
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); zoomInto(w.id); } };
+    row.oncontextmenu = (e) => { e.preventDefault(); workspaceMenu(w, e.clientX, e.clientY); };
+    box.append(row);
+
+    if (!inside.length) continue;
+    const kids = el("div", { className: "gkids" });
+    for (const p of inside) {
+      counted.add(p.id);
+      kids.append(...projectRows(p, () => openProjectIn(p, w.id)));
+    }
+    box.append(kids);
+  }
+
+  const loose = state.projects.filter((p) => !counted.has(p.id));
+  if (!loose.length) return;
+  // Named for what they lack rather than hidden behind a toggle, so a project
+  // an agent filed somewhere unexpected is one glance away, not one click.
+  box.append(el("div", { className: "pp-group", title: "Right-click a project to put it in a workspace" },
+    el("span", { textContent: state.workspaces.length ? "Not in a workspace" : "All projects" }),
+    el("span", { className: "n", textContent: String(loose.length) })));
+  for (const p of loose) box.append(...projectRows(p, () => navigate({ projectId: p.id, view: "chat" })));
+}
+
+/**
+ * One project's row, and its sessions under it when it is the open one.
+ *
+ * Shared by the tree and the zoomed-in list so the two cannot drift: same
+ * dot, same count, same keys, same menu.
+ */
+function projectRows(p, open) {
+  const on = p.id === state.projectId;
+  const row = el("div", { className: "gs" + (on ? " on" : ""), tabIndex: 0, role: "button" });
+  if (on) row.setAttribute("aria-current", "page");
+  row.title = p.open_count ? `${p.name}\n${plural(p.open_count, "open task", "open tasks")}` : p.name;
+  row.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }));
+  row.append(el("span", { className: "nm", textContent: p.name }));
+  if (p.open_count) row.append(el("span", { className: "kbd", textContent: String(p.open_count) }));
+  row.onclick = open;
+  row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+  row.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
+  if (!on) return [row];
+
+  // The open project's sessions sit under it, indented, so the column reads as
+  // one tree rather than as two lists that happen to be stacked.
+  const kids = el("div", { className: "gkids" });
+  const addSession = el("div", { className: "gs sub", tabIndex: 0, role: "button" },
+    el("span", { className: "nm dim", textContent: "+ New session" }));
+  const start = async () => { await newSession(); navigate({ view: "chat" }); };
+  addSession.onclick = start;
+  addSession.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); start(); } };
+  kids.append(addSession);
+
+  for (const sn of state.sessions) {
+    const srow = el("div", {
+      className: "gs sub" + (sn.id === state.sessionId && state.view === "chat" ? " on" : ""),
+      tabIndex: 0, role: "button", title: sn.title || "New session",
+    });
+    srow.append(
+      el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
+      el("span", { className: "nm", textContent: sn.title || "Session" })
+    );
+
+    const openS = async () => {
+      if (state.view !== "chat") { state.sessionId = sn.id; navigate({ view: "chat" }); return; }
+      await openSession(sn.id);
+    };
+
+    // Both actions were on the right click menu only, which is a place nobody
+    // looks. They are on the row now; the menu keeps them too.
+    const rename = el("button", { className: "srow-btn", title: "Rename", textContent: "✎" });
+    rename.onclick = (e) => { e.stopPropagation(); renameSession(sn); };
+
+    const close = el("button", { className: "srow-btn close", title: "Close this session", textContent: "×" });
+    close.onclick = (e) => { e.stopPropagation(); closeSession(sn); };
+
+    srow.append(el("span", { className: "srow-acts" }, rename, close));
+    srow.onclick = openS;
+    srow.ondblclick = (e) => { e.preventDefault(); renameSession(sn); };
+    srow.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openS(); } };
+    srow.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, e.clientX, e.clientY); };
+    kids.append(srow);
+  }
+  return [row, kids];
+}
+
+/** The settings button for a project open outside any workspace. */
+function projectFoot(foot) {
+  if (!foot || !state.projectId) return;
+  const settings = el("button", {
+    className: "btn wide" + (state.view === "project" ? " primary" : ""),
+    textContent: "Project settings",
+    title: "Settings for this project",
+  });
+  settings.onclick = () => navigate({ view: "project" });
+  foot.append(settings);
+}
+
+/** Opens a project inside the workspace it was listed under, so its folder is the one sessions use. */
+async function openProjectIn(p, workspaceId) {
+  state.workspaceId = workspaceId;
+  state.wsProjects = await window.delphi.workspaces.projects(workspaceId);
+  return navigate({ projectId: p.id, view: "chat" });
+}
+
+/**
+ * Up and down between rows, so a long list is not a long run of Tabs. Home and
+ * End go to the ends. Anything else is left to the row that has focus.
+ */
+function sidebarArrows(e) {
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+  const rows = [...e.currentTarget.querySelectorAll('[role="button"][tabindex="0"]')];
+  const at = rows.indexOf(document.activeElement);
+  if (at < 0) return;
+  e.preventDefault();
+  const next = e.key === "Home" ? 0 : e.key === "End" ? rows.length - 1
+    : Math.max(0, Math.min(rows.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)));
+  rows[next].focus();
 }
 
 
@@ -935,10 +1023,13 @@ function renderTabs() {
        ["queue", "Queue"],
        ["pads", "Pads", state.pads.length],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
-       ["activity", "Activity"]]
+       // Called History at every level because it is one thing, the audit log,
+       // narrowed or not. The key stays "activity" so the narrowed view keeps
+       // its own renderer and the All view's "history" route is untouched.
+       ["activity", "History"]]
     : state.workspaceId
     ? [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
-       ["queue", "Queue"], ["graph", "Mind map"], ["activity", "Activity"]]
+       ["queue", "Queue"], ["graph", "Mind map"], ["activity", "History"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
        ["graph", "Mind map"],
@@ -2075,6 +2166,7 @@ function projectMenu(p, x, y) {
     { node: projectSwatchRow(p.colour, async (colour) => { closeRowMenu(); await set({ colour }); }) },
     "-",
     ...statuses,
+    ...workspaceChoices(p),
     "-",
     // The field is cleared by hand the way the row's own click does it: navigate
     // drops the query from the state and the box goes on showing what was typed.
@@ -2082,6 +2174,29 @@ function projectMenu(p, x, y) {
     { label: "Archive…", run: () => archiveProject(p) },
     { label: "Delete the project…", danger: true, run: () => destroyProject(p) },
   ]);
+}
+
+/**
+ * "Put in <workspace>" for each workspace a project is not already in.
+ *
+ * Most projects were made by agents over MCP, which never links a folder, and a
+ * project in no workspace is the one the sidebar used to lose. Filing it is a
+ * right click here rather than a trip into Settings. The first link is made the
+ * main one, the way Settings does it, so sessions have a folder to run in.
+ */
+function workspaceChoices(p) {
+  const inside = state.workspaces.filter((w) => (state.wsMembers.get(w.id) || []).includes(p.id));
+  const open = state.workspaces.filter((w) => !inside.includes(w));
+  if (!open.length) return [];
+  return ["-", ...open.map((w) => ({
+    label: `Put in ${w.name}`,
+    run: async () => {
+      try {
+        await window.delphi.workspaces.link(p.id, w.id, { primary: inside.length === 0 });
+      } catch (error) { alert(error.message); return; }
+      await refresh();
+    },
+  }))];
 }
 
 // ---------------------------------------------------------------------------
@@ -2166,15 +2281,7 @@ async function renderWhatsNew(root) {
 }
 
 /** Today and Yesterday read faster than a date when scanning recent activity. */
-function dayLabel(iso) {
-  if (!iso) return "Earlier";
-  const day = String(iso).slice(0, 10);
-  const today = new Date().toISOString().slice(0, 10);
-  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-  if (day === today) return "Today";
-  if (day === yesterday) return "Yesterday";
-  return day;
-}
+const dayLabel = (stamp) => TIME.dayLabel(stamp);
 
 // ---------------------------------------------------------------------------
 // The Oracle
@@ -3147,7 +3254,7 @@ const VIEWS = [
     desc: "Counts, what is moving, what is stuck, and where to go next.",
   },
   {
-    id: "activity", group: "more", glyph: "feed", name: "Activity", tab: "activity",
+    id: "activity", group: "more", glyph: "feed", name: "History", tab: "activity",
     desc: "Every change, newest first, and a way to undo one.",
   },
   {
@@ -3282,7 +3389,10 @@ function openViewMenu(trigger, land = "current") {
   for (const [group, heading] of VIEW_GROUPS) {
     nodes.push(el("div", { className: "vp-group", textContent: heading }));
     for (const view of VIEWS) {
-      if (view.group !== group) continue;
+      // A view that is not built stays in VIEWS, with the reason, as the record
+      // of why. It is not offered: six rows advertising absence, out of fifteen,
+      // were a third of the picker spent on things that do nothing when clicked.
+      if (view.group !== group || view.why) continue;
       const row = viewRow(view, currentId, pick);
       rows.push(row);
       nodes.push(row);
@@ -3985,7 +4095,7 @@ function paintBulkBar() {
       async () => {
         const n = selected.size;
         await act((id) => window.delphi.tasks.remove(id));
-        setTimeout(() => alert(`${n} ${n === 1 ? "task" : "tasks"} deleted. Restore from this project's Activity tab.`), 30);
+        setTimeout(() => alert(`${n} ${n === 1 ? "task" : "tasks"} deleted. Restore from this project's History tab.`), 30);
       }, true)
   );
 
@@ -4391,7 +4501,7 @@ function taskMenu(t, x, y, { after = null } = {}) {
         await repaint();
         // Said where it happened, because that is when someone needs to know it
         // is not final.
-        setTimeout(() => alert("Task deleted. Restore it from this project's Activity tab."), 30);
+        setTimeout(() => alert("Task deleted. Restore it from this project's History tab."), 30);
       },
     },
   ]);
@@ -4549,7 +4659,7 @@ function epicMenu(o, x, y) {
   };
   const remove = async () => {
     // Asked before rather than reported after, which is the opposite of the way
-    // a deleted task is handled. A task can be restored from the Activity tab
+    // a deleted task is handled. A task can be restored from the History tab
     // and an epic cannot, so this is the one delete that has to be agreed to.
     const warning = o.total_count
       ? `Delete the epic “${o.name}”?\n\nIts ${plural(o.total_count, "task", "tasks")} stay in the project and stop being grouped. The epic itself cannot be restored.`
@@ -5626,7 +5736,7 @@ async function renderHistory(root) {
     if (e.undone) {
       row.append(el("span", { className: "chip", textContent: "undone" }));
     } else if (e.action === "delete" && !e.restorable) {
-      // The same honesty the project Activity tab has always had. This list used
+      // The same honesty the project History tab has always had. This list used
       // to offer an undo button on every row, including deletes with no stored
       // copy, where pressing it can only produce an error.
       row.append(el("span", { className: "chip", textContent: "not recoverable" }));
@@ -5657,8 +5767,8 @@ async function renderHistory(root) {
 // "2026-08-15 09:00:00" as local time. Left alone, a reminder set for nine in
 // Berlin would be described as firing at eleven and the arithmetic under
 // "in 20m" would be two hours out.
-const parseFireAt = (text) => new Date(`${String(text || "").replace(" ", "T").replace(/z$/i, "")}Z`);
-const toFireAt = (date) => date.toISOString().slice(0, 19).replace("T", " ");
+const parseFireAt = (text) => TIME.parseStamp(text) || new Date(NaN);
+const toFireAt = (date) => TIME.toStamp(date);
 
 const pad2 = (n) => String(n).padStart(2, "0");
 
@@ -6100,7 +6210,7 @@ const QUEUE_NAME = "ready";
 /** Minutes left on a lease, or how long ago it lapsed. */
 function leaseLeft(expires) {
   if (!expires) return { text: "no lease", late: false };
-  const ms = new Date(expires.replace(" ", "T") + "Z").getTime() - Date.now();
+  const ms = (TIME.parseStamp(expires)?.getTime() ?? NaN) - Date.now();
   const mins = Math.round(Math.abs(ms) / 60000);
   const said = mins < 60 ? `${mins}m` : `${Math.round(mins / 60)}h`;
   return ms >= 0 ? { text: `${said} left`, late: false } : { text: `${said} over`, late: true };
@@ -6801,11 +6911,58 @@ async function renderSettings(root) {
   const data = el("div", { className: "setting" });
   data.append(el("h3", { textContent: "Where your data lives" }));
   const dl = el("dl", { className: "kv" });
-  dl.append(el("dt", { textContent: "Database" }), el("dd", {}, el("span", { className: "mono", textContent: "~/va/delphi/delphi.db" })));
-  dl.append(el("dt", { textContent: "Settings" }), el("dd", {}, el("span", { className: "mono", textContent: "~/va/delphi/settings.json" })));
-  dl.append(el("dt", { textContent: "History" }), el("dd", { textContent: "Every change is recorded and can be reversed." }));
   data.append(dl);
   root.append(data);
+  paintDataInfo(data, dl);
+}
+
+/**
+ * The database this window is really reading, asked of the main process.
+ *
+ * This used to be a hard-coded path, and it went on naming the checkout's
+ * database while the app read another one. That is the split that left agents
+ * writing handoffs to a file nothing dispatched from. So it says "unknown"
+ * when it cannot ask rather than guess, and names a second database that is
+ * being ignored, because that is the one someone will open by mistake.
+ */
+async function paintDataInfo(section, dl) {
+  let info = null;
+  try {
+    const ask = window.delphi.app && window.delphi.app.dataInfo;
+    info = typeof ask === "function" ? await ask() : null;
+  } catch { info = null; }
+
+  const pathRow = (label, value) => {
+    const dd = el("dd", { className: "data-path" });
+    dd.append(el("span", { className: "mono", textContent: value || "unknown" }));
+    if (value) {
+      const copy = el("button", { className: "btn sm", type: "button", textContent: "Copy", title: `Copy ${value}` });
+      copy.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(value);
+          copy.textContent = "Copied";
+          setTimeout(() => { copy.textContent = "Copy"; }, 1200);
+        } catch (error) { notifyError(error); }
+      };
+      dd.append(copy);
+    }
+    dl.append(el("dt", { textContent: label }), dd);
+  };
+
+  pathRow("Database", info && info.path);
+  if (info && info.dbId) {
+    dl.append(el("dt", { textContent: "Database id" }),
+      el("dd", {}, el("span", { className: "mono", textContent: String(info.dbId).slice(0, 8), title: String(info.dbId) })));
+  }
+  const dir = info && info.dataDir;
+  pathRow("Settings", dir ? `${dir.replace(/[\\/]+$/, "")}/settings.json` : null);
+  dl.append(el("dt", { textContent: "History" }), el("dd", { textContent: "Every change is recorded and can be reversed." }));
+
+  if (info && info.checkoutDbIgnored) {
+    const other = typeof info.checkoutDbIgnored === "string" ? info.checkoutDbIgnored : "the checkout";
+    section.append(el("p", { className: "data-warn", role: "status",
+      textContent: `A second database at ${other} is not used. Merge it or delete it.` }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -6863,7 +7020,7 @@ const stripAnsi = (text) => String(text == null ? "" : text)
 
 /** How long a run has been going, to the second, for the clock on a running entry. */
 function elapsed(fromIso) {
-  const s = Math.max(0, Math.round((Date.now() - new Date(String(fromIso).replace(" ", "T") + "Z").getTime()) / 1000));
+  const s = TIME.secondsSince(fromIso) || 0;
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
@@ -6924,8 +7081,8 @@ function entryBriefLine(entry, all) {
  * recent", and "3d" answers it where "3 days 4 hours 12 minutes" does not.
  */
 function gap(fromIso, toIso) {
-  const from = new Date(String(fromIso).replace(" ", "T") + "Z").getTime();
-  const to = toIso ? new Date(String(toIso).replace(" ", "T") + "Z").getTime() : Date.now();
+  const from = TIME.parseStamp(fromIso)?.getTime() ?? NaN;
+  const to = toIso ? (TIME.parseStamp(toIso)?.getTime() ?? NaN) : Date.now();
   const seconds = Math.max(0, Math.round((to - from) / 1000));
   if (seconds < 90) return "moments";
   const minutes = Math.round(seconds / 60);
@@ -7036,9 +7193,8 @@ const CLOSING_LONG_MS = 3 * 60 * 1000;
 /** Whether a closing began more than a few minutes ago. at is SQLite's UTC "YYYY-MM-DD HH:MM:SS". */
 function closingLong(closing) {
   if (!closing || !closing.at) return false;
-  const text = String(closing.at);
-  const at = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(text) ? text : text.replace(" ", "T") + "Z");
-  return Number.isFinite(at) && Date.now() - at > CLOSING_LONG_MS;
+  const at = TIME.parseStamp(closing.at);
+  return !!at && Date.now() - at.getTime() > CLOSING_LONG_MS;
 }
 
 
@@ -7133,7 +7289,7 @@ function wbList(items, render, cap = 8) {
 
 /** How long ago an ISO time was, for the chip's "checked" line. */
 function agoWords(iso) {
-  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  const s = TIME.secondsSince(iso);
   if (!Number.isFinite(s)) return "";
   if (s < 60) return `${s}s ago`;
   if (s < 5400) return `${Math.round(s / 60)}m ago`;
@@ -7977,7 +8133,7 @@ async function openTaskSheet(taskId) {
       // Said at the moment it happens, because that is when someone needs to
       // know it can be taken back.
       refresh();
-      setTimeout(() => alert("Task deleted. It can be restored from the project's Activity tab."), 30);
+      setTimeout(() => alert("Task deleted. It can be restored from the project's History tab."), 30);
     };
 
     const close = el("button", { className: "icon-btn", title: "Close (Escape)" });
@@ -8510,7 +8666,7 @@ async function openTaskSheet(taskId) {
     const entries = [
       ["details", "Details", detail.subtasks.length || null],
       ["reminders", "Reminders", liveAlerts(alertsForTask(taskId)).length || null],
-      ["activity", "Activity", detail.events.length || null],
+      ["activity", "History", detail.events.length || null],
     ];
     for (const [key, label, count] of entries) {
       const b = el("button", { className: "ts-tab" + (pane === key ? " on" : ""), textContent: label });
@@ -9378,9 +9534,9 @@ function renderRail() {
   rail.textContent = "";
 
   const home = el("button", {
-    className: "rail-mark" + (state.workspaceId === null && state.projectId === null ? " on" : ""),
+    className: "rail-mark" + (state.workspaceId === null ? " on" : ""),
     type: "button",
-    title: "All workspaces",
+    title: "Every workspace and project",
   });
   home.append(el("img", { src: "assets/mark-64.png", width: 26, height: 26, alt: "Delphi" }));
   home.onclick = () => zoomOut();

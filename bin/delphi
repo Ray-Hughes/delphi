@@ -27,6 +27,7 @@ const { openServer } = require("../sheet/client");
 const fmt = require("../sheet/format");
 const { runEntry, logPathFor } = require("../sheet/run");
 const { splitCommand } = require("../agent/launch");
+const locate = require("../agent/locate");
 
 const HELP = {
   open: [
@@ -107,6 +108,12 @@ const HELP = {
     "Uses the harness from Delphi's settings; DELPHI_CHAT_AGENT names a different binary.",
   ],
   "shell-init": ["delphi shell-init [bash|zsh]", "Print a work function for your shell that really changes folder. Use: eval \"$(delphi shell-init)\""],
+  doctor: [
+    "delphi doctor [--path] [--json]",
+    "Which database Delphi is using, its id, whether the app is running against it, and whether this command,",
+    "Claude Code, Codex and Copilot are wired to that same database. Reports only; it never edits a config.",
+    "--path prints only the database's path, for scripts and the Makefile. Exits 1 when something needs attention.",
+  ],
   help: ["delphi help [<command>]", "This, or the detail for one command."],
 };
 
@@ -999,6 +1006,246 @@ const COMMANDS = {
   },
 };
 
+// --- doctor --------------------------------------------------------------------
+//
+// The question this answers is "is everything writing to the same database?",
+// because when the answer was no, nothing said so: an agent wrote, nothing
+// errored, and the work never appeared. It reads the agents' configs and says
+// where each one would land. It never edits them; a config is the person's.
+
+/** Every executable called name on PATH, in order. */
+function onPath(name) {
+  const found = [];
+  const exts = process.platform === "win32" ? (process.env.PATHEXT || ".EXE;.CMD").split(";") : [""];
+  for (const dir of String(process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const file = path.join(dir, name + ext);
+      try {
+        if (fs.statSync(file).isFile()) found.push(file);
+      } catch {}
+    }
+  }
+  return [...new Set(found)];
+}
+
+const realOr = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+
+/**
+ * Just enough TOML for a Codex MCP entry: [section] headers, and key = value
+ * where a value is a string, an array of strings or an inline table of strings.
+ * Anything else is skipped rather than guessed at.
+ */
+function parseTomlLite(text) {
+  const out = {};
+  let section = out;
+  const value = (raw) => {
+    raw = raw.trim();
+    if (raw.startsWith("{") && raw.endsWith("}")) {
+      const table = {};
+      for (const m of raw.slice(1, -1).matchAll(/([A-Za-z0-9_.-]+|"[^"]*")\s*=\s*("(?:[^"\\]|\\.)*"|'[^']*')/g)) {
+        table[m[1].replace(/^"|"$/g, "")] = value(m[2]);
+      }
+      return table;
+    }
+    if (raw.startsWith("[") && raw.endsWith("]")) {
+      return [...raw.slice(1, -1).matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g)].map((m) => (m[1] !== undefined ? JSON.parse('"' + m[1] + '"') : m[2]));
+    }
+    if (raw.startsWith('"')) { try { return JSON.parse(raw); } catch { return raw.slice(1, -1); } }
+    if (raw.startsWith("'")) return raw.slice(1, -1);
+    return raw;
+  };
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.replace(/\s+#.*$/, "").trim();
+    if (!t || t.startsWith("#")) continue;
+    const header = t.match(/^\[([^\]]+)\]$/);
+    if (header) {
+      section = out;
+      for (const part of header[1].split(".").map((x) => x.trim().replace(/^"|"$/g, ""))) {
+        section[part] = section[part] && typeof section[part] === "object" ? section[part] : {};
+        section = section[part];
+      }
+      continue;
+    }
+    const kv = t.match(/^([A-Za-z0-9_.-]+|"[^"]*")\s*=\s*(.+)$/);
+    if (kv) section[kv[1].replace(/^"|"$/g, "")] = value(kv[2]);
+  }
+  return out;
+}
+
+/** Entries that look like Delphi's server: named delphi, or running mcp_server.js. */
+function delphiEntries(servers) {
+  if (!servers || typeof servers !== "object") return [];
+  return Object.entries(servers).filter(([name, e]) => e && typeof e === "object" &&
+    (/delphi|brain|oracle/i.test(name) || (Array.isArray(e.args) && e.args.some((a) => /mcp_server\.js$/.test(String(a))))));
+}
+
+/** Where one registered entry's server would land, and whether that is this database. */
+function judgeEntry(agent, where, name, entry, resolved, dbId) {
+  const env = (entry.env && typeof entry.env === "object") ? entry.env : {};
+  const lands = locate.resolve({ env: { DELPHI_DB: env.DELPHI_DB, DELPHI_DATA_DIR: env.DELPHI_DATA_DIR } });
+  const args = Array.isArray(entry.args) ? entry.args.map(String) : [];
+  const server = args.find((a) => /mcp_server\.js$/.test(a)) || null;
+  const problems = [];
+  if (server && !fs.existsSync(server)) problems.push("its server file " + server + " does not exist");
+  const same = locate.samePath(lands.dbPath, resolved.dbPath);
+  if (!same) problems.push("it writes to " + lands.dbPath + ", not " + resolved.dbPath);
+  if (env.DELPHI_DB_ID && dbId && env.DELPHI_DB_ID !== dbId) problems.push("its DELPHI_DB_ID " + env.DELPHI_DB_ID + " is not this database's, so its server will refuse to start");
+  return {
+    agent, where, name,
+    command: entry.command || null, server,
+    db_path: lands.dbPath, same_database: same,
+    ok: problems.length === 0, problems,
+  };
+}
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) { return error.code === "ENOENT" ? undefined : { __error: error.message }; }
+}
+
+function agentConfigs(resolved, dbId) {
+  const home = os.homedir();
+  const found = [];
+  const missing = [];
+  const unreadable = [];
+
+  const claudeFile = path.join(home, ".claude.json");
+  const claude = readJson(claudeFile);
+  let claudeAny = false;
+  if (claude && claude.__error) unreadable.push({ agent: "Claude Code", file: claudeFile, error: claude.__error });
+  else if (claude) {
+    for (const [name, e] of delphiEntries(claude.mcpServers)) { claudeAny = true; found.push(judgeEntry("Claude Code", claudeFile + " (every folder)", name, e, resolved, dbId)); }
+    for (const [dir, project] of Object.entries(claude.projects || {})) {
+      for (const [name, e] of delphiEntries(project && project.mcpServers)) { claudeAny = true; found.push(judgeEntry("Claude Code", claudeFile + " (only in " + dir + ")", name, e, resolved, dbId)); }
+    }
+  }
+  const projectMcp = path.join(process.cwd(), ".mcp.json");
+  const local = readJson(projectMcp);
+  if (local && !local.__error) {
+    for (const [name, e] of delphiEntries(local.mcpServers)) { claudeAny = true; found.push(judgeEntry("Claude Code", projectMcp, name, e, resolved, dbId)); }
+  }
+  if (!claudeAny) missing.push({ agent: "Claude Code", file: claudeFile });
+
+  const codexFile = path.join(process.env.CODEX_HOME || path.join(home, ".codex"), "config.toml");
+  let codexAny = false;
+  try {
+    const toml = parseTomlLite(fs.readFileSync(codexFile, "utf8"));
+    for (const [name, e] of delphiEntries(toml.mcp_servers)) { codexAny = true; found.push(judgeEntry("Codex", codexFile, name, e, resolved, dbId)); }
+  } catch (error) {
+    if (error.code !== "ENOENT") unreadable.push({ agent: "Codex", file: codexFile, error: error.message });
+  }
+  if (!codexAny) missing.push({ agent: "Codex", file: codexFile });
+
+  const copilotFile = path.join(process.env.COPILOT_HOME || path.join(home, ".copilot"), "mcp-config.json");
+  const copilot = readJson(copilotFile);
+  let copilotAny = false;
+  if (copilot && copilot.__error) unreadable.push({ agent: "Copilot", file: copilotFile, error: copilot.__error });
+  else if (copilot) {
+    for (const [name, e] of delphiEntries(copilot.mcpServers)) { copilotAny = true; found.push(judgeEntry("Copilot", copilotFile, name, e, resolved, dbId)); }
+  }
+  if (!copilotAny) missing.push({ agent: "Copilot", file: copilotFile });
+
+  return { found, missing, unreadable };
+}
+
+function commandLine() {
+  const me = realOr(__filename);
+  const delphis = onPath("delphi").map((file) => ({ file, target: realOr(file), this_one: realOr(file) === me }));
+  const nodes = onPath("node");
+  let node = null;
+  if (nodes.length) {
+    const r = require("child_process").spawnSync(nodes[0], ["-e", "try{require('node:sqlite');process.stdout.write(process.version+' sqlite')}catch{process.stdout.write(process.version)}"], { encoding: "utf8", timeout: 10000 });
+    const out = String(r.stdout || "");
+    node = { file: nodes[0], version: out.split(" ")[0] || null, node_sqlite: out.includes("sqlite") };
+  }
+  return { delphi: delphis, node };
+}
+
+async function doctor(args) {
+  const parsed = parseArgs(args);
+  const resolved = locate.resolve();
+  if (parsed.flags.path) { say(resolved.dbPath); return 0; }
+
+  const report = {
+    database: {
+      path: resolved.dbPath, data_dir: resolved.dataDir, resolved_by: resolved.source,
+      exists: fs.existsSync(resolved.dbPath), checkout_db_ignored: resolved.checkoutDbIgnored,
+    },
+    whoami: null, server_error: null,
+    command_line: commandLine(),
+    agents: null,
+  };
+  // Only a database that exists is opened: starting the server would create an
+  // empty file, and a doctor that makes the thing it was asked to look for is
+  // no help.
+  if (report.database.exists) {
+    const client = connect({ timeoutMs: 30000 });
+    try {
+      await client.start();
+      report.whoami = await client.call("whoami");
+    } catch (error) {
+      report.server_error = error.message;
+    } finally {
+      client.close();
+    }
+  }
+  const dbId = report.whoami ? report.whoami.db_id : null;
+  report.agents = agentConfigs(resolved, dbId);
+
+  const problems = [];
+  if (!report.database.exists) problems.push("There is no database at " + resolved.dbPath + " yet. Start the Delphi app once to make it.");
+  if (report.server_error) problems.push("The MCP server would not answer: " + report.server_error);
+  if (resolved.checkoutDbIgnored) problems.push(locate.ignoredNotice(resolved).replace(/^delphi: /, ""));
+  const cl = report.command_line;
+  if (!cl.delphi.length) problems.push("delphi is not on PATH. Run make cli in the checkout to link it.");
+  else if (!cl.delphi[0].this_one) problems.push("The delphi first on PATH is " + cl.delphi[0].target + ", not this one (" + realOr(__filename) + ").");
+  for (const e of report.agents.found) if (!e.ok) problems.push(e.agent + " (" + e.where + ", " + e.name + "): " + e.problems.join("; ") + ".");
+  for (const u of report.agents.unreadable) problems.push(u.agent + ": could not read " + u.file + " (" + u.error + ").");
+  report.problems = problems;
+
+  if (parsed.flags.json) {
+    say(JSON.stringify(report, null, 2));
+    return problems.length ? 1 : 0;
+  }
+
+  const w = report.whoami;
+  const line = (label, text) => say("  " + label.padEnd(14) + text);
+  say("Database");
+  line("path", resolved.dbPath);
+  line("chosen by", resolved.source === "default" ? "the default, the per-user data folder" : resolved.source);
+  if (w) {
+    line("id", w.db_id || "none yet");
+    if (w.db_created_at) line("id since", w.db_created_at);
+    line("app", w.app_running ? "running (pid " + w.app.pid + ", checked in " + w.app.age_seconds + "s ago)" : "not running. " + w.app.reason + " Handoffs wait until it is.");
+    line("you are", w.actor + " (" + w.author_type + ")");
+    line("route", w.sqlite_route);
+  }
+  if (resolved.checkoutDbIgnored) line("ignored", resolved.checkoutDbIgnored);
+  say("");
+  say("Command line");
+  if (!cl.delphi.length) line("delphi", "not on PATH");
+  for (const d of cl.delphi) line("delphi", d.file + (d.file !== d.target ? " -> " + d.target : "") + (d.this_one ? "  (this one)" : ""));
+  if (cl.node) line("node", cl.node.file + " " + (cl.node.version || "?") + (cl.node.node_sqlite ? ", has node:sqlite" : ", no node:sqlite, so servers it runs use the sqlite3 binary"));
+  else line("node", "not on PATH");
+  say("");
+  say("Agents");
+  for (const e of report.agents.found) {
+    line(e.agent, (e.ok ? "ok, same database. " : "PROBLEM. ") + e.where + (e.ok ? "" : ": " + e.problems.join("; ")));
+  }
+  for (const m of report.agents.missing) {
+    line(m.agent, "not registered in " + m.file + ". It reaches Delphi only in sessions the app launches.");
+  }
+  for (const u of report.agents.unreadable) line(u.agent, "could not read " + u.file + ": " + u.error);
+  say("");
+  if (problems.length) {
+    say(problems.length + (problems.length === 1 ? " thing needs" : " things need") + " attention:");
+    for (const p of problems) say("  - " + p);
+  } else {
+    say("Everything points at one database.");
+  }
+  return problems.length ? 1 : 0;
+}
+
 // --- main ----------------------------------------------------------------------
 
 async function main(argv) {
@@ -1006,6 +1253,16 @@ async function main(argv) {
   if (!command || command === "help" || command === "--help" || command === "-h") {
     process.stdout.write(usage(args[0]));
     return 0;
+  }
+  // Before the usual connect, because --path must answer without a server and
+  // doctor has to report a server that will not start rather than die with it.
+  if (command === "doctor") {
+    try {
+      return await doctor(args);
+    } catch (error) {
+      process.stderr.write(`delphi: ${error.message}\n`);
+      return 1;
+    }
   }
   if (command === "shell-init") {
     try {

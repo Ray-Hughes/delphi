@@ -12,10 +12,10 @@ const fs = require("fs");
 const paths = require("./paths");
 const pads = require("./pads");
 const schemaLater = require("./agent/schema_later");
+const identity = require("./agent/identity");
 
-// Beside the source when run from a checkout, in the per-user data directory when
-// run from an installer. See paths.js: the packaged source directory is a
-// read-only archive, so a database cannot live there.
+// Decided by agent/locate.js, the same rule the MCP server and the command line
+// use, so the window and every agent are looking at one file. See paths.js.
 const DB_PATH = paths.DB_PATH;
 
 let db;
@@ -46,6 +46,10 @@ function open() {
     throw new Error(`Could not bring the database up to date: ${first.message} (${first.statement.split("\n")[0]})`);
   }
   db.exec(schema);
+  // After the schema, because on a fresh database meta has only just been made.
+  // Whichever process opens a file first mints its id, and nothing changes it
+  // after that; see agent/identity.js.
+  identity.ensure((statement) => db.prepare(statement).all());
   // After the schema, because on a fresh database the table it rebuilds has just
   // been created with the right constraint and there is nothing to do.
   widenAuditEntities(db);
@@ -2595,8 +2599,17 @@ function adoptProjectPaths() {
   return withPath.length;
 }
 
+// Which database this is, and the app's heartbeat in it. The heartbeat is how
+// an agent is told whether anything will dispatch its handoff; see
+// agent/identity.js.
+const metaQuery = (statement) => open().prepare(statement).all();
+const dbIdentity = () => identity.current(metaQuery);
+const appBeat = (options) => identity.beat(metaQuery, options);
+const appBeatClear = (options) => identity.clearBeat(metaQuery, options);
+
 module.exports = {
   DB_PATH,
+  identity: dbIdentity, appBeat, appBeatClear,
   // The graph builder works against the connection directly, so it is exposed
   // rather than every graph query being proxied through this module.
   handle: open,

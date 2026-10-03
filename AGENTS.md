@@ -63,20 +63,21 @@ is working.
 
 ## Which database it writes to
 
-An installed copy keeps its database in the per-user data directory
+The database is in the per-user data directory
 (`~/Library/Application Support/Delphi` on macOS, `%APPDATA%\Delphi` on Windows,
-`$XDG_CONFIG_HOME/Delphi` otherwise). A checkout keeps one beside the source. If you
-have both, the installed one wins, because that is the one the app you are looking at
-is reading.
+`$XDG_CONFIG_HOME/Delphi` otherwise), for the installed app and for a checkout alike.
+`agent/locate.js` decides it, and the app, this server and the `delphi` command all
+use it, so they cannot disagree. A checkout's own `delphi.db` is never opened; if one
+exists the server says so once on stderr, which your client keeps in its MCP log.
 
-This ordering matters more than it sounds. The server is registered by its path inside
-the checkout, so it used to find the neighbouring database first and write there, while
-the app read the other one. Nothing errors in that state: notes and tasks are written,
-and simply never appear. If two databases exist, the server says which it chose on
-stderr, which your client will have in its MCP log.
+Set `DELPHI_DB` to a file or `DELPHI_DATA_DIR` to a folder to use somewhere else.
+Call the `whoami` tool to see which database a session is on (path and id), who its
+writes are attributed to, and whether a Delphi app is running to dispatch handoffs.
+`delphi doctor` prints the same and checks the Claude Code, Codex and Copilot configs.
 
-Set `DELPHI_DB` to an absolute path to override, which is how you point the server at a
-checkout on purpose.
+A server the app launches is also given `DELPHI_DB_ID`, and refuses to start if the
+file it opens is a different database, so an agent Delphi starts cannot write to the
+wrong one.
 
 ## Connecting
 

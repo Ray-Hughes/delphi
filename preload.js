@@ -225,6 +225,12 @@ contextBridge.exposeInMainWorld("delphi", {
     set: (fields) => call("settings:set", fields),
     setHotkey: (accelerator) => call("settings:setHotkey", accelerator),
   },
+  app: {
+    // Where your data lives: { path, dbId, createdAt, dataDir, resolvedBy,
+    // checkoutDbIgnored (a path or null), checkoutNoticeDue }. See
+    // app:dataInfo in main.js.
+    dataInfo: () => call("app:dataInfo"),
+  },
   hide: () => ipcRenderer.send("hide"),
   openExternal: (url) => ipcRenderer.send("open-external", url),
   onShown: (fn) => ipcRenderer.on("shown", fn),

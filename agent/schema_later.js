@@ -117,6 +117,12 @@ const LATER_TABLES = [
   closing_at    TEXT,
   closing_actor TEXT
 )`],
+  // The file's identity and the app's heartbeat. See agent/identity.js, which
+  // mints the id once this table exists.
+  ["meta", `CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+)`],
 ];
 
 // [name, table, columns the index needs, statement]. The columns are checked

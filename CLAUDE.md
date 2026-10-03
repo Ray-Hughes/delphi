@@ -98,7 +98,8 @@ read. So these are shared:
   routes.
 
 A shared module must load under a plain Node with no dependencies, and every one
-of them has to be in `extraResources` as well as `files` (see packaging below).
+of them has to be in `files` and in `OUTSIDE_TOO` in `tools/after-pack.js` (see
+packaging below).
 Old twins are not being refactored onto this; new shared code follows it.
 
 **New columns go in `schema.sql` and `agent/schema_later.js`, not `db.js`.**
@@ -117,8 +118,8 @@ the importers) kept working. The vault mirrors each Sheet as a clean `.sheet`
 file beside the project's pads.
 
 **Run logs live in `DATA_DIR/sheets/<task>/<entry>.log`**, beside the database,
-so they inherit its never-in-git rule. From a checkout that is the checkout, which
-is why `/sheets/` is in `.gitignore`. `make prune-logs` drops the logs of tasks
+so they inherit its never-in-git rule. `/sheets/` is in `.gitignore` anyway, for
+a data folder pointed at the checkout on purpose. `make prune-logs` drops the logs of tasks
 done over 30 days ago, opening the database read-only through `sqlite3`.
 `make cli` links `bin/delphi` onto PATH.
 
@@ -195,20 +196,37 @@ commands Copilot or Codex run; that is why `delphi chat --auto` with Copilot nee
 `--allow-unguarded`. `sheet/run.js` asks it before every `$ ` run, a person's or
 an agent's, and fails closed when python3 or `guard.py` cannot be found.
 
-**Everything the server and the CLI require must be in `extraResources`.** They
-run under a plain Node outside `app.asar`, from `Resources/`, and find their
-modules by relative require, so the layout there mirrors the checkout: `agent/`,
-`sheet/`, `workbench/`, `bin/delphi`, `pads.js`, `git.js`, `harness.js`.
-electron-builder skips a missing entry without a word, and that is how every
-installed build from 1.3.0 shipped a server missing `agent/directives.js`.
-`tools/package_test.js` copies the layout to a temp folder, follows every
-relative require from the server and the CLI, and starts both, so a gap fails
-`npm test` rather than an install.
+**A module the app and the server both need goes in `files` and in
+`OUTSIDE_TOO`, never in `extraResources`.** The server and the CLI run under a
+plain Node outside `app.asar`, from `Resources/`, and find their modules by
+relative require, so the layout there mirrors the checkout. electron-builder
+leaves out of the archive anything `extraResources` copies, without a word, which
+is how 1.6.0 shipped an app that could not start: `db.js` could not find
+`./pads`. So shared modules are listed in `files` only, and `tools/after-pack.js`
+copies them out to `Resources/` before signing. `extraResources` keeps only what
+the app itself never loads. Every build from 1.3.0 to 1.5.0 had the opposite gap,
+a server missing `agent/directives.js`.
 
-**Tests never touch a real database.** Not `delphi.db` in the checkout, not the
-one in `~/Library/Application Support/Delphi`. Each test makes a temp directory
-and sets `DELPHI_DATA_DIR` (which `db.js` reads) and `DELPHI_DB` (which the
-server reads; it ignores `DELPHI_DATA_DIR`) inside it. `test_all.js` sets both to
+`tools/package_test.js` reads the real `app.asar` and follows every require and
+`<script src>` from the app, follows every require from the server and the CLI
+in `Resources/`, starts both, and launches the packaged app with
+`DELPHI_SMOKE=1` against an old database to prove it opens and migrates. The
+release workflow runs it on macOS and Windows before anything is published.
+
+**There is one database, and everything finds it the same way.**
+`agent/locate.js` is the only resolver: `DELPHI_DB`, then `DELPHI_DATA_DIR`,
+then the per-user data folder, whether the app is packaged or run from the
+checkout. A `delphi.db` beside the source is never opened, only reported, because
+the app once preferred it when unpackaged while agents used the installed one, and
+each wrote to a database the other never read. Every database carries a `db_id` in
+its `meta` table; agents Delphi launches get it as `DELPHI_DB_ID` and the server
+refuses to start on a mismatch. `whoami` and `delphi doctor` report which database
+is in use. A second copy of the app on the same data folder only brings the first
+forward. `make dev` runs the checkout on a separate database in `~/.delphi-dev`.
+
+**Tests never touch a real database.** Not the one in
+`~/Library/Application Support/Delphi`, not a stray one in the checkout. Each test
+makes a temp directory and sets `DELPHI_DATA_DIR` and `DELPHI_DB` inside it. `test_all.js` sets both to
 a temp folder before each test and strips the `DELPHI_*` variables an agent
 session carries, as a floor under that, not instead of it.
 
