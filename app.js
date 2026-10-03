@@ -4261,7 +4261,7 @@ async function quickLook(taskId) {
     ["Subtasks", detail.subtasks.length
       ? `${detail.subtasks.filter((s) => s.status === "done").length} of ${detail.subtasks.length} done`
       : "none"],
-    ["Comments", String(detail.comments.length)],
+    ["Sheet", detail.comments.length ? plural(detail.comments.length, "entry", "entries") : "nothing yet"],
     ["Created", ago(t.created_at)],
   ];
   const grid = el("div", { className: "qlook-grid" });
@@ -6706,8 +6706,91 @@ const STATUSES = [
   ["done", "Done"],
 ];
 
-/** Names that belong to software rather than to a person. */
-const isAgent = (name) => /claude|copilot|codex|cursor|agent|gpt|bot/i.test(String(name || ""));
+/**
+ * Names that belong to software rather than to a person.
+ *
+ * The same test as inferAuthorType in sheet/format.js. Keep the two identical,
+ * or the rail and the text format will disagree about who said something. The
+ * colon is what an actor launched by Delphi carries (claude-code:12).
+ */
+const isAgent = (name) => /claude|copilot|codex|cursor|agent|gpt|bot|runner|:/i.test(String(name || ""));
+
+/** An entry's author is software. What the writer recorded wins over the name. */
+const entryIsAgent = (entry) => entry.author_type ? entry.author_type !== "human" : isAgent(entry.author);
+
+// The text format's sigils, so the rail reads the way `delphi cat` prints.
+const SIGILS = { say: ">", agent: "@", run: "$", ask: "?", decide: "=", note: "!" };
+const KIND_WORD = { say: "said", agent: "agent said", run: "ran", ask: "asked", decide: "decided", note: "note" };
+const NOTE_KINDS = ["decision", "gotcha", "reference", "note"];
+
+// Whether the rail shows the ledger or everything. Per window rather than per
+// task: someone reviewing ledgers wants the next task opened the same way.
+let railLedger = false;
+
+/**
+ * Terminal colour and cursor codes out of text that is about to be shown. The
+ * main process strips logs already; this is for meta written by an agent,
+ * which nothing upstream has to have cleaned.
+ */
+const stripAnsi = (text) => String(text == null ? "" : text)
+  .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+  .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
+  .replace(/\x1b[@-Z\\-_]/g, "")
+  .replace(/\x1b/g, "");
+
+/** How long a run has been going, to the second, for the clock on a running entry. */
+function elapsed(fromIso) {
+  const s = Math.max(0, Math.round((Date.now() - new Date(String(fromIso).replace(" ", "T") + "Z").getTime()) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+const isRunning = (entry) => entry.kind === "run" && !!entry.meta && entry.meta.state === "running";
+
+/** A run's duration as a person would say it: 340ms, 1.2s, 3m 4s. */
+function duration(ms) {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+// Fixed markup, never anything from the database, which is why innerHTML is
+// acceptable for these and nowhere near an entry's text.
+const TS_ICONS = {
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  minus: '<path d="M5 12h14"/>',
+  file: '<path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/>',
+  x: '<path d="M18 6L6 18M6 6l12 12"/>',
+};
+function tsIcon(name, width = 2) {
+  const holder = document.createElement("span");
+  holder.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${TS_ICONS[name]}</svg>`;
+  return holder.firstChild;
+}
+
+/** One Sheet entry as a line of a brief, by kind, so a run or an ask still reads. */
+function entryBriefLine(entry, all) {
+  const flat = (text) => String(text || "").replace(/\s+/g, " ").trim();
+  if (entry.kind === "run") {
+    const m = entry.meta || {};
+    const result = m.state ? ` (${m.state}${m.state === "fail" && m.code != null ? `:${m.code}` : ""})` : "";
+    return `${entry.author} ran: ${flat(entry.body)}${result}`;
+  }
+  if (entry.kind === "ask") {
+    const options = (entry.meta && Array.isArray(entry.meta.options)) ? entry.meta.options : [];
+    return `${entry.author} asked: ${flat(entry.body)} ${options.map((o) => `[${o.key}] ${o.label}`).join(" ")}`.trim();
+  }
+  if (entry.kind === "decide") {
+    const lines = String(entry.body || "").split("\n");
+    const ask = all.find((e) => e.id === entry.ref_id);
+    const label = (entry.meta && entry.meta.label) || "";
+    const why = flat(lines.slice(1).join(" "));
+    return `${entry.author} decided [${(entry.meta && entry.meta.choice) || lines[0]}] ${label}` +
+      `${ask ? ` on "${flat(ask.body)}"` : ""}${why ? `: ${why}` : ""}`;
+  }
+  return `${entry.author}${entry.kind === "note" ? " (note)" : ""}: ${flat(entry.body)}`;
+}
 
 /**
  * A gap in words.
@@ -6754,7 +6837,7 @@ function handoffText(detail) {
 
   if (detail.comments.length) {
     lines.push("", "Discussion so far:");
-    for (const c of detail.comments) lines.push(`  ${c.author}: ${c.body.replace(/\s+/g, " ").trim()}`);
+    for (const c of detail.comments) lines.push(`  ${entryBriefLine(c, detail.comments)}`);
   }
 
   if (detail.events.length > 1) {
@@ -6812,6 +6895,10 @@ async function openTaskSheet(taskId) {
   sheet.append(top, body);
 
   const flashHost = el("span", { className: "hint" });
+  // Where the Workbench controls go, between the flash and Copy brief. One
+  // node kept across paintTop, so whatever paints it owns its own redraws and
+  // a menu open on it survives a live refresh of the header.
+  const wbSlot = el("div", { className: "wb" });
   const flash = (text) => {
     flashHost.textContent = text;
     setTimeout(() => { if (flashHost.textContent === text) flashHost.textContent = ""; }, 1500);
@@ -6856,7 +6943,7 @@ async function openTaskSheet(taskId) {
     } else {
       crumbs.append(el("span", { className: "crumb-now", textContent: `task ${detail.task.id}` }));
     }
-    top.append(crumbs, el("span", { className: "spacer" }), flashHost);
+    top.append(crumbs, el("span", { className: "spacer" }), flashHost, wbSlot);
 
     const hand = el("button", { className: "btn sm", textContent: "Copy brief" });
     hand.title = "Copies this task, its discussion and its history as a brief an agent can act on";
@@ -7238,64 +7325,529 @@ async function openTaskSheet(taskId) {
     paneBox.append(list);
   }
 
-  // --- rail: comments -------------------------------------------------------
+  // --- rail: the Sheet ------------------------------------------------------
 
   const railHead = el("div", { className: "ts-rail-head" });
   const railList = el("div", { className: "ts-comments" });
+  railList.setAttribute("role", "log");
+  railList.setAttribute("aria-label", "Sheet entries");
   const railFoot = el("div", { className: "ts-composer" });
 
-  function paintRail() {
-    railHead.textContent = "";
-    railHead.append(el("h4", { textContent: "Comments" }));
-    if (detail.comments.length) railHead.append(el("span", { className: "ts-count", textContent: String(detail.comments.length) }));
+  // Per entry view state, kept across repaints so a live refresh does not
+  // collapse output somebody was reading.
+  const outputOpen = new Set();
+  const outputText = new Map();   // id -> {text, truncated} or {error}
+  // id -> {sig, node}. A row whose signature is unchanged keeps its node, so a
+  // refresh leaves focus, hover and selection where they were.
+  const rowCache = new Map();
+  let railPainted = false;
 
-    railList.textContent = "";
-    if (!detail.comments.length) {
-      railList.append(el("div", { className: "hint pad",
-        textContent: "Nothing said yet. Agents write here too, and what they leave is what the next one reads." }));
-    }
-    for (const c of detail.comments) {
-      const agent = isAgent(c.author);
-      const row = el("div", { className: "ts-comment" });
-      const who = el("div", { className: "ts-comment-who" },
-        el("span", { className: "avatar" + (agent ? " agent" : ""), textContent: String(c.author || "?").slice(0, 1).toUpperCase() }),
-        el("span", { className: "ts-comment-author", textContent: c.author }),
-        agent ? el("span", { className: "agent-tag", textContent: "agent" }) : null,
-        el("span", { className: "hint", textContent: `${gap(c.created_at)} ago` }));
-      const kill = el("button", { className: "ts-kill", textContent: "×", title: "Delete comment" });
-      kill.onclick = async () => { await window.delphi.tasks.uncomment(c.id); await reload(); };
-      who.append(kill);
-      row.append(who, renderMarkdown(c.body));
-      railList.append(row);
-    }
-    railList.scrollTop = railList.scrollHeight;
+  const entryById = (id) => detail.comments.find((c) => c.id === id) || null;
+
+  function railCopied(button, label) {
+    const before = button.title;
+    button.title = label;
+    button.classList.add("done");
+    setTimeout(() => { button.title = before; button.classList.remove("done"); }, 1200);
   }
 
-  const composer = el("textarea", { className: "ts-composer-box", placeholder: "Write a comment" });
-  composer.setAttribute("aria-label", "New comment");
-  const post = async () => {
-    if (!composer.value.trim()) return;
-    await window.delphi.tasks.comment(taskId, composer.value, "you");
-    composer.value = "";
-    await reload();
-  };
-  composer.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); post(); } };
+  async function loadOutput(id) {
+    try {
+      const log = await window.delphi.sheets.log(id);
+      outputText.set(id, { text: stripAnsi(log.text || ""), truncated: !!log.truncated });
+    } catch (error) {
+      outputText.set(id, { error: String(error.message || error) });
+    }
+    paintRail();
+  }
+
+  function openFileMenu(button, row, entry, fromKeyboard) {
+    const box = button.getBoundingClientRect();
+    const items = [el("div", { className: "ctx-head", textContent: "File as" })];
+    for (const kind of NOTE_KINDS) {
+      items.push({
+        label: kind[0].toUpperCase() + kind.slice(1),
+        run: async () => {
+          try {
+            await window.delphi.sheets.file(entry.id, kind, null);
+            flash(`filed as ${kind}`);
+          } catch (error) { flash(String(error.message || error)); }
+          await reload();
+        },
+      });
+    }
+    button.setAttribute("aria-expanded", "true");
+    row.classList.add("menu-open");
+    const menu = rowMenu(box.right - 168, box.bottom + 4, items, {
+      className: "ts-entry-menu",
+      onClose: () => {
+        button.setAttribute("aria-expanded", "false");
+        row.classList.remove("menu-open");
+      },
+    });
+    menu.setAttribute("role", "menu");
+    const choices = [...menu.querySelectorAll(".ctx-item")];
+    for (const c of choices) c.setAttribute("role", "menuitem");
+    // Escape is caught here, before it reaches the document handler that
+    // closes the whole task panel.
+    menu.addEventListener("keydown", (e) => {
+      const at = choices.indexOf(document.activeElement);
+      if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); closeRowMenu(); button.focus(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); choices[(at + 1) % choices.length].focus(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); choices[(at - 1 + choices.length) % choices.length].focus(); }
+      else if (e.key === "Tab") { closeRowMenu(); }
+    });
+    // Focus moves in only for the keyboard; a click leaves it where the
+    // pointer is, so the first item does not light up as though chosen.
+    if (fromKeyboard) choices[0]?.focus();
+    else {
+      // The menu itself takes focus instead, so Escape and the arrows still
+      // reach its handler.
+      menu.tabIndex = -1;
+      menu.focus();
+    }
+  }
+
+  function entryActions(entry, row) {
+    const acts = el("span", { className: "ts-entry-acts" });
+    const act = (key, label, icon, extra = "") => {
+      const b = el("button", { className: `ts-act ${extra}`.trim(), title: label });
+      b.setAttribute("aria-label", label);
+      b.dataset.act = key;
+      b.append(tsIcon(icon, icon === "plus" || icon === "minus" || icon === "x" ? 2.2 : 2));
+      acts.append(b);
+      return b;
+    };
+
+    const promoted = !!entry.promoted;
+    const pro = act("promote", promoted ? "Take it out of the ledger" : "Promote to the ledger",
+      promoted ? "minus" : "plus", promoted ? "on" : "");
+    pro.setAttribute("aria-pressed", String(promoted));
+    pro.onclick = async () => {
+      try { await window.delphi.sheets.promote(entry.id, !promoted); } catch (error) { flash(String(error.message || error)); }
+      await reload();
+    };
+
+    // Filing is once only: the entry keeps its note, and a second note from
+    // the same words would be a duplicate in search and in the graph.
+    if (!entry.note_id) {
+      const file = act("file", "File as a project note", "file");
+      file.setAttribute("aria-haspopup", "menu");
+      file.setAttribute("aria-expanded", "false");
+      file.onclick = (e) => { e.stopPropagation(); openFileMenu(file, row, entry, e.detail === 0); };
+    }
+
+    const copyLabel = entry.kind === "run" ? "Copy the command (Shift for output too)" : "Copy";
+    const cp = act("copy", copyLabel, "copy");
+    cp.onclick = async (e) => {
+      try {
+        await window.delphi.sheets.copy(entry.id, { withOutput: entry.kind === "run" && e.shiftKey });
+        railCopied(cp, "Copied");
+      } catch (error) { flash(String(error.message || error)); }
+    };
+
+    const kill = act("delete", "Delete entry", "x", "kill");
+    kill.onclick = async () => { await window.delphi.tasks.uncomment(entry.id); await reload(); };
+    return acts;
+  }
+
+  function runBody(entry, body) {
+    const meta = entry.meta || {};
+    body.append(el("div", { className: "ts-run-cmd", textContent: entry.body, title: entry.body }));
+    const line = el("div", { className: "ts-run-meta" });
+    const state = meta.state;
+    if (state === "ok" || state === "fail" || state === "running") {
+      const code = meta.code === null || meta.code === undefined ? "" : `:${meta.code}`;
+      line.append(el("span", { className: `ts-run-state ${state}`, textContent: state === "fail" ? `fail${code}` : state }));
+    }
+    if (state === "running") line.append(el("span", { textContent: `${elapsed(entry.created_at)} so far` }));
+    else {
+      if (Number.isFinite(meta.dur_ms)) line.append(el("span", { textContent: duration(meta.dur_ms) }));
+      if (Number.isFinite(meta.lines)) line.append(el("span", { textContent: plural(meta.lines, "line", "lines") }));
+    }
+
+    // Short output arrives inline in meta.out and is shown as is. Anything
+    // longer stays in its log file until asked for, because a build log is
+    // not something to pull into every repaint of the rail.
+    const inline = typeof meta.out === "string" && meta.out ? stripAnsi(meta.out) : "";
+    const open = outputOpen.has(entry.id);
+    if (!inline && (meta.lines > 0 || state === "running")) {
+      const toggle = el("button", { className: "ts-linkbtn", textContent: open ? "Hide output" : "Show output" });
+      toggle.dataset.act = "output";
+      toggle.setAttribute("aria-expanded", String(open));
+      toggle.onclick = () => {
+        if (open) { outputOpen.delete(entry.id); paintRail(); return; }
+        outputOpen.add(entry.id);
+        outputText.delete(entry.id);
+        paintRail();
+        loadOutput(entry.id);
+      };
+      line.append(toggle);
+    }
+    body.append(line);
+
+    if (inline) body.append(el("pre", { className: "ts-run-out", textContent: inline }));
+    else if (open) {
+      const got = outputText.get(entry.id);
+      const pre = el("pre", { className: "ts-run-out full" });
+      pre.setAttribute("tabindex", "0");
+      pre.setAttribute("aria-label", "Command output");
+      if (!got) pre.append(el("span", { className: "cut", textContent: "Reading the log" }));
+      else if (got.error) pre.append(el("span", { className: "cut", textContent: `Could not read the log: ${got.error}` }));
+      else {
+        if (got.truncated) pre.append(el("span", { className: "cut", textContent: "Earlier output cut, this is the end of the log\n" }));
+        pre.append(document.createTextNode(got.text || ""));
+        // Opened at the end, because the end of a log is where the error is.
+        requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
+        if (!got.text) pre.append(el("span", { className: "cut", textContent: "No output was kept" }));
+      }
+      body.append(pre);
+    }
+  }
+
+  function askBody(entry, body, answer) {
+    body.append(el("div", { className: "ts-ask-q", textContent: entry.body }));
+    const options = (entry.meta && Array.isArray(entry.meta.options)) ? entry.meta.options : [];
+    const chosen = answer ? String((answer.meta && answer.meta.choice) || String(answer.body || "").split("\n")[0]).trim().toLowerCase() : null;
+    const opts = el("div", { className: "ts-ask-opts" + (answer ? " decided" : "") });
+    opts.setAttribute("role", "group");
+    opts.setAttribute("aria-label", answer ? "Options, decided" : "Choose an answer");
+    for (const option of options) {
+      const key = String(option.key).toLowerCase();
+      const isChosen = chosen === key;
+      const b = el("button", { className: "ts-opt" + (isChosen ? " chosen" : "") },
+        el("span", { className: "ts-opt-key", textContent: option.key }), String(option.label), isChosen ? " ✓" : null);
+      b.dataset.act = `opt-${key}`;
+      if (answer) {
+        b.disabled = true;
+        b.setAttribute("aria-label", `${option.label}${isChosen ? ", chosen" : ""}`);
+      } else {
+        b.title = `Decide: ${option.label}`;
+        b.onclick = async () => {
+          try { await window.delphi.sheets.decide(entry.id, option.key, null); } catch (error) { flash(String(error.message || error)); }
+          await reload();
+        };
+      }
+      opts.append(b);
+    }
+    body.append(opts);
+    if (answer) {
+      body.append(el("div", { className: "hint", style: "margin-top:5px",
+        textContent: `Decided by ${answer.author} ${gap(answer.created_at)} ago` }));
+    }
+  }
+
+  function decideBody(entry, body) {
+    const meta = entry.meta || {};
+    const lines = String(entry.body || "").split("\n");
+    const key = String(meta.choice || lines[0] || "").trim();
+    const ask = entry.ref_id ? entryById(entry.ref_id) : null;
+    let label = meta.label || "";
+    if (!label && ask && ask.meta && Array.isArray(ask.meta.options)) {
+      const hit = ask.meta.options.find((o) => String(o.key).toLowerCase() === key.toLowerCase());
+      if (hit) label = hit.label;
+    }
+    const head = el("div", { className: "ts-decide-head" }, "Decided ",
+      el("span", { className: "ts-opt-key", textContent: key }), label ? el("strong", { textContent: label }) : null);
+    if (ask) {
+      const ref = el("button", { className: "ts-linkbtn ts-ref", textContent: `on ${ask.body}` });
+      ref.title = "Show the question";
+      ref.dataset.act = "ref";
+      ref.onclick = () => {
+        const target = railList.querySelector(`.ts-entry[data-id="${ask.id}"]`);
+        if (!target) return;
+        target.scrollIntoView({ block: "center", behavior: motionOff() ? "auto" : "smooth" });
+        target.classList.add("flash");
+        setTimeout(() => target.classList.remove("flash"), 1400);
+      };
+      head.append(ref);
+    }
+    body.append(head);
+    const why = lines.slice(1).join("\n").trim();
+    if (why) body.append(renderMarkdown(why));
+  }
+
+  function entryNode(entry, ctx) {
+    const agent = entryIsAgent(entry);
+    const k = entry.kind === "say" ? (agent ? "agent" : "say") : (SIGILS[entry.kind] ? entry.kind : "say");
+    const row = el("div", { className: `ts-entry k-${k}` });
+    row.dataset.id = String(entry.id);
+    const inLedger = ctx.ledgerIds.has(entry.id);
+    const mark = el("span", { className: "ts-ledger-mark", textContent: inLedger ? "+" : "" });
+    if (inLedger) { mark.title = "In the ledger"; mark.setAttribute("aria-label", "In the ledger"); }
+    else mark.setAttribute("aria-hidden", "true");
+    const sigil = el("span", { className: "ts-sigil", textContent: SIGILS[k] });
+    sigil.setAttribute("aria-label", KIND_WORD[k]);
+    sigil.title = KIND_WORD[k];
+    row.append(mark, sigil);
+
+    const main = el("div", { className: "ts-entry-main" });
+    const tag = agent ? (entry.author_type === "tool" ? "tool" : "agent") : null;
+    const when = isRunning(entry) ? "now" : `${gap(entry.created_at)} ago`;
+    main.append(el("div", { className: "ts-entry-who" },
+      el("span", { className: "ts-entry-author", textContent: entry.author || "?", title: entry.author || "" }),
+      tag ? el("span", { className: "agent-tag", textContent: tag }) : null,
+      el("span", { className: "hint", textContent: when, title: String(entry.created_at || "") }),
+      entryActions(entry, row)));
+
+    const body = el("div", { className: "ts-entry-body" });
+    if (entry.kind === "run") runBody(entry, body);
+    else if (entry.kind === "ask") askBody(entry, body, ctx.answers.get(entry.id) || null);
+    else if (entry.kind === "decide") decideBody(entry, body);
+    else body.append(renderMarkdown(entry.body));
+    if (entry.note_id) {
+      const where = detail.project ? `filed to ${detail.project.name} notes` : "filed as a note";
+      body.append(el("div", { className: "ts-filed" },
+        el("span", { className: `kind ${entry.note_kind || "note"}`, textContent: entry.note_kind || "note" }),
+        el("span", { className: "hint", textContent: where })));
+    }
+    main.append(body);
+    row.append(main);
+    row.setAttribute("aria-label", `${KIND_WORD[k]} by ${entry.author || "unknown"}, ${when}`);
+    return row;
+  }
+
+  function paintRail({ stick = false } = {}) {
+    const entries = detail.comments;
+    // The ledger by the store's rule (sheet/store.js LEDGER_WHERE): promoted
+    // entries, every decision that answers a question, and the question each
+    // answers. Worked out here from the entries already loaded, rather than a
+    // second read on every refresh.
+    const answers = new Map();
+    for (const e of entries) if (e.kind === "decide" && e.ref_id) answers.set(e.ref_id, e);
+    const ledgerIds = new Set();
+    for (const e of entries) {
+      if (e.promoted || (e.kind === "decide" && e.ref_id) || answers.has(e.id)) ledgerIds.add(e.id);
+    }
+    const ctx = { answers, ledgerIds };
+    paintRailHead(entries.length, ledgerIds.size);
+    paintRailList(entries, ctx, stick);
+  }
+
+  // Redrawn only when what it says changes, so the clock's ticks never take
+  // focus off the toggle or the copy button.
+  let railHeadSig = null;
+  function paintRailHead(total, ledgerSize) {
+    const sig = [total, ledgerSize, railLedger].join("/");
+    if (sig === railHeadSig) return;
+    const hadFocus = railHead.contains(document.activeElement) ? document.activeElement.dataset.act : null;
+    railHeadSig = sig;
+    railHead.textContent = "";
+    const all = el("button", { textContent: "All" });
+    all.setAttribute("aria-pressed", String(!railLedger));
+    const led = el("button", {}, "Ledger ", el("span", { className: "ts-count", textContent: String(ledgerSize) }));
+    led.setAttribute("aria-pressed", String(railLedger));
+    all.dataset.act = "all";
+    led.dataset.act = "ledger";
+    all.onclick = () => { if (railLedger) { railLedger = false; paintRail({ stick: true }); } };
+    led.onclick = () => { if (!railLedger) { railLedger = true; paintRail({ stick: true }); } };
+    const seg = el("div", { className: "seg ts-ledger-toggle" }, all, led);
+    seg.setAttribute("role", "group");
+    seg.setAttribute("aria-label", "Show");
+    const copyAll = el("button", { className: "icon-btn" });
+    const copyAllLabel = railLedger ? "Copy the ledger as clean text" : "Copy the whole Sheet as clean text";
+    copyAll.title = copyAllLabel;
+    copyAll.setAttribute("aria-label", copyAllLabel);
+    copyAll.dataset.act = "copy-all";
+    copyAll.append(tsIcon("copy"));
+    copyAll.onclick = async () => {
+      try {
+        await window.delphi.sheets.copyAll(taskId, { ledger: railLedger });
+        copyAll.classList.add("on");
+        copyAll.title = "Copied";
+        setTimeout(() => { copyAll.classList.remove("on"); copyAll.title = copyAllLabel; }, 1200);
+      } catch (error) { flash(String(error.message || error)); }
+    };
+    railHead.append(el("h4", { textContent: "Sheet" }));
+    if (total) railHead.append(el("span", { className: "ts-count", textContent: String(total) }));
+    railHead.append(el("span", { className: "grow" }), seg, copyAll);
+    if (hadFocus) railHead.querySelector(`[data-act="${hadFocus}"]`)?.focus();
+  }
+
+  const railHint = el("div", { className: "hint pad" });
+  function paintRailList(entries, { answers, ledgerIds }, stick) {
+    const ctx = { answers, ledgerIds };
+
+    const shown = railLedger ? entries.filter((e) => ledgerIds.has(e.id)) : entries;
+    const nearBottom = railList.scrollHeight - railList.scrollTop - railList.clientHeight < 40;
+    const focused = railList.contains(document.activeElement) ? document.activeElement : null;
+    const focusedRow = focused ? focused.closest(".ts-entry") : null;
+    const focusedAct = focused && focused.dataset ? focused.dataset.act : null;
+
+    const wanted = [];
+    const keep = new Set();
+    for (const entry of shown) {
+      const answer = answers.get(entry.id);
+      // Everything a row draws from, so an unchanged row is never rebuilt.
+      // The time words are in it, which is what keeps "5m ago" honest.
+      const sig = JSON.stringify([entry, ledgerIds.has(entry.id), answer ? [answer.id, answer.body, answer.meta, answer.author, gap(answer.created_at)] : null,
+        gap(entry.created_at), isRunning(entry) ? elapsed(entry.created_at) : null, outputOpen.has(entry.id), outputText.get(entry.id) || null,
+        entry.ref_id ? (entryById(entry.ref_id) || {}).body : null, detail.project ? detail.project.name : null]);
+      const cached = rowCache.get(entry.id);
+      const node = cached && cached.sig === sig ? cached.node : entryNode(entry, ctx);
+      rowCache.set(entry.id, { sig, node });
+      keep.add(entry.id);
+      wanted.push(node);
+    }
+    for (const id of [...rowCache.keys()]) if (!keep.has(id)) rowCache.delete(id);
+
+    let hint = "";
+    if (!shown.length) {
+      hint = railLedger
+        ? "Nothing in the ledger yet. Promote an entry to keep it here: the ledger is what the next agent reads first."
+        : "Nothing written yet. Agents write here too, and what they leave is what the next one reads.";
+    } else if (railLedger) {
+      hint = "The ledger is what the next agent reads first. Promote an entry to keep it here.";
+    }
+    if (hint) {
+      if (railHint.textContent !== hint) railHint.textContent = hint;
+      wanted.push(railHint);
+    }
+
+    // Reconciled in place rather than cleared and refilled: an untouched row
+    // keeps its node, so focus stays put and nothing visibly redraws.
+    wanted.forEach((node, i) => {
+      const at = railList.children[i];
+      if (at !== node) railList.insertBefore(node, at || null);
+    });
+    while (railList.children.length > wanted.length) railList.lastElementChild.remove();
+
+    if (focusedRow && !focusedRow.isConnected) {
+      const again = railList.querySelector(`.ts-entry[data-id="${focusedRow.dataset.id}"]`);
+      const target = again && (focusedAct ? again.querySelector(`[data-act="${focusedAct}"]`) : null);
+      if (target) target.focus({ preventScroll: true });
+      else if (again) again.querySelector("button")?.focus({ preventScroll: true });
+    }
+    if (!railPainted || stick || nearBottom) railList.scrollTop = railList.scrollHeight;
+    railPainted = true;
+  }
+
+  // The rail's clocks. A running entry's elapsed time ticks every second;
+  // otherwise "5m ago" only needs keeping honest, once a minute. The repaint
+  // is the reconciling one, so a tick rebuilds the rows whose words changed
+  // and nothing else.
+  let tickCount = 0;
+  const railClock = setInterval(() => {
+    if (!overlay.isConnected) { clearInterval(railClock); return; }
+    tickCount += 1;
+    if (detail.comments.some(isRunning) || tickCount % 60 === 0) paintRail();
+  }, 1000);
+
+  // --- composer ---
+
+  const composerKind = el("div", { className: "ts-composer-kind" });
+  composerKind.setAttribute("aria-live", "polite");
+  const composer = el("textarea", { className: "ts-composer-box", placeholder: "Write to the Sheet" });
+  composer.setAttribute("aria-label", "Write to the Sheet");
   const send = el("button", { className: "btn primary sm", textContent: "Comment" });
+
+  /**
+   * What the box will post, read from its prefix. The same prefixes the text
+   * format uses for the same kinds, so nothing new has to be learned.
+   */
+  function composed() {
+    const v = composer.value;
+    if (/^\$ /.test(v)) {
+      // There is no IPC that runs a command from the window yet, and a run
+      // entry written without running anything would record something that
+      // never happened. The CLI runs it and records it properly.
+      return { kind: "run", ok: false, say: `Run it from the delphi CLI: delphi run ${taskId} -- <command>`, label: "Run" };
+    }
+    if (/^! /.test(v)) {
+      const text = v.slice(2).trim();
+      return { kind: "note", ok: !!text, say: "Posts a note", label: "Note", body: text };
+    }
+    if (/^\? /.test(v)) {
+      const parts = v.slice(2).split("|").map((s) => s.trim()).filter(Boolean);
+      const n = parts.length - 1;
+      const ok = n >= 2 && n <= 4;
+      return {
+        kind: "ask", ok, label: "Ask", question: parts[0], options: parts.slice(1),
+        say: ok ? `Asks "${parts[0]}" with ${n} options, a to ${"abcd"[n - 1]}` : "An ask needs 2 to 4 options: ? question | a | b",
+      };
+    }
+    return { kind: "say", ok: !!v.trim(), say: "Posts a comment", label: "Comment", body: v };
+  }
+
+  function senseComposer(error = null) {
+    const c = composed();
+    composerKind.textContent = "";
+    composerKind.className = `ts-composer-kind k-${c.kind}` + (c.kind === "run" ? " blocked" : "");
+    composerKind.append(el("span", { className: "ts-sigil", textContent: SIGILS[c.kind] }), error || c.say);
+    composer.classList.toggle("mono-in", c.kind === "run");
+    send.textContent = c.label;
+    send.disabled = !c.ok;
+  }
+
+  const post = async () => {
+    const c = composed();
+    if (!c.ok) return;
+    try {
+      if (c.kind === "ask") await window.delphi.sheets.ask(taskId, c.question, c.options);
+      else await window.delphi.sheets.append(taskId, { kind: c.kind, body: c.body });
+    } catch (error) {
+      senseComposer(String(error.message || error));
+      return;
+    }
+    composer.value = "";
+    senseComposer();
+    detail = await window.delphi.tasks.detail(taskId) || detail;
+    paintAll({ stick: true });
+  };
+  composer.oninput = () => senseComposer();
+  composer.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); post(); } };
   send.onclick = post;
-  railFoot.append(composer, el("div", { className: "ts-composer-row" },
-    el("span", { className: "hint", textContent: "Enter to send" }), send));
+  railFoot.append(composerKind, composer, el("div", { className: "ts-composer-row" },
+    el("span", { className: "hint", textContent: "! notes  ·  ? q | a | b asks  ·  $ runs from the CLI" }), send));
+  senseComposer();
 
   // --- assemble -------------------------------------------------------------
 
-  function paintAll() {
+  function paintAll({ stick = false } = {}) {
     paintTop();
     paintRing();
     paintMeta();
     paintDesc();
     paintTabs();
     paintPane();
-    paintRail();
+    paintRail({ stick });
     if (document.activeElement !== title) title.value = detail.task.title;
+  }
+
+  /**
+   * A write from somewhere else: an agent, the CLI, another window.
+   *
+   * Only what changed is redrawn, and nothing that holds something being typed:
+   * a description being edited, a chip's inline field, the subtask box. The
+   * composer is never redrawn at all, so a draft survives any number of these.
+   * Coalesced, because a busy agent can land several writes in one breath.
+   */
+  let liveBusy = false;
+  let liveAgain = false;
+  async function live() {
+    if (liveBusy) { liveAgain = true; return; }
+    liveBusy = true;
+    try {
+      do {
+        liveAgain = false;
+        const next = await window.delphi.tasks.detail(taskId);
+        if (openSheet !== handle) return;
+        if (!next) return;
+        if (JSON.stringify(next) === JSON.stringify(detail)) continue;
+        detail = next;
+        const holding = (box) => box.contains(document.activeElement);
+        paintTop();
+        paintRing();
+        if (!holding(meta)) paintMeta();
+        if (!editingDesc) paintDesc();
+        paintTabs();
+        if (!holding(paneBox)) paintPane();
+        paintRail();
+        if (document.activeElement !== title) title.value = detail.task.title;
+      } while (liveAgain);
+    } finally {
+      liveBusy = false;
+    }
   }
 
   main.append(titleRow, meta, desc, tabs, paneBox);
@@ -7318,7 +7870,8 @@ async function openTaskSheet(taskId) {
   };
 
   overlay.onclick = (e) => { if (e.target === overlay) closeSheet(); };
-  openSheet = { overlay, close: closeSheet };
+  const handle = { overlay, close: closeSheet, live };
+  openSheet = handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -8941,6 +9494,9 @@ window.delphi.onMenu(async ({ action, view, theme }) => {
 
 window.delphi.onShown(() => { refresh(); $("search").focus(); });
 window.delphi.onAlertsChanged(() => refresh());
+// Subscribed once, here, because preload has no way to unsubscribe: an open
+// task panel exposes live() and anything else open ignores it.
+window.delphi.onDbChanged(() => { if (openSheet && openSheet.live) openSheet.live(); });
 window.delphi.onFocusTask(({ projectId }) => {
   if (projectId) { state.projectId = projectId; state.view = "tasks"; }
   refresh();

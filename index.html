@@ -76,6 +76,21 @@
     --tc-purple: #7b4bd1;
     --tc-slate:  #5a6376;
 
+    /* The Sheet's entry kinds, one hue each, so a glance down the sigil column
+       says who did what. Close to the --tc-* set but not referenced from it:
+       decide and the run states needed more contrast on the light ground than
+       the task colours carry. Repeated in both dark blocks below. */
+    --kind-say:    #5f6156;
+    --kind-agent:  #7b4bd1;
+    --kind-run:    #0f7a80;
+    --kind-ask:    #8a6a00;
+    --kind-decide: #25754c;
+    --kind-note:   #c2410c;
+    --kind-ledger: #c2410c;
+    --run-ok:      #1a7a48;
+    --run-fail:    #b4283f;
+    --run-busy:    #94600a;
+
     /* Spacing scale. Everything uses these, so rhythm stays consistent
        rather than being decided per component. */
     --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
@@ -151,6 +166,10 @@
       --tc-purple: #b48bf0;
       --tc-slate:  #98a1b2;
 
+      --kind-say: #a4a69d; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+      --kind-decide: #4fb477; --kind-note: #f4762e; --kind-ledger: #f4762e;
+      --run-ok: #96e3a6; --run-fail: #e2685f; --run-busy: #e0a458;
+
       --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     }
   }
@@ -197,6 +216,10 @@
     --tc-red:    #e2685f;
     --tc-purple: #b48bf0;
     --tc-slate:  #98a1b2;
+
+    --kind-say: #a4a69d; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+    --kind-decide: #4fb477; --kind-note: #f4762e; --kind-ledger: #f4762e;
+    --run-ok: #96e3a6; --run-fail: #e2685f; --run-busy: #e0a458;
 
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   }
@@ -1773,7 +1796,7 @@
   .crumb-sep { color: var(--ink-faint); font-size: 12px; }
   .crumb-now { color: var(--ink-faint); font-size: 12px; }
 
-  .ts-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 330px; }
+  .ts-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 360px; }
   .ts-main { min-height: 0; overflow-y: auto; padding: var(--s5) var(--s5) var(--s6); }
   .ts-rail {
     min-height: 0; display: flex; flex-direction: column;
@@ -1888,24 +1911,25 @@
   }
   .ts-add:focus { border-style: solid; border-color: var(--accent); background: var(--bg); }
 
-  /* Rail */
+  /* Rail: the task's Sheet. Head, entries, composer. */
   .ts-rail-head {
-    display: flex; align-items: center; gap: var(--s2);
-    padding: var(--s4) var(--s4) var(--s3); border-bottom: 1px solid var(--line-soft);
+    display: flex; align-items: center; gap: var(--s2); min-height: 53px;
+    padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line-soft);
   }
   .ts-rail-head h4 { font-size: 12.5px; font-weight: 650; }
-  .ts-comments { flex: 1; min-height: 0; overflow-y: auto; padding: var(--s3) var(--s4); display: flex; flex-direction: column; gap: var(--s3); }
-  .ts-comment { font-size: 13px; }
-  .ts-comment-who { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
-  .ts-comment-author { font-weight: 620; font-size: 12.5px; }
-  .ts-comment .md { font-size: 13px; line-height: 1.65; color: var(--ink-dim); }
-  .ts-comment .md :first-child { margin-top: 0; }
-  .ts-comment .md :last-child { margin-bottom: 0; }
+  .ts-rail-head .grow { flex: 1; }
+  .ts-ledger-toggle button { padding: 2px 9px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; }
+  .ts-rail-head .icon-btn { width: 26px; height: 26px; }
+  .ts-rail-head .icon-btn.on { color: var(--good); }
+  .ts-comments {
+    flex: 1; min-height: 0; overflow-y: auto; padding: var(--s3) var(--s4) var(--s3) 6px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .ts-comments > .hint.pad { padding: var(--s3) 0 0 34px; }
   .ts-kill {
     margin-left: auto; background: none; border: 0; color: var(--ink-faint);
     font-size: 15px; line-height: 1; cursor: default; opacity: 0; padding: 0 2px;
   }
-  .ts-comment:hover .ts-kill { opacity: 1; }
   .ts-kill:hover { color: var(--crit); }
   .avatar {
     width: 20px; height: 20px; border-radius: 99px; flex: 0 0 20px;
@@ -1928,6 +1952,128 @@
   .ts-composer-box:focus { border-color: var(--accent); }
   .ts-composer-row { display: flex; align-items: center; gap: var(--s2); margin-top: 7px; }
   .ts-composer-row .hint { flex: 1; }
+
+  /* Sheet entries. Three columns: the ledger gutter, the sigil, the entry. The
+     gutter is always there, empty or not, so promoting an entry never shifts
+     the text. The sigils are the text format's, so the rail and `delphi cat`
+     read the same way. */
+  .ts-entry {
+    position: relative; display: grid; grid-template-columns: 12px 18px minmax(0, 1fr);
+    column-gap: 4px; padding: 7px 4px 8px 0; border-radius: var(--r-sm); font-size: 13px;
+  }
+  .ts-entry:hover, .ts-entry:focus-within, .ts-entry.menu-open { background: var(--raised); }
+  .ts-ledger-mark { color: var(--kind-ledger); font-family: var(--mono); font-weight: 600; font-size: 13px; line-height: 20px; text-align: center; }
+  .ts-sigil { font-family: var(--mono); font-weight: 600; font-size: 14px; line-height: 20px; color: var(--k); text-align: center; }
+  .k-say    { --k: var(--kind-say); }
+  .k-agent  { --k: var(--kind-agent); }
+  .k-run    { --k: var(--kind-run); }
+  .k-ask    { --k: var(--kind-ask); }
+  .k-decide { --k: var(--kind-decide); }
+  .k-note   { --k: var(--kind-note); }
+  .ts-entry-main { min-width: 0; }
+  .ts-entry-who { display: flex; align-items: center; gap: 6px; min-height: 22px; }
+  .ts-entry-author { font-weight: 620; font-size: 12.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ts-entry-who .hint { white-space: nowrap; }
+  .ts-entry-body { margin-top: 2px; }
+  .ts-entry .md { font-size: 13px; line-height: 1.6; color: var(--ink-dim); }
+  .ts-entry .md :first-child { margin-top: 0; }
+  .ts-entry .md :last-child { margin-bottom: 0; }
+  .k-note .md, .k-decide .md { color: var(--ink); }
+
+  /* Actions sit in the author line and show on hover or keyboard focus, the
+     way .ts-kill always has, so a quiet Sheet reads as text and not a toolbar.
+     Opacity rather than display, so they stay in the tab order. */
+  .ts-entry-acts {
+    position: absolute; top: 6px; right: 4px; display: flex; align-items: center; gap: 1px;
+    padding-left: 6px; background: var(--raised); border-radius: var(--r-sm); opacity: 0;
+  }
+  .ts-entry:hover .ts-entry-acts, .ts-entry:focus-within .ts-entry-acts, .ts-entry.menu-open .ts-entry-acts { opacity: 1; }
+  .ts-act {
+    width: 22px; height: 22px; padding: 0; display: grid; place-items: center;
+    border: 0; border-radius: var(--r-sm); background: none; color: var(--ink-faint); cursor: default;
+  }
+  .ts-act svg { width: 13px; height: 13px; }
+  .ts-act:hover, .ts-act[aria-expanded="true"] { background: var(--surface); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); }
+  .ts-act.on { color: var(--kind-ledger); }
+  .ts-act.done { color: var(--good); }
+  .ts-act.kill:hover { color: var(--crit); }
+  .ctx.ts-entry-menu:focus { outline: none; }
+  .ctx.ts-entry-menu { min-width: 168px; }
+  .ts-entry-menu .ctx-head { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.07em; font-weight: 600; color: var(--ink-faint); padding: 5px 10px 3px; }
+
+  .ts-filed { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; }
+  .ts-filed .kind { font-size: 9.5px; padding: 1px 6px; }
+
+  /* Runs */
+  .ts-run-cmd {
+    margin-top: 3px; font-family: var(--mono); font-size: 12px; line-height: 1.55; color: var(--ink);
+    overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .ts-run-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; margin-top: 5px; font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+  .ts-run-state {
+    display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 11px; font-weight: 500;
+    padding: 0 7px; border-radius: 99px; line-height: 18px; color: var(--rs, var(--ink-faint));
+    background: color-mix(in srgb, var(--rs, var(--ink-faint)) 12%, transparent);
+  }
+  .ts-run-state::before { content: ""; width: 6px; height: 6px; border-radius: 99px; background: currentColor; }
+  .ts-run-state.ok      { --rs: var(--run-ok); }
+  .ts-run-state.fail    { --rs: var(--run-fail); }
+  .ts-run-state.running { --rs: var(--run-busy); }
+  .ts-run-state.running::before { animation: ts-pulse 1.1s ease-in-out infinite; }
+  @keyframes ts-pulse { 50% { opacity: .3; } }
+  .ts-linkbtn { border: 0; background: none; padding: 0; color: var(--accent); font-size: 11.5px; cursor: default; }
+  .ts-linkbtn:hover { text-decoration: underline; }
+  .ts-linkbtn:disabled { color: var(--ink-faint); text-decoration: none; }
+  .ts-run-out {
+    margin: 6px 0 0; padding: 7px 9px; max-height: 92px; overflow: auto;
+    font-family: var(--mono); font-size: 11px; line-height: 1.55; color: var(--ink-dim);
+    background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+    white-space: pre; tab-size: 2;
+  }
+  .ts-run-out.full { max-height: 220px; }
+  .ts-run-out::-webkit-scrollbar-corner { background: transparent; }
+  .ts-run-out .cut { color: var(--ink-faint); }
+
+  /* Asks and decisions */
+  .ts-ask-q { margin-top: 2px; font-weight: 560; color: var(--ink); }
+  .ts-ask-opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+  .ts-opt {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px 3px 4px;
+    border: 1px solid var(--line); border-radius: var(--r); background: var(--surface);
+    font-size: 12.5px; color: var(--ink); cursor: default; text-align: left;
+  }
+  .ts-opt:hover:not(:disabled) { border-color: var(--kind-ask); }
+  .ts-opt:disabled { cursor: default; }
+  .ts-opt-key {
+    font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--kind-ask);
+    min-width: 18px; height: 18px; display: grid; place-items: center; border-radius: 3px;
+    background: color-mix(in srgb, var(--kind-ask) 12%, transparent);
+  }
+  .ts-ask-opts.decided .ts-opt { color: var(--ink-faint); }
+  .ts-ask-opts.decided .ts-opt-key { color: var(--ink-faint); background: var(--raised); }
+  .ts-ask-opts.decided .ts-opt.chosen {
+    color: var(--ink); border-color: var(--kind-decide);
+    background: color-mix(in srgb, var(--kind-decide) 8%, var(--surface));
+  }
+  .ts-ask-opts.decided .ts-opt.chosen .ts-opt-key { color: #fff; background: var(--kind-decide); }
+  .ts-decide-head { margin-top: 2px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--ink); }
+  .ts-decide-head .ts-opt-key { color: #fff; background: var(--kind-decide); }
+  .ts-decide-head + .md { margin-top: 3px; }
+  .ts-ref { font-size: 11.5px; color: var(--ink-faint); }
+  .ts-linkbtn.ts-ref { color: var(--ink-faint); text-align: left; }
+  .ts-entry.flash { box-shadow: inset 0 0 0 1px var(--kind-ask); }
+
+  /* The Workbench controls' slot in the task panel's top bar. Empty until
+     something paints it, and then it takes no room. */
+  .wb { display: flex; align-items: center; gap: 6px; }
+  .wb:empty { display: none; }
+
+  /* Composer: the prefix picks the kind, and the line above the box says which
+     before Enter is pressed, so nobody posts a note by accident. */
+  .ts-composer-kind { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; font-size: 11.5px; color: var(--ink-dim); min-height: 18px; }
+  .ts-composer-kind .ts-sigil { width: 18px; line-height: 18px; border-radius: 3px; background: color-mix(in srgb, var(--k) 12%, transparent); font-size: 12px; }
+  .ts-composer-kind.blocked { color: var(--ink-faint); }
+  .ts-composer-box.mono-in { font-family: var(--mono); font-size: 12.5px; }
 
   .timeline { display: flex; flex-direction: column; }
   .tl-row { display: flex; gap: var(--s3); padding-bottom: var(--s3); position: relative; }
