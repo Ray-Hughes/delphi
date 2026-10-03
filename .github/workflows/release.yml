@@ -45,7 +45,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # 22, as in CI. The launch check below also starts the MCP server under
+          # this Node, the way an editor would, and from 22.13 it has node:sqlite;
+          # Windows runners have no sqlite3 command to fall back on.
+          node-version: "22"
           cache: npm
 
       - run: npm ci
@@ -72,6 +75,20 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # The build this job just made, started for real before anything is uploaded.
+      # 1.6.0 was published with a main process that died on its first require: a
+      # green build, a dmg, a release page, and an app that could not open a
+      # window. tools/package_test.js reads the real app.asar and follows every
+      # require in it, starts the MCP server from Resources/, and launches the app
+      # with DELPHI_SMOKE=1 against a database from before 1.6, checking that it
+      # loads its window and migrates. The publish job needs this one, so a build
+      # that cannot start is never released.
+      - name: Check the packaged app starts
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then app="release/mac-$(uname -m | sed 's/x86_64/x64/')/Delphi.app"; else app="release/win-unpacked"; fi
+          ELECTRON_RUN_AS_NODE=1 "$(node -p "require('electron')")" tools/package_test.js --app "$app"
 
       - uses: actions/upload-artifact@v4
         with:

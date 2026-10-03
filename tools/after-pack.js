@@ -14,13 +14,59 @@
 // electron-builder has already signed it properly and re-signing would undo that.
 
 //
-// It also makes sure the command line tool is still executable once it has been
-// copied into Resources, which comes first because it applies to every platform
-// and because changing a file after signing it would be the wrong order.
+// Before signing, and on every platform, it does two things to Resources/,
+// because changing a file after signing it would be the wrong order:
+//
+// - copies out the modules that the app needs inside app.asar and the MCP server
+//   and the CLI need outside it (OUTSIDE_TOO below), and
+// - makes sure the command line tool is still executable.
 
 const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+
+/**
+ * Modules required both by the main process, from inside app.asar, and by the
+ * MCP server and bin/delphi, which run under a plain Node from Resources/ and
+ * cannot read the archive.
+ *
+ * They cannot go in extraResources. electron-builder excludes every
+ * extraResources source from the app, without a warning, so listing a file
+ * there takes it out of app.asar. 1.6.0 shipped like that and its main process
+ * died on require("./pads") before it opened a window. So these stay in `files`
+ * only, and are copied out here once the archive has been written.
+ *
+ * Paths are relative to the project and land at the same relative path under
+ * Resources/, which keeps the layout the server's relative requires expect.
+ * tools/package_test.js reads this list, so it is exported.
+ */
+const OUTSIDE_TOO = [
+  "pads.js",
+  "git.js",
+  "harness.js",
+  "agent/schema_later.js",
+  "agent/launch.js",
+  "sheet",
+  "workbench",
+];
+
+function resourcesDir(context) {
+  return context.electronPlatformName === "darwin"
+    ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, "Contents", "Resources")
+    : path.join(context.appOutDir, "resources");
+}
+
+/** Copies OUTSIDE_TOO from projectDir into resources. Throws if one is missing. */
+function copyOutsideToo(projectDir, resources) {
+  for (const rel of OUTSIDE_TOO) {
+    const from = path.join(projectDir, rel);
+    // Loud and fatal, unlike signing below. A build without one of these has an
+    // MCP server that cannot start, and that is not a release worth finishing.
+    if (!fs.existsSync(from)) throw new Error(`after-pack: ${rel} is listed in OUTSIDE_TOO but does not exist`);
+    fs.cpSync(from, path.join(resources, rel), { recursive: true });
+  }
+  console.log(`  after-pack: copied ${OUTSIDE_TOO.length} shared modules out beside app.asar`);
+}
 
 /**
  * Resources/bin/delphi has to carry its executable bit, because `make cli` and
@@ -30,9 +76,7 @@ const path = require("path");
  */
 function ensureCliExecutable(context) {
   if (context.electronPlatformName === "win32") return;
-  const resources = context.electronPlatformName === "darwin"
-    ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, "Contents", "Resources")
-    : path.join(context.appOutDir, "resources");
+  const resources = resourcesDir(context);
   const cli = path.join(resources, "bin", "delphi");
   if (!fs.existsSync(cli)) {
     console.log("  after-pack: no bin/delphi in this build, nothing to make executable");
@@ -45,6 +89,7 @@ function ensureCliExecutable(context) {
 }
 
 exports.default = async function afterPack(context) {
+  copyOutsideToo(context.packager.projectDir, resourcesDir(context));
   ensureCliExecutable(context);
   if (context.electronPlatformName !== "darwin") return;
   if (process.env.CSC_LINK || process.env.CSC_NAME) {
@@ -68,3 +113,6 @@ exports.default = async function afterPack(context) {
     console.error(`  after-pack: ad-hoc signing failed, the mac build may not launch: ${error.message}`);
   }
 };
+
+exports.OUTSIDE_TOO = OUTSIDE_TOO;
+exports.copyOutsideToo = copyOutsideToo;

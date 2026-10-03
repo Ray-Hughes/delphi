@@ -1,4 +1,29 @@
 const { app, BrowserWindow, globalShortcut, ipcMain, shell, screen, Tray, Menu, nativeImage, nativeTheme, Notification, dialog, safeStorage, clipboard } = require("electron");
+
+// DELPHI_SMOKE=1 is a launch test for a packaged build, used by
+// tools/package_test.js and the release workflow. It opens and migrates the
+// database, loads the renderer into a window that is never shown, prints
+// `delphi-smoke ok <version>` and exits 0. Any error on the way, including a
+// require that fails while this file is still loading, prints
+// `delphi-smoke fail <error>` and exits 1. No tray, no hotkey, no scheduler, no
+// notifications, no git housekeeping, and it refuses to run without
+// DELPHI_DATA_DIR, so it can only ever touch a database made for the test.
+//
+// It exists because 1.6.0 was published with a main process that died on its
+// first require, and nothing before publishing had ever started the app.
+// The handlers go in first, ahead of every other require, because that failure
+// happens before anything below this line runs.
+const SMOKE = process.env.DELPHI_SMOKE === "1";
+if (SMOKE) {
+  const fail = (error) => {
+    process.stdout.write(`delphi-smoke fail ${String((error && error.stack) || error).split("\n").join(" | ")}\n`);
+    app.exit(1);
+  };
+  process.on("uncaughtException", fail);
+  process.on("unhandledRejection", fail);
+  if (!process.env.DELPHI_DATA_DIR) fail(new Error("DELPHI_SMOKE needs DELPHI_DATA_DIR, so it never opens a real database"));
+  setTimeout(() => fail(new Error("no renderer within 60 seconds")), 60000).unref();
+}
 const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
@@ -167,7 +192,7 @@ function createWindow() {
     height: Math.min(880, Math.round(height * 0.88)),
     minWidth: 860,
     minHeight: 560,
-    show: !panel,                  // a normal app opens; a panel waits for the key
+    show: !panel && !SMOKE,        // a normal app opens; a panel waits for the key
     icon: path.join(__dirname, "assets", "mark-64.png"),
     backgroundColor: darkNow() ? "#0f1217" : "#f4f6f9",
     ...chromeFor(panel),
@@ -592,6 +617,7 @@ async function checkForUpdate({ quiet = true } = {}) {
 }
 
 app.whenReady().then(() => {
+  if (SMOKE) return smoke();
   loadSettings();
   // Before the database is opened for the first time, or the migration finds a
   // file already there and declines to do anything.
@@ -649,7 +675,28 @@ app.whenReady().then(() => {
 
 // Windows and Linux keep the process alive with no windows, which for a tray app
 // is correct. Clicking the dock icon on macOS should still bring the panel back.
-app.on("activate", () => show());
+app.on("activate", () => { if (!SMOKE) show(); });
+
+// See DELPHI_SMOKE at the top of this file.
+function smoke() {
+  if (app.dock) app.dock.hide();
+  loadSettings();
+  // handle() is what opens the file, applies schema.sql and runs
+  // agent/schema_later.js, so a migration that throws fails the smoke here.
+  db.handle();
+  db.seedHarnesses(harness.BUILTINS);
+  createWindow();
+  win.webContents.on("preload-error", (_event, file, error) => { throw new Error(`preload ${file}: ${error.message}`); });
+  win.webContents.on("did-fail-load", (_event, code, description) => { throw new Error(`renderer did not load: ${code} ${description}`); });
+  win.webContents.once("did-finish-load", async () => {
+    // The page loading proves little on its own: a preload that failed leaves a
+    // page with no bridge. So the bridge is asked for.
+    const bridge = await win.webContents.executeJavaScript("typeof window.delphi");
+    if (bridge !== "object") throw new Error(`the renderer has no window.delphi (${bridge})`);
+    process.stdout.write(`delphi-smoke ok ${app.getVersion()}\n`);
+    app.exit(0);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Reminders

@@ -65,33 +65,28 @@ module.exports = {
   // The MCP server is launched by an editor using its own Node, and a plain Node
   // cannot read inside an asar archive. So it is copied out as an ordinary file
   // that something other than Electron can actually run.
+  //
+  // Only files the app itself never requires belong here. electron-builder
+  // treats every extraResources source as excluded from app.asar, silently, so a
+  // file listed here and in `files` ends up outside the archive and missing from
+  // it. That is how 1.6.0 shipped a main process that died on require("./pads")
+  // before it could open a window. The modules both sides need (pads.js, git.js,
+  // harness.js, agent/schema_later.js, agent/launch.js, sheet/, workbench/) are
+  // copied out by tools/after-pack.js instead, from its OUTSIDE_TOO list, after
+  // the archive is written. tools/package_test.js reads both lists and the real
+  // archive, so neither half can go missing again without a test failing.
+  //
+  // The layout under Resources/ mirrors the checkout on purpose. The server and
+  // the CLI find their modules by relative require (`../sheet/store`, `../git`,
+  // `../agent/mcp_server.js`), so a require that works in a checkout works in an
+  // installed build.
   extraResources: [
     { from: "agent/mcp_server.js", to: "agent/mcp_server.js" },
-    // The pad grammar, which the server requires. Out here rather than only in
-    // the asar because the server is a plain Node process and cannot read in
-    // there, and because one copy of these rules is the whole point.
-    { from: "pads.js", to: "pads.js" },
     { from: "agent/guard.py", to: "agent/guard.py" },
     // The server requires ./directives. It was left out of this list when that
     // file arrived, and every installed build since shipped a server that died
-    // at its first require. Nothing failed at build time, which is why
-    // tools/package_test.js now launches the server from a copy of this layout.
+    // at its first require.
     { from: "agent/directives.js", to: "agent/directives.js" },
-    // Everything below mirrors the checkout's layout on purpose. The server and
-    // the CLI find each other and their modules by relative require
-    // (`../sheet/store`, `../git`, `../agent/mcp_server.js`), so as long as the
-    // tree under Resources/ has the same shape as the repository, a require that
-    // works in a checkout works in an installed build. Some of these do not exist
-    // yet; electron-builder warns and skips a missing source rather than failing.
-    { from: "agent/schema_later.js", to: "agent/schema_later.js" },
-    { from: "agent/launch.js", to: "agent/launch.js" },
-    { from: "sheet", to: "sheet" },
-    { from: "workbench", to: "workbench" },
-    // Also inside the asar for the main process. Copied out as well because
-    // workbench/git.js requires ../git.js and sheet/chat.js requires
-    // ../harness.js, and those run under the plain Node outside the archive.
-    { from: "git.js", to: "git.js" },
-    { from: "harness.js", to: "harness.js" },
     // The command line tool. Resources/bin/delphi spawns ../agent/mcp_server.js,
     // the same server an editor uses. tools/after-pack.js makes sure it is still
     // executable once it lands here.

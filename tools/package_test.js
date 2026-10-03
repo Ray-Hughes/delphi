@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 // test-runtime: electron-node
 //
-// Proves a packaged Delphi can start its MCP server and its command line tool,
-// without building an installer to find out.
+// Proves a packaged Delphi can start: the app itself, its MCP server and its
+// command line tool.
 //
 //   node tools/package_test.js                     simulated layout, plus release/ if current
 //   node tools/package_test.js --app PATH.app      also a specific packaged build, strictly
+//   node tools/package_test.js --app release/win-unpacked    the same for Windows or Linux
+//
+// DELPHI_SMOKE_SEED=/path/to/a/copy.db makes the launch tests start from a copy
+// of that database rather than tools/fixtures/pre_m0.sql. The file is copied
+// into a temp folder first and never opened where it is.
 //
 // Why this exists: electron-builder copies what electron-builder.config.js names
 // and says nothing about what it does not. agent/directives.js was left out of
@@ -28,8 +33,21 @@
 // package.json is skipped too, as stale, unless it was named with --app: an old
 // build in release/ failing would say nothing about the code in front of you.
 //
-// Nothing here touches a real database. The server is pointed at a database made
-// for the run in a temp directory, through DELPHI_DB.
+// Then 1.6.0 shipped a main process that died on require("./pads") before it
+// opened a window, with every check here green. electron-builder leaves out of
+// app.asar anything extraResources also copies, so the five files listed in both
+// were outside the archive and missing from it. This file had checked the config
+// lists and the copy outside, and never the archive or the app. So it now also:
+//
+// - models that exclusion for the simulated archive, and reads the real
+//   app.asar of a packaged build, following every require from main.js,
+//   preload.js and db.js inside it;
+// - launches the app with DELPHI_SMOKE=1 (see the top of main.js), from the
+//   checkout always and from a packaged build when there is one, against a
+//   database from before Sheets, and checks it came out migrated.
+//
+// Nothing here touches a real database. Everything is pointed at databases made
+// for the run in temp directories, through DELPHI_DB and DELPHI_DATA_DIR.
 
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
@@ -38,6 +56,8 @@ const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..");
 const PKG = require(path.join(ROOT, "package.json"));
+const { OUTSIDE_TOO } = require("./after-pack.js");
+const schemaLater = require("../agent/schema_later.js");
 
 // Paths the plan says are coming and are already wired into the config. Until a
 // file exists it is reported as pending rather than failed, so the config can
@@ -140,6 +160,9 @@ function inFiles(config, rel) {
 // A Resources folder made from the config
 
 function copyResources(config, into) {
+  // What tools/after-pack.js copies out after the archive is written, the same
+  // way it does it.
+  for (const rel of OUTSIDE_TOO) fs.cpSync(path.join(ROOT, rel), path.join(into, rel), { recursive: true });
   for (const { from, to } of config.extraResources) {
     const source = path.join(ROOT, from);
     if (!fs.existsSync(source)) continue;
@@ -274,6 +297,141 @@ function checkResourceRequires(resources, label) {
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The archive
+
+// What electron-builder will put in app.asar: whatever `files` names, minus every
+// extraResources source. The minus is the part that bit: it is not documented
+// where `files` is, and it applies to a file listed in both.
+function inSimulatedAsar(config, rel) {
+  const excluded = config.extraResources.some(({ from }) => {
+    const f = strip(from);
+    return rel === f || rel.startsWith(`${f}/`);
+  });
+  return inFiles(config, rel) && !excluded;
+}
+
+/**
+ * Follows every relative require from main.js, preload.js and db.js inside a
+ * real app.asar, reading the files out of the archive. @electron/asar is what
+ * electron-builder itself uses, so it is already in node_modules.
+ */
+function checkAsar(asarPath, label) {
+  const asar = require(path.join(ROOT, "node_modules", "@electron", "asar"));
+  const listed = new Set(asar.listPackage(asarPath).map((p) => p.replace(/\\/g, "/").replace(/^\//, "")));
+  const isFile = (rel) => {
+    if (!listed.has(rel)) return false;
+    try { return asar.statFile(asarPath, rel).files === undefined; } catch { return false; }
+  };
+  const resolveIn = (from, spec) => {
+    const base = path.posix.normalize(path.posix.join(path.posix.dirname(from), spec));
+    return [base, `${base}.js`, `${base}.json`, `${base}/index.js`].find(isFile) || null;
+  };
+  const seen = new Set();
+  const queue = ["main.js", "preload.js", "db.js"];
+  let missing = 0;
+  for (const root of queue) check(`${label}: app.asar has ${root}`, isFile(root)) || missing++;
+  while (queue.length) {
+    const rel = queue.shift();
+    if (seen.has(rel) || !isFile(rel)) continue;
+    seen.add(rel);
+    const text = asar.extractFile(asarPath, rel).toString("utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`\\])\/\/.*$/gm, "$1");
+    for (const [, spec] of text.matchAll(REQUIRE)) {
+      const target = resolveIn(rel, spec);
+      if (!check(`${label}: ${rel} requires ${spec}, and app.asar has it`, Boolean(target),
+                 "the main process would die on this require before it opened a window")) missing++;
+      else queue.push(target);
+    }
+  }
+  if (!missing) console.log(`  ok   ${label}: ${seen.size} files reachable from main.js, preload.js and db.js are all in app.asar`);
+}
+
+// ---------------------------------------------------------------------------
+// Launching the app
+
+function seedDatabase(dataDir) {
+  const seed = process.env.DELPHI_SMOKE_SEED;
+  const target = path.join(dataDir, "delphi.db");
+  if (seed) {
+    // The write-ahead log is copied with it: recent rows may only be in there.
+    for (const suffix of ["", "-wal", "-shm"]) {
+      if (fs.existsSync(seed + suffix)) fs.copyFileSync(seed + suffix, target + suffix);
+    }
+    return `a copy of ${path.basename(seed)}`;
+  }
+  const { DatabaseSync } = require("node:sqlite");
+  const handle = new DatabaseSync(target);
+  handle.exec(fs.readFileSync(path.join(__dirname, "fixtures", "pre_m0.sql"), "utf8"));
+  handle.close();
+  return "tools/fixtures/pre_m0.sql";
+}
+
+/** How to start the app with a display, or null and why not. */
+function launcher(binary, args) {
+  if (process.platform !== "linux") return { argv: [binary, ...args] };
+  const argv = [binary, "--no-sandbox", ...args];
+  if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) return { argv };
+  const xvfb = spawnSync("sh", ["-c", "command -v xvfb-run"], { encoding: "utf8" });
+  if (xvfb.status !== 0) return { skip: "no display, and xvfb-run is not installed" };
+  return { argv: ["xvfb-run", "-a", ...argv] };
+}
+
+/**
+ * Starts the app in smoke mode against a migrated copy of an old database, and
+ * checks it said ok, exited 0, and left every later column and table behind.
+ */
+function smokeLaunch(binary, args, label, env, want) {
+  const how = launcher(binary, args);
+  if (how.skip) { note(`${label}: launch not tested, ${how.skip}`); return; }
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "delphi-smoke-"));
+  try {
+    const from = seedDatabase(dataDir);
+    const childEnv = { ...env, DELPHI_SMOKE: "1", DELPHI_DATA_DIR: dataDir };
+    delete childEnv.DELPHI_DB;
+    delete childEnv.ELECTRON_RUN_AS_NODE;
+    const started = Date.now();
+    const r = spawnSync(how.argv[0], how.argv.slice(1), { env: childEnv, encoding: "utf8", timeout: 120000 });
+    const line = (r.stdout || "").split("\n").find((l) => l.startsWith("delphi-smoke ")) || "";
+    console.log(`  ${line || "(no delphi-smoke line)"}  [${label}, ${((Date.now() - started) / 1000).toFixed(1)}s, from ${from}]`);
+    const okLine = want ? `delphi-smoke ok ${want}` : "delphi-smoke ok ";
+    if (!check(`${label}: the app starts, migrates and loads its window`, r.status === 0 && line.startsWith(okLine),
+               `exit ${r.status}${r.signal ? ` on ${r.signal}` : ""}${r.error ? ` (${r.error.message})` : ""}\n${line}\n${(r.stderr || "").trim().split("\n").slice(-8).join("\n")}`)) return;
+
+    const { DatabaseSync } = require("node:sqlite");
+    const handle = new DatabaseSync(path.join(dataDir, "delphi.db"), { readOnly: true });
+    const columnsOf = (table) => new Set(handle.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+    let gaps = 0;
+    for (const [table, column] of schemaLater.LATER_COLUMNS) {
+      if (!columnsOf(table).has(column)) { gaps++; check(`${label}: ${table}.${column} exists after the launch`, false); }
+    }
+    for (const [table] of schemaLater.LATER_TABLES) {
+      const found = handle.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+      if (!found) { gaps++; check(`${label}: table ${table} exists after the launch`, false); }
+    }
+    handle.close();
+    if (!gaps) {
+      check(`${label}: migrated`, true);
+      console.log(`  ok   ${label}: all ${schemaLater.LATER_COLUMNS.length} later columns and ${schemaLater.LATER_TABLES.length} later tables are there`);
+    }
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+/** Where a packaged build keeps things, for a mac .app or an unpacked folder. */
+function packagedLayout(appPath) {
+  if (appPath.endsWith(".app")) {
+    return {
+      resources: path.join(appPath, "Contents", "Resources"),
+      binary: path.join(appPath, "Contents", "MacOS", PKG.productName || "Delphi"),
+    };
+  }
+  const exe = process.platform === "win32" ? `${PKG.productName}.exe` : PKG.name;
+  const candidates = [exe, PKG.productName, PKG.name].map((n) => path.join(appPath, n));
+  return { resources: path.join(appPath, "resources"), binary: candidates.find((c) => fs.existsSync(c)) || candidates[0] };
+}
+
 function electronBinary() {
   try {
     const binary = require(path.join(ROOT, "node_modules", "electron"));
@@ -287,11 +445,15 @@ function plainNode() {
   return r.status === 0 ? "node" : null;
 }
 
-function appVersion(app) {
-  const plist = path.join(app, "Contents", "Info.plist");
-  if (!fs.existsSync(plist)) return null;
-  const m = fs.readFileSync(plist, "utf8").match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
-  return m ? m[1] : null;
+// From the archive's own package.json, which is what app.getVersion() reports,
+// so it works for every platform's layout.
+function appVersion(resources) {
+  try {
+    const asar = require(path.join(ROOT, "node_modules", "@electron", "asar"));
+    return JSON.parse(asar.extractFile(path.join(resources, "app.asar"), "package.json").toString("utf8")).version;
+  } catch {
+    return null;
+  }
 }
 
 async function main() {
@@ -317,9 +479,15 @@ async function main() {
     for (const m of app.missing) check(`${m.from} requires ${m.spec}`, false, "does not resolve in the checkout");
     for (const file of app.files) {
       const rel = path.relative(ROOT, file).split(path.sep).join("/");
-      check(`files covers ${rel}`, inFiles(config, rel), "the main process requires it, and it would not be in app.asar");
+      if (!inFiles(config, rel)) check(`files covers ${rel}`, false, "the main process requires it, and it would not be in app.asar");
+      else check(`${rel} is in app.asar`, inSimulatedAsar(config, rel),
+                 "it is in extraResources too, and electron-builder leaves anything extraResources copies out of the archive. List it in OUTSIDE_TOO in tools/after-pack.js instead");
     }
-    console.log(`  ok   ${app.files.size} files reachable from main.js, preload.js and db.js checked against files`);
+    console.log(`  ok   ${app.files.size} files reachable from main.js, preload.js and db.js checked against the archive electron-builder will make`);
+    for (const rel of OUTSIDE_TOO) {
+      check(`OUTSIDE_TOO ${rel} exists`, exists(rel));
+      check(`OUTSIDE_TOO ${rel} is in files, so the app has it too`, inFiles(config, rel) || inFiles(config, `${rel}/`) || config.files.includes(`${rel}/`));
+    }
 
     // A real database, made the way the app makes one, so tools have tables to
     // read. Done after the config checks so a db.js mid-edit fails here, with a
@@ -331,7 +499,7 @@ async function main() {
       check("a fresh database opens through db.js", false, error.stack);
     }
 
-    section("simulated Resources/, copied from extraResources");
+    section("simulated Resources/, copied from extraResources and OUTSIDE_TOO");
     const resources = path.join(tmp, "Resources");
     fs.mkdirSync(resources);
     copyResources(config, resources);
@@ -348,10 +516,14 @@ async function main() {
       note("no node on PATH, the plain node launch was not exercised");
     }
 
+    section("the app, launched from the checkout");
+    if (electron) smokeLaunch(electron, [ROOT], "checkout", env, PKG.version);
+
     section("packaged build");
     const named = argValue("--app") || process.env.DELPHI_PACKAGED_APP;
     const appPath = path.resolve(named || path.join(ROOT, "release", `mac-${process.arch}`, "Delphi.app"));
-    const version = appVersion(appPath);
+    const layout = packagedLayout(appPath);
+    const version = appVersion(layout.resources);
     if (!fs.existsSync(appPath)) {
       if (named) check(`packaged app exists at ${appPath}`, false);
       else note(`skipped: no packaged app at ${path.relative(ROOT, appPath)}. Build one with npm run pack to include it`);
@@ -359,11 +531,12 @@ async function main() {
       note(`skipped: ${path.relative(ROOT, appPath)} is version ${version}, the checkout is ${PKG.version}. ` +
            "Rebuild with npm run pack, or name it with --app to test it anyway");
     } else {
-      const packaged = path.join(appPath, "Contents", "Resources");
-      const binary = path.join(appPath, "Contents", "MacOS", PKG.productName || "Delphi");
+      const { resources: packaged, binary } = layout;
+      checkAsar(path.join(packaged, "app.asar"), `packaged ${version}`);
       checkResourceRequires(packaged, `packaged ${version}`);
       await exerciseServer(packaged, binary, { ELECTRON_RUN_AS_NODE: "1" }, `packaged ${version}`, env);
       exerciseCli(packaged, binary, { ELECTRON_RUN_AS_NODE: "1" }, `packaged ${version}`, env);
+      smokeLaunch(binary, [], `packaged ${version}`, env, version);
     }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
