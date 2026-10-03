@@ -133,6 +133,113 @@ const old = path.join(dir, "old.db");
   h.close();
 }
 
+// --- a rebuild that does not stall the app ---------------------------------------
+
+section("learning is linear, and a rebuild writes only what changed");
+{
+  // A phrase is a name only if nobody writes it in lower case; that used to be
+  // a substring search per phrase per row.
+  const v = oracle.learnVocabulary({ texts: [
+    "we met Road Runner today.", "then Road Runner left.", "ask Road Runner again.", "ask Big Bird.", "so Big Bird said.",
+    "and Big Bird ran.", "a big bird flew by",
+  ] });
+  check("a capitalised phrase is learned", oracle.extract("Road Runner", v).map((e) => e.name), ["Road Runner"]);
+  check("one also written in lower case is not", oracle.extract("Big Bird", v).some((e) => e.name === "Big Bird"), false);
+  const many = [];
+  for (let r = 0; r < 3000; r++) many.push(`the team saw Wd${r % 700}x Wd${r % 90}y near the build. `.repeat(20));
+  const t0 = Date.now();
+  oracle.learnVocabulary({ texts: many });
+  check(`learning 3,000 rows takes well under the old quadratic time (${Date.now() - t0}ms)`, Date.now() - t0 < 2500, true);
+}
+
+/** The graph by names, so two databases with different ids compare. */
+function graphOf(h) {
+  const entities = h.prepare("SELECT kind, name, mentions FROM entities ORDER BY kind, name").all();
+  const edges = h.prepare(`SELECT e.source_type, e.source_id, e.relation, e.weight, e.evidence, e.target_type,
+      COALESCE(t.kind || ':' || t.name, e.target_id) AS target, COALESCE(s.kind || ':' || s.name, e.source_id) AS source
+    FROM edges e
+    LEFT JOIN entities t ON e.target_type = 'entity' AND t.id = e.target_id
+    LEFT JOIN entities s ON e.source_type = 'entity' AND s.id = e.source_id`).all()
+    .map((r) => JSON.stringify(r)).sort();
+  return JSON.stringify(entities) + edges.join("\n");
+}
+
+{
+  const { DatabaseSync } = require("node:sqlite");
+  const a = new DatabaseSync(path.join(dir, "incremental.db"));
+  const b = new DatabaseSync(path.join(dir, "scratch.db"));
+  const schema = fs.readFileSync(path.join(__dirname, "..", "schema.sql"), "utf8");
+  for (const h of [a, b]) {
+    h.exec(schema);
+    h.exec("INSERT INTO projects (key, name) VALUES ('offerworks', 'Offerworks'), ('ssnr-mpi', 'SSNR / MPI Person Update')");
+    for (let i = 0; i < 60; i++) {
+      h.prepare("INSERT INTO notes (project_id, title, body) VALUES (?, ?, ?)").run(1 + (i % 2), `Note ${i} on Offerworks`,
+        `Stripe and Kamal ${i}. Caseflow calls MPI in devtest. add_correlation then parse_response. See APPEALS-${1000 + i}.`);
+    }
+    h.prepare("INSERT INTO tasks (project_id, title, detail) VALUES (1, 'Deploy with Kamal', 'Stripe keys first')").run();
+  }
+  oracle.rebuild(a);
+  const edit = "UPDATE notes SET body = body || ' Postmark too.' WHERE id = 3; DELETE FROM notes WHERE id = 5; " +
+    "UPDATE notes SET project_id = 1 WHERE id = 4; INSERT INTO notes (project_id, title, body) VALUES (2, 'New one', 'Grafana and Stripe');";
+  a.exec(edit);
+  b.exec(edit);
+  const again = oracle.rebuild(a);
+  oracle.rebuild(b);
+  check("after edits, the incremental graph is the from-scratch graph", graphOf(a) === graphOf(b), true);
+  check("and only the rows that changed were rewritten", again.rewritten <= 4, true);
+  check("an unchanged store rewrites nothing", oracle.rebuild(a).rewritten, 0);
+  // A new process has no memory, and compares against the table instead.
+  check("nor does a fresh process over a built graph", oracle.rebuild(new DatabaseSync(path.join(dir, "incremental.db"))).rewritten, 0);
+}
+
+async function rebuildChecks() {
+  section("a paced rebuild hands the thread back");
+  const { DatabaseSync } = require("node:sqlite");
+  const file = path.join(dir, "paced.db");
+  const h = new DatabaseSync(file);
+  h.exec(fs.readFileSync(path.join(__dirname, "..", "schema.sql"), "utf8"));
+  h.exec("INSERT INTO projects (key, name) VALUES ('offerworks', 'Offerworks')");
+  const add = h.prepare("INSERT INTO notes (project_id, title, body) VALUES (1, ?, ?)");
+  h.exec("BEGIN");
+  for (let i = 0; i < 1500; i++) {
+    add.run(`Note ${i}`, `Offerworks bills through Stripe ${i % 40}. Caseflow, MPI, Kamal and Postmark. `.repeat(25));
+  }
+  h.exec("COMMIT");
+  let worst = 0;
+  let last = Date.now();
+  const tick = setInterval(() => { const now = Date.now(); worst = Math.max(worst, now - last); last = now; }, 1);
+  const paced = await oracle.rebuildAsync(h);
+  clearInterval(tick);
+  worst = Math.max(worst, Date.now() - last);
+  check(`no step holds the thread over 100ms (${worst}ms of ${paced.ms}ms)`, worst < 100, true);
+  const pacedGraph = graphOf(h);
+  h.exec("DELETE FROM edges; DELETE FROM entities;");
+  oracle.rebuild(new DatabaseSync(file));
+  check("and it builds what the synchronous rebuild builds", graphOf(h) === pacedGraph, true);
+
+  const overtaken = oracle.rebuildAsync(h);
+  oracle.rebuild(h);
+  check("a paced rebuild a newer one overtook stops without writing", await overtaken, null);
+
+  section("rebuilds are throttled while changes keep coming");
+  let runs = 0;
+  const scheduler = oracle.makeRebuildScheduler(async () => { runs++; }, { gapMs: 150 });
+  for (let i = 0; i < 10; i++) scheduler.poke();
+  await new Promise((r) => setTimeout(r, 20));
+  check("the first change rebuilds at once, the burst does not", runs, 1);
+  await new Promise((r) => setTimeout(r, 250));
+  check("and the end of the burst gets one more", runs, 2);
+  await new Promise((r) => setTimeout(r, 250));
+  check("then nothing until something changes", [runs, scheduler.pending()], [2, false]);
+}
+
+section("fit trims one long field too");
+{
+  const { fit } = require("../agent/recall");
+  const out = fit({ title: "t".repeat(40000), notes: [{ id: 1 }, { id: 2 }] }, 200, ["notes"]);
+  check("a single huge field is cut to the budget", [JSON.stringify(out).length <= 800, out.trimmed, out.title.endsWith("…")], [true, true, true]);
+}
+
 // --- the server ----------------------------------------------------------------
 
 delete process.env.ELECTRON_RUN_AS_NODE;
@@ -163,6 +270,14 @@ insertVector.run("note", meaningNote.id, blob([0, 1, 0, 0]), "a");
 insertVector.run("note", answerNote.id, blob([1, 0, 0, 0]), "b");
 insertVector.run("note", offerNote.id, blob([0, 0, 1, 0]), "c");
 for (let i = 0; i < 30; i++) db.handle().prepare("INSERT INTO comments (task_id, author, body) VALUES (?, 'claude-code:1', ?)").run(busy.id, `step ${i}: ${"words ".repeat(80)}`);
+// Everything promoted, thousands of times, under a title nobody should write.
+const hoarder = db.createTask({ projectId: va.id, title: "promoted everything " + "very long title ".repeat(400) });
+{
+  const add = db.handle().prepare("INSERT INTO comments (task_id, author, body, promoted) VALUES (?, 'claude-code:1', ?, 1)");
+  db.handle().exec("BEGIN");
+  for (let i = 0; i < 3000; i++) add.run(hoarder.id, `finding ${i}: ${"detail ".repeat(30)}`);
+  db.handle().exec("COMMIT");
+}
 db.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
 
 async function route(name, env) {
@@ -201,6 +316,10 @@ async function route(name, env) {
     const found = await client.call("search", { query: "MPI" });
     check("search counts everything it matched", [found.total.notes, found.total.tasks], [40, 60]);
     const task = await client.call("get_task", { id: busy.id });
+    const hoard = await client.call("get_task", { id: hoarder.id });
+    check(`3,000 promoted entries still fit the budget (${tokens(hoard)})`, tokens(hoard) < 1500, true);
+    check("the newest of the ledger, and how many more", [hoard.entry_ids.length <= 50, /2992 older ledger entries/.test(hoard.ledger_more)], [true, true]);
+    check("the newest entry is the one kept", hoard.sheet.includes("finding 2999"), true);
     check("get_task clips a long detail and Sheet, and says so", [task.clipped, task.task.detail.length < 3000, "comments" in task], [["detail", "sheet"], true, false]);
     check("and keeps the entry ids", task.entry_ids.length > 0 && task.entry_ids.length <= task.comments_total, true);
     check("get_note says more", (await client.call("get_note", { id: answerNote.id })).body.includes("Rotating the Vault secret"), true);
@@ -275,6 +394,7 @@ async function route(name, env) {
 }
 
 (async () => {
+  await rebuildChecks();
   await route("node:sqlite", {});
   await route("sqlite3 binary", { DELPHI_SQLITE_ROUTE: "binary" });
   console.log(`\n${checks - failures}/${checks} checks passed`);

@@ -152,6 +152,61 @@ const LATER_TABLES = [
   ["meta", `CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT
+)`],  // Cross-project items: flags first, because the other two name it. See
+  // schema.sql and items/store.js.
+  ["item_flags", `CREATE TABLE IF NOT EXISTS item_flags (
+  id              INTEGER PRIMARY KEY,
+  entity          TEXT NOT NULL,
+  entity_id       INTEGER NOT NULL,
+  project_id      INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  label           TEXT,
+  note            TEXT NOT NULL DEFAULT '',
+  evidence        TEXT,
+  status          TEXT NOT NULL DEFAULT 'open',
+  source          TEXT NOT NULL DEFAULT 'person',
+  created_by      TEXT,
+  created_by_type TEXT,
+  run_id          INTEGER,
+  proposal        TEXT,
+  proposed_by     TEXT,
+  proposed_at     TEXT,
+  decided_by      TEXT,
+  decided_at      TEXT,
+  decision_note   TEXT,
+  applied_audit_id INTEGER,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+)`],
+  ["flag_entries", `CREATE TABLE IF NOT EXISTS flag_entries (
+  id          INTEGER PRIMARY KEY,
+  flag_id     INTEGER NOT NULL REFERENCES item_flags(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL DEFAULT 'say',
+  author      TEXT NOT NULL,
+  author_type TEXT,
+  body        TEXT NOT NULL,
+  meta        TEXT,
+  ref_id      INTEGER REFERENCES flag_entries(id) ON DELETE SET NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+)`],
+  ["item_projects", `CREATE TABLE IF NOT EXISTS item_projects (
+  entity     TEXT NOT NULL,
+  entity_id  INTEGER NOT NULL,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  added_by   TEXT,
+  added_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  flag_id    INTEGER REFERENCES item_flags(id) ON DELETE SET NULL,
+  PRIMARY KEY (entity, entity_id, project_id)
+)`],
+  ["item_copies", `CREATE TABLE IF NOT EXISTS item_copies (
+  entity            TEXT NOT NULL,
+  entity_id         INTEGER NOT NULL,
+  source_id         INTEGER NOT NULL,
+  source_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  source_label      TEXT,
+  copied_by         TEXT,
+  copied_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  flag_id           INTEGER REFERENCES item_flags(id) ON DELETE SET NULL,
+  PRIMARY KEY (entity, entity_id)
 )`],
 ];
 
@@ -179,6 +234,44 @@ const LATER_INDEXES = [
   ["idx_workbenches_path", "workbenches", ["path", "state"],
    "CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_path ON workbenches(path) " +
    "WHERE state IN ('active', 'parked', 'missing', 'closing')", "'closing'"],
+  ["idx_item_flags_status", "item_flags", ["status"],
+   "CREATE INDEX IF NOT EXISTS idx_item_flags_status ON item_flags(status, id)"],
+  ["idx_item_flags_item", "item_flags", ["entity", "entity_id"],
+   "CREATE INDEX IF NOT EXISTS idx_item_flags_item ON item_flags(entity, entity_id)"],
+  ["idx_item_flags_live", "item_flags", ["entity", "entity_id", "status"],
+   "CREATE UNIQUE INDEX IF NOT EXISTS idx_item_flags_live ON item_flags(entity, entity_id) " +
+   "WHERE status IN ('open', 'evaluating', 'proposed')"],
+  ["idx_flag_entries_flag", "flag_entries", ["flag_id"],
+   "CREATE INDEX IF NOT EXISTS idx_flag_entries_flag ON flag_entries(flag_id, id)"],
+  ["idx_item_projects_project", "item_projects", ["project_id", "entity", "entity_id"],
+   "CREATE INDEX IF NOT EXISTS idx_item_projects_project ON item_projects(project_id, entity, entity_id)"],
+  ["idx_item_copies_source", "item_copies", ["entity", "source_id"],
+   "CREATE INDEX IF NOT EXISTS idx_item_copies_source ON item_copies(entity, source_id)"],
+];
+
+/**
+ * The delete trigger for one kind of item, as schema.sql spells it.
+ *
+ * One function for the four of them, because four hand-copied bodies is how
+ * one of them ends up clearing the wrong entity. tools/schema_parity_test.js
+ * compares what this makes with what schema.sql makes, statement for statement.
+ */
+function itemTrigger(name, table, entity) {
+  return `CREATE TRIGGER IF NOT EXISTS ${name} AFTER DELETE ON ${table} BEGIN
+  DELETE FROM item_projects WHERE entity = '${entity}' AND entity_id = old.id;
+  DELETE FROM item_copies   WHERE entity = '${entity}' AND entity_id = old.id;
+  UPDATE item_flags SET status = 'stale', updated_at = datetime('now')
+   WHERE entity = '${entity}' AND entity_id = old.id AND status IN ('open', 'evaluating', 'proposed');
+END`;
+}
+
+// [name, table it fires on, the tables its body writes, statement]. Created
+// when missing and every table it names exists, after the tables above.
+const LATER_TRIGGERS = [
+  ["items_task_ad", "tasks", ["item_projects", "item_copies", "item_flags"], itemTrigger("items_task_ad", "tasks", "task")],
+  ["items_note_ad", "notes", ["item_projects", "item_copies", "item_flags"], itemTrigger("items_note_ad", "notes", "note")],
+  ["items_pad_ad", "scratchpads", ["item_projects", "item_copies", "item_flags"], itemTrigger("items_pad_ad", "scratchpads", "scratchpad")],
+  ["items_link_ad", "links", ["item_projects", "item_copies", "item_flags"], itemTrigger("items_link_ad", "links", "link")],
 ];
 
 // Table names go into PRAGMA text, which cannot take a bound parameter. They
@@ -274,7 +367,7 @@ function allColumns(query) {
  * app first opens the file.
  */
 function apply(query) {
-  const result = { added: [], created: [], indexed: [], errors: [] };
+  const result = { added: [], created: [], indexed: [], triggered: [], errors: [] };
   const attempt = (statement, fn) => {
     try {
       return fn();
@@ -349,7 +442,19 @@ function apply(query) {
     });
   }
 
+  // Triggers last, because each names tables the steps above may have made.
+  const triggers = attempt("SELECT name FROM sqlite_master WHERE type = 'trigger'", () =>
+    new Set((query("SELECT name FROM sqlite_master WHERE type = 'trigger'") || []).map((r) => r.name)));
+  if (!triggers) return result;
+  for (const [name, table, writes, statement] of LATER_TRIGGERS) {
+    if (triggers.has(name) || !columns.has(table) || !writes.every((t) => columns.has(t))) continue;
+    attempt(statement, () => {
+      query(statement);
+      result.triggered.push(name);
+    });
+  }
+
   return result;
 }
 
-module.exports = { LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, apply, addLaterColumns, hasTable, columnsOf, allColumns };
+module.exports = { LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, apply, addLaterColumns, hasTable, columnsOf, allColumns };

@@ -247,6 +247,29 @@ function update(sql, id, fields = {}, { from = null } = {}) {
   return row ? get(sql, row.id) : null;
 }
 
+/**
+ * The project a job belongs to. A job about a task is the task's project's:
+ * its Workbench is built there, so its approval and its permission to run
+ * unguarded must come from there too, never from a project named beside it.
+ * A different project named alongside the task is refused rather than
+ * corrected, because the caller believed something that is not true.
+ */
+function projectFor(sql, { projectId = null, taskId = null } = {}) {
+  if (taskId == null) {
+    if (projectId == null) throw new Error("A job needs a project, or a task to take its project from.");
+    return Number(projectId);
+  }
+  const task = sql("SELECT t.id, t.project_id, p.name AS project_name FROM tasks t LEFT JOIN projects p ON p.id = t.project_id WHERE t.id = :p1", [Number(taskId)])[0];
+  if (!task) throw new Error(`There is no task ${taskId}.`);
+  if (task.project_id == null) throw new Error(`Task ${taskId} is not in a project, so there is nowhere for a job on it to run. Put it in a project first.`);
+  if (projectId != null && Number(projectId) !== Number(task.project_id)) {
+    const named = sql("SELECT name FROM projects WHERE id = :p1", [Number(projectId)])[0];
+    throw new Error(`Task ${taskId} is in project ${task.project_name} (${task.project_id}), not ${named ? named.name : "project"} (${projectId}). ` +
+      "A job runs in its task's project; leave the project out, or name that one.");
+  }
+  return Number(task.project_id);
+}
+
 /** How many jobs this project finished in the last hour. The loop breaker. */
 function finishedSince(sql, projectId, hours = 1) {
   return Number(sql(
@@ -258,5 +281,5 @@ function finishedSince(sql, projectId, hours = 1) {
 
 module.exports = {
   STATES, OPEN, FINAL, KINDS, LEGACY, OPEN_SQL,
-  approvalFor, folders, folderProblem, readFolder, toRun, get, list, insert, update, finishedSince,
+  approvalFor, projectFor, folders, folderProblem, readFolder, toRun, get, list, insert, update, finishedSince,
 };

@@ -14,7 +14,8 @@
 // In a fixture, {{CWD}} is replaced by the folder it runs in, and a line
 // {"fake":"hang"} stops there until the process is killed. {"fake":"sleep","ms":N}
 // waits N ms, and {"fake":"write","file":F,"text":T} writes T to F in the folder
-// it runs in, the way an agent's edit would.
+// it runs in, the way an agent's edit would. {"fake":"orphan","pidfile":P} leaves
+// a grandchild outside its process group holding stdout open.
 
 const fs = require("fs");
 
@@ -54,6 +55,15 @@ const started = Date.now();
     if (line.includes('"fake":"write"')) {
       const w = JSON.parse(line);
       fs.writeFileSync(require("path").join(process.cwd(), w.file), String(w.text));
+      continue;
+    }
+    if (line.includes('"fake":"orphan"')) {
+      // A grandchild in a process group of its own that keeps stdout open,
+      // the way a daemon an agent started would. Its pid goes to pidfile.
+      const o = JSON.parse(line);
+      const child = require("child_process").spawn("sleep", ["30"], { detached: true, stdio: ["ignore", "inherit", "inherit"] });
+      fs.writeFileSync(o.pidfile, String(child.pid));
+      child.unref();
       continue;
     }
     if (line.includes('"fake":"hang"')) {

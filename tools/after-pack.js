@@ -53,6 +53,9 @@ const OUTSIDE_TOO = [
   "agent/jobs.js",
   "sheet",
   "workbench",
+  // Move, copy, associate and flag: the server's tools and the app's IPC use
+  // the one store.
+  "items",
 ];
 
 function resourcesDir(context) {

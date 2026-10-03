@@ -136,6 +136,11 @@ let dbWatchTimer = null;
 // The vault is a mirror, so it is rebuilt after changes rather than kept in step
 // edit by edit. Debounced because typing in a note fires an update per blur and
 // a full rewrite per keystroke would be silly.
+const graphRebuild = oracle.makeRebuildScheduler(
+  () => oracle.rebuildAsync(db.handle()).catch((error) => console.error("oracle rebuild failed", error)),
+  { gapMs: 30000 }
+);
+
 function scheduleVaultExport() {
   if (settings.vaultEnabled === false) return;
   if (vaultTimer) clearTimeout(vaultTimer);
@@ -145,13 +150,10 @@ function scheduleVaultExport() {
     } catch (error) {
       console.error("vault export failed", error);
     }
-    // The graph is derived, so it is rebuilt rather than patched. Doing it here
-    // means it can never be staler than the notes it was built from.
-    try {
-      oracle.rebuild(db.handle());
-    } catch (error) {
-      console.error("oracle rebuild failed", error);
-    }
+    // The graph is derived, so it is rebuilt from the rows. Paced, so the window
+    // stays live on a big store, and throttled, because a running job writes
+    // about once a second; the last change of a burst is always rebuilt.
+    graphRebuild.poke();
 
     // Embedding is asynchronous and can be slow when a model is warming up, so it
     // is not awaited. Rows whose text is unchanged are skipped, so this settles
@@ -854,6 +856,13 @@ function checkForExternalWrites() {
         // So an open task panel shows an agent's Sheet entries as they land,
         // rather than when the person next clicks something.
         win.webContents.send("db-changed");
+        // An agent's flag or proposal lands in Needs you without a click. Only
+        // when the flags themselves changed, so every other write stays quiet.
+        const flags = flagSignature();
+        if (flags !== lastFlagSignature) {
+          lastFlagSignature = flags;
+          win.webContents.send("flags-changed", { external: true });
+        }
       }
     }
   } catch (error) {
@@ -1457,6 +1466,77 @@ handle("organizers:list", (projectId) => db.listOrganizers(projectId));
 handle("organizers:create", (payload) => { const r = db.createOrganizer(payload); scheduleVaultExport(); return r; });
 handle("organizers:update", (id, fields) => { const r = db.updateOrganizer(id, fields); scheduleVaultExport(); return r; });
 handle("organizers:delete", (id) => { const r = db.deleteOrganizer(id); scheduleVaultExport(); return r; });
+
+// ---------------------------------------------------------------------------
+// Items across projects, and flags
+//
+// Move, copy, also-belongs-to and flag-for-review, from items/store.js, the
+// store the MCP server uses too, so the window and an agent write the same
+// History rows. The window's writes are the person's. Refusals come back with
+// code REFUSED and details.refusals, each a sentence naming the blocker.
+
+const { makeItemStore } = require("./items/store");
+const itemStore = makeItemStore({
+  sql: db.sqlP, batch: db.batchP, actor: "you", authorType: "human",
+  settings: () => settings, derive: (padId) => db.derive(padId),
+});
+let lastFlagSignature = null;
+function flagSignature() {
+  try {
+    const row = db.handle().prepare("SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') || ':' || COALESCE(MAX(id), 0) AS sig FROM item_flags").get();
+    return row ? row.sig : null;
+  } catch {
+    return null;
+  }
+}
+// After every write here: the vault mirrors where things live, and Needs you
+// and the Flags list redraw from flags-changed, { flagId?, change }.
+function itemsChanged(change) {
+  scheduleVaultExport();
+  lastFlagSignature = flagSignature();
+  if (win && !win.isDestroyed()) win.webContents.send("flags-changed", change || {});
+}
+const itemWrite = (change, fn) => async (...args) => {
+  const r = await fn(...args);
+  itemsChanged(typeof change === "function" ? change(r, ...args) : { change });
+  return r;
+};
+// The op's own shape, or one wrapped as {op}; both, because a picker builds
+// the op and a proposal stores it.
+handle("items:plan", (payload = {}) => itemStore.plan(payload && payload.op ? payload.op : payload));
+handle("items:move", itemWrite("move", ({ entity, id, to, options } = {}) => itemStore.move(entity, id, to, options || {})));
+handle("items:copy", itemWrite("copy", ({ entity, id, to, options } = {}) => itemStore.copy(entity, id, to, options || {})));
+handle("items:associate", itemWrite("associate", ({ entity, id, projectId } = {}) => itemStore.associate(entity, id, projectId)));
+handle("items:dissociate", itemWrite("dissociate", ({ entity, id, projectId } = {}) => itemStore.dissociate(entity, id, projectId)));
+handle("items:where", ({ entity, id } = {}) => itemStore.where(entity, id));
+handle("items:flag", itemWrite((r) => ({ change: "flagged", flagId: r.flag.id }),
+  ({ entity, id, note, evidence, evaluate } = {}) => itemStore.flag({ entity, id, note, evidence: evidence ?? null, evaluate: evaluate || "oracle", source: "person" })));
+// A project delete offers to rehome what other projects still show (D7).
+handle("items:rehomePlan", (projectId) => itemStore.rehomePlan(projectId));
+handle("items:rehome", itemWrite("rehome", (projectId) => itemStore.rehome(projectId)));
+
+// opts: { status (string, list or "all"; open, evaluating and proposed when
+// left out), projectId, source, entity, entityId, needsYou }. With needsYou
+// the rows come back in the Needs you shape instead, sweep flags grouped.
+handle("flags:list", (opts = {}) => {
+  const o = opts || {};
+  if (o.needsYou) return itemStore.needsYou({ projectId: o.projectId ?? null });
+  return itemStore.listFlags({ status: o.status ?? null, projectId: o.projectId ?? null, source: o.source ?? null,
+    entity: o.entity ?? null, entityId: o.entityId ?? null });
+});
+handle("flags:get", (id) => itemStore.getFlag(id));
+handle("flags:reply", itemWrite((r) => ({ change: "reply", flagId: r.flag_id }), (id, body) => itemStore.reply(id, body)));
+handle("flags:evaluate", itemWrite((r) => ({ change: "evaluated", flagId: r.flag.id }), (id, opts = {}) => itemStore.evaluate(id, { mode: (opts && opts.mode) || "oracle" })));
+handle("flags:approve", itemWrite((r) => ({ change: "approved", flagId: r.flag.id }),
+  (id, opts = {}) => itemStore.decide(id, { approve: true, ops: (opts && opts.ops) || null, note: (opts && opts.note) || null, by: "you", byType: "human" })));
+handle("flags:reject", itemWrite((r) => ({ change: "rejected", flagId: r.flag.id }), (id, opts = {}) => {
+  const done = itemStore.decide(id, { approve: false, note: (opts && opts.note) || null, by: "you", byType: "human" });
+  if (opts && opts.reevaluate) done.flag = itemStore.evaluate(id, { mode: "oracle" }).flag;
+  return done;
+}));
+handle("flags:withdraw", itemWrite((r) => ({ change: "withdrawn", flagId: r.id }), (id) => itemStore.withdraw(id)));
+// On demand only (owner decision D5). It flags; it never moves anything.
+handle("flags:sweep", itemWrite("sweep", (opts = {}) => itemStore.sweep({ projectId: (opts && opts.projectId) ?? null, limit: (opts && opts.limit) || 20 })));
 
 handle("oracle:stats", () => ({
   ...oracle.stats(db.handle()),

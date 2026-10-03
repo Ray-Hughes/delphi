@@ -256,6 +256,41 @@ async function main() {
   const preloadText = fs.readFileSync(path.join(__dirname, "..", "preload.js"), "utf8");
   check("preload carries code and details through", /code: result\.code, details:/.test(preloadText), true);
 
+  section("items and flags");
+  for (const c of ["items:plan", "items:move", "items:copy", "items:associate", "items:dissociate", "items:where", "items:flag",
+    "items:rehomePlan", "items:rehome", "flags:list", "flags:get", "flags:reply", "flags:evaluate", "flags:approve",
+    "flags:reject", "flags:withdraw", "flags:sweep"]) {
+    check(`${c} is in preload and handled`, [called.includes(c), handlers.has(c)], [true, true]);
+  }
+  check("preload exposes onFlagsChanged", preload.includes("onFlagsChanged:"), true);
+  const here = db.createProject({ key: "ipc-here", name: "IPC here" });
+  const there = db.createProject({ key: "ipc-there", name: "IPC there" });
+  const parent = db.createTask({ projectId: here.id, title: "moves whole" });
+  const kid = db.createTask({ parentId: parent.id, title: "its kid" });
+  const planned = await call("items:plan", { op: { op: "move", entity: "task", id: parent.id, to: there.id } });
+  check("plan", [planned.ok, planned.counts.subtasks], [true, 1]);
+  const moved = await call("items:move", { entity: "task", id: parent.id, to: there.id, options: { keepInSource: true } });
+  check("move returns the audit id and the tasks", [typeof moved.auditId, moved.moved.tasks.sort()], ["number", [parent.id, kid.id].sort()]);
+  check("tasks:update with a project moves the subtree too", await (async () => {
+    await call("tasks:update", parent.id, { project_id: here.id });
+    return db.handle().prepare("SELECT project_id FROM tasks WHERE id = ?").get(kid.id).project_id;
+  })(), here.id);
+  const subtaskMove = await handlers.get("items:move")({}, { entity: "task", id: kid.id, to: there.id });
+  check("a refused move is {ok: false} with the sentence and REFUSED", [subtaskMove.ok, subtaskMove.code, /moves with its parent/.test(subtaskMove.error), Array.isArray(subtaskMove.details.refusals)],
+    [false, "REFUSED", true, true]);
+  const where = await call("items:where", { entity: "task", id: parent.id });
+  check("where", [where.home.id, where.also.map((p) => p.id)], [here.id, []]);
+  const sentBefore = sent.length;
+  const flagged = await call("items:flag", { entity: "task", id: parent.id, note: "belongs in IPC there", evaluate: "oracle" });
+  check("flag returns the flag, evaluated", [flagged.appended, flagged.flag.status, flagged.flag.proposal.ops[0].to], [false, "proposed", there.id]);
+  check("flags-changed went to the window", sent.slice(sentBefore).some(([c, p]) => c === "flags-changed" && p.flagId === flagged.flag.id), true);
+  const needs = await call("flags:list", { needsYou: true });
+  check("Needs you rows", needs.some((r) => r.source === "flag" && r.id === flagged.flag.id && r.kind === "decision"), true);
+  const approved = await call("flags:approve", flagged.flag.id, { note: "yes" });
+  check("approve applies", [approved.flag.status, db.handle().prepare("SELECT project_id FROM tasks WHERE id = ?").get(parent.id).project_id], ["applied", there.id]);
+  const swept = await call("flags:sweep", {});
+  check("sweep answers in its shape", [Array.isArray(swept.created), typeof swept.skipped], [true, "number"]);
+
   console.log(`\n${checks - failures}/${checks} checks passed`);
   fs.rmSync(dir, { recursive: true, force: true });
   process.exit(failures ? 1 : 0);

@@ -231,6 +231,21 @@ check("codex gets dotted overrides rather than a file",
       harness.mcpFlags("codex-config", { dbPath: "/tmp/d.db", sessionId: 1, actor: "t" }).file, null);
 
 // ---------------------------------------------------------------------------
+// Carrying a task's lines between pads, and copying a pad as a document.
+// Pure text in and out, so a move that carries lines can be undone by putting
+// the two bodies back.
+
+const carryBody = "# Plan\n\n- [ ] one <!--d:1-->\n  - [ ] sub <!--d:2-->\n    - [x] subsub <!--d:3-->\n- [ ] two <!--d:4-->\n\nprose";
+const cut = pads.cutBlock(carryBody, 1);
+check("cutBlock takes the line and everything nested under it", cut.block, "- [ ] one <!--d:1-->\n  - [ ] sub <!--d:2-->\n    - [x] subsub <!--d:3-->");
+check("and leaves the rest of the pad as it was", cut.body, "# Plan\n\n- [ ] two <!--d:4-->\n\nprose");
+check("a nested line comes out un-indented", pads.cutBlock(carryBody, 2).block, "- [ ] sub <!--d:2-->\n  - [x] subsub <!--d:3-->");
+check("no line, nothing cut", pads.cutBlock(carryBody, 99), null);
+check("appendBlock adds under a heading it makes", pads.appendBlock("intro", cut.block, "Moved in"), `intro\n\n## Moved in\n\n${cut.block}\n`);
+check("or at the end of the section that has it", pads.appendBlock("## Moved in\n\n- [ ] a\n\n## Other\nz", "- [ ] b", "moved in"), "## Moved in\n\n- [ ] a\n- [ ] b\n\n## Other\nz");
+check("the carried lines parse as the same tasks", [...pads.anchoredIds(pads.appendBlock("", cut.block))].sort(), [1, 2, 3]);
+check("stripAnchors leaves the document and no task ids", pads.stripAnchors(carryBody), "# Plan\n\n- [ ] one\n  - [ ] sub\n    - [x] subsub\n- [ ] two\n\nprose");
+check("which parses as lines with no anchors", pads.parse(pads.stripAnchors(carryBody)).every((e) => e.taskId === null), true);
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 fs.rmSync(dir, { recursive: true, force: true });

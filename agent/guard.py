@@ -104,27 +104,38 @@ WRAPPERS = [re.compile(p) for p in (
 
 # The delphi command itself, however it is named: on PATH, by a path, through
 # node or npx, or found at run time by which or command -v.
-DELPHI = re.compile(
+DELPHI_HEAD = (
     r"(?:(?:node|npx|bun|deno\s+run)(?:\s+-\S+)*\s+)?"
     r"(?:\"?\$\((?:which|command\s+-v|type\s+-p|whence\s+-p)\s+delphi\)\"?"
     r"|`(?:which|command\s+-v|type\s+-p)\s+delphi`"
     r"|[\"']?(?:\S*/)?delphi(?:\.js)?[\"']?)"
-    r"\s+[\"']?discard\b"
 )
+DELPHI = re.compile(DELPHI_HEAD + r"\s+[\"']?discard\b")
+# Approving or rejecting a proposal to move, copy or show work in another
+# project. The same fence as discard, for the same reason: it is a person's
+# decision, and an agent that reached it would be deciding about its own
+# proposal. The store refuses an agent's decision too; this is the courtesy in
+# front of it for a harness whose author type is not set.
+DELPHI_FLAGS = re.compile(DELPHI_HEAD + r"\s+[\"']?flags[\"']?\s+[\"']?(?:approve|reject)\b")
 
 
-def runs_discard(rest: str, depth: int = 0) -> bool:
-    """Whether this text, read as a command, is delphi discard once wrappers go."""
+def runs_delphi(rest: str, verb, depth: int = 0) -> bool:
+    """Whether this text, read as a command, is that delphi verb once wrappers go."""
     rest = rest.lstrip()
-    if DELPHI.match(rest):
+    if verb.match(rest):
         return True
     if depth >= 10:
         return False
     for wrapper in WRAPPERS:
         m = wrapper.match(rest)
-        if m and m.end() and runs_discard(rest[m.end():], depth + 1):
+        if m and m.end() and runs_delphi(rest[m.end():], verb, depth + 1):
             return True
     return False
+
+
+def runs_discard(rest: str, depth: int = 0) -> bool:
+    """Whether this text, read as a command, is delphi discard once wrappers go."""
+    return runs_delphi(rest, DELPHI, depth)
 
 
 def unmask(cmd: str) -> str:
@@ -148,10 +159,13 @@ def unmask(cmd: str) -> str:
 ARGV_DISCARD = re.compile(
     r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']discard["']"""
 )
+ARGV_FLAGS = re.compile(
+    r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']flags["']\s*,\s*["'](?:approve|reject)["']"""
+)
 
 
-def is_delphi_discard(cmd: str) -> bool:
-    """Whether delphi discard is run anywhere in this segment, in command position.
+def in_command_position(cmd: str, verb, argv) -> bool:
+    """Whether that delphi verb is run anywhere in this segment, in command position.
 
     Command position is the start, or just inside a $( ), a backquote, a ( or
     a <( ), or the quoted argument of an -c flag (sh -c, bash -lc, script -qc,
@@ -159,12 +173,22 @@ def is_delphi_discard(cmd: str) -> bool:
     grep pattern, a Sheet entry) is not in command position and is allowed.
     """
     cmd = unmask(cmd)
-    if ARGV_DISCARD.search(cmd):
+    if argv.search(cmd):
         return True
     starts = [0]
     starts += [m.end() for m in re.finditer(r"\$\(|<\(|`|\(|\{\s", cmd)]
     starts += [m.end() for m in re.finditer(r"\s-[a-zA-Z]*c\s+[\"']", cmd)]
-    return any(runs_discard(cmd[i:]) for i in starts)
+    return any(runs_delphi(cmd[i:], verb) for i in starts)
+
+
+def is_delphi_discard(cmd: str) -> bool:
+    """Whether delphi discard is run anywhere in this segment, in command position."""
+    return in_command_position(cmd, DELPHI, ARGV_DISCARD)
+
+
+def is_delphi_flags_decision(cmd: str) -> bool:
+    """Whether delphi flags approve or reject is run anywhere in this segment, in command position."""
+    return in_command_position(cmd, DELPHI_FLAGS, ARGV_FLAGS)
 
 
 def check_segment(cmd: str):
@@ -247,6 +271,12 @@ def check_segment(cmd: str):
         return (
             "delphi discard throws a Workbench away, and that is for a person to "
             "decide. Say what you would discard and why in the task's Sheet instead."
+        )
+    if is_delphi_flags_decision(c):
+        return (
+            "delphi flags approve and reject decide where someone's work lives, and "
+            "that is for a person. Say what you think on the flag instead: flag_item "
+            "adds to it, and propose_move records a proposal."
         )
     # DELPHI_CLIENT tells the MCP server the command line is calling, which
     # unlocks its command line only tools. An agent has no reason to say so.

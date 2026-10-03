@@ -10,7 +10,7 @@
 const fs = require("fs");
 const path = require("path");
 const { DatabaseSync } = require("node:sqlite");
-const { LATER_COLUMNS, LATER_TABLES } = require("../agent/schema_later");
+const { LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, apply } = require("../agent/schema_later");
 
 const db = new DatabaseSync(":memory:");
 db.exec(fs.readFileSync(path.join(__dirname, "..", "schema.sql"), "utf8"));
@@ -44,6 +44,52 @@ for (const [table, statement] of LATER_TABLES) {
   }
 }
 
-const total = LATER_COLUMNS.length + LATER_TABLES.length;
+// Indexes and triggers the same way: schema_later's text must make the same
+// object schema.sql makes, compared as SQLite stores it with the spacing
+// squeezed out, because a trigger that clears the wrong entity on one route
+// only shows up as a dangling association months later.
+const squeeze = (text) => String(text || "").replace(/\s+/g, " ").replace(/ IF NOT EXISTS/g, "").trim();
+const stored = (handle, type, name) =>
+  (handle.prepare("SELECT sql FROM sqlite_master WHERE type = ? AND name = ?").get(type, name) || {}).sql;
+for (const [, table, , statement] of LATER_INDEXES) {
+  // The other later tables an index needs, made here so every index can be
+  // created on this second handle the way schema_later would.
+  if (!stored(later, "table", table)) later.exec(stored(db, "table", table));
+  later.exec(statement);
+}
+for (const [, table] of LATER_TRIGGERS) if (!stored(later, "table", table)) later.exec(stored(db, "table", table));
+for (const [name, , , statement] of LATER_TRIGGERS) later.exec(statement);
+let extra = 0;
+for (const [type, list] of [["index", LATER_INDEXES], ["trigger", LATER_TRIGGERS]]) {
+  for (const [name] of list) {
+    extra++;
+    const want = squeeze(stored(db, type, name));
+    const got = squeeze(stored(later, type, name));
+    if (want && want === got) {
+      console.log(`  ok   ${type} ${name} is in schema.sql the same way`);
+    } else {
+      failed++;
+      console.log(`  FAIL ${type} ${name}: schema.sql ${want ? "declares it differently" : "does not declare it"}\n       schema.sql      ${want}\n       schema_later.js ${got}`);
+    }
+  }
+}
+
+// An old database, made before any of the later tables, gains every one of
+// them, their indexes and their triggers when schema_later runs on it, which is
+// what the MCP server does on startup against a file the app has not opened.
+const old = new DatabaseSync(":memory:");
+old.exec("CREATE TABLE projects (id INTEGER PRIMARY KEY, key TEXT, name TEXT); CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER, title TEXT); CREATE TABLE notes (id INTEGER PRIMARY KEY, project_id INTEGER, title TEXT, body TEXT); CREATE TABLE scratchpads (id INTEGER PRIMARY KEY, project_id INTEGER, key TEXT, title TEXT, body TEXT); CREATE TABLE links (id INTEGER PRIMARY KEY, project_id INTEGER, label TEXT, url TEXT);");
+const ran = apply((statement) => old.prepare(statement).all());
+for (const [type, names] of [["table", ["item_flags", "flag_entries", "item_projects", "item_copies"]],
+                             ["index", LATER_INDEXES.filter(([n]) => /item|flag/.test(n)).map(([n]) => n)],
+                             ["trigger", LATER_TRIGGERS.map(([n]) => n)]]) {
+  for (const name of names) {
+    extra++;
+    if (stored(old, type, name)) console.log(`  ok   an old database gains ${type} ${name}`);
+    else { failed++; console.log(`  FAIL an old database did not gain ${type} ${name} (${JSON.stringify(ran.errors)})`); }
+  }
+}
+
+const total = LATER_COLUMNS.length + LATER_TABLES.length + extra;
 console.log(`\n${total - failed}/${total} checks passed`);
 process.exit(failed ? 1 : 0);

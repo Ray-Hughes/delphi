@@ -99,6 +99,24 @@ const state = {
   oracleEntities: [],
   oracleError: null,
   provider: null,
+  // Every job, newest first, from runs:list. Read by Runs, Needs you, the
+  // sidebar, the title bar and a task's chip, and replaced whole on
+  // runs-changed rather than patched, so none of them can disagree.
+  runs: [],
+  // Every task in every project, for the sidebar's late counts and its
+  // "touched lately". The same list as allTasks when nothing narrows it.
+  everyTask: [],
+  // settings.json as last read, for the agent limits Runs draws.
+  settings: {},
+  pinned: [],
+  restOpen: false,
+  // Today opens All work until it is built; this says which of the two was clicked.
+  todayPick: false,
+  runsEarlier: false,
+  inboxFilter: "all",     // all | approvals | questions
+  inboxGroup: "urgency",  // urgency | project
+  lastHandAgent: null,
+  lastHandKind: "ask",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -546,6 +564,10 @@ async function refresh() {
       state.organizers = [];
     }
   }
+  state.everyTask = !state.query && !state.projectId
+    ? state.allTasks
+    : await window.delphi.tasks.list({ projectId: null, includeDone: true });
+  try { state.runs = await window.delphi.runs.list({ limit: 300 }); } catch { state.runs = []; }
   render();
 }
 
@@ -638,146 +660,10 @@ function goBack() {
 
 
 /**
- * The sidebar: where you are, and every project you could go to.
- *
- * It used to list only the projects inside the open workspace, and a workspace
- * is a folder. A project nobody had linked to a folder (every project an agent
- * made over MCP, and every one older than workspaces) had no row anywhere, and
- * could be reached only by clicking its chip on a task. So the picker is now a
- * tree of every project: each workspace with its projects under it, then the
- * projects that are in none. Zoomed into a workspace it narrows to that folder,
- * as before, because that is the point of zooming in.
- */
-function renderSidebar() {
-  renderRail();
-  const box = $("projects");
-  const foot = $("sidebar-foot");
-  box.textContent = "";
-  if (foot) foot.textContent = "";
-  box.onkeydown = sidebarArrows;
-
-  // A project opened from a chip or Back may not be in the workspace that is
-  // zoomed in. Drawing that workspace would put its sessions under a folder they
-  // have nothing to do with, so the full tree is drawn instead, with it marked.
-  const zoomed = state.workspaces.find((w) => w.id === state.workspaceId) || null;
-  const workspace = zoomed && (!state.projectId || state.wsProjects.some((p) => p.id === state.projectId))
-    ? zoomed : null;
-
-  if (!workspace) {
-    renderProjectTree(box);
-    projectFoot(foot);
-    return;
-  }
-
-  // --- inside a workspace --------------------------------------------------
-  const head = el("div", { className: "pp-head" });
-  const name = el("div", { className: "nm" });
-  name.append(el("span", { className: "t", textContent: workspace.name, title: workspace.name }));
-  name.append(el("span", { className: "p", textContent: workspace.path, title: workspace.path }));
-  head.append(name);
-  box.append(head);
-
-  box.append(el("div", { className: "pp-sec" },
-    el("span", { textContent: "Projects" }),
-    el("span", { className: "n", textContent: String(state.wsProjects.length) })));
-
-  const addProject = el("div", { className: "gnew", tabIndex: 0, role: "button" },
-    el("span", { textContent: "+" }), el("span", { textContent: "New project" }));
-  const make = () => createProject(workspace);
-  addProject.onclick = make;
-  addProject.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); make(); } };
-  box.append(addProject);
-
-  if (!state.wsProjects.length) {
-    box.append(el("div", { className: "pp-empty",
-      textContent: "No projects in this workspace yet." }));
-  }
-
-  for (const p of state.wsProjects) box.append(...projectRows(p, () => navigate({ projectId: p.id, view: "chat" })));
-
-  // The repository, under the sessions. Painted async and appended when it
-  // answers, because asking git costs a spawn and the sidebar must not wait on
-  // it. A folder that is not a repository is the ordinary case here, not an
-  // error, so it simply says nothing.
-  const gitBox = el("div", { className: "gitfoot" });
-  box.append(gitBox);
-  paintGit(gitBox, workspace.path);
-
-  if (foot) {
-    const settings = el("button", {
-      className: "btn wide" + (["project", "workspace"].includes(state.view) ? " primary" : ""),
-      textContent: state.projectId ? "Project settings" : "Workspace settings",
-      title: state.projectId ? "Settings for this project" : "Settings for this workspace",
-    });
-    settings.onclick = () => navigate({ view: state.projectId ? "project" : "workspace" });
-    foot.append(settings);
-  }
-}
-
-/**
- * Every project, under the workspace it belongs to, then the rest.
- *
- * A project in two workspaces is listed under both, because each is a true
- * answer to "what is in this folder", but drawn in full only under its home
- * one. Drawn in full twice, the open project's sessions appeared twice, with
- * two "+ New session" rows and two places claiming to be where you are. The
- * counts are open tasks, the number that says whether a project needs looking at.
- */
-function renderProjectTree(box) {
-  const counted = new Set();
-  const byId = new Map(state.projects.map((p) => [p.id, p]));
-
-  box.append(el("div", { className: "pp-sec" },
-    el("span", { textContent: "Projects" }),
-    el("span", { className: "n", textContent: String(state.projects.length) })));
-
-  if (!state.projects.length && !state.workspaces.length) {
-    box.append(el("div", { className: "pp-empty",
-      textContent: "None yet. Use + on the rail to add a folder, or file a task from an agent." }));
-    return;
-  }
-
-  for (const w of state.workspaces) {
-    const inside = (state.wsMembers.get(w.id) || []).map((id) => byId.get(id)).filter(Boolean);
-    const row = el("div", { className: "ws-row", tabIndex: 0, role: "button", title: `${w.path}\nOpen this workspace` });
-    row.append(el("span", { className: "ws-ico", textContent: w.icon || railLetter(w.name) }));
-    row.append(el("div", { className: "ws-txt" },
-      el("span", { className: "ws-nm", textContent: w.name }),
-      el("span", { className: "ws-p", textContent: w.path })));
-    if (inside.length) row.append(el("span", { className: "count", textContent: String(inside.length), title: "Projects" }));
-    row.onclick = () => zoomInto(w.id);
-    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); zoomInto(w.id); } };
-    row.oncontextmenu = (e) => { e.preventDefault(); workspaceMenu(w, e.clientX, e.clientY); };
-    box.append(row);
-
-    if (!inside.length) continue;
-    const kids = el("div", { className: "gkids" });
-    for (const p of inside) {
-      counted.add(p.id);
-      const home = state.wsHome.get(p.id);
-      const homeName = (state.workspaces.find((x) => x.id === home) || {}).name;
-      kids.append(...(home === w.id || !homeName
-        ? projectRows(p, () => openProjectIn(p, w.id))
-        : [echoRow(p, homeName, () => openProjectIn(p, home))]));
-    }
-    box.append(kids);
-  }
-
-  const loose = state.projects.filter((p) => !counted.has(p.id));
-  if (!loose.length) return;
-  // Named for what they lack rather than hidden behind a toggle, so a project
-  // an agent filed somewhere unexpected is one glance away, not one click.
-  box.append(el("div", { className: "pp-group", title: "Right-click a project to put it in a workspace" },
-    el("span", { textContent: state.workspaces.length ? "Not in a workspace" : "All projects" }),
-    el("span", { className: "n", textContent: String(loose.length) })));
-  for (const p of loose) box.append(...projectRows(p, () => navigate({ projectId: p.id, view: "chat" })));
-}
-
-/**
  * One project's row, and its sessions under it when it is the open one.
  *
- * Shared by the tree and the zoomed-in list so the two cannot drift: same
- * dot, same count, same keys, same menu.
+ * The sidebar draws its own row now and borrows only the sessions from here,
+ * so the rename, close and keyboard handling for a session live in one place.
  */
 function projectRows(p, open) {
   const on = p.id === state.projectId;
@@ -833,42 +719,6 @@ function projectRows(p, open) {
     kids.append(srow);
   }
   return [row, kids];
-}
-
-/**
- * A project's second mention, under a workspace that is not its home: the name,
- * dimmed, and where it lives in full. Never marked current and never given the
- * sessions, so there is one of each on screen. Opens the project at home.
- */
-function echoRow(p, homeName, open) {
-  const row = el("div", { className: "gs echo", tabIndex: 0, role: "button",
-    title: `${p.name}\nAlso in ${homeName}, where its sessions are` });
-  row.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }));
-  row.append(el("span", { className: "nm dim", textContent: p.name }));
-  row.append(el("span", { className: "kbd", textContent: `in ${homeName}` }));
-  row.onclick = open;
-  row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
-  row.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
-  return row;
-}
-
-/** The settings button for a project open outside any workspace. */
-function projectFoot(foot) {
-  if (!foot || !state.projectId) return;
-  const settings = el("button", {
-    className: "btn wide" + (state.view === "project" ? " primary" : ""),
-    textContent: "Project settings",
-    title: "Settings for this project",
-  });
-  settings.onclick = () => navigate({ view: "project" });
-  foot.append(settings);
-}
-
-/** Opens a project inside the workspace it was listed under, so its folder is the one sessions use. */
-async function openProjectIn(p, workspaceId) {
-  state.workspaceId = workspaceId;
-  state.wsProjects = await window.delphi.workspaces.projects(workspaceId);
-  return navigate({ projectId: p.id, view: "chat" });
 }
 
 /**
@@ -1045,6 +895,8 @@ function projectRow(p) {
 function renderTabs() {
   const box = $("tabs");
   box.textContent = "";
+  // Runs and Needs you are places of their own, not tabs of All work.
+  if (onHomeView()) return;
 
   const tabs = state.query
     ? [["oracle", "Oracle", state.oracleHits.length], ["tasks", "Matches", state.tasks.length + state.notes.length]]
@@ -1091,6 +943,12 @@ function render() {
   } else if (p) {
     $("title").textContent = p.name;
     $("subtitle").textContent = p.summary || "";
+  } else if (state.view === "runs") {
+    $("title").textContent = "Runs";
+    $("subtitle").textContent = "Agents working for you, across every project. Each run has its own Workbench and its own live Sheet; open one to watch it.";
+  } else if (state.view === "inbox") {
+    $("title").textContent = "Needs you";
+    $("subtitle").textContent = "Everything an agent is paused on until you answer, across all projects. Answering here clears it everywhere: in Runs, and on the task's Sheet.";
   } else {
     $("title").textContent = "All work";
     $("subtitle").textContent = "Everything open, across every project";
@@ -1104,7 +962,7 @@ function render() {
     ? ["overview", "chat", "tasks", "queue", "pads", "notes", "links", "activity", "project", "workspace"]
     : state.workspaceId
     ? ["new", "tasks", "queue", "graph", "activity", "workspace"]
-    : ["new", "tasks", "queue", "graph", "reminders", "history", "settings"];
+    : ["new", "tasks", "queue", "graph", "reminders", "history", "settings", ...HOME_VIEWS];
   if (!valid.includes(state.view)) state.view = valid[0];
 
   // Hidden rather than disabled when there is nowhere to go: a button that is
@@ -1113,6 +971,7 @@ function render() {
 
   renderMetrics();
   renderTabs();
+  paintTitleLive();
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
   // pane that has moved on. Several views await an IPC call before appending,
@@ -1154,6 +1013,8 @@ function render() {
     project: renderProjectSettings,
     workspace: renderWorkspaceSettings,
     settings: renderSettings,
+    runs: renderRuns,
+    inbox: renderInbox,
   })[state.view];
 
   // Several views are async. Without this, a throw inside one leaves an empty
@@ -1232,7 +1093,7 @@ function spinWhile(pane, { delay = 140 } = {}) {
 function renderMetrics() {
   const box = $("metrics");
   box.textContent = "";
-  if (state.query) return;
+  if (state.query || onHomeView()) return;
 
   const open = state.allTasks.filter((t) => t.status !== "done");
   const figures = [
@@ -1806,6 +1667,33 @@ function renderProjectSettings(root) {
     "What this project is called everywhere it appears: the sidebar, the title, and any task that belongs to it.",
     el("div", { className: "row" }, nameInput), nameMsg));
 
+  // --- folder ----------------------------------------------------------------
+  // Where an agent works when nothing more specific says: the last place a job
+  // looks, after the repositories and the workspaces. The refusal a job gives
+  // when a project has none sends people here by name, so it has to be here.
+  const folderMsg = el("span", { className: "hint" });
+  const folderInput = commitOnEnter(el("input", { className: "field", value: project.path || "", placeholder: "/path/to/the/code" }));
+  folderInput.onblur = () => {
+    const live = currentProject();
+    const value = folderInput.value.trim();
+    if (!live || value === (live.path || "")) return;
+    save({ path: value || null }, folderMsg);
+  };
+  const folderPick = el("button", { className: "btn", type: "button", textContent: "Choose folder…" });
+  folderPick.onclick = async () => {
+    try {
+      const picked = await window.delphi.dialog.pickFolder("The project's folder");
+      if (!picked) return;
+      folderInput.value = picked;
+      save({ path: picked }, folderMsg);
+    } catch (error) { folderMsg.className = "err-msg"; folderMsg.textContent = error.message; }
+  };
+  const folderBox = settingSection("Folder",
+    "Where agents work on this project when it has no repository or workspace of its own. A run that changes code still gets its own Workbench beside it; one that only answers reads from here.",
+    el("div", { className: "row" }, folderInput, folderPick), folderMsg);
+  folderBox.id = "project-folder";
+  root.append(folderBox);
+
   // --- workspaces ----------------------------------------------------------
   // A project is work, and work happens in folders: sometimes one, sometimes
   // four. SSNR spans caseflow, caseflow-efolder, the MPI person update service
@@ -1974,6 +1862,49 @@ function renderProjectSettings(root) {
       delMsg.textContent = error.message;
     });
   };
+  // --- agents ----------------------------------------------------------------
+  // Both off by default and both only ever set from this window: the MCP
+  // server cannot write either, so no agent can approve its own work by
+  // changing them. Each says what turning it on gives away, in the place it
+  // is turned on, rather than in a document nobody reads first.
+  const perms = el("div", { className: "setting", id: "agent-perms" });
+  perms.append(el("h3", { textContent: "Agents" }),
+    el("p", { textContent: "What agents may do in this project without asking you first. Work you hand to an agent yourself always starts straight away." }));
+  const permRow = (key, label, off, on, confirmOn = null) => {
+    const live = currentProject() || project;
+    const checked = Number(live[key]) === 1;
+    const id = `perm-${key}`;
+    const row = el("div", { className: "agent-perm" + (checked ? " on" : "") });
+    const box = el("input", { type: "checkbox", checked, id });
+    const say = el("div", { className: "warn-say", textContent: checked ? on : off });
+    const msg = el("span", { className: "hint" });
+    box.onchange = async () => {
+      if (box.checked && confirmOn) {
+        const ok = await wbDialog({
+          title: confirmOn.title, lead: confirmOn.lead,
+          actions: [{ label: "Keep it off", value: false }, { label: confirmOn.yes, kind: "danger", value: true }],
+          cancelValue: false,
+        });
+        if (!ok) { box.checked = false; return; }
+      }
+      await save({ [key]: box.checked }, msg);
+    };
+    row.append(box, el("div", {}, el("label", { className: "lbl", htmlFor: id, textContent: label }), say, msg));
+    return row;
+  };
+  perms.append(
+    permRow("auto_approve", "Let agents start work without asking",
+      "Off: when an agent hands work to another agent here, it waits in Needs you until you approve it.",
+      "On: an agent can set other agents working in this project, and you see it in Runs rather than being asked. Delphi still stops a project that runs away with itself after 12 jobs in an hour."),
+    permRow("allow_unguarded", "Allow agents without Delphi's safety guard",
+      "Off: an agent changes code here only with something checking its commands first: Claude Code with agent/guard.py installed, or Codex in its sandbox. Copilot is refused.",
+      "On: Copilot, and Claude Code without the guard, may run commands that nothing checks first, so an irreversible one (a force push, a deleted folder) would not be stopped. Each run still works only in its own Workbench.",
+      { title: "Allow agents without the safety guard?",
+        lead: "Copilot, and Claude Code without agent/guard.py, would run commands in this project's Workbenches with nothing checking them first. A force push or a deleted folder would not be stopped. Turn this on only if you accept that for this project.",
+        yes: "Allow it" }),
+  );
+  root.append(perms);
+
   root.append(settingSection("Delete this project",
     "Removes the project and, unless you say otherwise, hands its tasks back to All work. Everything it holds is copied first, so the whole thing can be put back from History afterwards.",
     el("div", { className: "row" }, del, delMsg)));
@@ -2192,7 +2123,10 @@ function projectMenu(p, x, y) {
     .filter((s) => s !== "archived" && s !== p.status)
     .map((s) => ({ label: PROJECT_STATUS_VERB[s], run: () => set({ status: s }) }));
 
+  const pinned = state.pinned.includes(p.id);
   rowMenu(x, y, [
+    { label: pinned ? "Unpin" : "Pin to the top", run: () => setPinned(p.id, !pinned) },
+    "-",
     { label: "Rename", run: rename },
     { label: p.summary ? "Edit the summary" : "Add a summary", run: describe },
     "-",
@@ -8124,6 +8058,9 @@ async function openTaskSheet(taskId) {
   // node kept across paintTop, so whatever paints it owns its own redraws and
   // a menu open on it survives a live refresh of the header.
   const wbSlot = el("div", { className: "wb" });
+  // This task's newest run, live: its state, and the way to Runs. Kept across
+  // paintTop for the same reason wbSlot is.
+  const runSlot = el("div", { className: "run-slot" });
   const flash = (text) => {
     flashHost.textContent = text;
     setTimeout(() => { if (flashHost.textContent === text) flashHost.textContent = ""; }, 1500);
@@ -8168,7 +8105,20 @@ async function openTaskSheet(taskId) {
     } else {
       crumbs.append(el("span", { className: "crumb-now", textContent: `task ${detail.task.id}` }));
     }
-    top.append(crumbs, el("span", { className: "spacer" }), flashHost, wbSlot, el("span", { className: "wb-sep" }));
+    top.append(crumbs, el("span", { className: "spacer" }), flashHost, runSlot, wbSlot, el("span", { className: "wb-sep" }));
+    paintRun();
+
+    const toAgent = el("button", { className: "btn sm", type: "button", textContent: "Hand to agent" });
+    toAgent.title = "Ask an agent about this task, or have it do the work in the task's own Workbench";
+    toAgent.onclick = async () => {
+      const run = await handToAgent(detail);
+      if (!run) return;
+      flash(`handed to ${run.harness_label}`);
+      // The list is asked for now rather than on the next runs-changed, so
+      // the chip is there the moment the dialog closes.
+      try { state.runs = await window.delphi.runs.list({ limit: 300 }); } catch {}
+      paintRunsLive();
+    };
 
     const hand = el("button", { className: "btn sm", textContent: "Copy brief" });
     hand.title = "Copies this task, its discussion and its history as a brief an agent can act on";
@@ -8197,7 +8147,43 @@ async function openTaskSheet(taskId) {
     close.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>';
     close.onclick = () => closeSheet();
 
-    top.append(hand, del, close);
+    top.append(toAgent, hand, del, close);
+  }
+
+  /**
+   * The chip for this task's newest run: open ones always, finished ones on
+   * the day they finished. A failure that names a setting gets the button to
+   * it, the same as in Runs.
+   */
+  function paintRun() {
+    runSlot.textContent = "";
+    const run = state.runs.find((r) => r.task_id === taskId);
+    if (!run) return;
+    const open = RUN_OPEN.includes(run.state);
+    if (!open && !isToday(run.finished_at || run.updated_at)) return;
+    const chip = runStateChip(run, "button");
+    chip.type = "button";
+    chip.textContent = `${run.harness_label || run.harness} ${RUN_STATE_WORDS[run.state] || run.state}`;
+    chip.title = [run.reply, run.request].filter(Boolean).join("\n\n");
+    const toRuns = async () => {
+      await closeSheet();
+      goTo({ projectId: null, view: RUN_WAITING.includes(run.state) ? "inbox" : "runs", query: "" });
+    };
+    chip.onclick = toRuns;
+    runSlot.append(chip);
+    if (run.state === "failed") {
+      const fix = settingFix(run.reply, run.project_id);
+      if (fix) {
+        const b = el("button", { className: "ts-linkbtn", type: "button", textContent: fix.label });
+        b.onclick = fix.go;
+        runSlot.append(b);
+      }
+    }
+    const sheetLink = el("button", { className: "ts-linkbtn", type: "button", textContent: "Sheet", title: "The newest entries on this task's Sheet, where the run writes" });
+    sheetLink.onclick = () => { railList.scrollTop = railList.scrollHeight; };
+    const runsLink = el("button", { className: "ts-linkbtn", type: "button", textContent: "Runs" });
+    runsLink.onclick = toRuns;
+    runSlot.append(sheetLink, runsLink);
   }
 
   // --- workbench ------------------------------------------------------------
@@ -9499,6 +9485,7 @@ async function openTaskSheet(taskId) {
   const handle = {
     overlay, close: closeSheet, live, taskId,
     wbRepaint: () => paintWorkbench(),
+    runsRepaint: () => paintRun(),
     // From a BUSY refusal: bring a running entry into view with its output open.
     showEntry: (id) => {
       outputOpen.add(id);
@@ -9527,6 +9514,1048 @@ async function openTaskSheet(taskId) {
     },
   };
   openSheet = handle;
+}
+
+// ---------------------------------------------------------------------------
+// Runs and Needs you
+//
+// One list of jobs (agent/jobs.js), read once and drawn in five places: the
+// Runs page, the Needs you inbox, the sidebar's badges, the title bar, and the
+// chip on a task. All five read state.runs, so answering something in one
+// clears it from the others in the same repaint rather than whenever each
+// next thinks to ask.
+// ---------------------------------------------------------------------------
+
+// The places that are not a project and have no tabs of their own.
+const HOME_VIEWS = ["runs", "inbox"];
+const RUN_OPEN = ["queued", "needs_approval", "running", "waiting_on_human"];
+const RUN_WAITING = ["needs_approval", "waiting_on_human"];
+
+const runsIn = (states) => state.runs.filter((r) => states.includes(r.state));
+const waitingRuns = () => runsIn(RUN_WAITING);
+// Questions answered here, by run, with the updated_at the run had then. The
+// dispatcher resumes an answered run on its next pass, which can be a minute
+// away; until the run itself moves it is shown as answered and not counted.
+const answeredRuns = new Map();
+const isAnswered = (r) => answeredRuns.has(r.id) && answeredRuns.get(r.id) === r.updated_at;
+const needsYouCount = () => waitingRuns().filter((r) => !isAnswered(r)).length;
+const onHomeView = () => !state.query && !state.projectId && HOME_VIEWS.includes(state.view);
+
+/**
+ * Asks for the list again, at most a few times a second.
+ *
+ * A running job reports activity once a second and every enabled agent can
+ * have several going, so a trailing debounce could be starved for as long as
+ * they run. This is a throttle instead: the first change starts a short timer
+ * and every change inside it rides along. The comparison afterwards means a
+ * ping that changed nothing anybody can see repaints nothing.
+ */
+let runsTimer = null;
+let runsBusy = false;
+let runsAgain = false;
+function runsChanged() {
+  if (runsTimer) return;
+  runsTimer = setTimeout(() => { runsTimer = null; reloadRuns(); }, 400);
+}
+async function reloadRuns() {
+  if (runsBusy) { runsAgain = true; return; }
+  runsBusy = true;
+  try {
+    do {
+      runsAgain = false;
+      let next;
+      try { next = await window.delphi.runs.list({ limit: 300 }); } catch { return; }
+      if (JSON.stringify(next) === JSON.stringify(state.runs)) continue;
+      state.runs = next;
+      paintRunsLive();
+    } while (runsAgain);
+  } finally {
+    runsBusy = false;
+  }
+}
+
+/** Everything that shows a run, and nothing else: no tasks, notes or pads are asked for again. */
+function paintRunsLive() {
+  renderSidebar();
+  paintTitleLive();
+  if (onHomeView()) repaintKeepingFocus();
+  if (openSheet && openSheet.runsRepaint) openSheet.runsRepaint();
+}
+
+/**
+ * A repaint that leaves the person where they were.
+ *
+ * render() replaces the pane, so a reply half typed into a question would be
+ * dropped by the next activity ping. Drafts live in runDrafts and the field
+ * that had focus is found again by its data-keep, caret and all.
+ */
+function repaintKeepingFocus() {
+  const a = document.activeElement;
+  const key = a && a.dataset ? a.dataset.keep : null;
+  const sel = key && typeof a.selectionStart === "number" ? [a.selectionStart, a.selectionEnd] : null;
+  render();
+  if (!key) return;
+  const again = document.querySelector(`[data-keep="${CSS.escape(key)}"]`);
+  if (!again) return;
+  again.focus({ preventScroll: true });
+  if (sel && again.setSelectionRange) { try { again.setSelectionRange(sel[0], sel[1]); } catch {} }
+}
+
+// What has been typed into a reply or a reason, by run, so a repaint keeps it.
+const runDrafts = new Map();
+// When Stop was pressed, by run. A run still going well after that gets Kill.
+const stopAsked = new Map();
+const KILL_AFTER_MS = 8000;
+
+// The clocks on the page move without asking the main process anything: the
+// stamps are already here, and only their distance from now has changed.
+setInterval(() => {
+  if (!onHomeView()) return;
+  for (const node of document.querySelectorAll("[data-since]")) node.textContent = spanWords(TIME.secondsSince(node.dataset.since));
+  for (const node of document.querySelectorAll("[data-waiting]")) node.textContent = `waiting ${spanWords(TIME.secondsSince(node.dataset.waiting))}`;
+}, 15000);
+
+// ---------------------------------------------------------------------------
+// Words and small parts
+
+/** 4:21pm, the way the mockups and a person say it. */
+function clockWords(stamp) {
+  const at = TIME.parseStamp(stamp);
+  if (!at) return "";
+  const h = at.getHours();
+  return `${h % 12 || 12}:${String(at.getMinutes()).padStart(2, "0")}${h >= 12 ? "pm" : "am"}`;
+}
+
+/** 40s, 19m, 2h 5m. */
+function spanWords(seconds) {
+  const s = Number.isFinite(seconds) ? Math.max(0, Math.round(seconds)) : 0;
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+const compactNumber = (n) => n < 1000 ? String(n) : n < 1e6 ? `${Math.round(n / 1000)}k` : `${(n / 1e6).toFixed(1)}M`;
+
+/**
+ * What a run has cost, in the unit its agent reports. Claude Code reports
+ * dollars and Codex reports tokens, and the two are never converted or added:
+ * a total made of guesses would be worse than two honest numbers.
+ */
+function runCost(run) {
+  if (run.cost_usd != null && run.cost_usd > 0) return `$${run.cost_usd.toFixed(2)}`;
+  const tokens = (run.tokens_in || 0) + (run.tokens_out || 0);
+  return tokens ? `${compactNumber(tokens)} tokens` : null;
+}
+
+const firstLineOf = (text, n = 160) => {
+  const line = String(text || "").split("\n").map((l) => l.trim()).find(Boolean) || "";
+  return line.length > n ? `${line.slice(0, n - 3)}...` : line;
+};
+
+// el() assigns props, and dataset is a getter that cannot be assigned to.
+const withData = (node, data) => { Object.assign(node.dataset, data); return node; };
+
+const AGENT_MARKS = { "claude-code": "C", codex: "X", copilot: "G" };
+
+function agentAvatar(key, label) {
+  const known = Object.prototype.hasOwnProperty.call(AGENT_MARKS, key);
+  const letter = known ? AGENT_MARKS[key] : String(label || key || "?").trim().charAt(0).toUpperCase() || "?";
+  return el("span", { className: `avatar lg ag-${known ? key : "other"}`, textContent: letter, title: label || key || "" });
+}
+
+function projectDot(projectId) {
+  const p = state.projects.find((x) => x.id === projectId);
+  return el("span", { className: "dot", style: `background:${(p && p.colour) || "var(--ink-faint)"}` });
+}
+
+/** "#155 The Foundry", or the request's first line for a job with no task yet. */
+function runTitle(run) {
+  const t = el("div", { className: "t" });
+  if (run.task_id) {
+    t.append(el("span", { className: "id", textContent: `#${run.task_id}` }), run.task_title || firstLineOf(run.request));
+  } else {
+    t.append(firstLineOf(run.request));
+  }
+  t.title = run.task_title || run.request || "";
+  return t;
+}
+
+const runWho = (run) => run.actor || run.harness;
+
+const RUN_STATE_WORDS = {
+  queued: "queued", needs_approval: "needs approval", running: "running",
+  waiting_on_human: "waiting on you", done: "done", failed: "failed", stopped: "stopped",
+};
+const RUN_STATE_CLASS = {
+  queued: "queued", needs_approval: "waiting", running: "running",
+  waiting_on_human: "waiting", done: "ok", failed: "fail", stopped: "stopped",
+};
+function runStateChip(run, tag = "span") {
+  return el(tag, { className: `ts-run-state ${RUN_STATE_CLASS[run.state] || ""}`, textContent: RUN_STATE_WORDS[run.state] || run.state });
+}
+
+// Fixed markup only, never anything from the database.
+const HOME_ICONS = {
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  inbox: '<path d="M3 13h5l1.5 3h5L16 13h5"/><path d="M5.5 5h13L21 13v6H3v-6z"/>',
+  runs: '<rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7h.01M7 17h.01"/>',
+  list: '<path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/>',
+  memory: '<path d="M12 3a6 6 0 0 0-4 10.5V17h8v-3.5A6 6 0 0 0 12 3z"/><path d="M9 21h6"/>',
+  folder: '<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2.5h8.5A1.5 1.5 0 0 1 21 9v9.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none"/>',
+  open: '<path d="M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
+};
+function homeIcon(name, className = "") {
+  const holder = document.createElement("span");
+  holder.innerHTML = `<svg class="${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${HOME_ICONS[name]}</svg>`;
+  return holder.firstChild;
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+
+/** The limits the dispatcher works to, read the way agent/dispatch.js reads them. */
+function runLimits() {
+  const s = state.settings || {};
+  const int = (v, fallback, lo, hi) => {
+    const n = Number(v);
+    return v != null && Number.isInteger(n) && n >= lo && n <= hi ? n : fallback;
+  };
+  const per = s.jobHarnessLimits && typeof s.jobHarnessLimits === "object" ? s.jobHarnessLimits : {};
+  return { global: int(s.jobConcurrency, 3, 1, 16), harness: (key) => int(per[key], 1, 0, 16) };
+}
+
+const enabledAgents = () => state.harnesses.filter((h) => Number(h.enabled) === 1 || h.enabled === true);
+const agentLabel = (key) => (state.harnesses.find((h) => h.key === key) || {}).label || key;
+
+/** Why a queued run has not started, in the dispatcher's own order of checks. */
+function whyQueued(run) {
+  const lim = runLimits();
+  const running = runsIn(["running"]);
+  const label = run.harness_label || agentLabel(run.harness);
+  const sameTask = run.task_id ? running.find((r) => r.task_id === run.task_id) : null;
+  if (sameTask) return `Waits for run ${sameTask.id} on the same task, which has one Workbench.`;
+  const cap = lim.harness(run.harness);
+  if (cap === 0) return `${label} is set to 0 at a time, so it waits until that is raised.`;
+  // The agent's own limit first when both bind: it is the more specific
+  // answer, and raising the overall number alone would not start it.
+  const mine = running.filter((r) => r.harness === run.harness).length;
+  if (mine >= cap) return `Waits for a ${label} slot. ${mine} of ${cap} ${cap === 1 ? "is" : "are"} busy.`;
+  if (running.length >= lim.global) return `Waits for a free slot. ${running.length} of ${lim.global} are busy.`;
+  return "Starts in a moment.";
+}
+
+function slotsBar() {
+  const lim = runLimits();
+  const running = runsIn(["running"]);
+  const bar = el("div", { className: "slots" });
+  const pips = el("span", { className: "slot-pips", title: `${running.length} of ${lim.global} slots in use` });
+  for (let i = 0; i < lim.global; i += 1) pips.append(el("i", { className: i < running.length ? "on" : "" }));
+  const busy = running.length >= lim.global ? `All ${lim.global} are busy.`
+    : running.length ? `${running.length} busy, ${lim.global - running.length} free.`
+    : lim.global === 1 ? "It is free." : `All ${lim.global} are free.`;
+  const per = el("span", { className: "per" });
+  enabledAgents().forEach((h, i) => {
+    const n = running.filter((r) => r.harness === h.key).length;
+    per.append(i ? ", " : "", `${h.label} `, el("b", { textContent: `${n} of ${lim.harness(h.key)}` }));
+  });
+  if (per.childNodes.length) per.append(".");
+  const change = el("button", { className: "btn sm", textContent: "Change", type: "button" });
+  change.onclick = () => limitsDialog();
+  bar.append(pips,
+    el("span", {}, el("b", { textContent: `${plural(lim.global, "agent", "agents")} at a time.` }), ` ${busy} `, per),
+    el("span", { className: "grow" }),
+    el("span", { className: "hint", textContent: "A run waiting on you gives its slot back." }),
+    change);
+  return bar;
+}
+
+/**
+ * How many agents at once, overall and per agent. Written through
+ * settings:set, then read back: a value the main process did not keep is said
+ * to have not been kept, rather than shown as saved.
+ */
+async function limitsDialog() {
+  const lim = runLimits();
+  let global = lim.global;
+  const per = Object.fromEntries(enabledAgents().map((h) => [h.key, lim.harness(h.key)]));
+  const say = el("div", { className: "lim-say" });
+  const paintSay = () => {
+    say.textContent = "";
+    const top = Object.entries(per).filter(([, n]) => n > 0 && n < global).sort((a, b) => b[1] - a[1])[0];
+    say.append("Up to ", el("b", { textContent: plural(global, "agent", "agents") }), " run at once");
+    if (top) say.append(", and no more than ", el("b", { textContent: `${top[1]} of them ${agentLabel(top[0])}` }));
+    say.append(". The next queued run starts the moment a slot frees. A run that is paused on you does not count.");
+  };
+  const stepper = (get, set, lo, hi) => {
+    const value = el("span", { textContent: String(get()) });
+    const less = el("button", { type: "button", textContent: "-", title: "Fewer" });
+    const more = el("button", { type: "button", textContent: "+", title: "More" });
+    const sync = () => { value.textContent = String(get()); less.disabled = get() <= lo; more.disabled = get() >= hi; paintSay(); };
+    less.onclick = () => { set(Math.max(lo, get() - 1)); sync(); };
+    more.onclick = () => { set(Math.min(hi, get() + 1)); sync(); };
+    sync();
+    return el("span", { className: "step" }, less, value, more);
+  };
+  const row = (avatar, label, note, step) => el("div", { className: "lim-row" }, avatar,
+    el("div", {}, el("div", { textContent: label }), note ? el("div", { className: "hint", textContent: note }) : null), step);
+  const rows = [row(el("span", { className: "avatar lg ag-other", textContent: "#" }), "All agents together", "Across every project",
+    stepper(() => global, (n) => { global = n; }, 1, 16))];
+  for (const h of enabledAgents()) {
+    rows.push(row(agentAvatar(h.key, h.label), h.label, h.key === "claude-code" ? "A subscription throttles past about 2" : null,
+      stepper(() => per[h.key], (n) => { per[h.key] = n; }, 0, 16)));
+  }
+  paintSay();
+  const ok = await wbDialog({
+    title: "How many agents at once",
+    body: [...rows, say],
+    actions: [{ label: "Cancel", value: false }, { label: "Save", kind: "primary", value: true }],
+    cancelValue: false,
+  });
+  if (!ok) return;
+  try {
+    const saved = await window.delphi.settings.set({ jobConcurrency: global, jobHarnessLimits: per });
+    const kept = saved && Number(saved.jobConcurrency) === global;
+    state.settings = saved || state.settings;
+    if (!kept) notify("Delphi did not keep that: this version does not accept agent limits from the window yet. They can be set in settings.json as jobConcurrency and jobHarnessLimits.", { error: true });
+  } catch (error) { notifyError(error); }
+  paintRunsLive();
+}
+
+// ---------------------------------------------------------------------------
+// Acting on a run
+
+async function openRunSheet(run) {
+  if (!run.task_id) { notify("This run has no task yet. It gets one, and a Sheet, when it starts."); return; }
+  await openTaskSheet(run.task_id);
+}
+
+/** Does something to a run, says what went wrong in the dispatcher's words, and asks for the list again. */
+async function runAct(fn) {
+  try { await fn(); } catch (error) { notifyError(error); }
+  reloadRuns();
+}
+
+async function stopRun(run) {
+  if (stopAsked.has(run.id) && Date.now() - stopAsked.get(run.id) >= KILL_AFTER_MS) {
+    // A second stop on a live run is the dispatcher's kill: SIGKILL to the
+    // agent's whole process group, no grace period.
+    return runAct(() => window.delphi.runs.stop(run.id));
+  }
+  const label = run.harness_label || run.harness;
+  const where = run.workbench && run.workbench.branch ? el("div", { className: "grp" },
+    el("div", { className: "grp-h" }, "Left in ", el("code", { textContent: run.workbench.branch })),
+    el("div", { className: "hint", textContent: run.workbench.path || "" })) : null;
+  const ok = await wbDialog({
+    title: `Stop ${label}${run.task_id ? ` on #${run.task_id}` : ""}?`,
+    lead: "It stops now, mid-step. Nothing is thrown away: the Workbench stays exactly as it is, and a Sheet entry records who stopped it and when.",
+    body: [where, el("p", { className: "wb-lead", textContent: "Afterwards you can hand it back to an agent, finish it yourself, or discard it from the task." })],
+    actions: [{ label: "Keep running", value: false }, { label: "Stop the run", kind: "danger", value: true }],
+    cancelValue: false,
+  });
+  if (!ok) return;
+  stopAsked.set(run.id, Date.now());
+  // Repainted once the grace period is over, so Stop turns into Kill without
+  // anything else having to happen first.
+  setTimeout(() => { if (onHomeView()) repaintKeepingFocus(); }, KILL_AFTER_MS + 100);
+  await runAct(() => window.delphi.runs.stop(run.id));
+}
+
+function stopButton(run) {
+  const asked = stopAsked.get(run.id);
+  const kill = asked && Date.now() - asked >= KILL_AFTER_MS;
+  const b = el("button", { className: "btn stop" + (kill ? " kill" : ""), type: "button" });
+  if (kill) {
+    b.textContent = "Kill";
+    b.title = "It has not stopped. Kill ends the agent and everything it started at once.";
+  } else if (asked) {
+    b.textContent = "Stopping";
+    b.disabled = true;
+  } else {
+    b.append(homeIcon("stop"), "Stop");
+  }
+  b.onclick = () => stopRun(run);
+  return b;
+}
+
+/**
+ * The button that goes with a refusal, when the refusal names a setting.
+ * Matched on the setting the sentence names, so a sentence that says only
+ * what went wrong gets no button rather than a wrong one.
+ */
+function settingFix(text, projectId) {
+  const t = String(text || "");
+  if (projectId && /project\b[^.]*settings|Allow unguarded agents/i.test(t)) {
+    const anchor = /\bFolder\b/.test(t) ? "project-folder" : "agent-perms";
+    return { label: "Open project settings", go: () => openProjectSettingsAt(projectId, anchor) };
+  }
+  if (/Settings, under Agents/i.test(t)) {
+    return { label: "Open Settings", go: () => goTo({ projectId: null, view: "settings", query: "" }) };
+  }
+  return null;
+}
+
+/** Project settings, scrolled to the section a refusal named, with its first field ready. */
+async function openProjectSettingsAt(projectId, anchor) {
+  if (openSheet) await openSheet.close();
+  await goTo({ projectId, view: "project", query: "" });
+  const box = document.getElementById(anchor);
+  if (!box) return;
+  box.scrollIntoView({ block: "start", behavior: motionOff() ? "auto" : "smooth" });
+  const field = box.querySelector("input");
+  if (field) field.focus({ preventScroll: true });
+}
+
+// ---------------------------------------------------------------------------
+// Rows
+
+function runningRow(run) {
+  const row = el("div", { className: "run" });
+  const s = el("div", { className: "s" }, projectDot(run.project_id),
+    el("span", { textContent: run.project_name || "" }), el("span", { className: "who", textContent: runWho(run) }));
+  if (run.workbench && run.workbench.branch) s.append(el("span", { className: "wbn", textContent: run.workbench.branch, title: run.workbench.path || "" }));
+  const main = el("div", { style: "min-width:0" }, runTitle(run), s);
+  if (run.last_activity) main.append(el("div", { className: "last", textContent: run.last_activity, title: run.last_activity }));
+  const since = run.started_at || run.created_at;
+  const cost = runCost(run);
+  const nums = el("div", { className: "nums" }, runStateChip(run), el("br"),
+    withData(el("b", { textContent: spanWords(TIME.secondsSince(since)) }), { since }), ` since ${clockWords(since)}`);
+  if (cost) nums.append(el("br"), el("span", { className: "c", textContent: `${cost} so far` }));
+  const sheet = el("button", { className: "btn", type: "button" }, homeIcon("open"), "Sheet");
+  sheet.onclick = () => openRunSheet(run);
+  row.append(agentAvatar(run.harness, run.harness_label), main, nums, el("div", { className: "acts" }, sheet, stopButton(run)));
+  return row;
+}
+
+function queuedRow(run) {
+  const row = el("div", { className: "run two" });
+  const s = el("div", { className: "s" }, projectDot(run.project_id), el("span", { textContent: run.project_name || "" }),
+    runStateChip(run), el("span", { textContent: whyQueued(run) }));
+  const remove = el("button", { className: "ts-linkbtn", type: "button", textContent: "Remove", title: "Take it out of the queue. Nothing has run." });
+  remove.onclick = () => runAct(() => window.delphi.runs.stop(run.id));
+  row.append(agentAvatar(run.harness, run.harness_label), el("div", { style: "min-width:0" }, runTitle(run), s), el("div", { className: "acts" }, remove));
+  return row;
+}
+
+function finishedRow(run) {
+  const row = el("div", { className: "run two" });
+  const rejected = run.approval === "rejected";
+  const res = run.state === "done" ? ["ok", "done"] : run.state === "failed" ? ["fail", "failed"] : ["stopped", rejected ? "rejected" : "stopped"];
+  const s = el("div", { className: "s wrap" }, el("span", { className: `res ${res[0]}`, textContent: res[1] }),
+    el("span", { className: "who", textContent: runWho(run) }));
+  const began = TIME.parseStamp(run.started_at);
+  const ended = TIME.parseStamp(run.finished_at);
+  const when = clockWords(run.finished_at);
+  if (began && ended) s.append(el("span", { textContent: `${when}, took ${spanWords((ended - began) / 1000)}` }));
+  else if (when) s.append(el("span", { textContent: when }));
+  const cost = runCost(run);
+  if (cost) s.append(el("span", { textContent: cost }));
+  const main = el("div", { style: "min-width:0" }, runTitle(run), s);
+  if (run.reply) main.append(el("div", { className: "result", textContent: firstLineOf(run.reply, 240), title: run.reply }));
+
+  const acts = el("div", { className: "acts" });
+  if (run.state === "failed") {
+    const fix = settingFix(run.reply, run.project_id);
+    if (fix) {
+      const b = el("button", { className: "ts-linkbtn", type: "button", textContent: fix.label });
+      b.onclick = fix.go;
+      acts.append(b);
+    }
+    // The dispatcher's own way to carry on: a reply queues the job again,
+    // resuming the agent's session when it has one.
+    const retry = el("button", { className: "ts-linkbtn", type: "button", textContent: "Retry" });
+    retry.onclick = () => runAct(() => window.delphi.runs.reply(run.id, "Try again from where you stopped."));
+    acts.append(retry);
+  }
+  const open = el("button", { className: "ts-linkbtn", type: "button", textContent: run.state === "done" && run.workbench ? "Review" : "Sheet" });
+  open.disabled = !run.task_id;
+  open.onclick = () => openRunSheet(run);
+  acts.append(open);
+  row.append(agentAvatar(run.harness, run.harness_label), main, acts);
+  return row;
+}
+
+/** The context an agent attached, as one readable line, whatever shape it came in. */
+function contextWords(context) {
+  if (context == null) return "";
+  if (typeof context === "string") return context;
+  for (const key of ["why", "reason", "summary", "note"]) if (typeof context[key] === "string") return context[key];
+  return "";
+}
+
+function waitingSide(run, buttons) {
+  const since = run.updated_at || run.created_at;
+  return el("div", { className: "side" },
+    withData(el("div", { className: "when", textContent: `waiting ${spanWords(TIME.secondsSince(since))}` }), { waiting: since }),
+    el("div", { className: "acts" }, buttons));
+}
+
+function approvalRow(run) {
+  const row = el("div", { className: "wr approve" });
+  const label = run.harness_label || run.harness;
+  const t = el("div", { className: "t" }, el("b", { textContent: label }),
+    run.kind === "do" ? " wants to change code for " : " wants to look into ");
+  if (run.task_id) t.append(el("b", { textContent: `#${run.task_id}` }), ` ${run.task_title || ""}`);
+  else t.append(`project ${run.project_name || ""}`);
+  const main = el("div", { style: "min-width:0" }, el("span", { className: "k", textContent: "Approval" }), t,
+    el("div", { className: "cmd", textContent: run.request || "" }));
+  const why = contextWords(run.context);
+  if (why) main.append(el("div", { className: "why", textContent: why }));
+  const s = el("div", { className: "s" }, projectDot(run.project_id), el("span", { textContent: run.project_name || "" }));
+  if (run.requested_by) s.append(el("span", { className: "who", textContent: `asked by ${run.requested_by}` }));
+  s.append(el("span", { textContent: run.kind === "do" ? "in its own Workbench" : "read only, in the project's folder" }));
+  main.append(s);
+
+  // Reject asks why, inline, so the reason goes on the Sheet with the
+  // refusal. Empty is allowed: a reason is a courtesy, not a gate.
+  const reasonKey = `reject-${run.id}`;
+  const rejecting = runDrafts.has(reasonKey);
+  if (rejecting) {
+    const field = withData(el("input", { className: "field", placeholder: "Why not? Optional. It goes on the Sheet.", value: runDrafts.get(reasonKey) || "" }), { keep: reasonKey });
+    field.oninput = () => runDrafts.set(reasonKey, field.value);
+    const send = el("button", { className: "btn no", type: "button", textContent: "Reject" });
+    const go = () => { const why = field.value.trim(); runDrafts.delete(reasonKey); runAct(() => window.delphi.runs.reject(run.id, why || null)); };
+    send.onclick = go;
+    field.onkeydown = (e) => {
+      if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); go(); }
+      if (e.key === "Escape") { e.stopPropagation(); runDrafts.delete(reasonKey); repaintKeepingFocus(); }
+    };
+    main.append(el("div", { className: "reject-why" }, field, send));
+    requestAnimationFrame(() => { if (field.isConnected && !document.activeElement?.dataset?.keep) field.focus(); });
+  }
+
+  const approve = el("button", { className: "btn ok", type: "button", textContent: "Approve" });
+  approve.onclick = () => { approve.disabled = true; runAct(() => window.delphi.runs.approve(run.id)); };
+  const reject = el("button", { className: "btn no", type: "button", textContent: rejecting ? "Cancel" : "Reject" });
+  reject.onclick = () => {
+    if (rejecting) runDrafts.delete(reasonKey); else runDrafts.set(reasonKey, "");
+    repaintKeepingFocus();
+  };
+  const buttons = [approve, reject];
+  if (run.task_id) {
+    const sheet = el("button", { className: "btn", type: "button", textContent: "Open Sheet" });
+    sheet.onclick = () => openRunSheet(run);
+    buttons.push(sheet);
+  }
+  row.append(agentAvatar(run.harness, label), main, waitingSide(run, buttons));
+  return row;
+}
+
+/**
+ * The question a waiting run's agent asked: the newest unanswered ask on its
+ * task's Sheet, by the job's own actor. Cached by the run's updated_at, so the
+ * Sheet is read again only when the run itself has moved.
+ */
+const askCache = new Map();
+async function askFor(run) {
+  const key = `${run.id}:${run.updated_at}`;
+  const hit = askCache.get(run.id);
+  if (hit && hit.key === key) return hit.ask;
+  if (!run.task_id) return null;
+  let ask = null;
+  try {
+    const read = await window.delphi.sheets.read(run.task_id, { mode: "tail", n: 80 });
+    const entries = (read && read.entries) || [];
+    const answered = new Set(entries.filter((e) => e.kind === "decide" && e.ref_id).map((e) => e.ref_id));
+    ask = [...entries].reverse().find((e) => e.kind === "ask" && !answered.has(e.id) && (!run.actor || e.author === run.actor)) || null;
+  } catch { ask = null; }
+  askCache.set(run.id, { key, ask });
+  return ask;
+}
+
+function questionRow(run) {
+  const row = el("div", { className: "wr question" });
+  const cached = askCache.get(run.id);
+  const fresh = cached && cached.key === `${run.id}:${run.updated_at}`;
+  const ask = fresh ? cached.ask : null;
+  if (!fresh) {
+    // Drawn with what the run already says, then again once the Sheet has
+    // answered, in place, so the rest of the page is not repainted for it.
+    askFor(run).then(() => { if (row.isConnected) row.replaceWith(questionRow(run)); });
+  }
+
+  const t = el("div", { className: "t" });
+  if (run.task_id) t.append(el("b", { textContent: `#${run.task_id}` }), " ");
+  t.append(ask ? ask.body : (run.reply ? firstLineOf(run.reply, 400) : `${run.harness_label} is waiting for an answer on the Sheet.`));
+  const main = el("div", { style: "min-width:0" }, el("span", { className: "k", textContent: "Question" }), t);
+
+  const options = ask && ask.meta && Array.isArray(ask.meta.options) ? ask.meta.options : [];
+  if (isAnswered(run)) {
+    main.append(el("div", { className: "why", textContent: "Answered. The run carries on the next time Delphi checks, within a minute." }));
+    row.append(agentAvatar(run.harness, run.harness_label), main, waitingSide(run, []));
+    return row;
+  }
+  if (options.length) {
+    const opts = el("div", { className: "opts" });
+    for (const o of options) {
+      const b = el("button", { className: "ts-opt", type: "button" },
+        el("span", { className: "ts-opt-key", textContent: String(o.key) }), String(o.label || o.text || o.key));
+      b.onclick = () => {
+        for (const x of opts.querySelectorAll("button")) x.disabled = true;
+        // Answering on the Sheet is what resumes the job: the dispatcher sees
+        // the decision against its agent's question and queues the next turn.
+        runAct(async () => {
+          await window.delphi.sheets.decide(ask.id, o.key, null);
+          answeredRuns.set(run.id, run.updated_at);
+          paintRunsLive();
+        });
+      };
+      opts.append(b);
+    }
+    main.append(opts);
+  }
+
+  const replyKey = `reply-${run.id}`;
+  const field = withData(el("input", {
+    className: "field",
+    placeholder: options.length ? "Or reply in your own words. It goes on the Sheet and the run carries on." : "Reply in your own words. It goes on the Sheet and the run carries on.",
+    value: runDrafts.get(replyKey) || "",
+  }), { keep: replyKey });
+  field.oninput = () => runDrafts.set(replyKey, field.value);
+  const send = el("button", { className: "btn", type: "button", textContent: "Reply" });
+  const go = () => {
+    const text = field.value.trim();
+    if (!text) { field.focus(); return; }
+    runDrafts.delete(replyKey);
+    send.disabled = true;
+    runAct(() => window.delphi.runs.reply(run.id, text));
+  };
+  send.onclick = go;
+  field.onkeydown = (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); go(); } };
+  main.append(el("div", { className: "reply" }, field, send));
+
+  const s = el("div", { className: "s" }, projectDot(run.project_id), el("span", { textContent: run.project_name || "" }),
+    el("span", { className: "who", textContent: runWho(run) }));
+  const asked = (ask && ask.created_at) || run.finished_at || run.updated_at;
+  if (asked) s.append(el("span", { textContent: `asked at ${clockWords(asked)}` }));
+  main.append(s);
+
+  const buttons = [];
+  if (run.task_id) {
+    const sheet = el("button", { className: "btn", type: "button", textContent: "Open Sheet" });
+    sheet.onclick = () => openRunSheet(run);
+    buttons.push(sheet);
+  }
+  row.append(agentAvatar(run.harness, run.harness_label), main, waitingSide(run, buttons));
+  return row;
+}
+
+const waitingRow = (run) => (run.state === "needs_approval" ? approvalRow(run) : questionRow(run));
+
+/** Oldest first: whoever has been waiting longest is answered first. */
+const byWaitAge = (a, b) => String(a.updated_at || a.created_at).localeCompare(String(b.updated_at || b.created_at));
+
+// ---------------------------------------------------------------------------
+// The two pages
+
+function section(title, count, hint, ...nodes) {
+  const head = el("div", { className: "sec-h" }, el("h2", { textContent: title }));
+  if (count != null) head.append(el("span", { className: "ts-count", textContent: String(count) }));
+  head.append(el("span", { className: "grow" }));
+  if (hint) head.append(typeof hint === "string" ? el("span", { className: "hint", textContent: hint }) : hint);
+  return el("div", { className: "sec" }, head, ...nodes);
+}
+
+const isToday = (stamp) => TIME.dayOf(stamp) === today();
+
+function renderRuns(root) {
+  const page = el("div", { className: "home-page" });
+  page.append(slotsBar());
+
+  const running = runsIn(["running"]);
+  const queued = runsIn(["queued"]).sort((a, b) => a.id - b.id);
+  const waiting = waitingRuns().sort(byWaitAge);
+  const finishedAll = runsIn(["done", "failed", "stopped"]);
+  const finished = state.runsEarlier ? finishedAll : finishedAll.filter((r) => isToday(r.finished_at || r.updated_at));
+
+  const box = (rows, empty) => el("div", { className: "box" }, rows.length ? rows : el("div", { className: "empty-line", textContent: empty }));
+
+  const left = el("div");
+  left.append(section("Running", running.length, "each in its own Workbench",
+    box(running.map(runningRow), "Nothing is running. Hand a task to an agent from its panel, or approve one waiting on you.")));
+  if (queued.length) left.append(section("Queued", queued.length, "start in this order as slots free", box(queued.map(queuedRow), "")));
+  const earlier = el("button", { className: "ts-linkbtn", type: "button", textContent: state.runsEarlier ? "Today only" : "Earlier" });
+  earlier.onclick = () => { state.runsEarlier = !state.runsEarlier; render(); };
+  left.append(section(state.runsEarlier ? "Finished" : "Finished today", finished.length, earlier,
+    box(finished.map(finishedRow), state.runsEarlier ? "Nothing has finished yet." : "Nothing has finished today.")));
+
+  // Each agent's own unit, summed per agent and never across them.
+  const totals = new Map();
+  for (const r of [...running, ...finishedAll.filter((x) => isToday(x.finished_at || x.updated_at))]) {
+    const t = totals.get(r.harness) || { label: r.harness_label || r.harness, usd: 0, tokens: 0 };
+    if (r.cost_usd) t.usd += r.cost_usd;
+    else t.tokens += (r.tokens_in || 0) + (r.tokens_out || 0);
+    totals.set(r.harness, t);
+  }
+  const spent = [...totals.values()].filter((t) => t.usd || t.tokens);
+  if (spent.length) {
+    const note = el("div", { className: "rule-note" }, "Today so far: ");
+    spent.forEach((t, i) => note.append(i ? ", " : "", el("b", { textContent: `${t.label} ${t.usd ? `$${t.usd.toFixed(2)}` : `${compactNumber(t.tokens)} tokens`}` })));
+    note.append(". Each agent reports its own unit, so they are not added together.");
+    left.lastChild.append(note);
+  }
+
+  const right = el("div", { className: "waiting-col" });
+  right.append(section("Waiting on you", waiting.length, "paused until you answer",
+    box(waiting.map(waitingRow), "Nothing is waiting on you.")));
+
+  page.append(el("div", { className: "runs-cols" }, left, right));
+  root.append(page);
+}
+
+function renderInbox(root) {
+  const page = el("div", { className: "home-page narrow" });
+  const all = waitingRuns().sort(byWaitAge);
+  const approvals = all.filter((r) => r.state === "needs_approval");
+  const questions = all.filter((r) => r.state === "waiting_on_human");
+
+  const group = el("div", { className: "seg-sm", role: "group" });
+  for (const [key, label] of [["urgency", "By urgency"], ["project", "By project"]]) {
+    const b = el("button", { type: "button", textContent: label });
+    b.setAttribute("aria-pressed", String(state.inboxGroup === key));
+    b.onclick = () => { state.inboxGroup = key; render(); };
+    group.append(b);
+  }
+  const chips = el("div", { className: "chips" });
+  for (const [key, label, n, cls] of [["all", "All", all.length, ""], ["approvals", "Approvals", approvals.length, "approve"], ["questions", "Questions", questions.length, "question"]]) {
+    const b = el("button", { className: `chipf ${cls}`.trim(), type: "button" });
+    b.setAttribute("aria-pressed", String(state.inboxFilter === key));
+    if (cls) b.append(el("span", { className: "sw" }));
+    b.append(`${label} `, el("b", { textContent: String(n) }));
+    b.onclick = () => { state.inboxFilter = key; render(); };
+    chips.append(b);
+  }
+  chips.append(el("span", { className: "grow" }), group);
+  page.append(chips);
+
+  const shown = state.inboxFilter === "approvals" ? approvals : state.inboxFilter === "questions" ? questions : all;
+  if (!shown.length) {
+    page.append(emptyState(all.length ? "Nothing of this kind" : "Nothing needs you",
+      "When an agent asks to start work, or asks a question on a Sheet, it waits here until you answer."));
+  } else {
+    const box = el("div", { className: "box" });
+    if (state.inboxGroup === "project") {
+      const byProject = new Map();
+      for (const r of shown) {
+        if (!byProject.has(r.project_id)) byProject.set(r.project_id, []);
+        byProject.get(r.project_id).push(r);
+      }
+      for (const [, list] of byProject) {
+        box.append(el("div", { className: "sub-h" }, list[0].project_name || "No project", el("span", { className: "r", textContent: plural(list.length, "waiting", "waiting") })));
+        list.forEach((r) => box.append(waitingRow(r)));
+      }
+    } else {
+      box.append(el("div", { className: "sub-h" }, "Agents are paused on these", el("span", { className: "r", textContent: "longest waiting first" })));
+      shown.forEach((r) => box.append(waitingRow(r)));
+    }
+    page.append(box);
+  }
+  page.append(el("div", { className: "rule-note" },
+    el("b", { textContent: "What is here: " }), "only things an agent is blocked on you for. Your own tasks are in All work. Finished runs are in Runs, under Finished today."));
+  root.append(page);
+}
+
+/** The title bar's line: how many agents are working and how many things wait on you. */
+function paintTitleLive() {
+  const box = $("tb-live");
+  if (!box) return;
+  const running = runsIn(["running"]).length;
+  const waiting = needsYouCount();
+  box.textContent = "";
+  box.hidden = !running && !waiting;
+  if (box.hidden) return;
+  if (running) box.append(el("span", { className: "live-dot" }), el("b", { textContent: String(running) }), running === 1 ? " agent working" : " agents working");
+  if (waiting) box.append(el("span", { className: "tbask", textContent: `${waiting} waiting on you` }));
+  box.title = waiting ? "Open Needs you" : "Open Runs";
+  box.onclick = () => goTo({ projectId: null, view: waiting ? "inbox" : "runs", query: "" });
+}
+
+// ---------------------------------------------------------------------------
+// Hand to agent, from a task
+
+/**
+ * A small composer: which agent, ask or do, and what for. Resolves to the new
+ * run, or null. A refusal is shown as the dispatcher wrote it, word for word,
+ * with a button to the setting it names when it names one, and the dialog
+ * stays open so the request is not lost.
+ */
+async function handToAgent(detail) {
+  if (!state.harnesses.length) {
+    try { state.harnesses = await window.delphi.harnesses.list(); } catch {}
+  }
+  const agents = enabledAgents();
+  const projectId = detail.project ? detail.project.id : detail.task.project_id;
+  return new Promise((resolve) => {
+    const overlay = el("div", { className: "overlay" });
+    const box = el("div", { className: "ask wb-dialog hand-dialog", role: "dialog" });
+    box.setAttribute("aria-modal", "true");
+    box.setAttribute("aria-label", "Hand to an agent");
+    const me = { box };
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKey, true);
+      const at = dialogStack.indexOf(me);
+      if (at >= 0) dialogStack.splice(at, 1);
+      overlay.remove();
+      resolve(value);
+    };
+
+    const picker = el("select", { className: "field", id: "hand-agent" });
+    for (const h of agents) {
+      const o = el("option", { value: h.key, textContent: h.ready === false ? `${h.label} (${h.detail || "not installed"})` : h.label });
+      picker.append(o);
+    }
+    const last = state.lastHandAgent && agents.some((h) => h.key === state.lastHandAgent) ? state.lastHandAgent : null;
+    if (last) picker.value = last;
+
+    let kind = state.lastHandKind === "do" ? "do" : "ask";
+    const kindSay = el("div", { className: "kind-say" });
+    const seg = el("div", { className: "seg-sm", role: "group" });
+    const paintKind = () => {
+      for (const b of seg.children) b.setAttribute("aria-pressed", String(b.dataset.kind === kind));
+      kindSay.textContent = kind === "do"
+        ? "Changes code in this task's own Workbench, a separate folder and branch. Nothing is merged or pushed without you."
+        : "Reads the project and answers on this task's Sheet. Changes nothing.";
+    };
+    for (const [key, label] of [["ask", "Ask"], ["do", "Do"]]) {
+      const b = withData(el("button", { type: "button", textContent: label }), { kind: key });
+      b.onclick = () => { kind = key; paintKind(); };
+      seg.append(b);
+    }
+    paintKind();
+
+    const request = el("textarea", { className: "field", id: "hand-request", placeholder: "What should it do? It also reads this task and its Sheet." });
+    const refusal = el("div", { className: "refusal", role: "alert" });
+    refusal.hidden = true;
+
+    const cancel = el("button", { className: "btn", type: "button", textContent: "Cancel" });
+    const go = el("button", { className: "btn primary", type: "button", textContent: "Hand it over" });
+    cancel.onclick = () => finish(null);
+    const submit = async () => {
+      if (go.disabled) return;
+      if (!agents.length) return;
+      go.disabled = true;
+      refusal.hidden = true;
+      try {
+        const run = await window.delphi.runs.create({ projectId, harness: picker.value, request: request.value, taskId: detail.task.id, kind });
+        state.lastHandAgent = picker.value;
+        state.lastHandKind = kind;
+        finish(run);
+      } catch (error) {
+        go.disabled = false;
+        refusal.textContent = "";
+        const words = String(error && error.message ? error.message : error);
+        refusal.append(el("div", { textContent: words }));
+        const fix = settingFix(words, projectId);
+        if (fix) {
+          const b = el("button", { className: "btn sm", type: "button", textContent: fix.label });
+          b.onclick = async () => { finish(null); await fix.go(); };
+          refusal.append(b);
+        }
+        refusal.hidden = false;
+      }
+    };
+    go.onclick = submit;
+    const onKey = (e) => {
+      if (dialogStack[dialogStack.length - 1] !== me) return;
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(null); }
+      else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.stopPropagation(); submit(); }
+    };
+    dialogStack.push(me);
+    document.addEventListener("keydown", onKey, true);
+
+    box.append(el("h3", { textContent: "Hand to an agent" }),
+      el("p", { className: "wb-lead", textContent: `#${detail.task.id} ${detail.task.title}` }));
+    if (!agents.length) {
+      box.append(el("div", { className: "refusal" }, el("div", { textContent: "No agent is turned on here. Turn one on in Settings, under Agents." })));
+      go.disabled = true;
+    } else {
+      box.append(el("label", { className: "lab", htmlFor: "hand-agent", textContent: "Agent" }), picker,
+        el("label", { className: "lab", textContent: "Kind" }), seg, kindSay,
+        el("label", { className: "lab", htmlFor: "hand-request", textContent: "Request" }), request);
+    }
+    box.append(refusal, el("div", { className: "ask-actions" }, el("span", { className: "hint", textContent: "Command + Enter to hand it over" }),
+      el("div", { style: "display:flex; gap:8px" }, cancel, go)));
+    box.querySelector(".ask-actions").style.justifyContent = "space-between";
+    overlay.append(box);
+    overlay.onclick = (e) => { if (e.target === overlay) finish(null); };
+    document.body.append(overlay);
+    (agents.length ? request : cancel).focus();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Pins
+
+// Kept in this window's storage until settings:set accepts pinnedProjects;
+// once it does, the setting wins and this copy is only the fallback.
+const PIN_KEY = "delphi.pinnedProjects";
+function readPins(settings) {
+  const clean = (list) => (Array.isArray(list) ? list.map(Number).filter(Number.isInteger) : []);
+  if (settings && Array.isArray(settings.pinnedProjects) && settings.pinnedProjects.length) return clean(settings.pinnedProjects);
+  try { return clean(JSON.parse(localStorage.getItem(PIN_KEY) || "[]")); } catch { return []; }
+}
+async function setPinned(projectId, on) {
+  const next = state.pinned.filter((id) => id !== projectId);
+  if (on) next.push(projectId);
+  state.pinned = next;
+  try { localStorage.setItem(PIN_KEY, JSON.stringify(next)); } catch {}
+  renderSidebar();
+  try {
+    const saved = await window.delphi.settings.set({ pinnedProjects: next });
+    if (saved) state.settings = saved;
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// The sidebar
+
+const ACTIVE_DAYS = 14;
+
+/** Per project: open tasks overdue, and the newest time anything in it was touched. */
+function projectPulse() {
+  const late = new Map();
+  const touched = new Map();
+  for (const t of state.everyTask) {
+    if (isOverdue(t)) late.set(t.project_id, (late.get(t.project_id) || 0) + 1);
+    const at = t.updated_at || t.created_at;
+    if (at && String(at) > String(touched.get(t.project_id) || "")) touched.set(t.project_id, at);
+  }
+  for (const p of state.projects) {
+    if (p.updated_at && String(p.updated_at) > String(touched.get(p.id) || "")) touched.set(p.id, p.updated_at);
+  }
+  return { late, touched };
+}
+
+function sidebarPlace() {
+  if (state.query || state.projectId) return null;
+  if (state.view === "runs") return "runs";
+  if (state.view === "inbox") return "inbox";
+  if (state.view === "graph") return "memory";
+  return state.todayPick ? "today" : "all";
+}
+
+function renderSidebar() {
+  const box = $("projects");
+  const foot = $("sidebar-foot");
+  box.textContent = "";
+  foot.textContent = "";
+  box.parentElement.classList.add("home");
+  foot.classList.add("home");
+  box.onkeydown = sidebarArrows;
+
+  const place = sidebarPlace();
+  const running = runsIn(["running"]);
+  const waiting = needsYouCount();
+  // The same count All work's header gives, from the same list.
+  const openTasks = state.everyTask.filter((t) => t.status !== "done").length;
+  const notes = state.projects.reduce((n, p) => n + (p.note_count || 0), 0);
+
+  const navRow = (key, icon, label, right, go) => {
+    const row = el("div", { className: "proj" + (place === key ? " active" : ""), tabIndex: 0, role: "button" });
+    if (place === key) row.setAttribute("aria-current", "page");
+    row.append(el("span", { className: "ico" }, homeIcon(icon)), el("span", { className: "proj-name", textContent: label }));
+    if (right) row.append(right);
+    const open = () => { $("search").value = ""; go(); };
+    row.onclick = open;
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+    return row;
+  };
+  const count = (n) => (n ? el("span", { className: "count", textContent: String(n) }) : null);
+  const nav = el("div", { className: "nav" });
+  nav.append(
+    // Today is not built yet; until it is, it opens All work rather than an
+    // empty page, and says so on hover.
+    Object.assign(navRow("today", "sun", "Today", null, () => navigate({ projectId: null, view: "new", query: "", todayPick: true })),
+      { title: "Today is on its way. For now it opens All work." }),
+    navRow("inbox", "inbox", "Needs you", waiting ? el("span", { className: "badge hot", textContent: String(waiting) }) : null,
+      () => navigate({ projectId: null, view: "inbox", query: "" })),
+    navRow("runs", "runs", "Runs", running.length ? el("span", { className: "badge live" }, el("span", { className: "live-dot" }), String(running.length)) : null,
+      () => navigate({ projectId: null, view: "runs", query: "" })),
+    navRow("all", "list", "All work", count(openTasks), () => navigate({ projectId: null, view: "new", query: "", todayPick: false })),
+    navRow("memory", "memory", "Memory", count(notes), () => navigate({ projectId: null, view: "graph", query: "", todayPick: false })),
+  );
+  box.append(nav, el("div", { className: "side-sep" }));
+
+  if (!state.projects.length) {
+    box.append(el("div", { className: "pp-empty", textContent: "No projects yet. Make one with New project below, or file a task from an agent." }));
+  }
+
+  const { late, touched } = projectPulse();
+  const agentsOn = new Map();
+  const busy = new Set();
+  for (const r of state.runs) {
+    if (r.state === "running") agentsOn.set(r.project_id, (agentsOn.get(r.project_id) || 0) + 1);
+    if (RUN_OPEN.includes(r.state)) busy.add(r.project_id);
+  }
+  const cutoff = TIME.toStamp(new Date(Date.now() - ACTIVE_DAYS * 86400000));
+  const isActive = (p) => busy.has(p.id) || String(touched.get(p.id) || "") >= cutoff;
+
+  const byId = new Map(state.projects.map((p) => [p.id, p]));
+  const pinned = state.pinned.map((id) => byId.get(id)).filter(Boolean);
+  const pinnedIds = new Set(pinned.map((p) => p.id));
+  const active = state.projects.filter((p) => !pinnedIds.has(p.id) && isActive(p));
+  const activeIds = new Set(active.map((p) => p.id));
+  const rest = state.projects.filter((p) => !pinnedIds.has(p.id) && !activeIds.has(p.id));
+
+  const row = (p) => {
+    const on = p.id === state.projectId;
+    const r = el("div", { className: "proj sb-proj" + (p.open_count ? "" : " quiet") + (on ? " active" : ""), tabIndex: 0, role: "button" });
+    if (on) r.setAttribute("aria-current", "page");
+    r.title = p.open_count ? `${p.name}\n${plural(p.open_count, "open task", "open tasks")}` : p.name;
+    r.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }),
+      el("span", { className: "proj-name", textContent: p.name }));
+    if (p.path) { const f = homeIcon("folder", "fold"); f.append(Object.assign(document.createElementNS("http://www.w3.org/2000/svg", "title"), { textContent: p.path })); r.append(f); }
+    const n = agentsOn.get(p.id);
+    if (n) r.append(el("span", { className: "ag", title: `${plural(n, "agent", "agents")} working here now` }, el("span", { className: "live-dot" }), String(n)));
+    const od = late.get(p.id);
+    if (od) r.append(el("span", { className: "od", textContent: `${od} late` }));
+    r.append(el("span", { className: "count", textContent: p.open_count ? String(p.open_count) : "" }));
+    const open = () => { $("search").value = ""; navigate({ projectId: p.id, view: "chat", query: "" }); };
+    r.onclick = open;
+    r.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+    r.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
+    if (!on) return [r];
+    // The open project keeps its sessions under it, so a conversation is one
+    // click away from wherever the project was opened.
+    const kids = projectRows(p, open)[1];
+    if (kids) kids.className = "sb-kids";
+    return kids ? [r, kids] : [r];
+  };
+
+  if (pinned.length) {
+    box.append(el("div", { className: "side-label" }, "Pinned"));
+    pinned.forEach((p) => box.append(...row(p)));
+  }
+  if (active.length) {
+    box.append(el("div", { className: "side-label" }, "Active", el("span", { className: "grow" }), el("span", { className: "n", textContent: `last ${ACTIVE_DAYS} days` })));
+    active.forEach((p) => box.append(...row(p)));
+  }
+  if (rest.length) {
+    const fold = el("div", { className: "fold-row" + (state.restOpen ? " open" : ""), tabIndex: 0, role: "button" });
+    fold.setAttribute("aria-expanded", String(!!state.restOpen));
+    fold.append(el("span", { className: "car", textContent: "▸" }), el("span", { className: "grow", textContent: pinned.length || active.length ? "Everything else" : "Projects" }));
+    const lateInside = rest.reduce((n, p) => n + (late.get(p.id) || 0), 0);
+    if (!state.restOpen && lateInside) fold.append(el("span", { className: "od", textContent: `${lateInside} late` }));
+    fold.append(el("span", { className: "count", textContent: String(rest.length) }));
+    const toggle = () => { state.restOpen = !state.restOpen; renderSidebar(); };
+    fold.onclick = toggle;
+    fold.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
+    box.append(fold);
+    // Folded, the open project still shows, so the sidebar never hides where you are.
+    rest.filter((p) => state.restOpen || p.id === state.projectId).forEach((p) => box.append(...row(p)));
+  }
+
+  const add = el("button", { className: "btn wide", type: "button" }, homeIcon("plus"), "New project");
+  add.onclick = () => createProject();
+  const gear = el("button", { className: "btn gear", type: "button", title: state.projectId ? "Settings for this project" : "Settings" }, homeIcon("gear"));
+  gear.setAttribute("aria-label", gear.title);
+  gear.onclick = () => navigate(state.projectId ? { view: "project" } : { projectId: null, view: "settings", query: "" });
+  foot.append(add, gear);
 }
 
 // ---------------------------------------------------------------------------
@@ -10933,13 +11962,31 @@ async function createProject(workspace) {
   const ws = workspace || state.workspaces.find((w) => w.id === state.workspaceId);
   // Reachable from the application menu, which does not know whether a workspace
   // is open. Saying so beats a menu item that appears to do nothing.
+  // With no rail there is no workspace open, and a project no longer needs one:
+  // a folder is something a project has. It is made on its own and opened at
+  // its settings, where the folder is the next thing to set.
   if (!ws) {
-    await askText({
-      title: "Open a workspace first",
-      label: "A project lives in a workspace. Pick one from the rail, or add a folder with + first.",
-      value: "", allowEmpty: true, confirmLabel: "Close",
+    const name = await askText({
+      title: "New project",
+      label: "What is this piece of work called? Its folder is set on the next screen.",
+      placeholder: "SSNR / MPI Person Update",
+      confirmLabel: "Create",
     });
-    return null;
+    if (!name) return null;
+    const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    let key = base || `p${Date.now()}`;
+    for (let n = 2; state.projects.some((p) => p.key === key); n += 1) key = `${base}-${n}`;
+    try {
+      const created = await window.delphi.projects.create({
+        key, name, colour: PROJECT_COLOURS[state.projects.length % PROJECT_COLOURS.length],
+      });
+      $("search").value = "";
+      await navigate({ projectId: created.id, view: "project", query: "" });
+      return created;
+    } catch (error) {
+      alert(`Could not create the project: ${error.message}`);
+      return null;
+    }
   }
 
   const name = await askText({
@@ -11153,6 +12200,8 @@ window.delphi.onMenu(async ({ action, view, theme }) => {
 });
 
 window.delphi.onShown(() => { refresh(); $("search").focus(); });
+// A job moved. Only the list of runs is asked for again, throttled; see runsChanged.
+window.delphi.onRunsChanged(() => runsChanged());
 window.delphi.onAlertsChanged(() => refresh());
 // Subscribed once, here, because preload has no way to unsubscribe: an open
 // task panel exposes live() and anything else open ignores it.
@@ -11184,17 +12233,20 @@ async function boot() {
   // slow to do on a render, and the strip needs to know which agents exist
   // before it can draw a tab for each of them.
   window.delphi.harnesses.list()
-    .then((h) => { state.harnesses = h; if (state.view === "chat") render(); })
+    .then((h) => { state.harnesses = h; if (state.view === "chat" || onHomeView()) render(); })
     .catch(() => {});
 
   try {
     const settings = await window.delphi.settings.get();
+    state.settings = settings || {};
+    state.pinned = readPins(settings);
     applyTheme(settings.theme);
     applyMotion(settings.animations !== false);
     if (["formatted", "raw"].includes(settings.noteView)) state.noteView = settings.noteView;
   } catch {
     applyTheme("system");
     applyMotion(true);
+    state.pinned = readPins(null);
   }
   refresh();
 }

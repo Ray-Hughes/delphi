@@ -127,11 +127,13 @@ function snippet(body, queryTerms, limit = 160) {
 }
 
 /**
- * Trims a result until its JSON fits the budget, from the end of the longest
- * list, since every list is in rank order. Says so, so an agent knows to ask
- * for more rather than assume there is none.
+ * Trims a result until its JSON fits the budget. Each round shortens whichever
+ * is bigger: the longest list, from its end since every list is in rank order,
+ * or the longest single string anywhere in the result, cut in half. A list alone
+ * was not enough: one huge note title or Sheet text sailed through any budget.
+ * Says so, so an agent knows to ask for more rather than assume there is none.
  */
-function fit(result, budgetTokens, lists) {
+function fit(result, budgetTokens, lists = []) {
   const limit = budgetTokens * CHARS_PER_TOKEN;
   let size = JSON.stringify(result).length;
   while (size > limit) {
@@ -143,12 +145,33 @@ function fit(result, budgetTokens, lists) {
       const s = JSON.stringify(list).length;
       if (s > longestSize) { longest = key; longestSize = s; }
     }
-    if (!longest) break;
-    result[longest].pop();
+    const field = longestString(result);
+    if (field && field.length > 80 && field.length >= longestSize) {
+      const cut = Math.max(80, Math.floor(field.length / 2));
+      field.holder[field.key] = field.value.slice(0, cut) + "…";
+    } else if (longest) {
+      result[longest].pop();
+    } else {
+      break;
+    }
     result.trimmed = true;
     size = JSON.stringify(result).length;
   }
   return result;
+}
+
+/** The longest string in a result, and where it sits, so fit can shorten it. */
+function longestString(value, best = null) {
+  if (!value || typeof value !== "object") return best;
+  for (const key of Object.keys(value)) {
+    const v = value[key];
+    if (typeof v === "string") {
+      if (!best || v.length > best.length) best = { holder: value, key, value: v, length: v.length };
+    } else if (v && typeof v === "object") {
+      best = longestString(v, best);
+    }
+  }
+  return best;
 }
 
 /**
@@ -317,12 +340,27 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
     };
   }
 
+  /**
+   * The other projects each note and task is shown in, read fresh per answer:
+   * an association is one row and changes without touching the item, so the
+   * corpus signature would not see it.
+   */
+  function alsoIn() {
+    if (!hasTable("item_projects")) return new Map();
+    const rows = sql(`SELECT ip.entity, ip.entity_id, GROUP_CONCAT(p.name, ', ') AS names FROM item_projects ip
+                      JOIN projects p ON p.id = ip.project_id WHERE ip.entity IN ('note', 'task')
+                      GROUP BY ip.entity, ip.entity_id`);
+    return new Map(rows.map((r) => [`${r.entity}:${r.entity_id}`, r.names]));
+  }
+  let also = new Map();
+  const alsoFor = (d) => also.get(`${d.type}:${d.id}`) || undefined;
+
   const noteItem = (d, score, qt) => ({
     id: d.id, title: d.row.title, kind: d.row.kind || undefined, project: d.row.project || undefined,
-    score: round(score), snippet: snippet(d.row.body, qt) || undefined,
+    also_in: alsoFor(d), score: round(score), snippet: snippet(d.row.body, qt) || undefined,
   });
   const taskItem = (d, score, qt) => {
-    const item = { id: d.id, title: d.row.title, status: d.row.status, project: d.row.project || undefined, score: round(score) };
+    const item = { id: d.id, title: d.row.title, status: d.row.status, project: d.row.project || undefined, also_in: alsoFor(d), score: round(score) };
     if (d.row.ref) item.ref = d.row.ref;
     // A task's title is its summary; the detail only earns a line when it is
     // where the match was.
@@ -334,6 +372,7 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
   /** search, compact: the rows that match, best first, one line each. */
   async function search(query, { limit = 8, budget = 1500 } = {}) {
     const r = await rank(query, { exact: true });
+    also = alsoIn();
     // Only rows some list actually matched: fusion puts every graph neighbour
     // in the running, and a search that returns rows without the word in them
     // reads as broken.
@@ -400,6 +439,7 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
   /** oracle_ask, compact: a cited answer, then what it came from. */
   async function ask(question, { limit = 6, budget = 1500 } = {}) {
     const r = await rank(question);
+    also = alsoIn();
     const notes = r.ranked.filter(([d]) => d.type === "note");
     const tasks = r.ranked.filter(([d]) => d.type === "task");
     const said = answer(question, notes, r.c, r.queryTerms);
@@ -490,12 +530,16 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
     }
     if (projects.length) {
       const ids = projects.map((p) => Number(p.id)).join(",");
+      // Filed under the project, or shown in it from another: an association
+      // is a person saying it is this project's business too.
+      const shown = (entity, alias) => (hasTable("item_projects")
+        ? ` OR ${alias}.id IN (SELECT entity_id FROM item_projects WHERE entity = '${entity}' AND project_id IN (${ids}))` : "");
       for (const n of sql(`SELECT n.id, n.title, n.kind, n.updated_at, p.name AS project, substr(n.body, 1, 600) AS body
-                           FROM notes n LEFT JOIN projects p ON p.id = n.project_id WHERE n.project_id IN (${ids})`)) {
+                           FROM notes n LEFT JOIN projects p ON p.id = n.project_id WHERE n.project_id IN (${ids})${shown("note", "n")}`)) {
         if (!notes.has(Number(n.id))) notes.set(Number(n.id), n);
       }
       for (const t of sql(`SELECT t.id, t.title, t.status, t.ref, t.updated_at, p.name AS project
-                           FROM tasks t LEFT JOIN projects p ON p.id = t.project_id WHERE t.project_id IN (${ids})`)) {
+                           FROM tasks t LEFT JOIN projects p ON p.id = t.project_id WHERE t.project_id IN (${ids})${shown("task", "t")}`)) {
         if (!tasks.has(Number(t.id))) tasks.set(Number(t.id), t);
       }
     }
@@ -516,6 +560,16 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
       UNION
       SELECT DISTINCT p.name FROM edges e JOIN tasks t ON e.source_type = 'task' AND t.id = e.source_id
       JOIN projects p ON p.id = t.project_id WHERE e.target_type = 'entity' AND e.target_id = :p1`, [entity.id]).map((p) => p.name) : [];
+    // "Spans" is true by declaration too, not only by mention: the projects the
+    // rows found are shown in count as projects this thing reaches.
+    if (hasTable("item_projects") && (noteList.length || taskList.length)) {
+      const pick = (list) => list.map((r) => Number(r.id)).join(",") || "0";
+      for (const r of sql(`SELECT DISTINCT p.name FROM item_projects ip JOIN projects p ON p.id = ip.project_id
+                            WHERE (ip.entity = 'note' AND ip.entity_id IN (${pick(noteList)}))
+                               OR (ip.entity = 'task' AND ip.entity_id IN (${pick(taskList)}))`)) {
+        if (!spans.includes(r.name)) spans.push(r.name);
+      }
+    }
     const related = entity.id != null ? sql(`
       SELECT o.kind, o.name FROM edges e
       JOIN entities o ON o.id = CASE WHEN e.source_id = :p1 THEN e.target_id ELSE e.source_id END
@@ -523,16 +577,19 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
         AND (e.source_id = :p1 OR e.target_id = :p1)
       ORDER BY e.weight DESC LIMIT 10`, [entity.id]).map((e) => `${e.name} (${e.kind})`) : [];
 
+    also = alsoIn();
     return fit({
       entity: { id: entity.id, kind: entity.kind, name: entity.name, mentions: entity.mentions },
       projects: [...new Set([...projects.map((p) => p.name), ...spans])],
       total: { notes: noteList.length, tasks: taskList.length },
       notes: noteList.slice(0, limit).map((n) => ({
         id: Number(n.id), title: n.title, kind: n.kind || undefined, project: n.project || undefined,
+        also_in: also.get(`note:${n.id}`) || undefined,
         evidence: n.evidence ? clip(n.evidence, 140) : (n.body ? snippet(n.body, new Set(), 140) : undefined),
       })),
       tasks: taskList.slice(0, limit).map((t) => ({
-        id: Number(t.id), title: t.title, status: t.status, project: t.project || undefined, ...(t.ref ? { ref: t.ref } : {}),
+        id: Number(t.id), title: t.title, status: t.status, project: t.project || undefined,
+        also_in: also.get(`task:${t.id}`) || undefined, ...(t.ref ? { ref: t.ref } : {}),
       })),
       related,
       more: "get_note {id} or get_task {id} to read one; limit for more rows; detail: \"full\" for whole bodies.",

@@ -156,6 +156,44 @@ function sqlP(query, params = []) {
   return open().prepare(statement).all(...values);
 }
 
+/**
+ * Runs a list of :p1 style statements as one unit, for the shared stores.
+ *
+ * A savepoint rather than BEGIN, because undo() already holds a transaction
+ * when it reverses a move, and SQLite has no nested BEGIN; a savepoint nests
+ * inside one and is a transaction of its own outside one. Statements return
+ * nothing, matching the server's sqlite3 route, which runs a batch as one
+ * script in one process.
+ */
+function batchP(statements) {
+  const conn = open();
+  conn.exec("SAVEPOINT delphi_batch");
+  try {
+    for (const [query, params] of statements) sqlP(query, params || []);
+    conn.exec("RELEASE delphi_batch");
+  } catch (error) {
+    conn.exec("ROLLBACK TO delphi_batch");
+    conn.exec("RELEASE delphi_batch");
+    throw error;
+  }
+}
+
+// Cross-project items: move, copy, association and flags, from the store the
+// MCP server shares. The app's writes are the person's. Made on first use,
+// because the store reaches back into this file's deriveInPlace for a pad
+// copy that should derive, and that is defined further down.
+let itemStore = null;
+function items() {
+  if (!itemStore) {
+    const { makeItemStore } = require("./items/store");
+    itemStore = makeItemStore({ sql: sqlP, batch: batchP, actor: "you", authorType: "human", derive: (id) => deriveInPlace(id) });
+  }
+  return itemStore;
+}
+// The condition that puts a row in a project, home or associated, from the one
+// place that writes it. See items/store.js inProject.
+const inProjectP = (entity, alias) => require("./items/store").inProject(entity, alias, ":projectId");
+
 // Audit summaries are read by people, so they say "1 task" rather than "1 tasks".
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
@@ -246,6 +284,11 @@ function projectActivity(projectId, limit = 200) {
         OR (entity = 'task'  AND entity_id IN (SELECT id FROM tasks  WHERE project_id = :projectId))
         OR (entity = 'note'  AND entity_id IN (SELECT id FROM notes  WHERE project_id = :projectId))
         OR (entity = 'link'  AND entity_id IN (SELECT id FROM links  WHERE project_id = :projectId))
+        -- Items shown here from another project: their changes are this
+        -- project's business too, which is the point of showing them.
+        OR (entity IN ('task', 'note', 'link', 'scratchpad')
+            AND entity_id IN (SELECT entity_id FROM item_projects
+                               WHERE project_id = :projectId AND entity = audit.entity))
         OR json_extract(COALESCE(before_json, after_json), '$.project_id') = :projectId
      ORDER BY id DESC
      LIMIT :limit`,
@@ -274,7 +317,13 @@ function listAudit(limit = 100) {
  * reminders, the project itself before any of them.
  */
 const RESTORE_ORDER = {
-  task: [["__subtasks", "tasks"], ["__comments", "comments"], ["__events", "status_events"]],
+  // __assoc is the other projects the item was shown in. The delete trigger
+  // takes those rows, so a restore that left them out would bring the item
+  // back to its home alone.
+  task: [["__subtasks", "tasks"], ["__comments", "comments"], ["__events", "status_events"], ["__assoc", "item_projects"]],
+  note: [["__assoc", "item_projects"]],
+  link: [["__assoc", "item_projects"]],
+  scratchpad: [["__assoc", "item_projects"]],
   project: [
     ["__organizers", "organizers"],
     ["__tasks", "tasks"],
@@ -381,6 +430,14 @@ function undo(auditId) {
 function applyUndo(entry) {
   const table = TABLES[entry.entity];
   const before = entry.before_json ? JSON.parse(entry.before_json) : null;
+
+  // A move, an association or its removal carries exactly what it changed in
+  // __op, and is reversed from that alone. Replaying the stored row instead
+  // reverted every edit made to the item since it moved.
+  if (entry.action === "update" && before && before.__op) {
+    items().undo(entry);
+    return;
+  }
 
   if (entry.action === "create") {
     // A project is the one create whose reversal is a cascading delete rather
@@ -515,11 +572,14 @@ const slugKey = (key) =>
   String(key ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
 function listProjects() {
+  // The counts are home only, so All work never counts one task twice.
+  // shared_count is the "+3 shared from other projects" beside them.
   return all(`
     SELECT p.*,
            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status != 'done') AS open_count,
            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS total_count,
-           (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id) AS note_count
+           (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id) AS note_count,
+           (SELECT COUNT(*) FROM item_projects ip WHERE ip.project_id = p.id) AS shared_count
     FROM projects p
     WHERE p.status != 'archived'
     ORDER BY p.sort_order, p.name
@@ -660,7 +720,19 @@ function projectContents(id) {
        (SELECT COUNT(*) FROM repos      WHERE project_id = :id) AS repos,
        (SELECT COUNT(*) FROM tasks
          WHERE id IN (SELECT id FROM doomed)
-           AND (project_id IS NULL OR project_id != :id)) AS subtasks_elsewhere`,
+           AND (project_id IS NULL OR project_id != :id)) AS subtasks_elsewhere,
+       -- Items homed here that other projects also show. A delete takes the
+       -- notes and pads among them from those projects too, so the window
+       -- offers to rehome them first (items:rehomePlan).
+       (SELECT COUNT(*) FROM (
+          SELECT 1 FROM tasks x WHERE x.project_id = :id AND x.parent_id IS NULL
+             AND EXISTS (SELECT 1 FROM item_projects ip WHERE ip.entity = 'task' AND ip.entity_id = x.id)
+          UNION ALL SELECT 1 FROM notes x WHERE x.project_id = :id
+             AND EXISTS (SELECT 1 FROM item_projects ip WHERE ip.entity = 'note' AND ip.entity_id = x.id)
+          UNION ALL SELECT 1 FROM scratchpads x WHERE x.project_id = :id
+             AND EXISTS (SELECT 1 FROM item_projects ip WHERE ip.entity = 'scratchpad' AND ip.entity_id = x.id)
+          UNION ALL SELECT 1 FROM links x WHERE x.project_id = :id
+             AND EXISTS (SELECT 1 FROM item_projects ip WHERE ip.entity = 'link' AND ip.entity_id = x.id))) AS shared_out`,
     { id }
   );
 }
@@ -893,7 +965,13 @@ function deleteOrganizer(id) {
 // because null and "no filter" have to stay distinguishable across IPC.
 function listTasks({ projectId = null, organizerId = null, includeDone = false, includeSubtasks = false } = {}) {
   const clauses = [];
-  if (projectId !== null) clauses.push("t.project_id = :projectId");
+  // Home or associated. With subtasks asked for, the subtasks of an associated
+  // parent come too: a subtask appears wherever its parent does.
+  if (projectId !== null) {
+    clauses.push(includeSubtasks
+      ? `(${inProjectP("task", "t")} OR t.parent_id IN (SELECT entity_id FROM item_projects WHERE project_id = :projectId AND entity = 'task'))`
+      : inProjectP("task", "t"));
+  }
   if (organizerId === "none") clauses.push("t.organizer_id IS NULL");
   else if (organizerId !== null) clauses.push("t.organizer_id = :organizerId");
   if (!includeDone) clauses.push("t.status != 'done'");
@@ -907,6 +985,7 @@ function listTasks({ projectId = null, organizerId = null, includeDone = false, 
   if (organizerId !== null && organizerId !== "none") params.organizerId = organizerId;
   return all(
     `SELECT t.*, p.name AS project_name, p.colour AS project_colour,
+            ${projectId !== null ? "CASE WHEN t.project_id IS :projectId THEN 0 ELSE 1 END" : "0"} AS associated,
             o.name AS organizer_name, o.colour AS organizer_colour,
             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id) AS subtask_count,
             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id AND s.status = 'done') AS subtask_done,
@@ -971,6 +1050,22 @@ function updateTask(id, fields, { actor = null } = {}) {
   // Read before the statement is assembled, because two of the rules below need
   // to know what the row currently is in order to decide what to write.
   const before = rowOf("task", id);
+
+  // A change of project is a move, and a move takes the whole subtree. This
+  // used to set project_id on the one row, which left every subtask in the
+  // project the task had left. It goes through the shared store now, the same
+  // rules and History row whether the window or an agent moved it, and the rest
+  // of the fields are applied after. A subtask is refused there with a sentence
+  // unless the same call takes it out of its parent (parent_id: null).
+  if (before && fields.project_id !== undefined && fields.project_id !== null &&
+      Number(fields.project_id) !== Number(before.project_id)) {
+    const { project_id: to, organizer_id: organizerId, ...rest } = fields;
+    const detach = before.parent_id != null && rest.parent_id === null;
+    if (detach) delete rest.parent_id;
+    items().move("task", id, Number(to), { organizerId: organizerId ?? null, detach });
+    if (!Object.keys(rest).length) return one("SELECT * FROM tasks WHERE id = :id", { id });
+    return updateTask(id, rest, { actor });
+  }
   const next = { ...fields };
 
   if (before) {
@@ -1359,6 +1454,7 @@ function deleteTask(id) {
   const params = Object.fromEntries(ids.map((v, i) => [`id${i}`, v]));
 
   before.__subtasks = subtaskRows;
+  before.__assoc = assocRows("task", id);
   before.__comments = all(`SELECT * FROM comments WHERE task_id IN (${placeholders})`, params);
   before.__events = all(`SELECT * FROM status_events WHERE task_id IN (${placeholders})`, params);
 
@@ -1369,10 +1465,15 @@ function deleteTask(id) {
 }
 
 // Notes are the memory spots.
+// Home and associated. associated is 1 on a row shown here from another
+// project, which the window badges with its home.
 function listNotes(projectId) {
   return all(
-    `SELECT * FROM notes WHERE project_id = :projectId
-     ORDER BY pinned DESC, updated_at DESC`,
+    `SELECT n.*, CASE WHEN n.project_id IS :projectId THEN 0 ELSE 1 END AS associated,
+            p.name AS home_name, p.colour AS home_colour
+       FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+      WHERE ${inProjectP("note", "n")}
+     ORDER BY n.pinned DESC, n.updated_at DESC`,
     { projectId }
   );
 }
@@ -1405,8 +1506,14 @@ function updateNote(id, fields) {
   return after;
 }
 
+// The other projects an item is shown in, kept on its delete so undo brings
+// them back: the delete trigger takes them, and nothing else remembers.
+const assocRows = (entity, id) =>
+  all("SELECT * FROM item_projects WHERE entity = :entity AND entity_id = :id", { entity, id });
+
 function deleteNote(id) {
   const before = rowOf("note", id);
+  if (before) before.__assoc = assocRows("note", id);
   run("DELETE FROM notes WHERE id = :id", { id });
   record({ action: "delete", entity: "note", entityId: id,
            summary: "deleted", label: before ? before.title : null, before });
@@ -1443,8 +1550,11 @@ let deriving = false;
 
 const listScratchpads = (projectId) =>
   all(
-    `SELECT * FROM scratchpads WHERE project_id = :projectId
-     ORDER BY pinned DESC, updated_at DESC`,
+    `SELECT s.*, CASE WHEN s.project_id IS :projectId THEN 0 ELSE 1 END AS associated,
+            p.name AS home_name, p.colour AS home_colour
+       FROM scratchpads s LEFT JOIN projects p ON p.id = s.project_id
+      WHERE ${inProjectP("scratchpad", "s")}
+     ORDER BY s.pinned DESC, s.updated_at DESC`,
     { projectId }
   );
 
@@ -1564,6 +1674,7 @@ function patchScratchpad(id, heading, text) {
 
 function deleteScratchpad(id) {
   const before = rowOf("scratchpad", id);
+  if (before) before.__assoc = assocRows("scratchpad", id);
   // The tasks outlive the pad, by the ON DELETE SET NULL on tasks.pad_id. Said
   // out loud because the opposite is what people expect from a cascade, and the
   // opposite is how a board gets emptied by a tidy-up.
@@ -1717,7 +1828,11 @@ function scratchpadTasks(padId) {
 }
 
 function listLinks(projectId) {
-  return all("SELECT * FROM links WHERE project_id = :projectId ORDER BY id", { projectId });
+  return all(
+    `SELECT l.*, CASE WHEN l.project_id IS :projectId THEN 0 ELSE 1 END AS associated,
+            p.name AS home_name, p.colour AS home_colour
+       FROM links l LEFT JOIN projects p ON p.id = l.project_id
+      WHERE ${inProjectP("link", "l")} ORDER BY l.id`, { projectId });
 }
 
 function createLink({ projectId, label, url, kind = "link" }) {
@@ -1733,6 +1848,7 @@ function createLink({ projectId, label, url, kind = "link" }) {
 
 function deleteLink(id) {
   const before = rowOf("link", id);
+  if (before) before.__assoc = assocRows("link", id);
   run("DELETE FROM links WHERE id = :id", { id });
   record({ action: "delete", entity: "link", entityId: id,
            summary: "removed link", label: before ? before.label : null, before });
@@ -1790,7 +1906,19 @@ function search(query) {
       { like }
     );
   }
-  return { tasks, notes, pads: padHits };
+  // Search stays global; each hit says which other projects show it, so a
+  // result reads "Second Brain app, also in Offerworks".
+  const alsoIn = (entity, rows) => {
+    if (!rows.length) return rows;
+    const found = all(
+      `SELECT ip.entity_id, GROUP_CONCAT(p.name, ', ') AS names FROM item_projects ip
+         JOIN projects p ON p.id = ip.project_id
+        WHERE ip.entity = :entity AND ip.entity_id IN (${rows.map((r) => Number(r.id)).join(", ")})
+        GROUP BY ip.entity_id`, { entity });
+    const byId = new Map(found.map((f) => [Number(f.entity_id), f.names]));
+    return rows.map((r) => ({ ...r, also_in: byId.get(Number(r.id)) || null }));
+  };
+  return { tasks: alsoIn("task", tasks), notes: alsoIn("note", notes), pads: alsoIn("scratchpad", padHits) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2614,6 +2742,8 @@ function adoptProjectPaths() {
 const dbIdentity = () => identity.current((statement) => open().prepare(statement).all());
 
 module.exports = {
+  batchP,
+  items,
   DB_PATH,
   identity: dbIdentity,
   // The graph builder works against the connection directly, so it is exposed

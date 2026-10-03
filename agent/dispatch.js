@@ -35,7 +35,6 @@
  */
 
 const os = require("os");
-const harness = require("../harness");
 const chat = require("../sheet/chat");
 const fmt = require("../sheet/format");
 const { makeSheetStore, pidAlive } = require("../sheet/store");
@@ -48,16 +47,115 @@ const ADAPTER_BY_PARSER = {
   "codex-json": { name: "codex", harnessKey: "codex", label: "Codex", mapper: chat.codexSheetMapper },
 };
 
-// Flags that switch off a harness's own permission checks or sandbox. A job
-// refuses to start with any of them, so an edited template cannot slip one in.
-// --allow-all-tools is Copilot's only way to use tools unattended, and is
-// allowed only where the project has said unguarded agents may run.
-const DANGER = [/bypassPermissions/i, /^--dangerously/i, /danger-full-access/i, /^--yolo$/i, /^--allow-all-paths$/i, /^--allow-all$/i];
+// What a job's command line may carry: an allowlist per harness, checked on
+// the real argv inside chatTurn immediately before every spawn, every turn.
+//
+// An allowlist rather than a denylist of known bypasses, because a denylist
+// only knows the bypasses someone thought of: each of these CLIs has several
+// (--dangerously-*, --yolo, --allow-all, --settings with a bypass mode in it,
+// -c approval_policy=never) and the next release can add another. A flag not
+// named here refuses the job, so a new one fails closed and costs an edit
+// here rather than a hole. Values are checked too, which is what keeps a job
+// that only reads (kind ask, run in the main checkout) read only.
+//
+// Delphi's own MCP wiring ({mcpFlags}) is matched exactly as Delphi made it
+// and taken out first; the same flag with any other value is refused.
+const MCP_TOOLS = "mcp__delphi";
+const toolList = (v) => String(v).split(/[\s,]+/).filter(Boolean);
+const anyValue = { value: true, ok: () => true };
+const flag = (ok = () => true) => ({ value: false, ok });
+const valued = (ok) => ({ value: true, ok });
+const oneOf = (allowed) => (v) => allowed.includes(v);
+const READ_TOOLS = ["Read", "Glob", "Grep", "LS"];
+const BUILTIN_TOOLS = [...READ_TOOLS, "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "TodoWrite", "default"];
 
-function dangerous(argv, unguarded) {
-  for (const arg of argv) {
-    if (DANGER.some((r) => r.test(arg))) return arg;
-    if (arg === "--allow-all-tools" && !unguarded) return arg;
+const POLICY = {
+  "claude-stream-json": {
+    flags: {
+      "-p": flag(), "--print": flag(),
+      "--output-format": anyValue, "--include-partial-messages": flag(), "--verbose": flag(),
+      "--model": anyValue, "--append-system-prompt": anyValue, "--resume": anyValue,
+      "--permission-mode": valued((v, c) => (c.kind === "do" ? ["acceptEdits", "default", "plan"] : ["default", "plan"]).includes(v)),
+      "--allowedtools": valued((v, c) => toolList(v).every((t) => (c.kind === "do" ? ["Bash", MCP_TOOLS] : [MCP_TOOLS]).includes(t))),
+      "--allowed-tools": valued((v, c) => toolList(v).every((t) => (c.kind === "do" ? ["Bash", MCP_TOOLS] : [MCP_TOOLS]).includes(t))),
+      "--tools": valued((v, c) => toolList(v).every((t) => (c.kind === "do" ? BUILTIN_TOOLS : READ_TOOLS).includes(t))),
+    },
+  },
+  "codex-json": {
+    // exec, then optionally resume <its own session id>, then flags, then the prompt.
+    leading: (rest, c) => {
+      if (rest[0] !== "exec") return { error: "it does not start with exec" };
+      if (rest[1] === "resume") return rest[2] === c.resume && c.resume ? { used: 3 } : { error: "resume without the job's own session" };
+      return { used: 1 };
+    },
+    trailingPrompt: true,
+    flags: {
+      "--json": flag(), "--skip-git-repo-check": flag(),
+      "-m": anyValue, "--model": anyValue,
+      "-s": valued((v, c) => (c.kind === "do" ? ["read-only", "workspace-write"] : ["read-only"]).includes(v)),
+      "--sandbox": valued((v, c) => (c.kind === "do" ? ["read-only", "workspace-write"] : ["read-only"]).includes(v)),
+    },
+  },
+  "copilot-json": {
+    flags: {
+      "--prompt": valued((v, c) => c.prompt != null && v === c.prompt),
+      "--output-format": anyValue, "--no-color": flag(), "--model": anyValue, "--session-id": anyValue,
+      // Copilot's tools, only where the project said unguarded agents may run,
+      // and only to change code; Delphi's own MCP server, to every job.
+      "--allow-all-tools": flag((_v, c) => c.kind === "do" && c.unguarded),
+      "--allow-tool": valued(oneOf(["delphi"])),
+    },
+  },
+};
+
+const clipArg = (t) => { const v = String(t); return v.length > 60 ? `${v.slice(0, 57)}...` : v; };
+
+/**
+ * Why this argv may not run as this job, or null. ctx: { parser, kind,
+ * unguarded, mcpFlags, prompt (when it is in argv rather than on stdin), resume }.
+ */
+function checkArgv(argv, { parser, kind = "ask", unguarded = false, mcpFlags = [], prompt = null, resume = null } = {}) {
+  const policy = POLICY[parser];
+  if (!policy) return `Delphi has no list of the flags a job may pass to a ${parser} agent`;
+  const ctx = { kind, unguarded, prompt, resume };
+  const rest = argv.map(String);
+  if (mcpFlags && mcpFlags.length) {
+    for (let at = 0; at + mcpFlags.length <= rest.length; at++) {
+      if (mcpFlags.every((f, j) => rest[at + j] === String(f))) { rest.splice(at, mcpFlags.length); break; }
+    }
+  }
+  let i = 0;
+  if (policy.leading) {
+    const lead = policy.leading(rest, ctx);
+    if (lead.error) return lead.error;
+    i = lead.used;
+  }
+  for (; i < rest.length; i++) {
+    const tok = rest[i];
+    if (policy.trailingPrompt && i === rest.length - 1 && prompt != null && tok === String(prompt)) continue;
+    if (!tok.startsWith("-") || tok === "-" || tok === "--") return `an argument it does not expect (${clipArg(tok)})`;
+    let name = tok;
+    let value;
+    let inline = false;
+    if (tok.startsWith("--")) {
+      const eq = tok.indexOf("=");
+      if (eq > 0) { name = tok.slice(0, eq); value = tok.slice(eq + 1); inline = true; }
+      name = name.toLowerCase();
+    } else if (tok.length > 2) {
+      name = tok.slice(0, 2); value = tok.slice(2); inline = true;
+    }
+    const rule = policy.flags[name];
+    if (!rule) return `${clipArg(tok)}, which is not on the list of flags a job may pass to this agent`;
+    if (rule.value) {
+      if (!inline) {
+        if (i + 1 >= rest.length) return `${name} with no value`;
+        value = rest[++i];
+      }
+      if (!rule.ok(value, ctx)) return `${name} ${clipArg(value)}`;
+    } else {
+      if (inline) return clipArg(tok);
+      if (!rule.ok(null, ctx)) return name;
+    }
   }
   return null;
 }
@@ -108,6 +206,10 @@ function createDispatcher({
   runTurn = chat.chatTurn,
   guardStatus = launch.guardStatus,
   hourlyLimit = HOURLY_LIMIT,
+  // For tests: a job's time limit in ms instead of jobTimeoutMinutes, and how
+  // long after it a turn that will not end is abandoned.
+  jobTimeoutMs = null,
+  hardGraceMs = 10000,
   log = (...parts) => console.error(...parts),
 } = {}) {
   if (typeof sql !== "function") throw new Error("createDispatcher needs a sql(query, params) function");
@@ -156,17 +258,12 @@ function createDispatcher({
    * reason, when it could never run: nothing to run it with, or nowhere.
    */
   function create({ projectId, harness: key, request, taskId = null, kind = "ask", context = null, wake = false, fromSessionId = null } = {}, { by = "you", type = "human" } = {}) {
-    if (!projectId) throw new Error("A job needs a project.");
-    const project = projectRow(projectId);
+    const project = projectRow(jobs.projectFor(sql, { projectId: projectId || null, taskId }));
     if (!project) throw new Error(`There is no project ${projectId}.`);
     const row = sql("SELECT key, label, enabled FROM harnesses WHERE key = :p1", [String(key || "")])[0];
     if (!row || !Number(row.enabled)) throw new Error(`There is no agent called "${key}" turned on here. Turn it on in Settings, under Agents.`);
     const problem = jobs.folderProblem(sql, project.id);
     if (problem) throw new Error(problem);
-    if (taskId != null) {
-      const task = sql("SELECT id, project_id FROM tasks WHERE id = :p1", [Number(taskId)])[0];
-      if (!task) throw new Error(`There is no task ${taskId}.`);
-    }
     const { state, approval } = jobs.approvalFor({ requesterType: type, autoApprove: Number(project.auto_approve) === 1 });
     const run = jobs.insert(sql, {
       projectId: project.id, toHarness: row.key, request, taskId, context, wake, kind, source: "person",
@@ -221,7 +318,10 @@ function createDispatcher({
     const run = jobs.get(sql, id);
     if (!run) throw new Error(`There is no job ${id}.`);
     if (["queued", "needs_approval", "waiting_on_human"].includes(run.state)) {
-      const after = jobs.update(sql, id, { state: "stopped", followup: null, reply: run.reply || `Stopped by ${by} before it ran.` }, { from: run.state });
+      // A job stopped before anyone approved it was in effect rejected, so a
+      // later reply cannot start it without an approval.
+      const refused = run.state === "needs_approval" ? { approval: "rejected", approved_by: by, approved_at: stamp() } : {};
+      const after = jobs.update(sql, id, { ...refused, state: "stopped", followup: null, reply: run.reply || `Stopped by ${by} before it ran.` }, { from: run.state });
       if (!after) return stop(id, { by });
       audit(id, `stopped while ${run.state.replace(/_/g, " ")}`, run.request, by);
       note(run.task_id, `Job ${id} stopped by ${by}.${after.workbench ? ` Its Workbench at ${after.workbench.path} is left as it is.` : ""}`);
@@ -275,8 +375,11 @@ function createDispatcher({
       if (live.has(Number(row.id))) continue;
       const run = jobs.get(sql, row.id);
       const raw = sql("SELECT runner_pid, runner_host, agent_pid FROM handoffs WHERE id = :p1", [run.id])[0] || {};
+      // Another machine sharing the file is left alone. On this one, a running
+      // row this process is not running is dead whatever its pid says: there
+      // is one app per database, and after a reboot the old pid can belong to
+      // anything, which used to leave such a job running forever.
       if (raw.runner_host && raw.runner_host !== host) continue;
-      if (raw.runner_pid && Number(raw.runner_pid) !== pid && isAlive(Number(raw.runner_pid))) continue;
       const still = raw.agent_pid && isAlive(Number(raw.agent_pid))
         ? ` Its agent process (pid ${raw.agent_pid}) may still be running; it is no longer watched.` : "";
       const reason = `interrupted: Delphi stopped while this job was running, so it never finished. It is not run again on its own; reply to it to carry on.` +
@@ -343,7 +446,12 @@ function createDispatcher({
           AND NOT EXISTS (SELECT 1 FROM handoffs j WHERE j.task_id = t.id AND j.state IN (${jobs.OPEN_SQL}))
         ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, t.id`, []);
     for (const t of rows) {
-      const took = sql("UPDATE tasks SET queue = NULL, updated_at = datetime('now') WHERE id = :p1 AND queue = :p2 RETURNING id", [t.id, t.queue])[0];
+      // The claim and status rechecked in the same statement as the take: an
+      // agent's queue_next between the look and here must not leave the task
+      // with two workers.
+      const took = sql(`UPDATE tasks SET queue = NULL, updated_at = datetime('now')
+                         WHERE id = :p1 AND queue = :p2 AND status NOT IN ('done', 'blocked')
+                           AND (claimed_by IS NULL OR claim_expires < datetime('now')) RETURNING id`, [t.id, t.queue])[0];
       if (!took) continue;
       const type = t.queued_by_type || "agent";
       const { state, approval } = jobs.approvalFor({ requesterType: type, autoApprove: Number(t.auto_approve) === 1 });
@@ -366,7 +474,8 @@ function createDispatcher({
                          AND NOT EXISTS (SELECT 1 FROM comments d WHERE d.kind = 'decide' AND d.ref_id = c.id)`, [row.task_id, row.actor])[0].n;
       if (Number(open)) continue;
       const answers = sql(`SELECT a.body AS question, d.meta AS meta, d.body AS body FROM comments d JOIN comments a ON a.id = d.ref_id
-                            WHERE d.kind = 'decide' AND a.task_id = :p1 AND a.author = :p2 AND d.created_at >= :p3 ORDER BY d.id`,
+                            WHERE d.kind = 'decide' AND d.author_type = 'human'
+                              AND a.task_id = :p1 AND a.author = :p2 AND d.created_at >= :p3 ORDER BY d.id`,
                           [row.task_id, row.actor, row.updated_at || "0"]);
       if (!answers.length) continue;
       const lines = answers.map((a) => {
@@ -544,6 +653,12 @@ function createDispatcher({
     const problem = jobs.folderProblem(sql, project.id);
     if (problem) return fail(problem);
 
+    // Approved, and allowed or not to run unguarded, as a job of this project;
+    // so it runs in this project or not at all. A row written before that was
+    // checked at the door is caught here.
+    if (job.task_id) {
+      try { jobs.projectFor(sql, { projectId: project.id, taskId: job.task_id }); } catch (error) { return fail(error.message); }
+    }
     const taskId = ensureTask(job, project);
     entry.taskId = taskId;
     const actor = job.actor || `${row.key}:job-${job.id}`;
@@ -605,8 +720,6 @@ function createDispatcher({
         }
       }
     }
-    const bad = dangerous(harness.expand(template, { ...values, prompt: "x", cwd, autoAllow: false, mcpFlags: [] }), unguarded);
-    if (bad) return fail(`Refusing to start ${label} with ${bad}: a job never switches off an agent's own permission checks. Check its command line in Settings, under Agents.`);
 
     job = jobs.update(sql, job.id, { cwd, workbench_id: workbench ? workbench.id : null, unguarded: unguarded ? 1 : 0, turns: (job.turns || 0) + 1 });
     if (entry.stopReason) return end(entry, { state: "stopped", reply: `Stopped by ${entry.stoppedBy || "you"} before it started.` });
@@ -638,12 +751,29 @@ function createDispatcher({
         activity(entry, action);
       },
       onError: (error) => log(`job ${job.id} sheet`, error.message),
+      // The real argv, every turn, just before it is spawned: a resume id and
+      // the MCP wiring are only known here, and a group that needs one of them
+      // is exactly where a bypass flag could hide from a check made earlier.
+      checkArgv: (argv, c) => {
+        const why = checkArgv(argv, { parser: row.parser, kind: job.kind, unguarded, ...c });
+        return why ? `Refusing to start ${label} with ${why}: a job passes only flags Delphi knows keep it ${job.kind === "do" ? "inside its Workbench" : "read only"}. Check its command line in Settings, under Agents.` : null;
+      },
     });
 
-    const timeoutMs = limits().timeoutMs;
+    const timeoutMs = jobTimeoutMs || limits().timeoutMs;
     entry.timer = setTimeout(() => {
       entry.stopReason = entry.stopReason || "timeout";
       if (entry.stop) entry.stop("timeout");
+      // A hard deadline. Something the agent started outside its process
+      // group can hold its output open, and then the turn never ends; the job
+      // is finished as failed and its slot freed whatever the pipes are doing.
+      const hard = setTimeout(() => {
+        if (!live.has(entry.id)) return;
+        end(entry, { state: "failed", fields: { agent_pid: null }, reply: `timeout: stopped after ${Math.round(timeoutMs / 60000)} minutes, the longest a job may run, and its agent did not finish when told to.` });
+        live.delete(entry.id);
+        soon();
+      }, hardGraceMs);
+      if (hard.unref) hard.unref();
     }, timeoutMs);
     if (entry.timer.unref) entry.timer.unref();
 
@@ -700,4 +830,4 @@ function createDispatcher({
   };
 }
 
-module.exports = { createDispatcher, dangerous, storeClient, ADAPTER_BY_PARSER, DEFAULTS };
+module.exports = { createDispatcher, checkArgv, POLICY, storeClient, ADAPTER_BY_PARSER, DEFAULTS };

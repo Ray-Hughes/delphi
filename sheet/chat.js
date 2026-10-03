@@ -541,6 +541,9 @@ function chatTurn({
   // process was not itself given one in its environment, and a look at every
   // action before it is written, which is where tokens are counted.
   values = {}, dbPath = null, dbId = null, onAction = null,
+  // (argv, { mcpFlags, prompt, resume }) => a refusal or null, asked of the
+  // real argv immediately before the spawn. The dispatcher's permission check.
+  checkArgv = null,
 }) {
   const command = resolveCommand(row.command);
   if (!command) {
@@ -558,6 +561,14 @@ function chatTurn({
   // goes there: a message starting with '-' in argv would be read as a flag.
   const onStdin = Boolean(adapter.promptOnStdin);
   const argv = harness.expand(row.args, { ...values, prompt: onStdin ? undefined : prompt, resume, cwd, autoAllow, mcpFlags: mcp.flags });
+  if (checkArgv) {
+    let refusal;
+    try { refusal = checkArgv(argv, { mcpFlags: mcp.flags, prompt: onStdin ? null : prompt, resume }); } catch (error) { refusal = error.message; }
+    if (refusal) {
+      if (mcp.file) { try { fs.unlinkSync(mcp.file); } catch {} }
+      return Promise.reject(new Error(refusal));
+    }
+  }
   const writer = createSheetWriter({ client: agentClient, taskId, adapter, cwd, logDir, onEntry, onError });
   const mapper = adapter.mapper((action) => {
     if (onAction) { try { onAction(action); } catch {} }
@@ -610,6 +621,16 @@ function chatTurn({
       signal(reason ? "SIGTERM" : "SIGINT");
       if (!reason) timers.push(setTimeout(() => signal("SIGTERM"), 3000));
       timers.push(setTimeout(() => signal("SIGKILL"), reason ? 2000 : 6000));
+      // A stop with a reason ends the turn even if something outside the
+      // group (a daemon the agent started) still holds its output open: the
+      // pipes are let go and the turn finishes, rather than waiting on them.
+      if (reason) {
+        timers.push(setTimeout(() => {
+          try { child.stdout.destroy(); } catch {}
+          try { child.stderr.destroy(); } catch {}
+          finish(null);
+        }, 3000));
+      }
       for (const t of timers) if (t.unref) t.unref();
     };
     try { onStart({ stop, pid: child.pid }); } catch {}

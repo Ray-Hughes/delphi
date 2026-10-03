@@ -136,13 +136,16 @@ const BUILTINS = [
       // somebody makes rather than a default they inherit.
       ["--permission-mode", "bypassPermissions", "{if:autoAllow}"],
       ["--tools", "", "{ifnot:autoAllow}", "{ifnot:jobWrite}", "{ifnot:jobRead}"],
-      // A job that only reads gets the reading tools and nothing else.
-      ["--tools", "Read,Glob,Grep", "{if:jobRead}"],
+      // A job that only reads gets the reading tools, and Delphi's own MCP
+      // tools (the server is registered as "delphi"), which in -p mode are
+      // refused unless allowed: without them it could not ask a person
+      // anything on the Sheet.
+      ["--tools", "Read,Glob,Grep", "--allowedTools", "mcp__delphi", "{if:jobRead}"],
       // A job that changes code: edits accepted, which Claude Code keeps to the
       // folder it runs in (the Workbench), and Bash allowed, which is why the
       // dispatcher runs this only with agent/guard.py installed as the hook, or
       // with the project's explicit say-so. Never bypassPermissions.
-      ["--permission-mode", "acceptEdits", "--allowedTools", "Bash", "{if:jobWrite}"],
+      ["--permission-mode", "acceptEdits", "--allowedTools", "Bash,mcp__delphi", "{if:jobWrite}"],
       "{mcpFlags}",
     ],
   },
@@ -193,6 +196,8 @@ const BUILTINS = [
       // Nothing can guard Copilot's commands, so a job gets its tools only in a
       // project that has said unguarded agents may run there.
       ["--allow-all-tools", "{if:jobUnguarded}"],
+      // Delphi's own MCP server, by name, for a job that only reads.
+      ["--allow-tool", "delphi", "{if:jobRead}"],
       // --session-id rather than --resume. --resume takes an optional value, so
       // passing it without one opens an interactive picker, and there is nobody
       // here to pick.

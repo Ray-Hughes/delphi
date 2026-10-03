@@ -360,9 +360,9 @@ function openWithApp(dataDir) {
   check("the index that needed the missing column was skipped, not failed",
         [outcome.indexed.includes("idx_comments_ledger"), outcome.indexed.includes("idx_workbenches_task")], [false, true]);
   check("a second apply finishes the job", schemaLater.apply((s) => q(partial, s)),
-        { added: ["comments.promoted"], created: [], indexed: ["idx_comments_ledger"], errors: [] });
+        { added: ["comments.promoted"], created: [], indexed: ["idx_comments_ledger"], triggered: [], errors: [] });
   check("and a third has nothing to do", schemaLater.apply((s) => q(partial, s)),
-        { added: [], created: [], indexed: [], errors: [] });
+        { added: [], created: [], indexed: [], triggered: [], errors: [] });
 
   section("another process adds the column between the look and the ALTER");
   // The app and several servers can open one old database together. Each

@@ -64,6 +64,9 @@ module.exports = {
     "agent/dispatch.js",
     "sheet/",
     "workbench/",
+    // Items across projects and flags: the store and the Oracle's evaluator,
+    // shared with the server (tools/after-pack.js copies them out as well).
+    "items/",
     "schema.sql",
     "oracle.sql",
     "package.json",
@@ -83,7 +86,7 @@ module.exports = {
   // it. That is how 1.6.0 shipped a main process that died on require("./pads")
   // before it could open a window. The modules both sides need (pads.js, git.js,
   // harness.js, embeddings.js, agent/schema_later.js, agent/launch.js, agent/locate.js,
-  // agent/identity.js, agent/jobs.js, sheet/, workbench/) are
+  // agent/identity.js, agent/jobs.js, sheet/, workbench/, items/) are
   // copied out by tools/after-pack.js instead, from its OUTSIDE_TOO list, after
   // the archive is written. tools/package_test.js reads both lists and the real
   // archive, so neither half can go missing again without a test failing.

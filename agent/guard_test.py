@@ -72,6 +72,14 @@ MUST_BLOCK = [
   "echo 42 | unbuffer -p delphi discard 42",
   "D=delphi; $D discard 42", "D=/usr/local/bin/delphi && ${D} discard 42",
   "\\delphi discard 42", "de\"\"lphi discard 42", "delphi dis''card 42",
+  # Approving or rejecting a proposal to move work is a person's call too,
+  # fenced the same way, through the same wrappers.
+  "delphi flags approve 12", "delphi  flags   reject 12 'no'", "bin/delphi flags approve 12 --note yes",
+  "node bin/delphi flags approve 12", "env DELPHI_ACTOR=me delphi flags approve 12",
+  "sh -c 'delphi flags approve 12'", "nohup delphi flags reject 3 why &", "(delphi flags approve 12)",
+  "echo $(delphi flags approve 12)", "$(which delphi) flags approve 12", "D=delphi; $D flags approve 12",
+  "script -q /dev/null delphi flags approve 12", "timeout 60 delphi flags approve 12",
+  "python3 -c 'import subprocess; subprocess.run([\"delphi\", \"flags\", \"approve\", \"12\"])'",
 ]
 
 MUST_ALLOW = [
@@ -105,6 +113,10 @@ MUST_ALLOW = [
   "expect -c 'spawn delphi finish 42'", "unbuffer -p delphi open 42",
   "D=delphi; $D status 42", "X=discard; echo $X", "printf '%s\\n' \"\" discard",
   "git commit -m 'guard: catch \\delphi and de\"\"lphi forms'",
+  # Reading flags is ordinary, and so is talking about approving one.
+  "delphi flags", "delphi flags list --all", "delphi flags show 12", "delphi help flags",
+  "git commit -m 'delphi flags approve is a person\\'s'", "grep -n 'flags approve' agent/guard.py",
+  "delphi say 42 'a person should run delphi flags approve 12'",
 ]
 
 fails = []

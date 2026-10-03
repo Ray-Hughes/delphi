@@ -39,7 +39,7 @@ for (const name of ["DELPHI_WORKBENCH_DIR", "DELPHI_BRANCH_PREFIX", "GIT_DIR", "
 const db = require("../db");
 const harness = require("../harness");
 const GIT = require("../git").findGit();
-const { createDispatcher, dangerous } = require("../agent/dispatch");
+const { createDispatcher, checkArgv } = require("../agent/dispatch");
 const { makeSheetStore, pidAlive } = require("../sheet/store");
 const { makeWorkbenchStore } = require("../workbench/store");
 const { createWorkbench } = require("../workbench/workbench");
@@ -239,7 +239,7 @@ async function main() {
   const claudeArgv = argvOf(0);
   check("Claude Code: edits accepted and Bash allowed, behind the guard",
     [claudeArgv.includes("acceptEdits"), claudeArgv[claudeArgv.indexOf("--allowedTools") + 1], claudeArgv.includes("--tools"), claudeArgv.includes("bypassPermissions")],
-    [true, "Bash", false, false]);
+    [true, "Bash,mcp__delphi", false, false]);
   const codexArgv = argvOf(1);
   check("Codex: its workspace-write sandbox, nothing wider",
     [codexArgv[codexArgv.indexOf("-s") + 1], codexArgv.filter((a) => a === "-s").length, codexArgv.includes("danger-full-access")], ["workspace-write", 1, false]);
@@ -290,7 +290,9 @@ async function main() {
   check("the global limit counts every harness", [d.running(), d.get(g2.id).state], [[g1.id], "queued"]);
   await waitFor("both global jobs done", () => d.get(g2.id).state === "done");
   const claudeAskArgv = runsOf(g2.id)[0].argv;
-  check("Claude Code reading gets the reading tools only", [claudeAskArgv[claudeAskArgv.indexOf("--tools") + 1], claudeAskArgv.includes("--allowedTools")], ["Read,Glob,Grep", false]);
+  check("Claude Code reading gets the reading tools, and Delphi's own MCP tools only",
+    [claudeAskArgv[claudeAskArgv.indexOf("--tools") + 1], claudeAskArgv[claudeAskArgv.indexOf("--allowedTools") + 1], claudeAskArgv.includes("--permission-mode")],
+    ["Read,Glob,Grep", "mcp__delphi", false]);
   settings.jobConcurrency = 3;
 
   // ------------------------------------------------------------------------------------
@@ -341,6 +343,36 @@ async function main() {
   db.sqlP("UPDATE tasks SET queue = 'codex', queued_by = 'copilot:7', queued_by_type = 'agent' WHERE id = :p1", [qa.id]);
   d.tick();
   check("an agent's queueing waits for a person", d.list({ taskId: qa.id }).map((r) => [r.state, r.requested_by]), [["needs_approval", "copilot:7"]]);
+  const held = db.createTask({ projectId: project.id, title: "claimed by a puller" });
+  db.sqlP("UPDATE tasks SET queue = 'codex', queued_by = 'you', queued_by_type = 'human', claimed_by = 'claude-code:9', claim_expires = datetime('now', '+30 minutes') WHERE id = :p1", [held.id]);
+  d.tick();
+  check("a task another agent holds is not taken as well", [d.list({ taskId: held.id }).length, db.taskDetail(held.id).task.queue], [0, "codex"]);
+  db.sqlP("UPDATE tasks SET queue = NULL WHERE id = :p1", [held.id]);
+
+  section("stopping a job nobody approved is rejecting it");
+  const sa = await client.call("handoff_send", { to: "codex", project_id: project.id, request: "stop me first" });
+  d.stop(sa.job_id);
+  let afterStop = null;
+  try { d.reply(sa.job_id, "now run"); } catch (e) { afterStop = e.message; }
+  check("a reply cannot start it without an approval", [d.get(sa.job_id).approval, /was rejected/.test(afterStop || "")], ["rejected", true]);
+
+  section("a job runs in its task's project, never one named beside it");
+  const other = db.createProject({ key: "other", name: "Other", path: app });
+  db.updateProject(other.id, { auto_approve: true, allow_unguarded: true });
+  const strictTask = db.createTask({ projectId: project.id, title: "belongs to Jobs" });
+  let xp = null;
+  try { await client.call("handoff_send", { to: "codex", project_id: other.id, task_id: strictTask.id, request: "change it", kind: "do" }); } catch (e) { xp = e.message; }
+  check("handoff_send refuses a project that is not the task's", /Task \d+ is in project Jobs .* not Other/.test(xp || ""), true);
+  let xw = null;
+  try { d.create({ projectId: other.id, harness: "codex", request: "x", taskId: strictTask.id }); } catch (e) { xw = e.message; }
+  check("so does the window", /not Other/.test(xw || ""), true);
+  const fromTask = await client.call("handoff_send", { to: "codex", task_id: strictTask.id, request: "no project named" });
+  check("with only a task, the job is the task's project's, and its approval rule", [fromTask.project_id, fromTask.state], [project.id, "needs_approval"]);
+  d.reject(fromTask.job_id);
+  const sneaked = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, task_id, request, kind, state, status, approval, requester_type)
+                           VALUES (:p1, 'codex', :p2, 'sneaked', 'do', 'queued', 'queued', 'auto', 'agent') RETURNING id`, [other.id, strictTask.id])[0].id;
+  await waitFor("the sneaked row to fail", () => (d.tick(), d.get(sneaked).state === "failed"));
+  check("a row written around the check fails before any Workbench", [/not Other/.test(d.get(sneaked).reply), d.get(sneaked).workbench], [true, null]);
 
   // ------------------------------------------------------------------------------------
   section("stop ends the agent's process group and leaves the Workbench");
@@ -388,8 +420,11 @@ async function main() {
   db.sqlP("UPDATE handoffs SET state = 'running', status = 'running', runner_pid = :p1, runner_host = :p2 WHERE id = :p3", [dead, os.hostname(), rj.id]);
   const elsewhere = d.create({ projectId: project.id, harness: "codex", request: "Another machine's", kind: "ask" });
   db.sqlP("UPDATE handoffs SET state = 'running', status = 'running', runner_pid = 1, runner_host = 'another-host' WHERE id = :p1", [elsewhere.id]);
+  // pid 1 is alive on every machine, as an old pid reused after a reboot would be.
+  const reused = d.create({ projectId: project.id, harness: "codex", request: "Pid reused", kind: "ask" });
+  db.sqlP("UPDATE handoffs SET state = 'running', status = 'running', runner_pid = 1, runner_host = :p1 WHERE id = :p2", [os.hostname(), reused.id]);
   const fresh = makeDispatcher();
-  check("recovery fails this machine's dead job only", fresh.recover(), [rj.id]);
+  check("recovery fails every running job of this machine it is not running, even one whose pid is alive again", fresh.recover(), [rj.id, reused.id]);
   check("as interrupted", [fresh.get(rj.id).state, /^interrupted/.test(fresh.get(rj.id).reply)], ["failed", true]);
   check("with a note on its Sheet", entriesOf(rt.id).some((e) => /interrupted/.test(e.body)), true);
   fresh.tick();
@@ -431,6 +466,50 @@ async function main() {
   check("an agent's is stopped, since that is how a loop shows", [tight.get(ha.job_id).state, /Delphi stopped this one/.test(tight.get(ha.job_id).reply)], ["failed", true]);
   tight.stop(hp.id);
 
+  section("an answer from an agent is not a person's");
+  setFixture("claude-code", claudeSlowAsk, claudeResumed);
+  const at = db.createTask({ projectId: project.id, title: "who answers" });
+  const aj = d.create({ projectId: project.id, harness: "claude-code", request: "Ask me", taskId: at.id, kind: "ask" });
+  d.tick();
+  const aactor = await waitFor("the actor", () => runsOf(aj.id).length && d.get(aj.id).actor);
+  const q = makeSheetStore({ sql: db.sqlP, actor: aactor, authorType: "agent" }).ask(at.id, "Self answered?", ["yes", "no"]);
+  await d.idle();
+  makeSheetStore({ sql: db.sqlP, actor: "codex:other", authorType: "agent" }).decide(q.id, "a");
+  await sleep(1100);
+  d.tick();
+  check("the job keeps waiting for a person", [d.get(aj.id).state, runsOf(aj.id).length], ["waiting_on_human", 1]);
+  d.stop(aj.id);
+
+  section("the real argv is checked before every turn, follow-ups included");
+  setFixture("codex", codexAsk);
+  const codexRow = db.listHarnesses().find((h) => h.key === "codex");
+  const original = codexRow.args_json;
+  db.updateHarness(codexRow.id, { args_json: original.replace('["resume","{resume}"]', '["resume","{resume}","--dangerously-bypass-approvals-and-sandbox"]') });
+  check("the edited template hides the flag in a group that needs a resume id", db.listHarnesses().find((h) => h.key === "codex").args_json.includes("dangerously"), true);
+  const fj = d.create({ projectId: project.id, harness: "codex", request: "first turn is clean", kind: "ask" });
+  await waitFor("the first turn", () => (d.tick(), d.get(fj.id).state === "done"));
+  d.reply(fj.id, "and again");
+  await waitFor("the follow-up refused", () => (d.tick(), d.get(fj.id).state === "failed"));
+  check("the follow-up is refused before anything is spawned", [/Refusing to start Codex with --dangerously-bypass-approvals-and-sandbox/.test(d.get(fj.id).reply), runsOf(fj.id).length], [true, 1]);
+  db.updateHarness(codexRow.id, { args_json: original });
+
+  section("a job past its time limit ends, even with its output held open");
+  const orphanPid = path.join(dir, "orphan.pid");
+  const claudeOrphan = fixture("claude_orphan.jsonl", [
+    { type: "system", subtype: "init", session_id: "sess-orphan" },
+    { fake: "orphan", pidfile: orphanPid },
+    { fake: "hang" },
+  ]);
+  setFixture("claude-code", claudeOrphan);
+  const quick = makeDispatcher({ jobTimeoutMs: 600, hardGraceMs: 1200 });
+  const oj = quick.create({ projectId: project.id, harness: "claude-code", request: "never ends", kind: "ask" });
+  const began = Date.now();
+  quick.tick();
+  await waitFor("the hard deadline", () => quick.get(oj.id).state === "failed", 15000);
+  check("finished as failed:timeout within the deadline", [/^timeout:/.test(quick.get(oj.id).reply), Date.now() - began < 6000, quick.running().length], [true, true, 0]);
+  try { process.kill(Number(fs.readFileSync(orphanPid, "utf8")), "SIGKILL"); } catch {}
+  await quick.idle();
+
   section("guards");
   const unguardedProject = db.createProject({ key: "strict", name: "Strict", path: app });
   const noGuard = makeDispatcher({ guardStatus: () => ({ installed: false, file: null }) });
@@ -442,7 +521,60 @@ async function main() {
   const cj = d.create({ projectId: unguardedProject.id, harness: "copilot", request: "edit", taskId: ct.id, kind: "do" });
   await waitFor("refused", () => (d.tick(), d.get(cj.id).state === "failed"));
   check("Copilot changing code needs the project's say-so", /Allow unguarded agents/.test(d.get(cj.id).reply), true);
-  check("a bypass flag in an edited template refuses the job", [dangerous(["-p", "x", "--permission-mode", "bypassPermissions"], false), dangerous(["--allow-all-tools"], false), dangerous(["--allow-all-tools"], true)], ["bypassPermissions", "--allow-all-tools", null]);
+  section("the allowlist");
+  const builtin = (key) => harness.BUILTINS.find((b) => b.key === key).args;
+  const real = (key, kind, extra = {}) => harness.expand(builtin(key), {
+    jobWrite: kind === "do", jobRead: kind === "ask", jobUnguarded: Boolean(extra.unguarded), autoAllow: false,
+    prompt: extra.prompt, resume: extra.resume, mcpFlags: ["--mcp-config", "/tmp/delphi-mcp/x.json"] });
+  const ok = (key, parser, kind, extra = {}) => checkArgv(real(key, kind, extra), { parser, kind, unguarded: Boolean(extra.unguarded), mcpFlags: ["--mcp-config", "/tmp/delphi-mcp/x.json"], prompt: extra.prompt ?? null, resume: extra.resume ?? null });
+  check("every built-in job command line passes, first turn and resumed",
+    [ok("claude-code", "claude-stream-json", "do"), ok("claude-code", "claude-stream-json", "ask", { resume: "s1" }),
+     ok("codex", "codex-json", "do", { prompt: "go" }), ok("codex", "codex-json", "ask", { prompt: "go", resume: "t1" }),
+     ok("copilot", "copilot-json", "do", { prompt: "go", unguarded: true }), ok("copilot", "copilot-json", "ask", { prompt: "go", resume: "c1" })],
+    [null, null, null, null, null, null]);
+  const denied = (argv, ctx) => checkArgv(argv, ctx) !== null;
+  const claudeDoCtx = { parser: "claude-stream-json", kind: "do" };
+  const claudeAskCtx = { parser: "claude-stream-json", kind: "ask" };
+  const codexDoCtx = { parser: "codex-json", kind: "do", prompt: "go" };
+  const codexAskCtx = { parser: "codex-json", kind: "ask", prompt: "go" };
+  const copDo = { parser: "copilot-json", kind: "do", prompt: "go" };
+  const copAsk = { parser: "copilot-json", kind: "ask", prompt: "go" };
+  check("bypasses in every spelling are refused", [
+    denied(["-p", "--resume", "abc", "--dangerously-skip-permissions"], claudeDoCtx),
+    denied(["-p", "--Dangerously-skip-permissions"], claudeDoCtx),
+    denied(["-p", "--dangerously-skip-permissions=true"], claudeDoCtx),
+    denied(["-p", "--permission-mode=bypassPermissions"], claudeDoCtx),
+    denied(["-p", "--settings", "/tmp/bypass.json"], claudeDoCtx),
+    denied(["-p", '--settings={"permissions":{"defaultMode":"bypassPermissions"}}'], claudeDoCtx),
+    denied(["-p", "--add-dir", "/"], claudeDoCtx),
+    denied(["exec", "-sdanger-full-access", "go"], codexDoCtx),
+    denied(["exec", "--sandbox=danger-full-access", "go"], codexDoCtx),
+    denied(["exec", "-c", "approval_policy=never", "go"], codexDoCtx),
+    denied(["exec", "--full-auto", "go"], codexDoCtx),
+    denied(["exec", "--dangerously-bypass-approvals-and-sandbox", "go"], codexDoCtx),
+    denied(["--prompt=go", "--yolo"], { ...copDo, unguarded: true }),
+    denied(["--prompt=go", "--yolo=true"], { ...copDo, unguarded: true }),
+    denied(["--prompt=go", "--allow-all-tools=true"], { ...copDo, unguarded: true }),
+    denied(["--prompt=go", "--ALLOW-ALL-TOOLS"], copDo),
+    denied(["--prompt=go", "--allow-all"], { ...copDo, unguarded: true }),
+    denied(["--prompt=go", "--allow-all-paths"], { ...copDo, unguarded: true }),
+    denied(["--prompt=go", "--allow-all-urls"], { ...copDo, unguarded: true }),
+  ], Array(19).fill(true));
+  check("a job that only reads may not be given a tool that writes", [
+    denied(["-p", "--allowedTools", "Bash"], claudeAskCtx),
+    denied(["-p", "--allowedTools", "mcp__delphi,Edit"], claudeAskCtx),
+    denied(["-p", "--allowedTools", "Write"], claudeAskCtx),
+    denied(["-p", "--permission-mode", "acceptEdits"], claudeAskCtx),
+    denied(["-p", "--tools", "Read,Bash"], claudeAskCtx),
+    denied(["exec", "-s", "workspace-write", "go"], codexAskCtx),
+    denied(["--prompt=go", "--allow-tool", "shell"], copAsk),
+    denied(["--prompt=go", "--allow-all-tools"], copAsk),
+    denied(["-p", "--permission-mode", "plan", "--allowedTools", "mcp__delphi"], claudeAskCtx),
+  ], [true, true, true, true, true, true, true, true, false]);
+  check("only Delphi's own MCP wiring, as Delphi made it",
+    [checkArgv(["-p", "--mcp-config", "/tmp/delphi-mcp/x.json"], { ...claudeDoCtx, mcpFlags: ["--mcp-config", "/tmp/delphi-mcp/x.json"] }),
+     denied(["-p", "--mcp-config", "/tmp/evil.json"], { ...claudeDoCtx, mcpFlags: ["--mcp-config", "/tmp/delphi-mcp/x.json"] })],
+    [null, true]);
 
   client.close();
   await d.idle();

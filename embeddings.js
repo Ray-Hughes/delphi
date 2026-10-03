@@ -304,4 +304,4 @@ function status(db) {
   return { models: rows, total: rows.reduce((n, r) => n + r.n, 0) };
 }
 
-module.exports = { embed, embedQuery, reindex, nearest, similarity, provider, status, fromBlob };
+module.exports = { embed, embedQuery, reindex, nearest, similarity, provider, status, fromBlob, lexicalVector };

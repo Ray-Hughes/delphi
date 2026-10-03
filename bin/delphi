@@ -96,6 +96,12 @@ const HELP = {
     "in the folder is kept for 30 days; the command that puts it back is printed.",
   ],
   done: ["delphi done <task>", "Mark a task done. If it still has a Workbench, offers to finish that too."],
+  flags: [
+    "delphi flags [list] [--project KEY] [--status S|--all] | show <id> | approve <id> [--note \"<text>\"] | reject <id> \"<why>\"",
+    "Items flagged as possibly filed in the wrong project, and where the Oracle or an agent proposes they go.",
+    "approve applies the proposal (a move, copy or association, undoable from History); reject needs a reason,",
+    "so the next look does not propose the same thing. Both are a person's decision and are refused in an agent's session.",
+  ],
   chat: [
     "delphi chat <task> [--agent claude|copilot] [--auto] [--allow-unguarded] [\"<message>\" | -- <message...>]",
     "Talk to an agent on a task's Sheet. What it says, the commands it runs and the files it edits are written",
@@ -129,7 +135,7 @@ function usage(command) {
 
 // --- arguments -----------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["--tail", "--cwd", "--why", "--title", "--repo", "--project", "--agent"]);
+const VALUE_FLAGS = new Set(["--tail", "--cwd", "--why", "--title", "--repo", "--project", "--agent", "--note", "--status"]);
 
 function parseArgs(argv) {
   const positional = [];
@@ -543,7 +549,50 @@ async function resolve(client, ref, command) {
   return client.call("sheet_resolve", { task: String(need(ref, "The task", command)) });
 }
 
+/** One flag as a line: what, where it lives, and what is proposed. */
+function flagLine(f) {
+  const where = f.home ? ` (${f.home})` : f.project ? ` (${f.project.key})` : "";
+  const proposal = f.proposal_summary || (typeof f.proposal === "string" ? f.proposal : null);
+  const item = f.item || `${f.entity} ${f.entity_id}`;
+  return `#${f.id} ${f.status.padEnd(9)} ${item} "${f.label || ""}"${where}${proposal ? `  ${proposal}` : ""}`;
+}
+
 const COMMANDS = {
+  async flags(client, { positional, flags }) {
+    const verb = positional[0] || "list";
+    if (verb === "list") {
+      const rows = await client.call("list_flags", {
+        ...(flags.all ? { status: "all" } : flags.status ? { status: flags.status } : {}),
+        ...(flags.project ? { project: flags.project } : {}),
+      });
+      if (!rows.length) { say("Nothing flagged."); return 0; }
+      for (const f of rows) say(flagLine(f));
+      return 0;
+    }
+    const id = entryId(positional[1], "flags");
+    if (verb === "show") {
+      const got = await client.call("flag_get", { flag_id: id });
+      say(flagLine(got.flag));
+      if (got.flag.note) say(`  ${got.flag.note}`);
+      for (const e of got.entries) say(`  ${e.kind.padEnd(6)} ${e.author}: ${String(e.body).split("\n")[0]}`);
+      for (const p of got.plan || []) say(`  plan: ${p.summary}`);
+      return 0;
+    }
+    if (verb === "approve") {
+      const done = await client.call("flag_decide", { flag_id: id, decision: "approve", ...(flags.note ? { note: String(flags.note) } : {}) });
+      say(`Applied: ${flagLine(done.flag)}`);
+      if (done.audit_ids && done.audit_ids.length) say(`Undo it from History (entry ${done.audit_ids.join(", ")}).`);
+      return 0;
+    }
+    if (verb === "reject") {
+      const why = need(flags.note || positional.slice(2).join(" "), "Why it is rejected", "flags");
+      const done = await client.call("flag_decide", { flag_id: id, decision: "reject", note: String(why) });
+      say(`Rejected: ${flagLine(done.flag)}`);
+      return 0;
+    }
+    throw new UsageError(`flags knows list, show, approve and reject, not '${verb}'.`, "flags");
+  },
+
   async cat(client, { positional, flags }) {
     const { task } = await resolve(client, positional[0], "cat");
     if (flags.ledger && flags.tail !== undefined) {
@@ -1302,6 +1351,14 @@ async function main(argv) {
   // agent that gets this far is told plainly that it is not its call.
   if (command === "discard" && process.env.DELPHI_AUTHOR_TYPE === "agent") {
     process.stderr.write("delphi: discard is for a person to decide, and this is an agent's session. Say what you would discard and why in the task's Sheet instead. Nothing was thrown away.\n");
+    return 1;
+  }
+  // Approving or rejecting a proposal to move someone's work is a person's
+  // call, like discard. The store refuses an agent's decision too; this says
+  // so before a server is even started, and the guard blocks the command in
+  // an agent's shell before it gets here.
+  if (command === "flags" && ["approve", "reject"].includes(args[0]) && process.env.DELPHI_AUTHOR_TYPE === "agent") {
+    process.stderr.write(`delphi: ${args[0]} is for a person to decide, and this is an agent's session. Say what you think on the flag instead (flag_item adds to it). Nothing was changed.\n`);
     return 1;
   }
   // Before anything touches the terminal: the full screen view in a pipe or a

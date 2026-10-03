@@ -130,6 +130,19 @@ function openDatabase() {
         // out version produced, so nothing downstream has to know which is in use.
         return handle.prepare(statement).all();
       },
+      // Several statements as one unit, for a move that must land whole. A
+      // savepoint so it nests if a caller ever holds a transaction already.
+      batch(statements) {
+        handle.exec("SAVEPOINT delphi_batch");
+        try {
+          for (const statement of statements) handle.prepare(statement).all();
+          handle.exec("RELEASE delphi_batch");
+        } catch (error) {
+          handle.exec("ROLLBACK TO delphi_batch");
+          handle.exec("RELEASE delphi_batch");
+          throw error;
+        }
+      },
     };
   } catch {
     const binary = findSqlite();
@@ -163,6 +176,25 @@ function openDatabase() {
           } catch {
             return [];
           }
+        } finally {
+          try { fs.unlinkSync(file); } catch {}
+        }
+      },
+      // Each query() is its own process, so no transaction spans two of them.
+      // A batch is therefore one script in one process, between BEGIN and
+      // COMMIT, with .bail so the first failure ends the process before the
+      // COMMIT and the whole script rolls back. execFileSync throws on that
+      // exit, with sqlite3's own message on stderr.
+      batch(statements) {
+        const lines = [".timeout 5000", ".bail on", "BEGIN IMMEDIATE;",
+          ...statements.map((q) => (q.trim().endsWith(";") ? q : `${q};`)), "COMMIT;"];
+        const file = path.join(os.tmpdir(), `delphi-${process.pid}-${Date.now()}-batch.sql`);
+        fs.writeFileSync(file, lines.join("\n"));
+        try {
+          execFileSync(binary, [DB], { input: `.read ${file}\n`, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] });
+        } catch (error) {
+          const said = String((error && error.stderr) || "").trim().split("\n")[0];
+          throw new Error(said || String(error.message || error));
         } finally {
           try { fs.unlinkSync(file); } catch {}
         }
@@ -306,7 +338,7 @@ function literal(v) {
   return `'${String(v).replace(/'/g, "''")}'`;
 }
 
-function sql(query, params = []) {
+function render(query, params = []) {
   // Values are substituted into the statement rather than bound. Both routes take
   // the statement as text, so doing it once here keeps them interchangeable.
   //
@@ -335,8 +367,18 @@ function sql(query, params = []) {
   if (highest !== params.length) {
     throw new Error(`sql(): ${params.length} values given for ${highest} placeholders`);
   }
+  return statement;
+}
 
+function sql(query, params = []) {
+  const statement = render(query, params);
   return DATABASE.query(statement.endsWith(";") ? statement : statement + ";");
+}
+
+/** [[query, params], ...] as one transaction, on either route. For the shared stores. */
+function batch(statements) {
+  if (!statements.length) return;
+  DATABASE.batch(statements.map(([query, params]) => render(query, params || [])));
 }
 
 /**
@@ -410,6 +452,18 @@ const benches = createWorkbench({
   settings: () => readSettings(),
 });
 
+// Cross-project items and flags, from the store the app uses. Its moves are
+// batches, which on the sqlite3 route are one script in one process, so a
+// task never lands in one project with its subtasks in another. The author
+// type falls back to what the name looks like, so an agent whose launcher did
+// not say what it is cannot approve a proposal by leaving the type out.
+const { makeItemStore, inProject } = require("../items/store");
+const ITEM_AUTHOR_TYPE = AUTHOR_TYPE || sheetFormat.inferAuthorType(ACTOR);
+const itemStore = makeItemStore({
+  sql, batch, actor: ACTOR, authorType: ITEM_AUTHOR_TYPE, settings: () => readSettings(),
+  derive: (padId) => derivePad(padId),
+});
+
 // When sheet_read last swept a task for lost runs. See sheet_read.
 const SWEEP_EVERY_MS = 30000;
 const swept = new Map();
@@ -443,15 +497,27 @@ function workbenchNotice(taskId) {
  * it for sheet_promote and the rest. Empty columns go, a long detail or Sheet is
  * clipped with a word saying so, and only the latest statuses are listed.
  */
+const TASK_TITLE_CHARS = 300;
 const TASK_DETAIL_CHARS = 2000;
 const TASK_SHEET_CHARS = 3000;
-const TASK_ENTRY_CHARS = 300;
+const TASK_ENTRY_CHARS = 200;
 const TASK_HISTORY_SHOWN = 4;
+// The newest of the ledger, then the recent tail. A ledger is meant to be
+// short, but nothing stops an agent promoting everything, and a task with
+// thousands of promoted entries returned all of them.
+const TASK_LEDGER_SHOWN = 8;
+const TASK_TAIL_SHOWN = 6;
+const TASK_LIST_SHOWN = 50;
+const TASK_BUDGET = 1500;
 function taskBrief(task) {
   const id = Number(task.id);
   const row = {};
   for (const [k, v] of Object.entries(task)) if (v !== null && v !== "" && k !== "colour") row[k] = v;
   const clipped = [];
+  if (row.title && String(row.title).length > TASK_TITLE_CHARS) {
+    row.title = String(row.title).slice(0, TASK_TITLE_CHARS) + "…";
+    clipped.push("title");
+  }
   if (row.detail && String(row.detail).length > TASK_DETAIL_CHARS) {
     row.detail = String(row.detail).slice(0, TASK_DETAIL_CHARS) + "…";
     clipped.push("detail");
@@ -460,30 +526,40 @@ function taskBrief(task) {
   const context = sheets.context(id);
   let entries = context.entries;
   let text = context.text;
+  let ledgerMore = 0;
   if (text.length > TASK_SHEET_CHARS) {
-    // The ledger whole, then as much of the recent tail as fits, bodies clipped.
+    // The newest of the ledger and of the tail, bodies clipped.
     const ledger = entries.filter((e) => e.promoted || e.kind === "decide" || e.kind === "ask");
-    const tail = entries.filter((e) => !ledger.includes(e)).slice(-6);
+    const tail = entries.filter((e) => !ledger.includes(e)).slice(-TASK_TAIL_SHOWN);
+    ledgerMore = Math.max(0, ledger.length - TASK_LEDGER_SHOWN);
     const short = (e) => ({ ...e, body: String(e.body || "").length > TASK_ENTRY_CHARS ? String(e.body).slice(0, TASK_ENTRY_CHARS) + "…" : e.body });
-    entries = [...ledger, ...tail].sort((x, y) => x.id - y.id).map(short);
-    text = sheetFormat.format({ header: sheets.header(id), entries }, { clean: true });
+    entries = [...ledger.slice(-TASK_LEDGER_SHOWN), ...tail].sort((x, y) => x.id - y.id).map(short);
+    text = sheetFormat.format({ header: { ...sheets.header(id), title: row.title }, entries }, { clean: true });
     clipped.push("sheet");
   }
+  const ids = entries.map((e) => e.id);
+  const subtasks = sql("SELECT id, title, status FROM tasks WHERE parent_id = :p1 ORDER BY id", [id]);
 
   const history = sql("SELECT status, actor, at FROM status_events WHERE task_id = :p1 ORDER BY at, id", [id]);
-  return {
+  // Whatever the caps above miss (a title of thousands of characters, say),
+  // the budget catches: fit trims the longest field or list until it fits.
+  return recallFit({
     task: row,
     project: task.project_id ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [task.project_id])[0] : null,
-    subtasks: sql("SELECT id, title, status FROM tasks WHERE parent_id = :p1 ORDER BY id", [id]),
+    subtasks: subtasks.slice(0, TASK_LIST_SHOWN),
+    ...(subtasks.length > TASK_LIST_SHOWN ? { subtasks_total: subtasks.length } : {}),
     sheet: text,
-    entry_ids: entries.map((e) => e.id),
+    ...(ledgerMore ? { ledger_more: `${ledgerMore} older ledger entries are not shown; sheet_read mode ledger has them.` } : {}),
+    entry_ids: ids.slice(-TASK_LIST_SHOWN),
+    ...(ids.length > TASK_LIST_SHOWN ? { entry_ids_total: ids.length } : {}),
     comments_total: context.total,
     comments_shown: entries.length,
     history: history.slice(-TASK_HISTORY_SHOWN),
     ...(history.length > TASK_HISTORY_SHOWN ? { history_total: history.length } : {}),
     ...(clipped.length ? { clipped, more: "get_task with detail \"full\", or sheet_read mode full, for the rest." } : {}),
-  };
+  }, TASK_BUDGET, ["subtasks", "history"]);
 }
+const recallFit = (...args) => require("./recall").fit(...args);
 
 /** What an agent is shown of a task's Sheet: the ledger plus the recent tail. */
 function sheetContext(taskId) {
@@ -544,13 +620,20 @@ const audit = (action, entity, entityId, summary, label) =>
 // duplicated, only the writes.
 
 /** A pad by id, or by project and key, which is how an agent addresses one. */
-function findPad(a) {
+function findPad(a, { shown = false } = {}) {
   if (a.id != null) return sql("SELECT * FROM scratchpads WHERE id = :p1", [Number(a.id)])[0] || null;
   if (!a.key) throw new Error("Pass either id, or project_id and key.");
   const projectId = resolveProjectId(a);
   if (projectId == null) throw new Error("Pass either id, or project_id and key.");
-  return sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
-             [projectId, String(a.key)])[0] || null;
+  const own = sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
+                  [projectId, String(a.key)])[0] || null;
+  if (own || !shown) return own;
+  // For reading only: a pad shown here from another project, when exactly one
+  // has the key. A write by key stays home only, so it never lands in a
+  // project the agent did not name.
+  const others = sql(`SELECT s.* FROM scratchpads s JOIN item_projects ip ON ip.entity = 'scratchpad' AND ip.entity_id = s.id
+                       WHERE ip.project_id = :p1 AND s.key = :p2`, [projectId, String(a.key)]);
+  return others.length === 1 ? others[0] : null;
 }
 
 /**
@@ -714,7 +797,7 @@ function projectScope() {
 const TOOLS = {
   whoami: {
     description:
-      "Which Delphi database you are connected to, who your writes are attributed to, and whether a Delphi app is running to dispatch handoffs (app_running is true, false, or \"unknown\" when it cannot be told). Call it when you are not sure your work is landing where the person can see it.",
+      "Your database, who your writes are attributed to, and whether a Delphi app is running to dispatch handoffs (app_running: true, false or \"unknown\"). Call it when unsure your work lands where the person sees it.",
     schema: { type: "object", properties: {} },
     run: () => {
       const app = appState();
@@ -802,18 +885,22 @@ const TOOLS = {
     run: (a) => {
       const where = [];
       const params = [];
-      if (a.project_id != null) { params.push(a.project_id); where.push(`t.project_id = :p${params.length}`); }
+      // Home or shown here from another project; a row from elsewhere says
+      // its home, so an agent knows where it really lives.
+      if (a.project_id != null) { params.push(resolveProjectId(a)); where.push(inProject("task", "t", `:p${params.length}`)); }
       if (a.status) { params.push(a.status); where.push(`t.status = :p${params.length}`); }
       else if (!a.include_done) where.push("t.status != 'done'");
+      const asked = a.project_id != null ? Number(params[0]) : null;
       return sql(
-        `SELECT t.id, t.title, t.detail, t.status, t.priority, t.due, t.ref, p.name AS project
+        `SELECT t.id, t.title, t.detail, t.status, t.priority, t.due, t.ref, p.name AS project,
+                ${asked != null ? `CASE WHEN t.project_id IS ${asked} THEN NULL ELSE p.key END` : "NULL"} AS home
          FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
          ${where.length ? "WHERE " + where.join(" AND ") : ""}
          ORDER BY CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 1 WHEN 'todo' THEN 2 ELSE 3 END,
                   CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, t.id DESC
          LIMIT 200`,
         params
-      );
+      ).map(({ home, ...row }) => (home ? { ...row, home } : row));
     },
   },
 
@@ -869,14 +956,33 @@ const TOOLS = {
         status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
         priority: { type: "string", enum: ["high", "med", "low"] },
         due: { type: "string" },
-        project_id: { type: "number" },
+        project_id: { type: "number", description: "Moves it, subtasks too: only a task you filed in the last day, else flag_item" },
         assignee: { type: "string", description: "Who holds it; your actor name to take it" },
       },
     },
     run: (a) => {
-      const before = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
+      let before = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
       if (!before) throw new Error(`No task ${a.id}`);
-      const fields = ["title", "detail", "status", "priority", "due", "project_id", "assignee"].filter((f) => a[f] !== undefined);
+      // A change of project is a move (owner decision D2). An agent may move a
+      // task it filed itself in the last day, which is fixing its own
+      // misfiling, the common case; anything else is a person's call, so it is
+      // refused with the tool that asks for one. The move goes through the
+      // shared store, so the subtasks follow and the epic it left is cleared:
+      // setting the column here used to leave the task filed under an epic in
+      // the project it had left.
+      if (a.project_id !== undefined && a.project_id !== null && Number(a.project_id) !== Number(before.project_id)) {
+        const suffix = `(by ${ACTOR})`;
+        const mine = sql(`SELECT id FROM audit WHERE action = 'create' AND entity = 'task' AND entity_id = :p1
+                            AND substr(summary, -length(:p2)) = :p2 AND at >= datetime('now', '-24 hours') LIMIT 1`,
+                         [before.id, suffix])[0];
+        if (!mine) {
+          throw new Error(`Task ${before.id} was not filed by you in the last 24 hours, so moving it is a person's call. ` +
+            `Flag it instead: flag_item with entity "task", id ${before.id}, and a note saying where it belongs and why.`);
+        }
+        itemStore.move("task", before.id, Number(a.project_id));
+        before = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
+      }
+      const fields = ["title", "detail", "status", "priority", "due", "assignee"].filter((f) => a[f] !== undefined);
       if (!fields.length) return before;
       const params = fields.map((f) => a[f]);
       const sets = fields.map((f, i) => `${f} = :p${i + 1}`).join(", ");
@@ -899,14 +1005,14 @@ const TOOLS = {
 
   queue_next: {
     description:
-      "Claim the next piece of work from the queue and get everything needed to do it. Call this when you are ready to work rather than waiting to be given something. Returns null when the queue is empty, which means there is nothing to do and you should stop rather than invent work. Pass project_id or project when you are only able to work on one project, for example because you are running in that project's checkout: without it you will be handed whatever is at the top of the pool, whichever project it belongs to.",
+      "Claim the next queued task with everything needed to do it, when you are ready to work. claimed null means the queue is empty: stop, do not invent work. Pass project_id or project if you can only work on one project (say you run in its checkout); otherwise you get the top of the whole pool.",
     schema: {
       type: "object",
       properties: {
-        queue: { type: "string", description: "Which pool. Defaults to ready." },
-        minutes: { type: "number", description: "How long to hold it before the claim lapses. Defaults to 30." },
-        project_id: { type: "number", description: "Only take work from this project. Leave it out to take from any." },
-        project: { type: "string", description: "The same thing by project key, if that is what you have." },
+        queue: { type: "string", description: "Pool, default ready" },
+        minutes: { type: "number", description: "Claim length, default 30" },
+        project_id: { type: "number", description: "Only this project" },
+        project: { type: "string", description: "Same, by key" },
       },
     },
     run: (a) => {
@@ -977,7 +1083,7 @@ const TOOLS = {
 
   queue_release: {
     description:
-      "Give a claimed task back without finishing it. Always say why: the next agent reads that reason before starting, and an unexplained release is a task that gets picked up and abandoned again.",
+      "Give a claimed task back unfinished. Say why: the next agent reads it first, and an unexplained release is picked up and abandoned again.",
     schema: {
       type: "object",
       required: ["task_id", "reason"],
@@ -1009,13 +1115,13 @@ const TOOLS = {
 
   queue_extend: {
     description:
-      "Push your claim's expiry out because you are still working. A lease is short so a dead agent's task comes back quickly, which makes a slow but healthy agent the awkward case. Call this rather than letting the lease lapse: once it has, the task may already belong to someone else.",
+      "Extend your claim while you are still working. Do it before the lease lapses: after that the task may be someone else's.",
     schema: {
       type: "object",
       required: ["task_id"],
       properties: {
         task_id: { type: "number" },
-        minutes: { type: "number", description: "How much longer you need. Defaults to another full lease." },
+        minutes: { type: "number", description: "Default another full lease" },
       },
     },
     run: (a) => {
@@ -1041,13 +1147,13 @@ const TOOLS = {
 
   queue_complete: {
     description:
-      "Finish a claimed task. The summary is left as a comment and is what the next person or agent reads to know what actually happened, so write it for them rather than for a changelog. Your summary is promoted into the task's ledger automatically, so the next agent reads it first. If you learned something that matters beyond this task, sheet_file it.",
+      "Finish a claimed task. Your summary is promoted into the task's ledger automatically, the first thing the next agent reads: write it for them, not as a changelog. If something matters beyond this task, sheet_file it.",
     schema: {
       type: "object",
       required: ["task_id", "summary"],
       properties: {
         task_id: { type: "number" },
-        summary: { type: "string", description: "What you did, and anything the next person needs to know." },
+        summary: { type: "string", description: "What you did, and what the next person needs to know" },
       },
     },
     run: (a) => {
@@ -1072,13 +1178,13 @@ const TOOLS = {
   },
 
   queue_status: {
-    description: "What is waiting in the queue and what other agents are already holding. Read it before claiming if you want to know whether it is worth starting.",
+    description: "What is waiting in the queue and what other agents hold.",
     schema: {
       type: "object",
       properties: {
         queue: { type: "string" },
-        project_id: { type: "number", description: "Only count work in this project. Leave it out for the whole pool." },
-        project: { type: "string", description: "The same thing by project key." },
+        project_id: { type: "number", description: "Only this project" },
+        project: { type: "string", description: "Same, by key" },
       },
     },
     run: (a) => {
@@ -1544,13 +1650,13 @@ const TOOLS = {
     run: (a) => {
       const projectId = a.project_id ?? (a.project ? resolveProjectId(a) : null);
       return sql(
-        `SELECT id, project_id, key, title, author, derives_tasks, updated_at,
-                length(body) AS size
-         FROM scratchpads
-         ${projectId ? "WHERE project_id = :p1" : ""}
-         ORDER BY pinned DESC, updated_at DESC LIMIT 100`,
-        projectId ? [projectId] : []
-      );
+        `SELECT s.id, s.project_id, s.key, s.title, s.author, s.derives_tasks, s.updated_at,
+                length(s.body) AS size, CASE WHEN s.project_id IS :p1 THEN NULL ELSE p.key END AS home
+         FROM scratchpads s LEFT JOIN projects p ON p.id = s.project_id
+         ${projectId ? `WHERE ${inProject("scratchpad", "s", ":p1")}` : "WHERE :p1 IS NULL"}
+         ORDER BY s.pinned DESC, s.updated_at DESC LIMIT 100`,
+        [projectId || null]
+      ).map(({ home, ...row }) => (projectId && home ? { ...row, home } : row));
     },
   },
 
@@ -1566,7 +1672,7 @@ const TOOLS = {
       },
     },
     run: (a) => {
-      const pad = findPad(a);
+      const pad = findPad(a, { shown: true });
       if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
       return pad;
     },
@@ -1669,33 +1775,28 @@ const TOOLS = {
 
   handoff_send: {
     description:
-      "Hand a piece of work to another agent as a job. Use this when something is better done by a different tool, or by a second opinion: \"have Codex review this branch\" (kind ask), \"have Claude write the migration\" (kind do).\n\n" +
-      "kind ask: the agent reads the project's folder and answers in words. kind do: it changes code, always in the task's own Workbench (a separate folder and branch), never in the main checkout, and a person reviews the result. A job without a task_id gets a task of its own, whose Sheet is the job's log.\n\n" +
-      "It returns immediately with a job_id. A job an agent sends waits for a person to approve it (state needs_approval) unless the project lets agents start work by themselves; the result says which. The Delphi app runs approved jobs, several at once. So do not wait, do not poll in a loop, and do not sleep: finish what you were doing and say you have handed it over. The result says whether a Delphi app is running to dispatch it (yes, no, or unknown when it cannot tell) and whether you can be woken; believe it. Read where it got to later with run_status.\n\n" +
-      "Call list_agents first if you are not sure which agents this machine has.",
+      "Hand work to another agent as a job. kind ask: it reads the project and answers (\"have Codex review this branch\"). kind do: it changes code in the task's own Workbench, never the main checkout, and a person reviews it. Without task_id the job gets a task whose Sheet is its log.\n\n" +
+      "Returns a job_id at once. An agent's job waits for a person's approval (needs_approval) unless the project lets agents start work; the result says which, whether a Delphi app is running to dispatch it, and whether you will be woken. Believe it. Do not wait, poll or sleep: finish and say you handed it over; read it later with run_status. Unsure of the name? list_agents.",
     schema: {
       type: "object",
       required: ["to", "request"],
       properties: {
-        to: { type: "string", description: "The agent's key, e.g. codex, claude-code, copilot" },
-        request: { type: "string", description: "What you want done, written for them rather than for a log" },
-        kind: { type: "string", enum: ["ask", "do"], description: "ask (default): read and answer. do: change code, in a Workbench." },
+        to: { type: "string", description: "Agent key: codex, claude-code, copilot" },
+        request: { type: "string", description: "Written for them, not for a log" },
+        kind: { type: "string", enum: ["ask", "do"], description: "Default ask" },
         project_id: { type: "number" },
-        project: { type: "string", description: "Project key, as an alternative to project_id" },
-        task_id: { type: "number", description: "The task this is about, if there is one" },
-        context: {
-          type: "object",
-          description: "Branch, files, pad ids: whatever they will need and cannot work out",
-        },
-        wake: {
-          type: "boolean",
-          description: "Whether you want a turn when the reply lands. True unless you are handing something over and leaving.",
-        },
+        project: { type: "string", description: "Key, instead of project_id" },
+        task_id: { type: "number" },
+        context: { type: "object", description: "Branch, files, pad ids: what they cannot work out" },
+        wake: { type: "boolean", description: "A turn when the reply lands; false if you are leaving" },
       },
     },
     run: (a) => {
-      const projectId = a.project_id ?? resolveProjectId(a);
-      if (projectId == null) throw new Error("A handoff needs a project. Pass project_id or project.");
+      // A job about a task belongs to the task's project, where its Workbench is
+      // built; naming another project beside it is refused (agent/jobs.js).
+      const named = a.project_id ?? resolveProjectId(a);
+      if (named == null && a.task_id == null) throw new Error("A handoff needs a project. Pass project_id or project.");
+      const projectId = jobs.projectFor(sql, { projectId: named, taskId: a.task_id ?? null });
       const target = sql("SELECT key, label, enabled FROM harnesses WHERE key = :p1", [String(a.to)])[0];
       if (!target) {
         const known = sql("SELECT key FROM harnesses WHERE enabled = 1").map((r) => r.key).join(", ");
@@ -1704,7 +1805,6 @@ const TOOLS = {
       if (!target.enabled) throw new Error(`${target.label} is turned off in Delphi's settings.`);
       const kind = a.kind === undefined || a.kind === null ? "ask" : String(a.kind);
       if (!jobs.KINDS.includes(kind)) throw new Error(`kind must be ask (read and answer) or do (change code), not '${kind}'.`);
-      if (a.task_id != null && !sql("SELECT id FROM tasks WHERE id = :p1", [Number(a.task_id)])[0]) throw new Error(`No task ${a.task_id}.`);
       // Refused now rather than failed later: an agent told at once that the
       // project has no folder can tell its person what to set.
       const problem = jobs.folderProblem(sql, Number(projectId));
@@ -1758,11 +1858,11 @@ const TOOLS = {
 
   handoff_status: {
     description:
-      "What has been handed to and from you, and where each one got to. Use this when you have come back to a session and want to know whether an answer arrived while you were away. run_status and run_list say the same with more detail.",
+      "What was handed to and from you and where each got to: check it on returning to a session. run_status and run_list say more.",
     schema: {
       type: "object",
       properties: {
-        id: { type: "number", description: "One handoff, in full, including the reply" },
+        id: { type: "number", description: "One, in full, with the reply" },
         project_id: { type: "number" },
         project: { type: "string" },
       },
@@ -1787,11 +1887,11 @@ const TOOLS = {
 
   run_status: {
     description:
-      "Where one job got to: its state (queued, needs_approval, running, waiting_on_human, done, failed, stopped), who asked and who approved it, its Workbench, tokens so far, and the reply. Its full log is the task's Sheet (sheet_read). Read it when you come back, rather than polling.",
+      "One job: state (queued, needs_approval, running, waiting_on_human, done, failed, stopped), who asked and approved, Workbench, tokens, reply. Its log is the task's Sheet. Read it when you return; do not poll.",
     schema: {
       type: "object",
       required: ["job_id"],
-      properties: { job_id: { type: "number", description: "The job_id handoff_send returned" } },
+      properties: { job_id: { type: "number", description: "From handoff_send" } },
     },
     run: (a) => {
       const run = jobs.get(sql, Number(a.job_id));
@@ -1802,15 +1902,15 @@ const TOOLS = {
 
   run_list: {
     description:
-      "Jobs, newest first, in one project or all of them, optionally only some states or only the ones you asked for or are running. Approving a job is a person's decision, made in the Delphi app; no tool does it.",
+      "Jobs, newest first, by project, states, or only yours. Approving one is a person's decision in the app; no tool does it.",
     schema: {
       type: "object",
       properties: {
         project_id: { type: "number" },
-        project: { type: "string", description: "Project key, as an alternative to project_id" },
-        states: { type: "array", items: { type: "string", enum: jobs.STATES }, description: "Only jobs in these states" },
-        mine: { type: "boolean", description: "Only jobs you asked for or are running as" },
-        limit: { type: "number", description: "At most this many. Defaults to 25." },
+        project: { type: "string" },
+        states: { type: "array", items: { type: "string", enum: jobs.STATES } },
+        mine: { type: "boolean", description: "Ones you asked for or run" },
+        limit: { type: "number", description: "Default 25" },
       },
     },
     run: (a) => {
@@ -1941,14 +2041,13 @@ const TOOLS = {
 
   timer_set: {
     description:
-      "Ask to be given a turn later. Use this instead of waiting: for a build you have started, a deploy, anything that finishes on its own clock.\n\n" +
-      "Only works from inside a Delphi agent tab, because there has to be a session to wake. Waiting in a loop instead burns tokens for no reason and stops the moment your turn ends.",
+      "Get a turn later instead of waiting, for a build, a deploy, anything on its own clock. Only inside a Delphi agent tab, which has a session to wake. Waiting in a loop burns tokens and stops when your turn ends.",
     schema: {
       type: "object",
       required: ["minutes", "message"],
       properties: {
-        minutes: { type: "number", description: "How long from now" },
-        message: { type: "string", description: "What to tell you when you wake, in enough detail to carry on" },
+        minutes: { type: "number", description: "From now" },
+        message: { type: "string", description: "What to tell you on waking, enough to carry on" },
       },
     },
     run: (a) => {
@@ -1991,15 +2090,17 @@ const TOOLS = {
     run: (a) => {
       if (a.detail !== "full") return recall.search(String(a.query), opts(a, 8));
       const like = `%${a.query}%`;
+      const also = (entity) => `(SELECT GROUP_CONCAT(ap.name, ', ') FROM item_projects ip JOIN projects ap ON ap.id = ip.project_id
+                                  WHERE ip.entity = '${entity}' AND ip.entity_id = x.id) AS also_in`;
       return {
         tasks: sql(
-          `SELECT t.id, t.title, t.status, p.name AS project FROM tasks t
-           LEFT JOIN projects p ON p.id = t.project_id
-           WHERE t.title LIKE :p1 OR t.detail LIKE :p1 OR t.ref LIKE :p1 LIMIT 30`, [like]),
+          `SELECT x.id, x.title, x.status, p.name AS project, ${also("task")} FROM tasks x
+           LEFT JOIN projects p ON p.id = x.project_id
+           WHERE x.title LIKE :p1 OR x.detail LIKE :p1 OR x.ref LIKE :p1 LIMIT 30`, [like]),
         notes: sql(
-          `SELECT n.id, n.title, n.kind, n.body, p.name AS project FROM notes n
-           LEFT JOIN projects p ON p.id = n.project_id
-           WHERE n.title LIKE :p1 OR n.body LIKE :p1 LIMIT 30`, [like]),
+          `SELECT x.id, x.title, x.kind, x.body, p.name AS project, ${also("note")} FROM notes x
+           LEFT JOIN projects p ON p.id = x.project_id
+           WHERE x.title LIKE :p1 OR x.body LIKE :p1 LIMIT 30`, [like]),
       };
     },
   },
@@ -2165,6 +2266,93 @@ const TOOLS = {
     },
   },
 
+  // --- items in the wrong place ------------------------------------------------
+  //
+  // An agent may say an item is misfiled and propose where it belongs. Nothing
+  // here applies a proposal: approving is a person's, in the window or with
+  // delphi flags approve, which the guard blocks in an agent's shell.
+
+  flag_item: {
+    description:
+      "Say an item may be in the wrong project: note where it belongs and why. Changes nothing; the Oracle proposes a home and a person decides.",
+    schema: {
+      type: "object",
+      required: ["entity", "id", "note"],
+      properties: {
+        entity: { type: "string", enum: ["task", "note", "scratchpad", "link", "organizer", "session"] },
+        id: { type: "number" },
+        note: { type: "string" },
+        evidence: { type: "array", items: { type: "object" }, description: "{type: text|url, value} or {type: task|note|pad|project, id}" },
+      },
+    },
+    run: (a) => {
+      const made = itemStore.flag({ entity: a.entity, id: a.id, note: a.note, evidence: a.evidence ?? null, suggest: a.suggest ?? null, source: "agent" });
+      return { flag_id: made.flag.id, status: made.flag.status, appended: made.appended, proposal: made.flag.proposal_summary };
+    },
+  },
+
+  propose_move: {
+    description:
+      "Propose where an item belongs: 1 to 3 ops (move, copy, associate, dissociate). Never applies: returns the plan with any refusals, for a person to approve.",
+    schema: {
+      type: "object",
+      required: ["ops", "reasoning"],
+      properties: {
+        flag_id: { type: "number", description: "Or entity and id" },
+        entity: { type: "string" },
+        id: { type: "number" },
+        ops: { type: "array", items: { type: "object" }, description: "{op, entity, id, to, keepInSource}" },
+        reasoning: { type: "string" },
+        confidence: { type: "number", description: "0 to 1" },
+      },
+    },
+    run: (a) => {
+      const done = itemStore.propose({ flagId: a.flag_id ?? null, entity: a.entity ?? null, id: a.id ?? null, ops: a.ops,
+        reasoning: a.reasoning, confidence: a.confidence ?? null, by: ACTOR, evaluator: ACTOR });
+      return { flag_id: done.flag.id, status: done.flag.status, plan: done.plan.map((p) => ({ ok: p.ok, summary: p.summary, refusals: p.refusals })) };
+    },
+  },
+
+  list_flags: {
+    description: "Flags on possibly misfiled items, with each proposal in a line. Open ones unless status says.",
+    schema: {
+      type: "object",
+      properties: {
+        status: { type: "string", description: "e.g. applied, rejected, all" },
+        project_id: { type: "number" },
+        project: { type: "string" },
+      },
+    },
+    run: (a) => itemStore.listFlags({ status: a.status ? (a.status === "live" ? null : a.status) : null, projectId: resolveProjectId(a) })
+      .map((f) => ({ id: f.id, item: `${f.entity} ${f.entity_id}`, label: f.label, home: f.project ? f.project.key : null,
+        status: f.status, proposal: f.proposal_summary, by: f.created_by })),
+  },
+
+  // The command line's alone (INTERNAL_TOOLS): a person approving or
+  // rejecting, from delphi flags. The store refuses an agent's decision
+  // whatever reached it, so this being unlisted is a courtesy, as the
+  // Workbench tools' is.
+  flag_decide: {
+    description: "Approve or reject a flag's proposal.",
+    schema: {
+      type: "object",
+      required: ["flag_id", "decision"],
+      properties: {
+        flag_id: { type: "number" }, decision: { type: "string", enum: ["approve", "reject"] },
+        note: { type: "string" }, ops: { type: "array", items: { type: "object" } },
+      },
+    },
+    run: (a) => {
+      const done = itemStore.decide(a.flag_id, { approve: a.decision === "approve", ops: a.ops ?? null, note: a.note ?? null });
+      return { flag: done.flag, audit_ids: done.auditIds };
+    },
+  },
+  flag_get: {
+    description: "One flag with its thread and the plan of its proposal.",
+    schema: { type: "object", required: ["flag_id"], properties: { flag_id: { type: "number" } } },
+    run: (a) => itemStore.getFlag(a.flag_id),
+  },
+
   recent_activity: {
     description: "What changed recently, and who changed it. Useful for picking up where another agent left off.",
     schema: { type: "object", properties: { limit: { type: "number" } } },
@@ -2201,6 +2389,7 @@ const INTERNAL_TOOLS = new Set([
   "workbench_park", "workbench_resume", "workbench_update", "workbench_commit", "workbench_push",
   "workbench_pr", "workbench_finish_plan", "workbench_finished", "workbench_busy", "workbench_closing", "workbench_discarded", "workbench_recreate",
   "workbench_forget", "workbench_housekeep", "workbench_advanced",
+  "flag_decide", "flag_get",
 ]);
 const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";
 
