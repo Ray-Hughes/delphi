@@ -1308,12 +1308,12 @@ const TOOLS = {
         task_id: { type: "number" }, ref: { type: "string" },
         unsaved: { type: "number" }, files: { type: "array", items: { type: "string" } },
         commits: { type: "number" }, detached: { type: "number" }, ignored: { type: "number" },
-        branch_deleted: { type: "boolean" }, not_kept: { type: "array", items: { type: "string" } },
+        branch_tip: { type: "string" }, not_kept: { type: "array", items: { type: "string" } },
       },
     },
     run: (a) => benches.markDiscarded(benchFor(a.task_id).id, {
       ref: a.ref, unsaved: a.unsaved, files: a.files, commits: a.commits, detached: a.detached,
-      ignored: a.ignored, branchDeleted: a.branch_deleted === true, notKept: a.not_kept,
+      ignored: a.ignored, branchTip: typeof a.branch_tip === "string" ? a.branch_tip : null, notKept: a.not_kept,
     }),
   },
   workbench_recreate: {

@@ -456,8 +456,43 @@ function trashEntries(root) {
   try { names = fs.readdirSync(dir); } catch { return []; }
   return names.filter((n) => /^\d+-\d{13}$/.test(n)).map((n) => {
     const trash = path.join(dir, n);
-    return { trash, manifest: readManifest(trash), kept: fs.existsSync(`${trash}.kept`) };
+    return { trash, id: Number(n.split("-")[0]), manifest: readManifest(trash), kept: fs.existsSync(`${trash}.kept`) };
   });
+}
+
+// A lock older than this is someone's that died without letting go.
+const LOCK_STALE_MS = 60 * 60 * 1000;
+
+/**
+ * Takes the one lock on a .trash entry (an O_EXCL file beside it), or
+ * returns null when someone else holds it: two housekeeping runs, or the
+ * app emptying a folder while a terminal's housekeeping looks at it, must
+ * never both record, note or delete. A lock whose process is gone (same
+ * machine) or that is over an hour old is broken and taken.
+ */
+function takeLock(trash) {
+  const file = `${trash}.lock`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(file, "wx");
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: require("os").hostname(), at: Date.now() }));
+      fs.closeSync(fd);
+      return () => { try { fs.unlinkSync(file); } catch {} };
+    } catch (error) {
+      if (error.code !== "EEXIST") return null;
+      let info = null;
+      let age = 0;
+      try { info = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+      try { age = Date.now() - fs.statSync(file).mtimeMs; } catch {}
+      const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+      const stale = info
+        ? (info.host === require("os").hostname() && !alive(Number(info.pid))) || Date.now() - Number(info.at) > LOCK_STALE_MS
+        : age > 10000;
+      if (!stale) return null;
+      try { fs.unlinkSync(file); } catch {}
+    }
+  }
+  return null;
 }
 
 /** A git blob id computed here, for files in a folder git no longer knows. */
@@ -555,16 +590,28 @@ function deleteTree(root) {
  * was made: then it is kept where it is, a .kept marker beside it so
  * housekeeping leaves it alone, and the caller tells the person.
  */
-async function emptyTrash(git, { repo, trash, tree, since, notKept = [], copy = [] }) {
+async function emptyTrash(git, { repo, trash, tree, since, notKept = [], copy = [], locked = false }) {
   if (!trash || !fs.existsSync(trash)) return { deleted: true, kept: null, changed: [] };
+  if (!locked) {
+    const release = takeLock(trash);
+    // Someone else is on it; they finish the job, and nothing is said twice.
+    if (!release) return { deleted: false, kept: null, changed: [], busy: true };
+    try { return await emptyTrash(git, { repo, trash, tree, since, notKept, copy, locked: true }); } finally { release(); }
+  }
+  if (!fs.existsSync(trash)) return { deleted: true, kept: null, changed: [] };
+  if (fs.existsSync(`${trash}.kept`)) return { deleted: false, kept: trash, changed: [], already: true };
   const changed = await changedSince(git, { repo, trash, tree, since, notKept, copy });
   if (changed.length) {
     try { fs.writeFileSync(`${trash}.kept`, `Kept because these changed after the copy was made:\n${changed.join("\n")}\n`); } catch {}
     return { deleted: false, kept: trash, changed };
   }
   try {
+    // Marked first: a delete that stops part way leaves a folder that no
+    // longer matches its copy, and the marker is what tells housekeeping it
+    // was already checked and is only to be finished off.
+    try { fs.writeFileSync(`${trash}.deleting`, ""); } catch {}
     deleteTree(trash);
-    try { fs.unlinkSync(`${trash}.json`); } catch {}
+    for (const ext of [".json", ".deleting"]) { try { fs.unlinkSync(`${trash}${ext}`); } catch {} }
     return { deleted: true, kept: null, changed: [] };
   } catch (error) {
     return { deleted: false, kept: null, changed: [], reason: String(error.code || error.message) };
@@ -572,7 +619,7 @@ async function emptyTrash(git, { repo, trash, tree, since, notKept = [], copy = 
 }
 
 module.exports = {
-  TRASH, trashPath, moveAside, volumeNow, readManifest, trashEntries, changedSince, deleteTree, emptyTrash,
+  TRASH, trashPath, moveAside, volumeNow, readManifest, trashEntries, takeLock, changedSince, deleteTree, emptyTrash,
   KEEP_DAYS, PER_FILE_MAX, TOTAL_MAX, WALK_MAX, NAMESPACES, REPRODUCIBLE_DIRS,
   reproducible, ignoredReport, nestedRepos, confirmToken, refFor, freeNames, recoverText, recoverFor, untilDate, snapshot, expire,
 };

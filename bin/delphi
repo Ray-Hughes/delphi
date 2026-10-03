@@ -919,12 +919,14 @@ const COMMANDS = {
     // above, this refuses rather than lose files nobody was shown.
     const { running } = await client.call("workbench_busy", { task_id: task.id });
     const result = await bench.discardFolder(wb, { confirm: plan.confirm, busy: running });
-    await client.call("workbench_discarded", {
+    // The server records it, then deletes the branch (its own, at the tip
+    // the copy holds), then writes the note, in that order.
+    const recorded = await client.call("workbench_discarded", {
       task_id: task.id, ref: result.ref, unsaved: result.unsaved, files: result.files, commits: result.commits,
-      detached: result.detached, ignored: result.ignored, branch_deleted: result.branchDeleted, not_kept: result.notKept,
+      detached: result.detached, ignored: result.ignored, not_kept: result.notKept,
+      branch_tip: result.branchToDelete ? result.branchToDelete.tip : undefined,
     });
-    // The branch goes only now that the Discard is recorded.
-    result.branchDeleted = (await bench.afterRecord(result)).branchDeleted;
+    result.branchDeleted = recorded.branchDeleted === true;
     await emptyAside(client, task.id, bench, result);
     say(result.keptRemote
       ? `Discarded. The branch is still on the remote as ${result.keptRemote}.`

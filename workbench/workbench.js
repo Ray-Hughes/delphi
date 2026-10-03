@@ -261,20 +261,20 @@ async function discardFolder(wb, { git = defaultGit, confirm = null, busy = [] }
   const snap = await keep.snapshot(git, {
     repo: plan.top, folder: plan.folderGone ? null : wb.path, branch: wb.branch, ref: plan.ref,
     keep: plan.look ? plan.look.report.keep : [], hidden: plan.hidden, expect: plan.look ? plan.look.st.untracked : [],
-    message: `Kept by Delphi before discarding task ${wb.task_id}'s Workbench\n\nBranch: ${wb.branch}\nFolder: ${wb.path}\n`,
+    message: `Kept by Delphi before discarding task ${wb.task_id}'s Workbench\n\nBranch: ${wb.branch}\nFolder: ${wb.path}\n\n${TRAILER}: ${Number(wb.id)}\n`,
   });
   if (!snap.ok) throw refusal(`Could not keep a copy of the folder first: ${snap.reason} Nothing was thrown away.`, "NO_COPY");
   const recover = snap.ref === plan.ref ? plan.recover
     : await keep.recoverFor(git, { ref: snap.ref, repo: plan.top, folder: wb.path, branch: wb.branch, id: wb.id, until: plan.until, notKept: plan.notKept });
-  // The branch goes only after the Discard is recorded (afterRecord): until
-  // then the branch is one of the two ways back to the work.
+  // The branch goes only after the Discard is recorded (markDiscarded):
+  // until then the branch is one of the two ways back to the work.
   // Held by another folder means someone else is on it; this folder holding
   // it is expected, since it has not moved yet.
   const held = !plan.branchPushed && snap.tip ? (await git.branchState(plan.top, wb.branch)).checkedOutAt : null;
   const holder = held && !git.samePath(held, wb.path) ? held : null;
   const branchToDelete = !plan.branchPushed && snap.tip && !holder ? { branch: wb.branch, tip: snap.tip } : null;
   const done = {
-    mode: "discard", discarded: true, branchDeleted: Boolean(branchToDelete), branchToDelete, keptRemote: plan.remote, branch: wb.branch,
+    mode: "discard", discarded: true, branchDeleted: false, branchToDelete, keptRemote: plan.remote, branch: wb.branch,
     ref: snap.ref, sha: snap.sha, until: plan.until, recover,
     unsaved: plan.unsaved.length, files: plan.unsaved.slice(0, 5),
     commits: plan.commits.length, detached: plan.detached.length,
@@ -288,17 +288,36 @@ async function discardFolder(wb, { git = defaultGit, confirm = null, busy = [] }
   return done;
 }
 
+// The line every copy's commit message ends with, binding it to one
+// Workbench. Housekeeping believes a .trash manifest's ref only when the
+// commit it names says this, for the Workbench the manifest claims.
+const TRAILER = "Delphi-Workbench";
+
+/** Whether a ref is a copy Delphi made of this Workbench: its name and its commit's trailer. */
+async function isOwnCopy(git, top, wb, ref, kind) {
+  const base = keep.refFor(kind, wb);
+  const name = String(ref || "");
+  if (!(name === base || (name.startsWith(base) && /^-\d+$/.test(name.slice(base.length))))) return false;
+  const body = await git.run(top, ["log", "-1", "--format=%B", name]);
+  return body.ok && new RegExp(`^${TRAILER}: ${Number(wb.id)}$`, "m").test(body.stdout);
+}
+
 /**
- * What comes after a Discard is recorded and before its folder is emptied:
- * deleting the branch, if it never reached a remote, and only if it still
- * points where the copy saw it.
+ * Deletes a Discarded Workbench's branch, and only that: the branch named on
+ * the row (never one a manifest names), only while it still points at tip,
+ * only when tip is a parent of the copy (so its commits stay reachable from
+ * the copy), and only when it never reached a remote and no folder has it.
  */
-async function afterRecord(done, { git = defaultGit } = {}) {
-  if (!done || !done.branchToDelete) return { branchDeleted: false };
-  const { branch, tip } = done.branchToDelete;
-  const holder = (await git.branchState(done.top, branch)).checkedOutAt;
-  const ok = !holder && (await git.deleteBranch(done.top, branch, tip)).ok;
-  return { branchDeleted: ok };
+async function deleteKeptBranch(git, wb, top, ref, tip) {
+  if (!tip || !top || !/^[0-9a-f]{40,64}$/.test(String(tip))) return false;
+  if (await git.refExists(top, `refs/remotes/${git.REMOTE}/${wb.branch}`)) return false;
+  const now = await git.run(top, ["rev-parse", "--verify", "--quiet", `refs/heads/${wb.branch}^{commit}`]);
+  if (!now.ok || now.stdout.trim() !== tip) return false;
+  const parents = await git.run(top, ["rev-list", "--parents", "-n", "1", ref]);
+  if (!parents.ok || !parents.stdout.trim().split(" ").slice(1).includes(tip)) return false;
+  const held = (await git.branchState(top, wb.branch)).checkedOutAt;
+  if (held) return false;
+  return (await git.deleteBranch(top, wb.branch, tip)).ok;
 }
 
 /**
@@ -363,7 +382,7 @@ async function finishFolder(wb, { git = defaultGit, confirm = null, busy = [] } 
   const snap = await keep.snapshot(git, {
     repo: top, folder: wb.path, branch: wb.branch, ref: keep.refFor("finished", wb), keep: report.keep,
     expect: st.untracked, hidden: st.hidden,
-    message: `Kept by Delphi before finishing task ${wb.task_id}'s Workbench\n\nBranch: ${wb.branch}\nFolder: ${wb.path}\n`,
+    message: `Kept by Delphi before finishing task ${wb.task_id}'s Workbench\n\nBranch: ${wb.branch}\nFolder: ${wb.path}\n\n${TRAILER}: ${Number(wb.id)}\n`,
   });
   if (!snap.ok) throw refusal(`Could not keep a copy of the folder first: ${snap.reason} Nothing was removed.`, "NO_COPY");
   const until = keep.untilDate();
@@ -910,7 +929,7 @@ function createWorkbench({
   function settle(wb, done) {
     const run = async () => {
       const result = await emptyMoved(done, { git });
-      if (result.kept) await note(wb.task_id, keptWords(result, done));
+      if (result.kept && !result.already) await note(wb.task_id, keptWords(result, done));
       return { deleted: result.deleted, kept: result.kept, changed: result.changed };
     };
     if (trashInBackground) {
@@ -939,6 +958,7 @@ function createWorkbench({
     }
     const top = await repoTopOf(wb);
     if (!top || !(await git.refExists(top, ref))) throw refusal(`There is no copy at ${ref}, so the Workbench was not marked finished.`, "NO_COPY");
+    if (!(await isOwnCopy(git, top, wb, ref, "finished"))) throw refusal(`${ref} is not a copy Delphi made of this Workbench, so nothing was recorded.`, "NO_COPY");
     const notKept = (Array.isArray(summary.notKept) ? summary.notKept : []).slice(0, 1000).map((f) => String(f).slice(0, 300));
     const recover = await keep.recoverFor(git, { ref, repo: top, folder: wb.path, branch: wb.branch, id: wb.id, until: keep.untilDate(), notKept });
     const removedIgnored = summary.removedIgnored === true || notKept.length > 0;
@@ -969,8 +989,7 @@ function createWorkbench({
     }
     const done = await discardFolder(wb, { git, confirm, busy: busyIn(wb) });
     drop(wb.path);
-    await markDiscarded(id, done);
-    done.branchDeleted = (await afterRecord(done, { git })).branchDeleted;
+    done.branchDeleted = (await markDiscarded(id, done)).branchDeleted === true;
     const cleanup = await settle(wb, done);
     return { ...shown(done), cleanup };
   }
@@ -996,6 +1015,9 @@ function createWorkbench({
     if (!top || !(await git.refExists(top, ref))) {
       throw refusal(`There is no copy at ${ref}, so the Workbench was not marked discarded.`, "NO_COPY");
     }
+    if (!(await isOwnCopy(git, top, wb, ref, "discarded"))) {
+      throw refusal(`${ref} is not a copy Delphi made of this Workbench, so nothing was recorded.`, "NO_COPY");
+    }
     const when = await git.run(top, ["log", "-1", "--format=%ct", ref]);
     const made = Number(when.ok ? when.stdout.trim() : NaN);
     const until = keep.untilDate(keep.KEEP_DAYS, Number.isFinite(made) ? made * 1000 : Date.now());
@@ -1007,17 +1029,20 @@ function createWorkbench({
     if (count(summary.commits)) parts.push(plural(count(summary.commits), "local commit", "local commits"));
     if (count(summary.detached)) parts.push(plural(count(summary.detached), "commit on no branch", "commits on no branch"));
     if (count(summary.ignored)) parts.push(plural(count(summary.ignored), "ignored file", "ignored files"));
-    const branchDeleted = summary.branchDeleted === true;
+    drop(wb.path);
+    store.setState(wb.id, "discarded");
+    // The branch goes after the record and before the note, so the note says
+    // what happened rather than what was meant to.
+    const tip = summary.branchToDelete && summary.branchToDelete.tip || summary.branchTip || null;
+    const branchDeleted = await deleteKeptBranch(git, wb, top, ref, tip);
     const pushed = await git.refExists(top, `refs/remotes/${git.REMOTE}/${wb.branch}`);
     const branchWords = pushed ? `the branch is kept on the remote as ${git.REMOTE}/${wb.branch}`
       : branchDeleted ? `the branch ${wb.branch} was deleted` : `the branch ${wb.branch} is kept`;
-    drop(wb.path);
-    store.setState(wb.id, "discarded");
     const notKept = (Array.isArray(summary.notKept) ? summary.notKept : []).slice(0, 1000).map((f) => String(f).slice(0, 300));
     const recover = await keep.recoverFor(git, { ref, repo: top, folder: wb.path, branch: wb.branch, id: wb.id, until, notKept });
     await note(wb.task_id, `discarded workbench with ${parts.length ? parts.join(", ") : "nothing unsaved in it"}; ${branchWords}. ${recover}`);
     store.audit(wb.task_id, "discarded workbench");
-    return { discarded: true, ref, until, recover };
+    return { discarded: true, ref, until, recover, branchDeleted };
   }
 
   // ---------------------------------------------------------------------------
@@ -1067,6 +1092,13 @@ function createWorkbench({
   async function forgetBench(id) {
     const wb = store.get(id);
     if (wb.state === "finished" || wb.state === "discarded") return { forgotten: true };
+    // Its folder may only have been moved aside by a Finish or Discard that
+    // did not finish; forgetting it would leave that folder unexplained.
+    const aside = trashFor(wb);
+    if (aside.length) {
+      throw refusal(`This Workbench's folder was moved to ${aside[0].trash} by a Finish or Discard that did not complete. Look through it first; Forget leaves it alone until it is gone.`,
+        "IN_TRASH", { details: { trash: aside.map((e) => e.trash) } });
+    }
     if (isDir(wb.path) && !isEmptyDir(wb.path)) {
       throw refusal(`The folder is still there (${wb.path}). Finish it or discard it instead, so nothing in it is lost by accident.`, "NOT_MISSING");
     }
@@ -1168,44 +1200,149 @@ function createWorkbench({
 
   /**
    * Finishes what a Finish or Discard started and did not see through: the
-   * folder was moved into .trash, and then the process died. Each entry's
-   * manifest says which Workbench it was and what it was checked against.
+   * folder was moved into .trash, and then the process died.
    *
-   * - No manifest: not ours to judge, never deleted.
-   * - Marked kept: a person has to look, never deleted.
-   * - Its Workbench still open and its folder gone: the verb is recorded
-   *   now, from the manifest, Sheet note and recover text included, and a
-   *   Discard's branch goes after that, as it would have.
-   * - Then the same check as at the time: deleted only if nothing in it
-   *   changed after the copy, else kept, with a Sheet note.
+   * The manifest beside an entry is a hint, never authority: anyone with a
+   * shell can write one. What is acted on comes from the database row
+   * (repository, branch, folder) and from git (the copy, which must be one
+   * Delphi made of this Workbench, by its trailer). An entry is believed only
+   * when its manifest names this row's own folder, its .git.was points at
+   * this Workbench's own registration, every file in the copy is in it, and
+   * nothing in it differs from the copy. Anything else: nothing is recorded,
+   * nothing deleted, and the task's Sheet says once where the folder is.
+   *
+   * One entry at a time, under its lock, with the row read again after the
+   * lock is taken, so two housekeeping runs (or the app emptying one while a
+   * terminal's housekeeping looks) never both record, note or delete.
    */
   async function sweepTrash(root, report) {
     for (const entry of keep.trashEntries(root)) {
-      const m = entry.manifest;
-      if (entry.kept || !m || !m.ref || !m.tree) continue;
+      if (entry.kept) continue;
       let row = null;
-      try { row = store.find(m.workbench); } catch {}
-      if (!row || Number(row.task_id) !== Number(m.task_id)) continue;
-      const done = { ...m, trash: entry.trash };
-      if (row.state !== "finished" && row.state !== "discarded") {
-        if (isDir(row.path)) continue;
-        try {
-          if (m.mode === "finish") await markFinished(row.id, { ref: m.ref, notKept: m.notKept, removedIgnored: m.removedIgnored });
-          else await markDiscarded(row.id, m);
-          if (m.mode !== "finish") await afterRecord(done, { git });
-          report.reconciled.push(row.id);
-        } catch {
+      try { row = store.find(entry.id); } catch {}
+      if (!row) continue;
+      const release = keep.takeLock(entry.trash);
+      if (!release) continue;
+      try {
+        if (!fs.existsSync(entry.trash) || fs.existsSync(`${entry.trash}.kept`)) continue;
+        row = store.get(row.id);
+        const open = row.state !== "finished" && row.state !== "discarded";
+        if (open && isDir(row.path)) continue;
+        // A delete that was checked and started, then stopped (a file it
+        // could not remove): finished off once the row is closed and the
+        // copy is still this Workbench's own.
+        if (!open && fs.existsSync(`${entry.trash}.deleting`)) {
+          const m = keep.readManifest(entry.trash) || {};
+          const top = await repoTopOf(row);
+          const kind = row.state === "finished" ? "finished" : "discarded";
+          if (Number(m.workbench) === Number(row.id) && top && await isOwnCopy(git, top, row, m.ref, kind)) {
+            try {
+              keep.deleteTree(entry.trash);
+              for (const ext of [".json", ".deleting"]) { try { fs.unlinkSync(`${entry.trash}${ext}`); } catch {} }
+              report.trashed.push(entry.trash);
+            } catch {}
+          }
           continue;
         }
-      }
-      const result = await emptyMoved(done, { git });
-      if (result.kept) {
-        await note(row.task_id, keptWords(result, done));
-        report.keptTrash.push(result.kept);
-      } else if (result.deleted) {
-        report.trashed.push(entry.trash);
+        const trust = await recognise(row, entry.trash, keep.readManifest(entry.trash));
+        if (!trust.ok) {
+          await unrecognised(row, entry.trash, trust.why);
+          report.unrecognised = [...(report.unrecognised || []), entry.trash];
+          continue;
+        }
+        const done = trust.done;
+        if (open) {
+          // Recorded only when the moved folder is exactly the copy: a
+          // folder that changed after it is not one this can vouch for.
+          const changed = await keep.changedSince(git, { repo: done.top, trash: done.trash, tree: done.tree, since: done.since, notKept: done.notKept, copy: done.copy });
+          if (changed.length) {
+            await unrecognised(row, entry.trash, `${someOf(changed)} in it ${changed.length === 1 ? "differs" : "differ"} from the copy`);
+            continue;
+          }
+          try {
+            if (done.mode === "finish") await markFinished(row.id, { ref: done.ref, notKept: done.notKept, removedIgnored: done.removedIgnored });
+            else await markDiscarded(row.id, { ...done.summary, ref: done.ref, notKept: done.notKept, branchToDelete: done.branchToDelete });
+            report.reconciled.push(row.id);
+          } catch {
+            continue;
+          }
+        } else if (done.mode === "discard" && row.state === "discarded" && done.branchToDelete) {
+          // Recorded, then the process died before the branch went.
+          if (await deleteKeptBranch(git, row, done.top, done.ref, done.branchToDelete.tip)) {
+            await note(row.task_id, `deleted the branch ${row.branch}, which the Discard meant to; its commits are in ${done.ref}`);
+          }
+        }
+        const result = await keep.emptyTrash(git, { repo: done.top, trash: done.trash, tree: done.tree, since: done.since, notKept: done.notKept, copy: done.copy, locked: true });
+        if (result.kept) {
+          if (!result.already) await note(row.task_id, keptWords(result, done));
+          report.keptTrash.push(result.kept);
+        } else if (result.deleted) {
+          report.trashed.push(entry.trash);
+        }
+      } finally {
+        release();
       }
     }
+  }
+
+  /**
+   * Whether a .trash entry is what its manifest says, checked against the
+   * row and git. Returns the facts to act on, all row derived, or why not.
+   */
+  async function recognise(row, trash, m) {
+    if (!m) return { ok: false, why: "it has no manifest Delphi can read" };
+    if (Number(m.workbench) !== Number(row.id) || Number(m.task_id) !== Number(row.task_id)) return { ok: false, why: "its manifest names another Workbench" };
+    if (!m.folder || !(m.folder === row.path || git.samePath(m.folder, row.path))) return { ok: false, why: "its manifest names another folder" };
+    const mode = m.mode === "finish" ? "finish" : m.mode === "discard" ? "discard" : null;
+    if (!mode) return { ok: false, why: "its manifest does not say what it was" };
+    const top = await repoTopOf(row);
+    if (!top) return { ok: false, why: "its repository is not there" };
+    const ref = String(m.ref || "");
+    if (!(await git.refExists(top, ref)) || !(await isOwnCopy(git, top, row, ref, mode === "finish" ? "finished" : "discarded"))) {
+      return { ok: false, why: "the copy it names is missing, or is not one Delphi made of this Workbench" };
+    }
+    // Its .git file, renamed when it was moved, must point at this
+    // Workbench's own registration under the repository's git folder.
+    let gitdir = "";
+    try { gitdir = (/^gitdir:\s*(.+)$/m.exec(fs.readFileSync(path.join(trash, ".git.was"), "utf8")) || [])[1] || ""; } catch {}
+    const common = await git.run(top, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const own = common.ok && gitdir
+      && git.samePath(path.dirname(gitdir.trim()), path.join(common.stdout.trim(), "worktrees"))
+      && new RegExp(`^${path.basename(row.path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d*$`).test(path.basename(gitdir.trim()));
+    if (!own) return { ok: false, why: "it was not moved there from this Workbench" };
+    const tree = (await git.run(top, ["rev-parse", `${ref}^{tree}`])).stdout.trim();
+    const ct = Number((await git.run(top, ["log", "-1", "--format=%ct", ref])).stdout.trim());
+    // A manifest cannot push the check's start past the copy's own time.
+    const since = Math.min(Number(m.since) || 0, Number.isFinite(ct) ? ct * 1000 : 0);
+    const listed = await git.runWith(top, ["ls-tree", "-r", "-z", "--name-only", ref], { timeout: 10 * 60000 });
+    const missing = listed.stdout.split("\0").filter(Boolean).filter((p) => { try { fs.lstatSync(path.join(trash, p)); return false; } catch { return true; } });
+    if (missing.length) return { ok: false, why: `${someOf(missing)} from the copy ${missing.length === 1 ? "is" : "are"} not in it` };
+    const notKept = (Array.isArray(m.notKept) ? m.notKept : []).map((n) => String(n));
+    const tip = m.branchToDelete && typeof m.branchToDelete.tip === "string" ? m.branchToDelete.tip : null;
+    return {
+      ok: true,
+      done: {
+        mode, ref, top, tree, since, trash, notKept, wb: row,
+        copy: setupMod.copyList(row.copy_files ?? setupMod.DEFAULT_COPY),
+        removedIgnored: m.removedIgnored === true,
+        branchToDelete: mode === "discard" && tip ? { branch: row.branch, tip } : null,
+        summary: { unsaved: m.unsaved, files: m.files, commits: m.commits, detached: m.detached, ignored: m.ignored },
+      },
+    };
+  }
+
+  /** Says once, on the row's task, that a folder is in .trash that this cannot vouch for. */
+  async function unrecognised(row, trash, why) {
+    const marker = `${trash}.noted`;
+    if (fs.existsSync(marker)) return;
+    try { fs.writeFileSync(marker, `${why}\n`); } catch {}
+    await note(row.task_id, `found a folder at ${trash} that Delphi cannot vouch for (${why}), so nothing was recorded and nothing deleted. ` +
+      "Look through it; if it is this Workbench's work, move it back or keep what you need, then delete it yourself.");
+  }
+
+  /** .trash entries for a Workbench, which Forget must not leave behind unexplained. */
+  function trashFor(row) {
+    return keep.trashEntries(path.dirname(row.path)).filter((e) => e.id === Number(row.id));
   }
 
   /**
@@ -1257,4 +1394,4 @@ function keptWords(result, done) {
     `for example with diff -ru; then delete the old folder yourself.`;
 }
 
-module.exports = { STATUS_TTL_MS, WINDOWS_PATH_LIMIT, createWorkbench, discardPlanFor, discardFolder, finishFolder, afterRecord, emptyMoved, keptWords, repoTopFor };
+module.exports = { STATUS_TTL_MS, WINDOWS_PATH_LIMIT, createWorkbench, discardPlanFor, discardFolder, finishFolder, emptyMoved, keptWords, repoTopFor };

@@ -724,6 +724,87 @@ async function main() {
     }
   }
 
+  // -------------------------------------------------------------------------
+  section("G7. A manifest is a hint: housekeeping acts only on what the row and git confirm");
+  {
+    const W = require("../workbench/workbench");
+    const r = makeRepo("g7");
+    const anyNote = (taskId, re) => notes(taskId).filter((n) => re.test(n)).length;
+
+    // Forged: the folder is only away (a disk unplugged), an agent makes a
+    // ref and a manifest naming another repository and its branch.
+    const victim = makeRepo("g7victim");
+    git(victim.app, "branch", "precious");
+    const tip = git(victim.app, "rev-parse", "precious");
+    const f = await bench(r, "forged");
+    write(path.join(f.wb.path, "work.txt"), "real work\n");
+    fs.renameSync(f.wb.path, `${f.wb.path}.away`);
+    const ref = `refs/delphi/discarded/${f.t.id}-${f.wb.id}`;
+    git(r.app, "update-ref", ref, git(r.app, "rev-parse", "HEAD"));
+    const forged = path.join(path.dirname(f.wb.path), keep.TRASH, `${f.wb.id}-${Date.now()}`);
+    fs.mkdirSync(forged, { recursive: true });
+    fs.writeFileSync(`${forged}.json`, JSON.stringify({ mode: "discard", workbench: f.wb.id, task_id: f.t.id, folder: f.wb.path, ref,
+      tree: git(r.app, "rev-parse", "HEAD^{tree}"), top: victim.app, since: Date.now(), branchToDelete: { branch: "precious", tip } }));
+    const hk1 = await benches.housekeep();
+    check("a forged entry records nothing", [hk1.reconciled, store.get(f.wb.id).state !== "discarded"], [[], true]);
+    check("deletes nothing, here or in another repository", [exists(forged), gitOk(victim.app, "rev-parse", "--verify", "refs/heads/precious"), gitOk(r.app, "rev-parse", "--verify", `refs/heads/${f.wb.branch}`)], [true, true, true]);
+    check("and says once where it is", anyNote(f.t.id, /cannot vouch for/), 1);
+    await benches.housekeep();
+    check("not twice", anyNote(f.t.id, /cannot vouch for/), 1);
+    await rejects("Forget refuses while it is there", benches.forget(f.wb.id), /moved to .*\.trash/, "IN_TRASH");
+    fs.renameSync(`${f.wb.path}.away`, f.wb.path);
+    check("the real folder is untouched when it comes back", read(path.join(f.wb.path, "work.txt")), "real work\n");
+    fs.rmSync(forged, { recursive: true, force: true });
+    for (const ext of [".json", ".noted"]) fs.rmSync(`${forged}${ext}`, { force: true });
+
+    // A ref without Delphi's trailer is not a copy, even under the right name.
+    const n = await bench(r, "untrailed");
+    fs.renameSync(n.wb.path, `${n.wb.path}.away`);
+    git(r.app, "update-ref", `refs/delphi/discarded/${n.t.id}-${n.wb.id}`, git(r.app, "rev-parse", "HEAD"));
+    await rejects("markDiscarded refuses a ref Delphi did not write", benches.markDiscarded(n.wb.id, { ref: `refs/delphi/discarded/${n.t.id}-${n.wb.id}` }), /not a copy Delphi made/, "NO_COPY");
+    fs.renameSync(`${n.wb.path}.away`, n.wb.path);
+
+    // Two housekeeping runs at once over one moved folder.
+    const c = await bench(r, "concurrent");
+    for (let i = 0; i < 2000; i++) write(path.join(c.wb.path, `bulk/f${i}.txt`), `x${i}\n`);
+    const cdone = await W.discardFolder(store.get(c.wb.id));
+    const [a1, a2] = await Promise.all([benches.housekeep(), benches.housekeep()]);
+    check("two at once record it exactly once", [a1.reconciled.length + a2.reconciled.length, anyNote(c.t.id, /^discarded workbench/)], [1, 1]);
+    check("and leave no stray marker or lock", fs.readdirSync(path.dirname(cdone.trash)).filter((x) => x.startsWith(`${c.wb.id}-`)), []);
+
+    // Recorded, then the process died before the branch went.
+    const b = await bench(r, "pending branch");
+    commit(b.wb, "w.txt", "w\n", "c");
+    const bdone = await W.discardFolder(store.get(b.wb.id));
+    const rec = await benches.markDiscarded(b.wb.id, { ...bdone, branchToDelete: null });   // the delete never happened
+    check("the note is written after the branch step, and says what happened", [rec.branchDeleted, / is kept\./.test(notes(b.t.id).filter((x) => /^discarded/.test(x)).pop())], [false, true]);
+    await benches.housekeep();
+    check("housekeeping deletes it, from the row's own branch and the copy's tip", gitOk(r.app, "rev-parse", "--verify", `refs/heads/${b.wb.branch}`), false);
+    check("and says so", anyNote(b.t.id, /deleted the branch .* which the Discard meant to/), 1);
+    check("its commits are still in the copy", gitOk(r.app, "merge-base", "--is-ancestor", bdone.branchToDelete.tip, bdone.ref), true);
+
+    // A truncated manifest, and a copy deleted early.
+    for (const how of ["truncated manifest", "copy deleted"]) {
+      const x = await bench(r, how);
+      write(path.join(x.wb.path, "w.txt"), "w\n");
+      const xd = await W.discardFolder(store.get(x.wb.id));
+      if (how === "truncated manifest") fs.writeFileSync(`${xd.trash}.json`, fs.readFileSync(`${xd.trash}.json`, "utf8").slice(0, 40));
+      else git(r.app, "update-ref", "-d", xd.ref);
+      const hk = await benches.housekeep();
+      check(`${how}: nothing recorded, the folder kept`, [hk.reconciled.includes(x.wb.id), exists(path.join(xd.trash, "w.txt"))], [false, true]);
+      check(`${how}: the Sheet says where it is`, notes(x.t.id).some((t) => t.includes(xd.trash)), true);
+      await rejects(`${how}: Forget refuses`, benches.forget(x.wb.id), /moved to/, "IN_TRASH");
+    }
+
+    // The app emptying while housekeeping runs: one of them does it, once.
+    const e = await bench(r, "race empty");
+    for (let i = 0; i < 2000; i++) write(path.join(e.wb.path, `bulk/f${i}.txt`), `x${i}\n`);
+    const ed = await W.discardFolder(store.get(e.wb.id));
+    await benches.markDiscarded(e.wb.id, ed);
+    const [em, hkE] = await Promise.all([W.emptyMoved(ed), benches.housekeep()]);
+    check("emptied once, with no kept note", [exists(ed.trash), em.kept || hkE.keptTrash.length ? "kept" : "ok", anyNote(e.t.id, /^kept the old folder/)], [false, "ok", 0]);
+  }
+
   await viaServer();
   fs.rmSync(dir, { recursive: true, force: true });
   console.log(`\n${checks - failures}/${checks} checks passed`);
