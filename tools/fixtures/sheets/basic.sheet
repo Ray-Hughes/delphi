@@ -1,0 +1,12 @@
+---
+task: 42
+title: fix zip DLQ backlog
+project: efolder
+status: doing
+---
+> ray: why is the DLQ filling up?
+@ claude: visibility timeout is under p95 job time  {id:806}
+$ aws sqs get-queue-attributes --queue-url ...  {id:807 by:ray ok dur:1.2s lines:340}
+? retry strategy: [a] exponential [b] fixed  {id:808 by:ray}
+= a  {id:809 by:ray ref:808 +}
+! bump timeout to 15m before deploy  {id:810 by:ray + note:gotcha}

@@ -1,0 +1,11 @@
+---
+task: 6
+title: braces that are text
+project: misc
+status: todo
+---
+> ray: the config is literally  {x}
+> ray: unknown keys are text  {colour:red}  {id:41}
+! a quoted sheet line: $ ls  {id:1 ok}  {}
+! same, in an entry that has a block of its own  {id:1 ok}  {id:43 by:ray}
+@ claude: two spaces inside a brace  { id:1}  {id:44}

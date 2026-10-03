@@ -21,8 +21,8 @@
 
 const { spawn } = require("child_process");
 const path = require("path");
-const fs = require("fs");
-const os = require("os");
+const { splitCommand, resolveBinary, guardStatus } = require("./launch");
+const { openServer: openClient } = require("../sheet/client");
 
 // --- options ----------------------------------------------------------------
 
@@ -142,171 +142,22 @@ function projectFilter(options) {
 const log = (...parts) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...parts);
 const warn = (...parts) => console.error(`[${new Date().toISOString().slice(11, 19)}]`, ...parts);
 
-// --- command line into argv --------------------------------------------------
+// --- command line into argv, the guard, and the server ---------------------
+//
+// splitCommand, resolveBinary and guardStatus live in agent/launch.js, and the
+// MCP client in sheet/client.js, because the delphi command line spawns things
+// and talks to the server too, and two copies of either would drift.
 
-/**
- * Splits an agent command into argv, honouring quotes.
- *
- * Deliberately not a shell: no globbing, no substitution, no operators. The
- * command comes from a config file or an environment variable and the prompt it
- * carries comes from the database, and the two must never meet in a string that
- * something else parses.
- */
-function splitCommand(text) {
-  const out = [];
-  let current = "";
-  let started = false;
-  let quote = null;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (quote) {
-      if (ch === quote) quote = null;
-      else if (ch === "\\" && quote === '"' && i + 1 < text.length) current += text[++i];
-      else current += ch;
-      continue;
-    }
-    if (ch === '"' || ch === "'") { quote = ch; started = true; continue; }
-    if (/\s/.test(ch)) {
-      if (started || current) { out.push(current); current = ""; started = false; }
-      continue;
-    }
-    current += ch;
-    started = true;
-  }
-  if (quote) throw new Error(`Unbalanced ${quote} in the agent command`);
-  if (started || current) out.push(current);
-  return out;
-}
-
-/** Where a binary actually is, or null. Used to fail before claiming anything. */
-function resolveBinary(name) {
-  if (name.includes(path.sep) || name.startsWith(".")) {
-    const full = path.resolve(name);
-    return fs.existsSync(full) ? full : null;
-  }
-  const exts = process.platform === "win32"
-    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";")
-    : [""];
-  for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
-    for (const ext of exts) {
-      const candidate = path.join(dir, name + ext);
-      try { if (fs.existsSync(candidate)) return candidate; } catch {}
-    }
-  }
-  return null;
-}
-
-// --- the guard ---------------------------------------------------------------
-
-/**
- * Whether agent/guard.py is wired in as a PreToolUse hook for Bash.
- *
- * An unattended runner is the case guard.py was written for: nobody is watching
- * the permission prompts because nobody is watching at all. Checked here rather
- * than trusted, because the failure is silent otherwise, and a runner that has
- * been quietly unguarded for a week looks exactly like one that has not.
- */
-function guardStatus(cwd) {
-  const files = [
-    path.join(os.homedir(), ".claude", "settings.json"),
-    path.join(cwd, ".claude", "settings.json"),
-    path.join(cwd, ".claude", "settings.local.json"),
-  ];
-  for (const file of files) {
-    let parsed;
-    try {
-      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    } catch {
-      continue;
-    }
-    const entries = parsed && parsed.hooks && parsed.hooks.PreToolUse;
-    if (!Array.isArray(entries)) continue;
-    for (const entry of entries) {
-      const matcher = String(entry && entry.matcher || "");
-      const body = JSON.stringify(entry && entry.hooks || []);
-      if (/guard\.py/.test(body) && /Bash/.test(matcher)) return { installed: true, file };
-    }
-  }
-  return { installed: false, file: null };
-}
-
-// --- MCP client --------------------------------------------------------------
-
-/**
- * Speaks JSON-RPC 2.0 to agent/mcp_server.js over its stdio transport.
- *
- * One server process for the life of the runner. It handles each line as it
- * arrives, so concurrent calls are safe, and every request carries an id so the
- * answers cannot be mixed up.
- */
+/** The runner's server: the shared client, attributed to this runner. */
 function openServer(options) {
-  if (!fs.existsSync(options.server)) {
-    throw new Error(`No MCP server at ${options.server}. Pass --server or set DELPHI_MCP_SERVER.`);
-  }
-  const env = { ...process.env, DELPHI_ACTOR: options.actor };
-  const child = spawn(process.execPath, [options.server], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env,
+  return openClient({
+    server: options.server,
+    actor: options.actor,
+    clientName: "delphi-queue-runner",
+    verbose: options.verbose,
+    log,
+    warn,
   });
-
-  const pending = new Map();
-  let nextId = 1;
-  let buffer = "";
-  let dead = null;
-
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
-    buffer += chunk;
-    let index;
-    while ((index = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, index).trim();
-      buffer = buffer.slice(index + 1);
-      if (!line) continue;
-      let message;
-      try { message = JSON.parse(line); } catch { continue; }
-      const waiter = pending.get(message.id);
-      if (!waiter) continue;
-      pending.delete(message.id);
-      if (message.error) waiter.reject(new Error(message.error.message || "MCP error"));
-      else waiter.resolve(message.result);
-    }
-  });
-
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => warn("mcp:", String(chunk).trimEnd()));
-
-  const fail = (reason) => {
-    dead = dead || new Error(reason);
-    for (const waiter of pending.values()) waiter.reject(dead);
-    pending.clear();
-  };
-  child.on("error", (error) => fail(`MCP server could not start: ${error.message}`));
-  child.on("exit", (code, signal) => fail(`MCP server exited (${signal || code})`));
-
-  const request = (method, params) => new Promise((resolve, reject) => {
-    if (dead) return reject(dead);
-    const id = nextId++;
-    pending.set(id, { resolve, reject });
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-  });
-
-  return {
-    async start() {
-      await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "delphi-queue-runner", version: "1" } });
-    },
-    /** Calls a tool and unwraps the JSON the server packs into its text content. */
-    async call(tool, args = {}) {
-      if (options.verbose) log(`mcp ${tool}`, JSON.stringify(args));
-      const result = await request("tools/call", { name: tool, arguments: args });
-      const text = result && result.content && result.content[0] && result.content[0].text;
-      if (typeof text !== "string") return null;
-      try { return JSON.parse(text); } catch { return text; }
-    },
-    close() {
-      try { child.stdin.end(); } catch {}
-      try { child.kill(); } catch {}
-    },
-  };
 }
 
 // --- the brief ---------------------------------------------------------------
@@ -720,7 +571,13 @@ async function dryRun(server, options, argv, binary) {
   console.log(`On a non-zero exit or after ${options.timeout}s: queue_release with the reason.`);
 }
 
-main().catch((error) => {
-  warn(error.message);
-  process.exit(1);
-});
+// Only when run, not when required: the tests load the brief and the argument
+// parsing from here without starting a runner.
+if (require.main === module) {
+  main().catch((error) => {
+    warn(error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { parseArgs, projectFilter, buildBrief, refusal, describeFailure, clip, splitCommand, resolveBinary, guardStatus };

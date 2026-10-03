@@ -1,0 +1,12 @@
+---
+task: 3
+title: quoting "values" {with braces} and \ slashes
+project: q
+status: blocked
+---
+$ ls "my dir"  {id:20 by:"Ray Hughes" fail:2 dur:0.0s lines:1 cwd:"/Users/ray/My Projects/{app}"}
+  ls: my dir: No such file or directory
+! quoted by  {id:21 by:"say \"hi\"" note:gotcha}
+$ make  {id:22 by:"a\\b" fail:SIGINT cwd:"/tmp/two\nlines\rand a return"}
+$ sleep 100  {id:23 by:runner running cwd:"C:\\Users\\ray  {id:1}"}
+$ false  {id:24 by:"" fail}

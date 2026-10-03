@@ -138,6 +138,24 @@ def check_segment(cmd: str):
     if re.search(r"\bterraform\s+destroy\b", c) and "-target" not in c:
         return "terraform destroy without a target tears down the whole stack."
 
+    # --- Delphi's own Workbenches ---------------------------------------------
+    # Discard throws away a Workbench folder and, when it was never pushed, its
+    # branch. That is a human call by design: agents get no MCP tool for it, and
+    # the CLI wants a terminal and a typed task id. This is the third of those
+    # fences, for an agent that finds the CLI and pipes the confirm into it.
+    # Matched in command position only, however the CLI is reached (on PATH,
+    # bin/delphi, node bin/delphi, sudo, sh -c), so a commit message or a Sheet
+    # entry that merely mentions the words is not refused.
+    if re.search(
+        r"^(?:\w+=\S*\s+)*(?:sudo\s+)?(?:(?:ba|z)?sh\s+-c\s+[\"']?)?"
+        r"(?:node\s+|npx\s+)?(?:\S*/)?delphi\s+discard\b",
+        c,
+    ):
+        return (
+            "delphi discard throws a Workbench away, and that is for a person to "
+            "decide. Say what you would discard and why in the task's Sheet instead."
+        )
+
     # --- host level ------------------------------------------------------------
     if re.search(r"\b(mkfs|fdisk)\b", c) or re.search(r"\bdiskutil\s+erase", c):
         return "Formatting or partitioning a disk."

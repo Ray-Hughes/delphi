@@ -1,0 +1,17 @@
+---
+task: 9
+title: fenced code
+project: app
+status: doing
+---
+@ claude: here is the script  {id:11}
+  ```sh
+  $ npm test
+  > not a say
+  = not a decide
+  ---
+  ```
+$ npm test  {id:12 by:ray ok dur:0.4s lines:3 cwd:/Users/ray/src/app}
+  > delphi@1.5.0 test
+  49/49 checks passed
+$ npm run lint  {id:13 by:ray running cwd:/Users/ray/src/app}

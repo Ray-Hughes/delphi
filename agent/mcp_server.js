@@ -151,9 +151,13 @@ function findSqlite() {
  * It is not always there. It landed in Node 22.5 behind a flag and only became
  * available unflagged later, so requiring it throws on plenty of the versions an
  * editor might be running. That throw is the whole test.
+ *
+ * DELPHI_SQLITE_ROUTE=binary skips it. That is for the tests, which have to
+ * prove both routes on a machine where node:sqlite is always there.
  */
 function openDatabase() {
   try {
+    if (process.env.DELPHI_SQLITE_ROUTE === "binary") throw new Error("binary route asked for");
     const { DatabaseSync } = require("node:sqlite");
     const handle = new DatabaseSync(DB);
     // Wait for another writer rather than failing on contention. Two agents
@@ -211,6 +215,21 @@ function openDatabase() {
 
 const DATABASE = openDatabase();
 
+/**
+ * Brings the database up to date before the first request, once.
+ *
+ * The app used to be the only thing that migrated, so an agent could meet a
+ * database the app had not opened since an upgrade and fail on a column that
+ * did not exist yet. Failures go to stderr, which is the client's MCP log rather
+ * than the protocol stream, and the server carries on: an agent missing one
+ * column it may never touch is better off than an agent with no tracker at all.
+ */
+const schemaLater = require("./schema_later");
+const MIGRATED = schemaLater.apply((statement) => DATABASE.query(statement));
+for (const failure of MIGRATED.errors) {
+  process.stderr.write(`delphi: could not migrate (${failure.message}): ${failure.statement.split("\n")[0]}\n`);
+}
+
 // --- database ---------------------------------------------------------------
 
 /**
@@ -231,12 +250,19 @@ function sql(query, params = []) {
   // Values are substituted into the statement rather than bound. Both routes take
   // the statement as text, so doing it once here keeps them interchangeable.
   //
-  // Placeholders are replaced highest-numbered first so :p10 is not eaten by the
-  // pattern for :p1.
-  let statement = query;
-  params.forEach((_, i) => {
-    const index = params.length - 1 - i;
-    statement = statement.replaceAll(`:p${index + 1}`, literal(params[index]));
+  // One pass over the query as written, with a replacement function. It used to
+  // be one replaceAll per parameter, highest first, which went wrong two ways
+  // with values that are quite ordinary in a Sheet: a value quoting a lower
+  // numbered placeholder was itself rewritten by the next pass, and a string
+  // replacement gives $& and its relatives a meaning, so a value holding one
+  // spliced pieces of the query into itself. The regex is greedy on digits,
+  // which is also what stops :p10 being read as :p1.
+  //
+  // A placeholder with no value is left exactly as written, so SQLite reports
+  // it as the error it is rather than it quietly becoming NULL.
+  const statement = String(query).replace(/:p(\d+)/g, (match, n) => {
+    const index = Number(n) - 1;
+    return index >= 0 && index < params.length ? literal(params[index]) : match;
   });
 
   return DATABASE.query(statement.endsWith(";") ? statement : statement + ";");
@@ -391,18 +417,24 @@ function derivePad(padId) {
     }
 
     if (task) {
+      // Values go through sql()'s placeholders, never spliced into the text
+      // first. A title spliced in as a literal is still query text when sql()
+      // runs, so a line that happened to mention a placeholder was rewritten.
       const sets = [];
-      if (current.title && current.title !== task.title) sets.push(`title = ${literal(current.title)}`);
+      const values = [];
+      const set = (column, value) => { values.push(value); sets.push(`${column} = :p${values.length}`); };
+      if (current.title && current.title !== task.title) set("title", current.title);
       const status = pads.statusFor(current.done, task.status);
       if (status !== task.status) {
-        sets.push(`status = ${literal(status)}`);
+        set("status", status);
         sets.push(status === "done" ? "completed_at = datetime('now')" : "completed_at = NULL");
       }
-      if (current.assignee && current.assignee !== task.assignee) sets.push(`assignee = ${literal(current.assignee)}`);
-      if (current.priority && current.priority !== task.priority) sets.push(`priority = ${literal(current.priority)}`);
-      if (parentId !== (task.parent_id ?? null)) sets.push(`parent_id = ${literal(parentId)}`);
+      if (current.assignee && current.assignee !== task.assignee) set("assignee", current.assignee);
+      if (current.priority && current.priority !== task.priority) set("priority", current.priority);
+      if (parentId !== (task.parent_id ?? null)) set("parent_id", parentId);
       if (sets.length) {
-        sql(`UPDATE tasks SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = :p1`, [task.id]);
+        values.push(task.id);
+        sql(`UPDATE tasks SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = :p${values.length}`, values);
         if (status !== task.status) {
           sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
               [task.id, status, ACTOR]);
@@ -410,14 +442,18 @@ function derivePad(padId) {
         }
       }
     } else {
-      sql(
+      // RETURNING rather than a second SELECT on last_insert_rowid(). On the
+      // sqlite3 binary route every sql() call is its own process, and a new
+      // connection's last_insert_rowid() is always 0, so every pad task filed
+      // that way came back as undefined.
+      task = sql(
         `INSERT INTO tasks (project_id, title, status, priority, assignee, parent_id, pad_id, source, completed_at)
          VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, 'pad',
-                 CASE WHEN :p3 = 'done' THEN datetime('now') END)`,
+                 CASE WHEN :p3 = 'done' THEN datetime('now') END)
+         RETURNING *`,
         [pad.project_id, current.title || "Untitled", current.done ? "done" : "todo",
          current.priority || "med", current.assignee || null, parentId, pad.id]
-      );
-      task = sql("SELECT * FROM tasks WHERE id = last_insert_rowid()")[0];
+      )[0];
       sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
           [task.id, task.status, ACTOR]);
       audit("create", "task", task.id, "read out of a pad", task.title);
@@ -545,12 +581,14 @@ const TOOLS = {
         if (!parent) throw new Error(`No task ${a.parent_id} to hang this from`);
         projectId = parent.project_id;
       }
-      sql(
+      // RETURNING, not "the newest row": with two agents filing at once the
+      // newest row can be the other agent's.
+      const row = sql(
         `INSERT INTO tasks (project_id, title, detail, priority, due, ref, parent_id, source)
-         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8)`,
+         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8)
+         RETURNING id, title`,
         [projectId, a.title, a.detail ?? null, a.priority || "med", a.due ?? null, a.ref ?? null, a.parent_id ?? null, ACTOR]
-      );
-      const row = sql("SELECT id, title FROM tasks ORDER BY id DESC LIMIT 1")[0];
+      )[0];
       sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'todo', :p2)", [row.id, ACTOR]);
       audit("create", "task", row.id, "created", row.title);
       return row;
@@ -840,10 +878,10 @@ const TOOLS = {
       const task = sql("SELECT id, title FROM tasks WHERE id = :p1", [a.task_id])[0];
       if (!task) throw new Error(`No task ${a.task_id}`);
       if (!a.body || !String(a.body).trim()) throw new Error("A comment needs something in it");
-      sql("INSERT INTO comments (task_id, author, body) VALUES (:p1, :p2, :p3)",
-          [a.task_id, ACTOR, String(a.body).trim()]);
+      const row = sql("INSERT INTO comments (task_id, author, body) VALUES (:p1, :p2, :p3) RETURNING *",
+                      [a.task_id, ACTOR, String(a.body).trim()])[0];
       audit("update", "task", a.task_id, "commented", task.title);
-      return sql("SELECT * FROM comments WHERE task_id = :p1 ORDER BY id DESC LIMIT 1", [a.task_id])[0];
+      return row;
     },
   },
 
@@ -861,9 +899,9 @@ const TOOLS = {
       },
     },
     run: (a) => {
-      sql(`INSERT INTO notes (project_id, title, body, kind) VALUES (:p1, :p2, :p3, :p4)`,
-          [a.project_id, a.title, a.body, a.kind || "note"]);
-      const row = sql("SELECT id, title FROM notes ORDER BY id DESC LIMIT 1")[0];
+      const row = sql(`INSERT INTO notes (project_id, title, body, kind) VALUES (:p1, :p2, :p3, :p4)
+                       RETURNING id, title`,
+                      [a.project_id, a.title, a.body, a.kind || "note"])[0];
       audit("create", "note", row.id, "created", row.title);
       return row;
     },
@@ -1039,9 +1077,12 @@ const TOOLS = {
       }
       if (!target.enabled) throw new Error(`${target.label} is turned off in Delphi's settings.`);
 
-      sql(
+      // RETURNING for the reason derivePad gives: on the binary route a fresh
+      // connection's last_insert_rowid() is 0, and this returned nothing.
+      const row = sql(
         `INSERT INTO handoffs (project_id, from_session_id, to_harness, task_id, request, context_json, wake)
-         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7)`,
+         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7)
+         RETURNING *`,
         [
           projectId,
           // Set by whatever launched this server. A handoff from a tab knows
@@ -1052,8 +1093,7 @@ const TOOLS = {
           a.context ? JSON.stringify(a.context) : null,
           a.wake === false ? 0 : 1,
         ]
-      );
-      const row = sql("SELECT * FROM handoffs WHERE id = last_insert_rowid()")[0];
+      )[0];
       audit("create", "handoff", row.id, `asked ${row.to_harness}`, row.request.slice(0, 80));
       return {
         ...row,
@@ -1198,12 +1238,13 @@ const TOOLS = {
         );
       }
       const minutes = Math.max(1, Number(a.minutes) || 1);
-      sql(
+      // RETURNING for the reason derivePad gives.
+      const row = sql(
         `INSERT INTO alerts (session_id, kind, fire_at, message)
-         VALUES (:p1, 'timer', datetime('now', :p2), :p3)`,
+         VALUES (:p1, 'timer', datetime('now', :p2), :p3)
+         RETURNING id, fire_at`,
         [session, `+${minutes} minutes`, String(a.message)]
-      );
-      const row = sql("SELECT id, fire_at FROM alerts WHERE id = last_insert_rowid()")[0];
+      )[0];
       return { ...row, note: "Set. Finish your turn: you will be given another one when it fires." };
     },
   },
@@ -1369,7 +1410,16 @@ const TOOLS = {
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 
-function handle(req) {
+/**
+ * Answers one request.
+ *
+ * Async so a tool may return a promise: starting a Workbench fetches and runs
+ * git, which is not something to do synchronously on the only thread. Every
+ * synchronous tool still runs to completion before the next line is read,
+ * because an async function runs up to its first await at once, so the order
+ * writes land in is the order requests arrived in, as it was before.
+ */
+async function handle(req) {
   const { id, method, params } = req;
 
   if (method === "initialize") {
@@ -1402,7 +1452,7 @@ function handle(req) {
   if (method === "tools/call") {
     const tool = TOOLS[params.name];
     if (!tool) throw new Error(`Unknown tool ${params.name}`);
-    const result = tool.run(params.arguments || {});
+    const result = await tool.run(params.arguments || {});
     const content = [{ type: "text", text: JSON.stringify(result, null, 2) }];
 
     // The last word, and the one an agent is most likely to act on, because it
@@ -1456,6 +1506,9 @@ function watchSettings() {
 }
 
 let buffer = "";
+// Requests still being answered. A client that writes its last request and
+// closes stdin straight away is entitled to the answer, so the exit waits.
+const inFlight = new Set();
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
   let index;
@@ -1471,18 +1524,24 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
 
-    try {
-      const result = handle(req);
+    const answered = handle(req).then(
       // Notifications have no id and must not be answered.
-      if (req.id !== undefined) send({ jsonrpc: "2.0", id: req.id, result });
-    } catch (error) {
-      if (req.id !== undefined) {
-        send({ jsonrpc: "2.0", id: req.id, error: { code: -32603, message: String(error.message || error) } });
+      (result) => { if (req.id !== undefined) send({ jsonrpc: "2.0", id: req.id, result }); },
+      (error) => {
+        if (req.id !== undefined) {
+          send({ jsonrpc: "2.0", id: req.id, error: { code: -32603, message: String((error && error.message) || error) } });
+        }
       }
-    }
+    );
+    inFlight.add(answered);
+    answered.finally(() => inFlight.delete(answered));
   }
 });
 
 watchSettings();
 
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => {
+  // Exit once the last answer has left, not merely been queued: a pipe on macOS
+  // is written asynchronously, and process.exit does not wait for it.
+  Promise.allSettled(Array.from(inFlight)).then(() => process.stdout.write("", () => process.exit(0)));
+});

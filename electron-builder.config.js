@@ -44,6 +44,15 @@ module.exports = {
     "git.js",
     "terminal.js",
     "harness.js",
+    // Sheets and Workbenches. Listed before the files exist, because a missing
+    // entry here is not an error: electron-builder skips it without a word, and
+    // the first anyone hears of it is a packaged app that cannot start.
+    // tools/package_test.js is what checks this list against the main process's
+    // requires, so a gap shows up in `npm test` rather than on someone's Mac.
+    "agent/schema_later.js",
+    "agent/launch.js",
+    "sheet/",
+    "workbench/",
     "schema.sql",
     "oracle.sql",
     "package.json",
@@ -63,6 +72,30 @@ module.exports = {
     // there, and because one copy of these rules is the whole point.
     { from: "pads.js", to: "pads.js" },
     { from: "agent/guard.py", to: "agent/guard.py" },
+    // The server requires ./directives. It was left out of this list when that
+    // file arrived, and every installed build since shipped a server that died
+    // at its first require. Nothing failed at build time, which is why
+    // tools/package_test.js now launches the server from a copy of this layout.
+    { from: "agent/directives.js", to: "agent/directives.js" },
+    // Everything below mirrors the checkout's layout on purpose. The server and
+    // the CLI find each other and their modules by relative require
+    // (`../sheet/store`, `../git`, `../agent/mcp_server.js`), so as long as the
+    // tree under Resources/ has the same shape as the repository, a require that
+    // works in a checkout works in an installed build. Some of these do not exist
+    // yet; electron-builder warns and skips a missing source rather than failing.
+    { from: "agent/schema_later.js", to: "agent/schema_later.js" },
+    { from: "agent/launch.js", to: "agent/launch.js" },
+    { from: "sheet", to: "sheet" },
+    { from: "workbench", to: "workbench" },
+    // Also inside the asar for the main process. Copied out as well because
+    // workbench/git.js requires ../git.js and sheet/chat.js requires
+    // ../harness.js, and those run under the plain Node outside the archive.
+    { from: "git.js", to: "git.js" },
+    { from: "harness.js", to: "harness.js" },
+    // The command line tool. Resources/bin/delphi spawns ../agent/mcp_server.js,
+    // the same server an editor uses. tools/after-pack.js makes sure it is still
+    // executable once it lands here.
+    { from: "bin/delphi", to: "bin/delphi" },
   ],
 
   // No version in the filename, on purpose. It makes

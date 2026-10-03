@@ -11,6 +11,7 @@ const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
 const pads = require("./pads");
+const schemaLater = require("./agent/schema_later");
 
 // Beside the source when run from a checkout, in the per-user data directory when
 // run from an installer. See paths.js: the packaged source directory is a
@@ -33,8 +34,17 @@ function open() {
   const schema = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
   // Columns first, then the schema. schema.sql indexes some of these columns, and
   // an index on a column that does not exist yet is an error that stops the whole
-  // file, so an older database would fail to open at all.
-  addLaterColumns(db);
+  // file, so an older database would fail to open at all. See agent/schema_later.js
+  // for why the list lives there: the MCP server runs the same one.
+  //
+  // apply() never throws, because the server would rather serve without a column
+  // than not serve. The app has always refused to open a database it could not
+  // bring up to date, and still does, so the first failure is raised here.
+  const later = schemaLater.apply((statement) => db.prepare(statement).all());
+  if (later.errors.length) {
+    const first = later.errors[0];
+    throw new Error(`Could not bring the database up to date: ${first.message} (${first.statement.split("\n")[0]})`);
+  }
   db.exec(schema);
   // After the schema, because on a fresh database the table it rebuilds has just
   // been created with the right constraint and there is nothing to do.
@@ -49,78 +59,6 @@ function open() {
     console.error("could not adopt project paths into workspaces", error);
   }
   return db;
-}
-
-/**
- * Adds columns that arrived after a database was first created.
- *
- * schema.sql stays idempotent because everything in it is CREATE ... IF NOT
- * EXISTS, but SQLite has no ADD COLUMN IF NOT EXISTS, so a new column on an
- * existing table cannot live there alone. Rather than bring in a migration
- * framework and a version table for what has so far only ever been added
- * columns, each one is named here and applied when it is missing.
- *
- * The column is also declared in schema.sql, so a fresh database gets it from
- * there and this finds nothing to do. Anything more structural than an added
- * column should get a real migration rather than an entry here.
- */
-const LATER_COLUMNS = [
-  ["tasks", "parent_id", "INTEGER REFERENCES tasks(id) ON DELETE CASCADE"],
-  ["tasks", "assignee", "TEXT"],
-  ["projects", "task_view", "TEXT NOT NULL DEFAULT 'list'"],
-  ["tasks", "queue", "TEXT"],
-  ["tasks", "claimed_by", "TEXT"],
-  ["tasks", "claim_expires", "TEXT"],
-  // Names a table schema.sql has not created yet, which is legal: SQLite
-  // resolves foreign key targets when a row is written, not when the column is
-  // declared, and the CREATE TABLE lands a few statements later in the same open.
-  ["tasks", "organizer_id", "INTEGER REFERENCES organizers(id) ON DELETE SET NULL"],
-  ["tasks", "external_key", "TEXT"],
-  ["comments", "external_key", "TEXT"],
-  ["organizers", "external_key", "TEXT"],
-  ["tasks", "colour", "TEXT"],
-  // A project is a folder now. Added here as well as in schema.sql because an
-  // existing database already has the table and never re-runs the CREATE.
-  ["projects", "path", "TEXT"],
-  ["projects", "icon", "TEXT"],
-  // A session runs somewhere. A project spanning four repos cannot tell an
-  // agent which folder to work in without this.
-  ["sessions", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL"],
-  // Whether the agent may use tools without asking. Off by default, and
-  // deliberately per session: it is the difference between something that talks
-  // and something that edits your files.
-  ["sessions", "auto_allow", "INTEGER NOT NULL DEFAULT 0"],
-  // The pad this task was read out of, when it was read out of one. Nullable
-  // because a task typed into the board is not derived from anything, and SET
-  // NULL because deleting the working document must not delete the work.
-  ["tasks", "pad_id", "INTEGER REFERENCES scratchpads(id) ON DELETE SET NULL"],
-  // A session can now be somebody else's agent rather than the built-in chat.
-  ["sessions", "harness", "TEXT"],
-  ["sessions", "native_id", "TEXT"],
-  ["sessions", "cwd", "TEXT"],
-  ["sessions", "run_state", "TEXT NOT NULL DEFAULT 'idle'"],
-  ["sessions", "last_run_at", "TEXT"],
-  // What this row looked like when Delphi last seeded it, so seedHarnesses can
-  // tell a definition nobody has touched from one somebody has edited.
-  ["harnesses", "seeded_json", "TEXT"],
-  // Alerts grew a second job. A reminder is a person being nudged about a task;
-  // a timer is a session being woken about something that finished while it was
-  // not running. Same table because they are the same mechanism, and there is
-  // already one sweep that fires due rows every minute.
-  ["alerts", "session_id", "INTEGER REFERENCES sessions(id) ON DELETE CASCADE"],
-  ["alerts", "kind", "TEXT NOT NULL DEFAULT 'reminder'"],
-  ["alerts", "payload", "TEXT"],
-];
-
-function addLaterColumns(db) {
-  for (const [table, column, definition] of LATER_COLUMNS) {
-    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
-    // No rows means the table does not exist yet, which is a brand new database.
-    // schema.sql is about to create it with the column already in place.
-    if (!columns.length) continue;
-    if (columns.some((c) => c.name === column)) continue;
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
 }
 
 /**
@@ -177,6 +115,32 @@ function widenAuditEntities(db) {
 const all = (sql, params = {}) => open().prepare(sql).all(params);
 const one = (sql, params = {}) => open().prepare(sql).get(params);
 const run = (sql, params = {}) => open().prepare(sql).run(params);
+
+/**
+ * Runs a query written in the MCP server's style, :p1 to :pN, with real binding.
+ *
+ * The stores under sheet/ and workbench/ are shared with the server rather than
+ * twinned, and take whichever sql() they are handed. The server substitutes
+ * literals because one of its routes is a sqlite3 subprocess; this binds, which
+ * is the better thing to do when there is a handle to bind against. One regex
+ * pass with a replacement function, so nothing in a value is ever looked at.
+ *
+ * Values are coerced the way the server's literal() renders them, so a store
+ * sees the same thing stored whichever side wrote it: a boolean is 1 or 0, a
+ * number that is not finite is NULL, and anything else that is not a number or
+ * a string is turned into one rather than refused.
+ */
+function sqlP(query, params = []) {
+  const statement = String(query).replace(/:p(\d+)/g, (_, n) => `?${n}`);
+  const values = params.map((v) => {
+    if (v === null || v === undefined) return null;
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "boolean") return v ? 1 : 0;
+    if (typeof v === "bigint" || typeof v === "string") return v;
+    return String(v);
+  });
+  return open().prepare(statement).all(...values);
+}
 
 // Audit summaries are read by people, so they say "1 task" rather than "1 tasks".
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -2608,6 +2572,8 @@ module.exports = {
   // The graph builder works against the connection directly, so it is exposed
   // rather than every graph query being proxied through this module.
   handle: open,
+  // For the stores shared with the MCP server. See sqlP.
+  sqlP,
   listProjects, listArchivedProjects, getProject, createProject, updateProject, deleteProject,
   projectContents,
   listTasks, createTask, updateTask,

@@ -1,3 +1,13 @@
+-- A database as it was before Sheets and Workbenches (gate G1).
+--
+-- schema.sql exactly as it stood at commit fb9fdaf, then a few rows. It has none
+-- of the comments columns, the repos columns or the workbenches table, which is
+-- what tools/migrate_test.js needs: the MCP server and db.js must each bring a
+-- file like this up to date on their own, on either database route.
+--
+-- Do not regenerate this from the current schema.sql. Its whole value is that
+-- it is old.
+
 -- Delphi: projects hold tasks, notes and links.
 --
 -- The unit of thought here is the project, not the task. A flat task list stops
@@ -112,20 +122,10 @@ CREATE TABLE IF NOT EXISTS comments (
   author     TEXT NOT NULL DEFAULT 'you',
   body       TEXT NOT NULL,
   external_key TEXT,                        -- see tasks.external_key
-  -- What sort of entry this is on the task's Sheet. Free text validated in code
-  -- (sheet/store.js KINDS), for the reason projects.task_view gives.
-  kind         TEXT NOT NULL DEFAULT 'say',     -- say | run | ask | decide | note
-  author_type  TEXT,                            -- human | agent | tool; null = infer
-  meta         TEXT,                            -- JSON, kind specific
-  promoted     INTEGER NOT NULL DEFAULT 0,
-  ref_id       INTEGER REFERENCES comments(id) ON DELETE SET NULL,
-  note_id      INTEGER REFERENCES notes(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id, id);
--- The ledger is the promoted entries, read on every claim and every get_task.
-CREATE INDEX IF NOT EXISTS idx_comments_ledger ON comments(task_id, promoted);
 
 -- Every status a task has been in, and when it entered it.
 --
@@ -230,10 +230,7 @@ CREATE TABLE IF NOT EXISTS repos (
   name       TEXT NOT NULL,
   path       TEXT NOT NULL,
   is_primary INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  base_branch  TEXT,   -- null = detect (origin/HEAD, then main, then master)
-  setup_cmd    TEXT,   -- null = not detected yet; '' = detected, nothing to run
-  copy_files   TEXT    -- null = '.env,.env.local'; comma separated, untracked, never overwritten
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_repos_project ON repos(project_id);
 
@@ -564,35 +561,34 @@ CREATE TABLE IF NOT EXISTS locks (
   UNIQUE (project_id, key)
 );
 
--- Workbenches: a git worktree per task, so two pieces of work never share one
--- checkout. The folder and branch are real; this row is what Delphi knows about
--- them, kept so a folder deleted by hand shows up as Missing rather than as a
--- task that quietly forgot where its work was.
---
--- No CHECK on state, for the reason projects.task_view gives. Validated in
--- workbench/store.js (STATES): active | parked | finished | discarded | missing.
---
--- agent/schema_later.js creates this table too, from the same text, because the
--- MCP server never runs this file. Change one and change the other.
-CREATE TABLE IF NOT EXISTS workbenches (
-  id          INTEGER PRIMARY KEY,
-  task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  repo_id     INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-  path        TEXT NOT NULL,
-  branch      TEXT NOT NULL,
-  base        TEXT NOT NULL,
-  state       TEXT NOT NULL DEFAULT 'active',
-  owner       TEXT,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  closed_at   TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_workbenches_task ON workbenches(task_id, state);
--- Missing counts as live in both. A Missing row is still the task's Workbench
--- until someone picks Recreate or Forget, and letting Start make a second one
--- beside it is how one branch ends up in two rows. The path index stops two
--- rows ever claiming one folder.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_live
-  ON workbenches(task_id, repo_id) WHERE state IN ('active', 'parked', 'missing');
-CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_path
-  ON workbenches(path) WHERE state IN ('active', 'parked', 'missing');
+-- --- rows ---------------------------------------------------------------------
+
+INSERT INTO projects (id, key, name, summary, sort_order) VALUES
+  (1, 'legacy', 'Legacy project', 'From before the upgrade', 10),
+  (2, 'general', 'General', NULL, 99);
+
+INSERT INTO tasks (id, project_id, title, detail, status, priority, ref, legacy_id) VALUES
+  (1, 1, 'an old task with comments', 'Detail from the old days.', 'doing', 'high', 'OLD-1', 'T-1'),
+  (2, 1, 'a finished one', NULL, 'done', 'low', NULL, NULL),
+  (3, NULL, 'an orphan', NULL, 'todo', 'med', NULL, NULL);
+
+INSERT INTO comments (id, task_id, author, body, created_at, updated_at) VALUES
+  (1, 1, 'ray', 'Plain words.', '2026-01-01 10:00:00', '2026-01-01 10:00:00'),
+  (2, 1, 'claude-code:3', 'Multi
+line, with a fence:
+```
+$ npm test
+```', '2026-01-02 10:00:00', '2026-01-02 10:00:00'),
+  (3, 2, 'you', 'Quotes '' and :p1 and $& from before.', '2026-01-03 10:00:00', '2026-01-03 10:00:00');
+
+INSERT INTO notes (id, project_id, title, body, kind) VALUES
+  (1, 1, 'an old gotcha', 'Remember this.', 'gotcha');
+
+INSERT INTO repos (id, project_id, name, path, is_primary) VALUES
+  (1, 1, 'legacy', '/tmp/delphi-migrate-test-legacy', 1);
+
+INSERT INTO sessions (id, project_id, title, harness) VALUES
+  (1, 1, 'an old session', 'claude-code');
+
+INSERT INTO harnesses (id, key, label, args_json, enabled) VALUES
+  (1, 'codex', 'Codex', '[]', 1);
