@@ -1271,17 +1271,24 @@ async function renderOverview(root) {
         className: "kind" + (r.is_primary ? " decision" : ""),
         textContent: r.is_primary ? "primary" : "helper",
       }));
+      const acts = el("div", { className: "repo-acts" });
       row.append(el("div", { className: "grow" },
         el("div", { textContent: r.name }),
-        el("div", { className: "mono", textContent: r.path })));
+        el("div", { className: "mono repo-path", textContent: r.path }),
+        // Under the path rather than beside it: three buttons beside a path in
+        // the narrow column left the path a few characters wide.
+        acts));
       if (!r.is_primary) {
         const mk = el("button", { className: "btn sm", textContent: "Make primary" });
         mk.onclick = async () => { await window.delphi.repos.setPrimary(r.id); refresh(); };
-        row.append(mk);
+        acts.append(mk);
       }
+      const wbSet = el("button", { className: "btn sm", textContent: "Workbench settings" });
+      wbSet.onclick = async () => { if (await repoWorkbenchSettings(r)) refresh(); };
+      acts.append(wbSet);
       const rm = el("button", { className: "btn sm", textContent: "Remove" });
       rm.onclick = async () => { await window.delphi.repos.remove(r.id); refresh(); };
-      row.append(rm);
+      acts.append(rm);
       flush.append(row);
     });
     repoCard.card.append(flush);
@@ -6553,6 +6560,68 @@ async function renderSettings(root) {
   // --- reminders -----------------------------------------------------------
   root.append(remindersSettings(settings));
 
+  // --- workbenches ---------------------------------------------------------
+  // The two settings every Workbench reads. Saved on change, like the rest of
+  // this page, and checked by the main process, whose refusal is shown as is.
+  const benchBox = el("div", { className: "setting" });
+  benchBox.append(el("h3", { textContent: "Workbenches" }));
+  benchBox.append(el("p", {
+    textContent: "A Workbench is a task's own folder and branch, so two pieces of work never share a checkout. These apply to every project; each repository's base branch, setup command and copied files are under Workbench settings on the project's Overview.",
+  }));
+
+  const benchField = ({ id, label, hint, value, placeholder, key }) => {
+    const input = el("input", { className: "field mono-in", id, value: value || "", placeholder, spellcheck: false, autocomplete: "off" });
+    const msg = el("span", { className: "hint" });
+    let saved = value || "";
+    input.onchange = async () => {
+      try {
+        const updated = await window.delphi.settings.set({ [key]: input.value.trim() || null });
+        Object.assign(settings, updated);
+        saved = input.value.trim();
+        msg.className = "ok-msg";
+        msg.textContent = "Saved";
+      } catch (e) {
+        msg.className = "err-msg";
+        msg.textContent = e.message;
+        input.value = saved;
+      }
+    };
+    const sub = el("div", { className: "setting-sub" },
+      el("h4", {}, el("label", { htmlFor: id, textContent: label })),
+      el("p", { className: "hint", textContent: hint }),
+      el("div", { className: "row" }, input, msg));
+    return { sub, input };
+  };
+
+  const editor = benchField({
+    id: "wb-editor", key: "workbenchEditor", value: settings.workbenchEditor, placeholder: "code",
+    label: "Editor command",
+    hint: "What Open and Open > Editor run, with the Workbench folder added on the end. Leave it empty for VS Code's code when it is installed, or else whatever the system opens a folder with. The terminal Sheet's W uses $VISUAL or $EDITOR instead.",
+  });
+  benchBox.append(editor.sub);
+
+  const prefix = benchField({
+    id: "wb-prefix", key: "workbenchBranchPrefix", value: settings.workbenchBranchPrefix, placeholder: "your username",
+    label: "Branch prefix",
+    hint: "What every Workbench branch starts with, so a shared remote shows whose branch is whose. Leave it empty for your username on this computer.",
+  });
+  // The same cleaning workbench/naming.js gives a prefix, so the example is
+  // the name git will really be given.
+  const cleanPrefix = (text) => String(text || "").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/\.{2,}/g, ".")
+    .replace(/^[.-]+|[.-]+$/g, "").replace(/\.lock$/i, "").slice(0, 40);
+  const example = el("p", { className: "hint wb-example" });
+  const paintExample = () => {
+    example.textContent = "";
+    example.append("A task 42 called \"Fix the zip DLQ backlog\" gets ",
+      el("span", { className: "mono", textContent: `${cleanPrefix(prefix.input.value) || "<your username>"}/42-fix-the-zip-dlq-backlog` }),
+      ", or leads with its ticket, such as EF-1288, when it has one.");
+  };
+  prefix.input.addEventListener("input", paintExample);
+  paintExample();
+  prefix.sub.append(example);
+  benchBox.append(prefix.sub);
+  root.append(benchBox);
+
   // --- vault ---------------------------------------------------------------
   const v = el("div", { className: "setting" });
   v.append(el("h3", { textContent: "Markdown vault" }));
@@ -7315,6 +7384,60 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
     notify(`Discarded.${keptWords(r)}`);
   } catch (error) { notifyError(error); }
   if (after) await after();
+}
+
+/**
+ * A repository's Workbench settings: where a Workbench branches from, what
+ * runs once its folder exists, and which untracked files are copied in.
+ *
+ * A null base branch or setup command means Delphi works it out at Start, and
+ * the first Start writes the detected command back here. Each field says which
+ * it is showing, so nobody edits a value thinking it was typed by a person.
+ */
+async function repoWorkbenchSettings(repo) {
+  let refused = null;
+  let values = { base: repo.base_branch || "", setup: repo.setup_cmd == null ? "" : repo.setup_cmd, copy: repo.copy_files == null ? "" : repo.copy_files };
+  for (;;) {
+    const field = (id, value, placeholder) => el("input", { className: "field mono-in", id, value, placeholder, spellcheck: false, autocomplete: "off" });
+    const base = field("wb-base", values.base, "origin's default branch, then main");
+    const setup = field("wb-setup", values.setup, repo.setup_cmd == null ? "worked out at the first Start" : "nothing runs");
+    const copy = field("wb-copy", values.copy, ".env,.env.local");
+    const tag = (text) => el("span", { className: "wb-tag", textContent: text });
+    const row = (input, label, state, hint) => el("div", { className: "wb-field" },
+      el("label", { htmlFor: input.id }, label, state ? tag(state) : null), input, el("div", { className: "hint", textContent: hint }));
+    const choice = await wbDialog({
+      title: `Workbench settings for ${repo.name}`,
+      lead: repo.path,
+      className: "wb-settings",
+      body: [
+        row(base, "Base branch", repo.base_branch ? null : "detected",
+          "Where every Workbench branch starts from, and what Update brings in. Empty means detect: origin's default branch, then main, then master."),
+        row(setup, "Setup command", repo.setup_cmd == null ? "detected at Start" : null,
+          repo.setup_cmd == null
+            ? "Runs in a new Workbench once its folder exists. Delphi looks at the lockfiles at the first Start and writes what it finds here."
+            : "Runs in a new Workbench once its folder exists, as the first Start found it or as last edited. Empty runs nothing."),
+        row(copy, "Files to copy", repo.copy_files == null ? "default" : null,
+          "Untracked files copied from the main checkout into each new Workbench, comma separated. Never overwrites, and only files inside the repository."),
+        refused ? el("div", { className: "err-msg", role: "alert", textContent: refused }) : null,
+      ],
+      actions: [{ label: "Cancel", value: null }, { label: "Save", value: "save", kind: "primary" }],
+    });
+    if (choice !== "save") return false;
+    values = { base: base.value.trim(), setup: setup.value.trim(), copy: copy.value.trim() };
+    const fields = { base_branch: values.base || null, copy_files: values.copy || null };
+    // An empty setup field means "run nothing" once something was detected or
+    // typed, and leaves "detect at Start" alone when nothing ever was.
+    if (!(repo.setup_cmd == null && !values.setup)) fields.setup_cmd = values.setup;
+    try {
+      await window.delphi.repos.update(repo.id, fields);
+      notify(`Workbench settings saved for ${repo.name}.`);
+      return true;
+    } catch (error) {
+      // Asked again with what was typed, and the refusal inside the dialog,
+      // so a refused branch name is a fix rather than starting over.
+      refused = String(error.message || error);
+    }
+  }
 }
 
 /** Which repository a Start should use, when the project has more than one. */
