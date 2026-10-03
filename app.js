@@ -1288,6 +1288,37 @@ async function renderOverview(root) {
   }
   right.append(repoCard.card);
 
+  // --- workbenches ---------------------------------------------------------
+  // The tasks with a folder and branch of their own, and how each one stands.
+  // Each row opens its task, which is where the verbs are.
+  let benches = [];
+  try { benches = await window.delphi.workbench.list({ projectId: project.id }); } catch (error) { console.error("workbench list", error); }
+  const benchCard = card("Workbenches");
+  if (!benches.length) {
+    benchCard.body.append(emptyState("No Workbenches yet", "Start one from a task."));
+  } else {
+    benchCard.card.querySelector(".card-head").append(el("span", { className: "ts-count", textContent: String(benches.length) }));
+    benchCard.body.remove();
+    const flush = el("div", { className: "card-body flush" });
+    for (const wb of benches) {
+      const row = el("div", { className: "list-row clickable wb-row", tabIndex: 0, role: "button" });
+      row.setAttribute("aria-label", `${wb.task_title}, ${wbLook(wb).words}`);
+      row.append(el("div", { className: "grow" },
+        el("div", { className: "wb-row-title", textContent: wb.task_title }),
+        el("div", { className: "wb-row-sub" },
+          el("span", { className: "mono", textContent: wb.branch }),
+          wb.task_status === "done" ? el("span", { className: "wb-flag", textContent: "task is done" }) : null)),
+        wbChip(wb, async (act) => { act.disabled = true; await wbUpdate(wb); refresh(); }));
+      row.onclick = () => openTaskSheet(wb.task_id);
+      row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTaskSheet(wb.task_id); } };
+      flush.append(row);
+    }
+    benchCard.card.append(flush);
+  }
+  // In the wide column, after what needs attention: a row carries a title, a
+  // branch and a sentence of status, and the narrow one wrapped all three.
+  left.insertBefore(benchCard.card, memCard.card);
+
   // --- links ---------------------------------------------------------------
   const linkCard = card("Links");
   if (!state.links.length) {
@@ -6762,6 +6793,8 @@ const TS_ICONS = {
   file: '<path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>',
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/>',
   x: '<path d="M18 6L6 18M6 6l12 12"/>',
+  caret: '<path d="M6 9l6 6 6-6"/>',
+  dots: '<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>',
 };
 function tsIcon(name, width = 2) {
   const holder = document.createElement("span");
@@ -6860,6 +6893,514 @@ function handoffText(detail) {
   return lines.join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// Workbenches
+//
+// A task's own folder and branch. The verbs live in workbench/workbench.js and
+// arrive here as plain-English results or plain-English errors; the window's
+// job is to ask before anything that could lose work and to show those words
+// as they were written, never to translate them back into git.
+// ---------------------------------------------------------------------------
+
+// Kept at module scope rather than in the task panel, because a Start's setup
+// can outlive the panel it was started from and should still read as Starting
+// when the task is opened again. taskId -> { phase, text }.
+const wbStarting = new Map();
+
+/**
+ * A message that has to be read, not glanced at: an error from git, a warning
+ * from Start, the outcome of Finish. The header flash is gone in a second and a
+ * half, which suits "saved" and not "the push was refused because...". Shown
+ * over everything, including a dialog, and for longer the more there is to read.
+ */
+let toastTimer = null;
+function notify(text, { error = false } = {}) {
+  const words = String(text && text.message ? text.message : text || "").trim();
+  if (!words) return;
+  let toast = document.querySelector(".wb-toast");
+  if (!toast) {
+    toast = el("div", { className: "wb-toast" });
+    toast.onclick = () => toast.remove();
+    document.body.append(toast);
+  }
+  toast.className = "wb-toast" + (error ? " err" : "");
+  toast.setAttribute("role", error ? "alert" : "status");
+  toast.textContent = words;
+  clearTimeout(toastTimer);
+  const ms = Math.min(14000, 3000 + words.length * 45);
+  toastTimer = setTimeout(() => toast.remove(), ms);
+}
+const notifyError = (error) => notify(error, { error: true });
+
+/**
+ * A question with buttons. Resolves to the chosen action's value, or to
+ * cancelValue on Escape or a click outside. Enter picks the primary action, so
+ * the safe answer is never the one a stray keypress gives unless it is also
+ * the primary one.
+ */
+function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, className = "" }) {
+  return new Promise((resolve) => {
+    const overlay = el("div", { className: "overlay" });
+    const box = el("div", { className: `ask wb-dialog ${className}`.trim(), role: "dialog" });
+    box.setAttribute("aria-modal", "true");
+    box.setAttribute("aria-label", title);
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKey, true);
+      overlay.remove();
+      resolve(value);
+    };
+    const buttons = actions.map((a) => {
+      const b = el("button", { className: `btn ${a.kind || ""}`.trim(), textContent: a.label, type: "button" });
+      b.onclick = () => { if (!b.disabled) finish(a.value); };
+      if (a.bind) a.bind(b);
+      return b;
+    });
+    const primary = buttons[actions.findIndex((a) => a.kind === "primary" || a.kind === "danger")] || null;
+    const onKey = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(cancelValue);
+      } else if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (primary && !primary.disabled) primary.click();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    box.append(el("h3", { textContent: title }));
+    if (lead) box.append(el("p", { className: "wb-lead", textContent: lead }));
+    for (const node of body) if (node) box.append(node);
+    box.append(el("div", { className: "ask-actions" }, buttons));
+    overlay.append(box);
+    overlay.onclick = (event) => { if (event.target === overlay) finish(cancelValue); };
+    document.body.append(overlay);
+    const focus = box.querySelector("input") || primary || buttons[buttons.length - 1];
+    if (focus) focus.focus();
+  });
+}
+
+/** A list of file names or commits, cut short with a count of the rest. */
+function wbList(items, render, cap = 8) {
+  const ul = el("ul");
+  for (const item of items.slice(0, cap)) ul.append(el("li", {}, render(item)));
+  if (items.length > cap) ul.append(el("li", { className: "hint", textContent: `and ${items.length - cap} more` }));
+  return ul;
+}
+
+/** How long ago an ISO time was, for the chip's "checked" line. */
+function agoWords(iso) {
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (!Number.isFinite(s)) return "";
+  if (s < 60) return `${s}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+
+/** Which of the chip's looks a Workbench gets: one per state, in words, never git's. */
+function wbLook(wb) {
+  const st = wb.status || {};
+  if (wb.state === "missing" || st.state === "missing") return { cls: "missing", words: "Missing" };
+  // A folder that is there but cannot be read: drawn like Missing, in the
+  // module's own words, because Finish and Discard both refuse it.
+  if (st.state === "unreadable") return { cls: "missing", words: st.words || "Unreadable", unreadable: true };
+  if (wb.state === "parked") return { cls: "parked", words: "Parked" };
+  return { cls: st.state || "ready", words: st.words || "Ready" };
+}
+
+/**
+ * The status chip. Update rides inside it when the branch is behind, because
+ * that is the moment it means something; under More it is always there.
+ */
+function wbChip(wb, onUpdate) {
+  const st = wb.status || {};
+  const { cls, words } = wbLook(wb);
+  const chip = el("span", { className: `wb-chip ${cls}` }, el("span", { className: "wb-words", textContent: words }));
+  const checked = st.checkedAt ? `Checked ${agoWords(st.checkedAt)}` : "";
+  // The words in full as well, since a narrow row cuts them short.
+  chip.title = (cls === "parked" || cls === "missing") && st.words && st.words !== words ? `${st.words}. ${checked}`
+    : st.message ? `${st.message} ${checked}` : `${words}. ${checked}`;
+  if (onUpdate && st.behind > 0 && cls !== "parked" && cls !== "missing") {
+    const act = el("button", { className: "wb-act", textContent: "Update", type: "button" });
+    act.title = `Bring in the latest ${st.base || wb.base}`;
+    act.onclick = (e) => { e.stopPropagation(); onUpdate(act); };
+    chip.append(act);
+  }
+  return chip;
+}
+
+/** Update from base, said in the module's own words whichever way it went. */
+async function wbUpdate(wb) {
+  try {
+    const r = await window.delphi.workbench.update(wb.id);
+    if (r.ok) notify(`Updated from ${wb.base}. ${r.words}`);
+    else notifyError(r.conflict && r.conflict.files && r.conflict.files.length
+      ? `${r.words} Clashing: ${r.conflict.files.join(", ")}.` : r.words);
+  } catch (error) { notifyError(error); }
+}
+
+/**
+ * Finish, without ever losing work.
+ *
+ * The module refuses a Finish with unsaved changes or unshared commits, and it
+ * is right to. This walks the person through each refusal before it happens,
+ * asking at every step, so the folder is only removed once its work is safe on
+ * the remote. Every step can be cancelled and nothing is done behind a dialog.
+ */
+async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) {
+  const done = async () => { if (after) await after(); };
+  const wbApi = window.delphi.workbench;
+  try {
+    let st = await wbApi.status(wbId, { fresh: true });
+
+    if (st.unsaved) {
+      const files = el("div", { className: "grp" },
+        el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(st.unsaved) }),
+          st.unsaved === 1 ? "unsaved change" : "unsaved changes"),
+        wbList(st.files || [], (f) => el("span", { className: "mono", textContent: f })));
+      const go = await wbDialog({
+        title: "Save the changes first?",
+        lead: "Finish only removes a folder when everything in it is saved. Commit them to the branch, or cancel and keep working.",
+        body: [files],
+        actions: [{ label: "Cancel", value: null }, { label: "Commit them", value: "commit", kind: "primary" }],
+      });
+      if (go !== "commit") return;
+      const message = await askText({
+        title: "Commit message",
+        label: "Every changed file goes into one commit on the Workbench's branch.",
+        value: title, confirmLabel: "Commit",
+      });
+      if (!message) return;
+      st = await wbApi.commit(wbId, message);
+      await done();
+    }
+
+    if (st.ahead) {
+      const go = await wbDialog({
+        title: `${plural(st.ahead, "commit", "commits")} not shared yet`,
+        lead: `Finish only removes a folder whose work is safe on the remote. Push the branch to share ${st.ahead === 1 ? "it" : "them"}.`,
+        actions: [{ label: "Cancel", value: null }, { label: "Push", value: "push", kind: "primary" }],
+      });
+      if (go !== "push") return;
+      const pushed = await wbApi.push(wbId);
+      await done();
+      if (!pushed.ok) { notifyError(pushed.reason); return; }
+    }
+
+    const pr = await wbApi.pr(wbId);
+    if (pr.via) {
+      const go = await wbDialog({
+        title: "Open a pull request?",
+        lead: pr.via === "gh"
+          ? "The branch is on the remote. GitHub's command line can open the pull request now, or find the one already open."
+          : "The branch is on the remote. This opens the host's page for starting a pull request.",
+        actions: [
+          { label: "Cancel", value: null },
+          { label: "Finish without one", value: "skip" },
+          { label: "Open pull request", value: "pr", kind: "primary" },
+        ],
+      });
+      if (!go) return;
+      if (go === "pr") {
+        const made = await wbApi.pr(wbId, { create: true });
+        // No pull request and no page to open one on: stop here, with the
+        // folder still in place, rather than finish as though it had worked.
+        if (!made.url) { notifyError(made.reason || "Could not open a pull request."); return; }
+        window.delphi.openExternal(made.url);
+        if (made.reason) notify(made.reason);
+      }
+    }
+
+    const r = await wbApi.finish(wbId);
+    notify(`Finished. The folder is gone and the branch ${r.branch} is kept.`);
+    await done();
+
+    if (r.taskStatus === "doing") {
+      const mark = await wbDialog({
+        title: `Mark task ${taskId} done?`,
+        lead: "The Workbench is finished and the task is still in progress.",
+        actions: [{ label: "Leave it", value: null }, { label: "Mark done", value: "done", kind: "primary" }],
+      });
+      if (mark === "done") {
+        await window.delphi.tasks.update(taskId, { status: "done" });
+        await done();
+      }
+    }
+  } catch (error) {
+    notifyError(error);
+    await done();
+  }
+}
+
+/**
+ * Discard: the one verb that throws work away. It shows everything that would
+ * go, from the module's own plan, and stays disabled until the task's number
+ * is typed exactly.
+ */
+async function discardWorkbench(wbId, taskId, { after = null } = {}) {
+  let plan;
+  try { plan = await window.delphi.workbench.discardPlan(wbId); } catch (error) { notifyError(error); return; }
+  const body = [];
+  if (plan.unsaved.length) {
+    body.push(el("div", { className: "grp" },
+      el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(plan.unsaved.length) }),
+        plan.unsaved.length === 1 ? "unsaved change" : "unsaved changes"),
+      wbList(plan.unsaved, (f) => el("span", { className: "mono", textContent: f }))));
+  }
+  if (plan.commits.length) {
+    body.push(el("div", { className: "grp" },
+      el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(plan.commits.length) }),
+        plan.commits.length === 1 ? "commit that exists only here" : "commits that exist only here"),
+      wbList(plan.commits, (c) => [
+        el("span", { className: "mono", style: "color:var(--ink-faint)", textContent: String(c.sha).slice(0, 7) }),
+        el("span", { textContent: c.subject }),
+      ])));
+  }
+  // Ignored files come summarised by folder, and commits made on a detached
+  // HEAD separately; both are drawn from whatever words the plan carries.
+  const ignored = Array.isArray(plan.ignored) ? plan.ignored : [];
+  if (ignored.length) {
+    body.push(el("div", { className: "grp" },
+      el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(ignored.length) }),
+        ignored.length === 1 ? "folder of ignored files" : "folders of ignored files"),
+      wbList(ignored, (g) => el("span", { className: "mono",
+        textContent: typeof g === "string" ? g : `${g.dir || g.path || ""}${g.count != null ? `  (${plural(g.count, "file", "files")})` : ""}` }))));
+  }
+  const detached = Array.isArray(plan.detached) ? plan.detached : Array.isArray(plan.detachedCommits) ? plan.detachedCommits : [];
+  if (detached.length) {
+    body.push(el("div", { className: "grp" },
+      el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(detached.length) }),
+        detached.length === 1 ? "commit on no branch" : "commits on no branch"),
+      wbList(detached, (c) => [
+        el("span", { className: "mono", style: "color:var(--ink-faint)", textContent: String(c.sha || c).slice(0, 7) }),
+        el("span", { textContent: c.subject || "" }),
+      ])));
+  }
+  if (!plan.unsaved.length && !plan.commits.length && !ignored.length && !detached.length) {
+    body.push(el("p", { className: "wb-lead", textContent: "Nothing in it exists only here, so no work is lost." }));
+  }
+  body.push(plan.branchPushed
+    ? el("p", { className: "wb-lead" }, "The branch ", el("span", { className: "mono", textContent: plan.branch }),
+        " is on the remote as ", el("span", { className: "mono", textContent: plan.remote }), ", so it is kept.")
+    : el("p", { className: "wb-lead" }, "The branch ", el("span", { className: "mono", textContent: plan.branch }),
+        " was never pushed, so it goes too."));
+  const recover = plan.recover || plan.recovery || null;
+  if (recover) body.push(el("p", { className: "wb-lead wb-recover", textContent: typeof recover === "string" ? recover : recover.text || "" }));
+  const want = String(taskId);
+  const input = el("input", { className: "field", type: "text", autocomplete: "off", spellcheck: false });
+  input.setAttribute("aria-label", `Type ${want} to confirm`);
+  body.push(el("div", { className: "confirm" },
+    el("label", {}, "Type ", el("strong", { textContent: want }), " to confirm"), input));
+  let go = null;
+  input.oninput = () => {
+    const ok = input.value === want;
+    go.disabled = !ok;
+    input.classList.toggle("match", ok);
+  };
+  const choice = await wbDialog({
+    title: `Discard the Workbench for task ${taskId}?`,
+    lead: recover ? "This deletes the folder. What was in it is kept aside first, so it can be got back."
+      : "This deletes the folder and any work that exists nowhere else. It cannot be undone.",
+    body,
+    actions: [
+      { label: "Cancel", value: null },
+      { label: "Discard", value: "discard", kind: "danger", bind: (b) => { go = b; b.disabled = true; } },
+    ],
+  });
+  if (choice !== "discard") return;
+  try {
+    const r = await window.delphi.workbench.discard(wbId, input.value);
+    const back = r.recover || r.recovery;
+    if (back) { notify(`Discarded. ${typeof back === "string" ? back : back.text || ""}`); if (after) await after(); return; }
+    notify(r.branchDeleted ? `Discarded, with the branch ${r.branch}.`
+      : r.keptRemote ? `Discarded. The branch is kept on the remote as ${r.keptRemote}.`
+      : `Discarded. The branch ${r.branch} is kept.`);
+  } catch (error) { notifyError(error); }
+  if (after) await after();
+}
+
+/** Which repository a Start should use, when the project has more than one. */
+function pickRepo(list) {
+  let chosen = list.find((c) => c.is_primary) || list[0];
+  const choices = el("div", { className: "destroy-choices" });
+  list.forEach((c, i) => {
+    const id = `wb-repo-${i}`;
+    const radio = el("input", { type: "radio", name: "wb-repo", id, checked: c === chosen });
+    radio.onchange = () => { if (radio.checked) chosen = c; };
+    choices.append(el("label", { className: "destroy-choice", htmlFor: id }, radio,
+      el("span", {},
+        el("span", { className: "destroy-choice-label" }, c.name, c.is_primary ? el("span", { className: "pill muted", textContent: "primary", style: "margin-left:6px" }) : null),
+        el("span", { className: "mono", textContent: c.path }))));
+  });
+  return wbDialog({
+    title: "Which repository?",
+    lead: "This project has several. The Workbench gets its own folder and branch in the one you pick.",
+    body: [choices],
+    actions: [{ label: "Cancel", value: false }, { label: "Start working", value: true, kind: "primary" }],
+    cancelValue: false,
+  }).then((ok) => (ok ? chosen : null));
+}
+
+// Subscribed once, here, because preload has no way to unsubscribe. Starting
+// is remembered per task; an open task panel is told so it can redraw.
+window.delphi.onWorkbenchEvent((e) => {
+  if (e.phase === "ready" || e.phase === "failed") wbStarting.delete(e.taskId);
+  else wbStarting.set(e.taskId, e);
+  if (e.phase === "failed") notifyError(e.text);
+  if (openSheet && openSheet.taskId === e.taskId && openSheet.wbEvent) openSheet.wbEvent(e);
+});
+
+// Done prompts Finish. Not now changes nothing: the task stays done and the
+// Workbench stays as it is.
+window.delphi.onWorkbenchPrompt(async (p) => {
+  const go = await wbDialog({
+    title: "Finish the Workbench too?",
+    lead: `Task ${p.taskId} is done, and its Workbench is still open.`,
+    body: [el("div", { className: "grp" },
+      el("div", { className: "wb-row-title", textContent: p.taskTitle }),
+      el("div", { className: "mono", textContent: p.branch }),
+      el("div", { className: "mono", style: "color:var(--ink-faint)", textContent: p.path }))],
+    actions: [{ label: "Not now", value: null }, { label: "Finish", value: "finish", kind: "primary" }],
+  });
+  if (go !== "finish") return;
+  await finishWorkbench(p.workbenchId, p.taskId, {
+    title: p.taskTitle,
+    after: async () => { if (openSheet && openSheet.live) await openSheet.live(); refresh(); },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Composer runs: live output
+//
+// Output arrives in pieces as it is written, for as long as the command runs,
+// and a build can write tens of megabytes. Nothing here holds more than the
+// last RUN_KEEP lines, and the DOM is written at most once a frame, so a
+// runaway command cannot take the window down with it. The whole log is on
+// disk regardless; this is only the view of its end.
+// ---------------------------------------------------------------------------
+
+const RUN_KEEP = 2000;
+const RUN_PENDING_CAP = 4 * 1024 * 1024;
+const RUN_PARTIAL_CAP = 64 * 1024;
+const runBuffers = new Map();   // entryId -> buffer, for runs started in this window
+const runKills = new Map();     // entryId -> presses of Stop so far
+// Runs that ended, since a quick one can finish before sheets.run has even
+// answered, and a buffer made after that would wait for an end already past.
+const runsEnded = new Set();
+
+function runBuffer(entryId, taskId) {
+  let b = runBuffers.get(entryId);
+  if (!b) {
+    b = { entryId, taskId, lines: [], partial: "", dropped: 0, pending: [], size: 0, frame: 0, pre: null, follow: true, scroll: 0 };
+    runBuffers.set(entryId, b);
+  }
+  return b;
+}
+
+// A carriage return redraws the line in a terminal, which is how progress
+// bars work. Keeping only what follows the last one shows what a terminal
+// would be showing, rather than every frame of the bar.
+const runLine = (raw) => {
+  const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+  const at = line.lastIndexOf("\r");
+  return stripAnsi(at >= 0 ? line.slice(at + 1) : line);
+};
+
+function runTake(b) {
+  if (!b.pending.length) return;
+  let text = b.partial + b.pending.join("");
+  b.pending = [];
+  b.size = 0;
+  // More arrived in one frame than will ever be shown. Everything before the
+  // last stretch is counted and dropped without being split into lines.
+  if (text.length > RUN_PENDING_CAP) {
+    const cut = text.indexOf("\n", text.length - RUN_PENDING_CAP);
+    const from = cut >= 0 ? cut + 1 : text.length - RUN_PENDING_CAP;
+    for (let i = text.indexOf("\n"); i >= 0 && i < from; i = text.indexOf("\n", i + 1)) b.dropped += 1;
+    b.dropped += b.lines.length;
+    b.lines = [];
+    text = text.slice(from);
+  }
+  const parts = text.split("\n");
+  b.partial = parts.pop();
+  if (b.partial.length > RUN_PARTIAL_CAP) b.partial = b.partial.slice(-RUN_PARTIAL_CAP);
+  for (const p of parts) b.lines.push(runLine(p));
+  if (b.lines.length > RUN_KEEP) {
+    const over = b.lines.length - RUN_KEEP;
+    b.lines.splice(0, over);
+    b.dropped += over;
+  }
+}
+
+function runPaint(b) {
+  const pre = b.pre;
+  if (!pre || !pre.isConnected) return;
+  pre.textContent = "";
+  if (b.truncated) {
+    pre.append(el("span", { className: "cut", textContent: "Showing the last part. The full log opens when it finishes.\n" }));
+  } else if (b.dropped) {
+    pre.append(el("span", { className: "cut", textContent: `Showing the last ${plural(b.lines.length, "line", "lines")}. The whole log is kept.\n` }));
+  }
+  const tail = b.partial ? runLine(b.partial) : "";
+  const text = b.lines.join("\n") + (tail ? (b.lines.length ? "\n" : "") + tail : "");
+  if (text) pre.append(document.createTextNode(text));
+  else pre.append(el("span", { className: "cut", textContent: "Waiting for output" }));
+  if (b.follow) pre.scrollTop = pre.scrollHeight;
+  else pre.scrollTop = b.scroll;
+}
+
+function runFlush(b) {
+  b.frame = 0;
+  runTake(b);
+  runPaint(b);
+}
+
+/** The persistent output node for a live run, so a row rebuilt by the clock keeps it, scroll and all. */
+function runPre(b) {
+  if (!b.pre) {
+    const pre = el("pre", { className: "ts-run-out full live" });
+    pre.setAttribute("tabindex", "0");
+    pre.setAttribute("aria-label", "Command output, live");
+    pre.addEventListener("scroll", () => {
+      b.follow = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+      b.scroll = pre.scrollTop;
+    });
+    b.pre = pre;
+  }
+  requestAnimationFrame(() => runPaint(b));
+  return b.pre;
+}
+
+window.delphi.onSheetRunOutput(({ entryId, taskId, chunk, chunks, truncated }) => {
+  const b = runBuffer(entryId, taskId);
+  // The main process may batch pieces, and may skip some when they come too
+  // fast; skipped output is in the log, which is read in full once it ends.
+  if (truncated) b.truncated = true;
+  chunk = Array.isArray(chunks) ? chunks.join("") : String(chunk || "");
+  b.pending.push(chunk);
+  b.size += chunk.length;
+  // Folded in early when a single frame's worth is already more than will be
+  // kept, so the pending list itself cannot grow without bound.
+  if (b.size > RUN_PENDING_CAP * 2) runTake(b);
+  if (!b.frame) b.frame = requestAnimationFrame(() => runFlush(b));
+});
+
+window.delphi.onSheetRunDone(({ entryId, taskId, entry }) => {
+  const b = runBuffers.get(entryId);
+  if (b) {
+    if (b.frame) cancelAnimationFrame(b.frame);
+    runFlush(b);
+  }
+  if (openSheet && openSheet.taskId === taskId && openSheet.runDone) openSheet.runDone(entryId, b, entry);
+  runBuffers.delete(entryId);
+  runKills.delete(entryId);
+  runsEnded.add(entryId);
+  if (runsEnded.size > 200) runsEnded.delete(runsEnded.values().next().value);
+});
+
 /**
  * Opens one task as a workspace.
  *
@@ -6943,7 +7484,7 @@ async function openTaskSheet(taskId) {
     } else {
       crumbs.append(el("span", { className: "crumb-now", textContent: `task ${detail.task.id}` }));
     }
-    top.append(crumbs, el("span", { className: "spacer" }), flashHost, wbSlot);
+    top.append(crumbs, el("span", { className: "spacer" }), flashHost, wbSlot, el("span", { className: "wb-sep" }));
 
     const hand = el("button", { className: "btn sm", textContent: "Copy brief" });
     hand.title = "Copies this task, its discussion and its history as a brief an agent can act on";
@@ -6973,6 +7514,252 @@ async function openTaskSheet(taskId) {
     close.onclick = () => closeSheet();
 
     top.append(hand, del, close);
+  }
+
+  // --- workbench ------------------------------------------------------------
+
+  // The advanced disclosure, when More has asked for it: { id, data }.
+  let wbAdv = null;
+  const advHost = el("div");
+  // Set while a verb is running, so a second click cannot start a second one.
+  let wbBusy = false;
+
+  const wbAfter = async () => { await reload(); refresh(); };
+
+  /** Runs one Workbench verb with the cluster disabled, and says what went wrong in the module's words. */
+  async function wbDo(fn) {
+    if (wbBusy) return;
+    wbBusy = true;
+    paintWorkbench();
+    try { await fn(); } catch (error) { notifyError(error); }
+    wbBusy = false;
+    await wbAfter();
+  }
+
+  async function wbStart() {
+    let opts = {};
+    try {
+      const list = await window.delphi.workbench.candidates(taskId);
+      if (list.length > 1) {
+        const pick = await pickRepo(list);
+        if (!pick) return;
+        opts = pick.repo_id != null ? { repoId: pick.repo_id } : { path: pick.path };
+      }
+    } catch (error) { notifyError(error); return; }
+    // Set before the call, because the module's own phases arrive while it is
+    // still running, and a Start with no setup is over before it returns.
+    wbStarting.set(taskId, { phase: "starting", text: "Starting" });
+    paintWorkbench();
+    try {
+      const made = await window.delphi.workbench.start(taskId, opts);
+      if (made.warnings && made.warnings.length) notify(made.warnings.join(" "));
+    } catch (error) {
+      wbStarting.delete(taskId);
+      notifyError(error);
+    }
+    await wbAfter();
+  }
+
+  /** A menu under a button, right edges aligned, the way the mockup hangs them. */
+  function wbMenu(button, items) {
+    const box = button.getBoundingClientRect();
+    button.setAttribute("aria-expanded", "true");
+    const menu = rowMenu(box.left, box.bottom + 4, items, {
+      className: "wb-menu",
+      onClose: () => button.setAttribute("aria-expanded", "false"),
+    });
+    menu.setAttribute("role", "menu");
+    menu.style.left = `${Math.max(8, box.right - menu.offsetWidth)}px`;
+    for (const c of menu.querySelectorAll(".ctx-item")) c.setAttribute("role", "menuitem");
+    menu.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); closeRowMenu(); button.focus(); }
+    });
+    return menu;
+  }
+
+  function wbMenuItem(label, hint, run, danger = false) {
+    const b = el("button", { className: "ctx-item" + (danger ? " danger" : ""), type: "button" },
+      el("span", { textContent: label }), hint ? el("span", { className: "hint", textContent: hint }) : null);
+    b.onclick = async () => { closeRowMenu(); await run(); };
+    return b;
+  }
+
+  async function wbOpen(wb, target) {
+    try {
+      const r = await window.delphi.workbench.open(wb.id, target);
+      flash(`opened in ${r.via === "folder" ? "the file browser" : r.via}`);
+    } catch (error) { notifyError(error); }
+  }
+
+  async function wbShowAdvanced(wb) {
+    try {
+      wbAdv = { id: wb.id, data: await window.delphi.workbench.advanced(wb.id) };
+    } catch (error) { notifyError(error); return; }
+    paintAdvanced();
+    advHost.scrollIntoView({ block: "nearest", behavior: motionOff() ? "auto" : "smooth" });
+  }
+
+  function paintWorkbench() {
+    wbSlot.textContent = "";
+    const wb = detail.workbench;
+    const starting = wbStarting.get(taskId);
+    const btn = (label, cls, run, title) => {
+      const b = el("button", { className: `btn sm ${cls}`.trim(), textContent: label, type: "button", disabled: wbBusy });
+      if (title) b.title = title;
+      b.onclick = run;
+      return b;
+    };
+
+    if (starting) {
+      // The module says "Running npm ci"; the chip says which kind of running.
+      const text = starting.phase === "setup" && /^Running /.test(starting.text || "")
+        ? `Running setup: ${starting.text.slice(8)}` : starting.text || "Starting";
+      wbSlot.append(el("span", { className: "wb-chip starting", role: "status" }, el("span", { className: "spinner" }), text),
+        btn("Start working", "", null));
+      wbSlot.lastChild.disabled = true;
+      return;
+    }
+    if (!wb) {
+      // A task outside every project has nowhere to start one, so it gets no button.
+      if (detail.project && detail.task.status !== "done") {
+        wbSlot.append(btn("Start working", "primary", wbStart,
+          "A folder and a branch of its own for this task, so it never shares a checkout"));
+      }
+      return;
+    }
+
+    const look = wbLook(wb);
+    wbSlot.append(wbChip(wb, () => wbDo(() => wbUpdate(wb))));
+
+    if (look.unreadable) {
+      wbSlot.append(btn("Why?", "", () => notifyError((wb.status && (wb.status.message || wb.status.words)) || "The folder cannot be read.")));
+      return;
+    }
+    if (look.cls === "missing") {
+      wbSlot.append(
+        btn("Recreate", "primary", () => wbDo(async () => {
+          await window.delphi.workbench.recreate(wb.id);
+          flash("folder recreated");
+        }), `Puts the folder back at ${wb.path}, on ${wb.branch}`),
+        btn("Forget", "", async () => {
+          const go = await wbDialog({
+            title: "Forget this Workbench?",
+            lead: `The folder is already gone. The branch ${wb.branch} is left exactly as it is.`,
+            actions: [{ label: "Cancel", value: null }, { label: "Forget", value: "forget", kind: "primary" }],
+          });
+          if (go) wbDo(() => window.delphi.workbench.forget(wb.id));
+        }));
+      return;
+    }
+
+    const parked = wb.state === "parked";
+    const tone = parked ? "" : "primary";
+    const open = btn("Open", tone, () => wbOpen(wb, "editor"), "Open in your editor");
+    const caret = el("button", { className: `btn sm ${tone}`.trim(), type: "button", title: "Editor, Terminal or Folder", disabled: wbBusy });
+    caret.setAttribute("aria-haspopup", "menu");
+    caret.setAttribute("aria-expanded", "false");
+    caret.setAttribute("aria-label", "Open in");
+    caret.append(tsIcon("caret", 2.6));
+    const mac = document.body.classList.contains("mac");
+    caret.onclick = (e) => {
+      e.stopPropagation();
+      wbMenu(caret, [
+        wbMenuItem("Editor", "code", () => wbOpen(wb, "editor")),
+        wbMenuItem("Terminal", "Terminal", () => wbOpen(wb, "terminal")),
+        wbMenuItem("Folder", mac ? "Finder" : "files", () => wbOpen(wb, "folder")),
+      ]);
+    };
+    const split = el("span", { className: "wb-split" }, open, caret);
+
+    if (parked) {
+      wbSlot.append(btn("Resume", "primary", () => wbDo(async () => {
+        await window.delphi.workbench.resume(wb.id);
+        flash("resumed");
+      })), split);
+    } else {
+      wbSlot.append(split, btn("Finish", "", () => {
+        if (wbBusy) return;
+        wbBusy = true;
+        paintWorkbench();
+        finishWorkbench(wb.id, taskId, { title: detail.task.title, after: reload })
+          .finally(async () => { wbBusy = false; await wbAfter(); });
+      }, "Save, share and put the folder away. The branch is kept."));
+    }
+
+    const more = el("button", { className: "icon-btn", type: "button", title: "More", disabled: wbBusy });
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", "false");
+    more.setAttribute("aria-label", "More Workbench actions");
+    more.append(tsIcon("dots", 2.4));
+    more.onclick = (e) => {
+      e.stopPropagation();
+      const showing = wbAdv && wbAdv.id === wb.id;
+      wbMenu(more, [
+        parked
+          ? wbMenuItem("Resume", null, () => wbDo(() => window.delphi.workbench.resume(wb.id)))
+          : wbMenuItem("Park", null, () => wbDo(async () => {
+              await window.delphi.workbench.park(wb.id);
+              flash("parked");
+            })),
+        wbMenuItem(`Update from ${wb.base}`, null, () => wbDo(() => wbUpdate(wb))),
+        wbMenuItem(showing ? "Hide advanced" : "Show advanced", null, () => {
+          if (showing) { wbAdv = null; paintAdvanced(); } else wbShowAdvanced(wb);
+        }),
+        "-",
+        wbMenuItem("Discard...", null, () => discardWorkbench(wb.id, taskId, { after: wbAfter }), true),
+      ]);
+    };
+    wbSlot.append(more);
+  }
+
+  /**
+   * What a Workbench is underneath, for the person learning it: the real
+   * branch and folder, and the git commands each button stands for. Only from
+   * More, never in the way.
+   */
+  function paintAdvanced() {
+    advHost.textContent = "";
+    const wb = detail.workbench;
+    if (!wbAdv || !wb || wb.id !== wbAdv.id) { wbAdv = null; return; }
+    const a = wbAdv.data;
+    const copyBtn = (text, label) => {
+      const b = el("button", { className: "ts-act", title: label, type: "button" });
+      b.setAttribute("aria-label", label);
+      b.append(tsIcon("copy"));
+      b.onclick = async () => {
+        try { await navigator.clipboard.writeText(text); railCopied(b, "Copied"); } catch (error) { notifyError(error); }
+      };
+      return b;
+    };
+    const adv = el("details", { className: "wb-adv", open: true });
+    const tw = el("span", { className: "tw", textContent: "▶" });
+    tw.setAttribute("aria-hidden", "true");
+    adv.append(el("summary", {}, tw, "Workbench, advanced", el("span", { className: "grow" }),
+      el("span", { className: "wb-adv-why", textContent: "What Delphi did, in git's words" })));
+    const grid = el("div", { className: "wb-adv-grid" });
+    for (const [k, v] of [["Branch", a.branch], ["Folder", a.path], ["Based on", a.base], ["Repository", a.repo]]) {
+      grid.append(el("span", { className: "k", textContent: k }), el("span", { className: "v", textContent: v || "" }),
+        copyBtn(v || "", `Copy ${k.toLowerCase()}`));
+    }
+    const body = el("div", { className: "wb-adv-body" }, grid, el("h5", { textContent: "The git commands behind each button" }));
+    const why = (cmd) => (/^cd /.test(cmd) ? "go to the folder"
+      : / status$/.test(cmd) ? "the status words"
+      : / push /.test(cmd) ? "Push, before Finish"
+      : / worktree list$/.test(cmd) ? "every Workbench here"
+      : / worktree remove /.test(cmd) ? "Finish" : "");
+    for (const cmd of a.commands || []) {
+      body.append(el("div", { className: "wb-cmd" }, el("code", { textContent: cmd }),
+        el("span", { className: "why", textContent: why(cmd) }), copyBtn(cmd, "Copy command")));
+    }
+    if (a.unmanaged && a.unmanaged.length) {
+      body.append(el("h5", { textContent: "Folders found here that Delphi does not manage" }));
+      for (const u of a.unmanaged) {
+        body.append(el("div", { className: "wb-cmd" }, el("code", { textContent: u.path }),
+          el("span", { className: "why", textContent: u.branch || "" })));
+      }
+    }
+    adv.append(body);
+    advHost.append(adv);
   }
 
   // --- title ----------------------------------------------------------------
@@ -7461,6 +8248,23 @@ async function openTaskSheet(taskId) {
       line.append(el("span", { className: `ts-run-state ${state}`, textContent: state === "fail" ? `fail${code}` : state }));
     }
     if (state === "running") line.append(el("span", { textContent: `${elapsed(entry.created_at)} so far` }));
+    // Only a run this window started can be stopped from it: the main process
+    // holds its process group, and nobody else's run is this window's to end.
+    const live = state === "running" ? runBuffers.get(entry.id) || null : null;
+    if (live) {
+      const presses = runKills.get(entry.id) || 0;
+      const stop = el("button", { className: "ts-linkbtn ts-stop", type: "button", textContent: presses ? "Kill" : "Stop" });
+      stop.dataset.act = "stop";
+      stop.title = presses ? "It has not stopped. Kill it outright." : "Interrupt it, as Ctrl-C would";
+      stop.onclick = async () => {
+        try {
+          await window.delphi.sheets.interrupt(entry.id);
+          runKills.set(entry.id, presses + 1);
+        } catch (error) { notifyError(error); }
+        paintRail();
+      };
+      line.append(stop);
+    }
     else {
       if (Number.isFinite(meta.dur_ms)) line.append(el("span", { textContent: duration(meta.dur_ms) }));
       if (Number.isFinite(meta.lines)) line.append(el("span", { textContent: plural(meta.lines, "line", "lines") }));
@@ -7480,13 +8284,15 @@ async function openTaskSheet(taskId) {
         outputOpen.add(entry.id);
         outputText.delete(entry.id);
         paintRail();
-        loadOutput(entry.id);
+        // A live run already has everything it said since it started.
+        if (!runBuffers.has(entry.id)) loadOutput(entry.id);
       };
       line.append(toggle);
     }
     body.append(line);
 
     if (inline) body.append(el("pre", { className: "ts-run-out", textContent: inline }));
+    else if (open && live) body.append(runPre(live));
     else if (open) {
       const got = outputText.get(entry.id);
       const pre = el("pre", { className: "ts-run-out full" });
@@ -7681,7 +8487,8 @@ async function openTaskSheet(taskId) {
       // Everything a row draws from, so an unchanged row is never rebuilt.
       // The time words are in it, which is what keeps "5m ago" honest.
       const sig = JSON.stringify([entry, ledgerIds.has(entry.id), answer ? [answer.id, answer.body, answer.meta, answer.author, gap(answer.created_at)] : null,
-        gap(entry.created_at), isRunning(entry) ? elapsed(entry.created_at) : null, outputOpen.has(entry.id), outputText.get(entry.id) || null,
+        gap(entry.created_at), isRunning(entry) ? elapsed(entry.created_at) : null, outputOpen.has(entry.id),
+        runBuffers.has(entry.id), runKills.get(entry.id) || 0, outputText.get(entry.id) || null,
         entry.ref_id ? (entryById(entry.ref_id) || {}).body : null, detail.project ? detail.project.name : null]);
       const cached = rowCache.get(entry.id);
       const node = cached && cached.sig === sig ? cached.node : entryNode(entry, ctx);
@@ -7748,10 +8555,14 @@ async function openTaskSheet(taskId) {
   function composed() {
     const v = composer.value;
     if (/^\$ /.test(v)) {
-      // There is no IPC that runs a command from the window yet, and a run
-      // entry written without running anything would record something that
-      // never happened. The CLI runs it and records it properly.
-      return { kind: "run", ok: false, say: `Run it from the delphi CLI: delphi run ${taskId} -- <command>`, label: "Run" };
+      const command = v.slice(2).trim();
+      // Said before Enter, because where a command runs is the thing most
+      // worth knowing about it. The main process picks the same way: the
+      // Workbench, then the project's folders, then home.
+      const wb = detail.workbench;
+      const where = wb && wb.state !== "missing" ? "the Workbench folder"
+        : detail.project ? "the project's folder" : "your home folder";
+      return { kind: "run", ok: !!command, say: `Runs in ${where}, output is kept`, label: "Run", command };
     }
     if (/^! /.test(v)) {
       const text = v.slice(2).trim();
@@ -7772,7 +8583,7 @@ async function openTaskSheet(taskId) {
   function senseComposer(error = null) {
     const c = composed();
     composerKind.textContent = "";
-    composerKind.className = `ts-composer-kind k-${c.kind}` + (c.kind === "run" ? " blocked" : "");
+    composerKind.className = `ts-composer-kind k-${c.kind}`;
     composerKind.append(el("span", { className: "ts-sigil", textContent: SIGILS[c.kind] }), error || c.say);
     composer.classList.toggle("mono-in", c.kind === "run");
     send.textContent = c.label;
@@ -7783,7 +8594,16 @@ async function openTaskSheet(taskId) {
     const c = composed();
     if (!c.ok) return;
     try {
-      if (c.kind === "ask") await window.delphi.sheets.ask(taskId, c.question, c.options);
+      if (c.kind === "run") {
+        // Resolves once the command has started, or been refused by the
+        // guard; its output follows on onSheetRunOutput. Opened straight
+        // away, because whoever typed it is waiting to see what it says.
+        const entry = await window.delphi.sheets.run(taskId, c.command);
+        if (entry && entry.id != null) {
+          outputOpen.add(entry.id);
+          if (isRunning(entry) && !runsEnded.has(entry.id)) runBuffer(entry.id, taskId);
+        }
+      } else if (c.kind === "ask") await window.delphi.sheets.ask(taskId, c.question, c.options);
       else await window.delphi.sheets.append(taskId, { kind: c.kind, body: c.body });
     } catch (error) {
       senseComposer(String(error.message || error));
@@ -7798,13 +8618,15 @@ async function openTaskSheet(taskId) {
   composer.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); post(); } };
   send.onclick = post;
   railFoot.append(composerKind, composer, el("div", { className: "ts-composer-row" },
-    el("span", { className: "hint", textContent: "! notes  ·  ? q | a | b asks  ·  $ runs from the CLI" }), send));
+    el("span", { className: "hint", textContent: "$ runs  ·  ! notes  ·  ? q | a | b asks" }), send));
   senseComposer();
 
   // --- assemble -------------------------------------------------------------
 
   function paintAll({ stick = false } = {}) {
     paintTop();
+    paintWorkbench();
+    paintAdvanced();
     paintRing();
     paintMeta();
     paintDesc();
@@ -7837,6 +8659,8 @@ async function openTaskSheet(taskId) {
         detail = next;
         const holding = (box) => box.contains(document.activeElement);
         paintTop();
+        paintWorkbench();
+        if (!wbAdv || !detail.workbench || detail.workbench.id !== wbAdv.id) paintAdvanced();
         paintRing();
         if (!holding(meta)) paintMeta();
         if (!editingDesc) paintDesc();
@@ -7850,7 +8674,7 @@ async function openTaskSheet(taskId) {
     }
   }
 
-  main.append(titleRow, meta, desc, tabs, paneBox);
+  main.append(titleRow, meta, desc, advHost, tabs, paneBox);
   rail.append(railHead, railList, railFoot);
   overlay.append(sheet);
   document.body.append(overlay);
@@ -7870,7 +8694,24 @@ async function openTaskSheet(taskId) {
   };
 
   overlay.onclick = (e) => { if (e.target === overlay) closeSheet(); };
-  const handle = { overlay, close: closeSheet, live };
+  const handle = {
+    overlay, close: closeSheet, live, taskId,
+    // A Start phase for this task: redraw the chip, and once it is over, the
+    // whole panel, since the Workbench row now exists.
+    wbEvent: (e) => { paintWorkbench(); if (e.phase === "ready" || e.phase === "failed") reload(); },
+    // A run from this window finished. What was streamed stays on screen as
+    // the expanded output, so finishing does not blank what was being read.
+    runDone: (entryId, buffer) => {
+      if (buffer && buffer.truncated && outputOpen.has(entryId)) {
+        outputText.delete(entryId);
+        loadOutput(entryId);
+      } else if (buffer && outputOpen.has(entryId)) {
+        const tail = buffer.partial ? runLine(buffer.partial) : "";
+        outputText.set(entryId, { text: buffer.lines.join("\n") + (tail ? "\n" + tail : ""), truncated: buffer.dropped > 0 });
+      }
+      reload();
+    },
+  };
   openSheet = handle;
 }
 
@@ -9497,6 +10338,10 @@ window.delphi.onAlertsChanged(() => refresh());
 // Subscribed once, here, because preload has no way to unsubscribe: an open
 // task panel exposes live() and anything else open ignores it.
 window.delphi.onDbChanged(() => { if (openSheet && openSheet.live) openSheet.live(); });
+// Coming back to the window is when someone has been editing in the
+// Workbench, so its status words are asked again then. The module caches each
+// answer for ten seconds, so this never turns into git in a loop.
+window.addEventListener("focus", () => { if (openSheet && openSheet.live) openSheet.live(); });
 window.delphi.onFocusTask(({ projectId }) => {
   if (projectId) { state.projectId = projectId; state.view = "tasks"; }
   refresh();
