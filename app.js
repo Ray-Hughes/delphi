@@ -151,6 +151,11 @@ function celebrateDone(row) {
   }
 }
 
+// Open dialogs, newest last. Each listens on the document, so without this
+// one Enter or Escape would answer every dialog stacked on the screen: a done
+// prompt arriving over the commit message box, say. Only the top one answers.
+const dialogStack = [];
+
 /**
  * Asks for one line of text. Resolves to the string, or null if cancelled.
  *
@@ -171,11 +176,14 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
     const input = el("input", { className: "field", value, placeholder, type: "text" });
     const error = el("div", { className: "err-msg", style: "display:none" });
 
+    const me = {};
     let settled = false;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       document.removeEventListener("keydown", onKey, true);
+      const at = dialogStack.indexOf(me);
+      if (at >= 0) dialogStack.splice(at, 1);
       overlay.remove();
       resolve(result);
     };
@@ -197,6 +205,7 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
     // Captured on the document, because the window-level handler treats Escape as
     // "hide the window" and would take the whole app away instead of this box.
     const onKey = (event) => {
+      if (dialogStack[dialogStack.length - 1] !== me) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
@@ -207,6 +216,7 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
         submit();
       }
     };
+    dialogStack.push(me);
     document.addEventListener("keydown", onKey, true);
 
     const cancel = el("button", { className: "btn", textContent: "Cancel", type: "button" });
@@ -1914,11 +1924,14 @@ function confirmDestroy({ project, counts }) {
     const overlay = el("div", { className: "overlay" });
     const box = el("div", { className: "ask" });
 
+    const me = {};
     let settled = false;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       document.removeEventListener("keydown", onKey, true);
+      const at = dialogStack.indexOf(me);
+      if (at >= 0) dialogStack.splice(at, 1);
       overlay.remove();
       resolve(result);
     };
@@ -1972,6 +1985,7 @@ function confirmDestroy({ project, counts }) {
     ok.onclick = () => { if (!ok.disabled) finish({ tasks: mode }); };
 
     const onKey = (event) => {
+      if (dialogStack[dialogStack.length - 1] !== me) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
@@ -1982,6 +1996,7 @@ function confirmDestroy({ project, counts }) {
         if (!ok.disabled) finish({ tasks: mode });
       }
     };
+    dialogStack.push(me);
     document.addEventListener("keydown", onKey, true);
 
     const actions = el("div", { className: "ask-actions" });
@@ -7009,9 +7024,6 @@ function notify(text, { error = false } = {}) {
 }
 const notifyError = (error) => notify(error, { error: true });
 
-// Open dialogs, newest last. Each listens on the document, so without this
-// one Enter or Escape would answer every dialog stacked on the screen.
-const dialogStack = [];
 
 /**
  * A question with buttons. Resolves to the chosen action's value, or to
@@ -7131,10 +7143,18 @@ function wbChip(wb, onUpdate) {
   const st = wb.status || {};
   const { cls, words } = wbLook(wb);
   const chip = el("span", { className: `wb-chip ${cls}` }, el("span", { className: "wb-words", textContent: words }));
-  const checked = st.checkedAt ? `Checked ${agoWords(st.checkedAt)}` : "";
-  // The words in full as well, since a narrow row cuts them short.
-  chip.title = (cls === "parked" || cls === "missing") && st.words && st.words !== words ? `${st.words}. ${checked}`
-    : st.message ? `${st.message} ${checked}` : `${words}. ${checked}`;
+  // The words in full as well, since a narrow row cuts them short. Worked
+  // out again on hover and on each refresh, so "Checked 4s ago" stays true
+  // without the chip being rebuilt; wbTitle takes the newest status.
+  let latest = st;
+  chip.wbTitle = (next) => {
+    if (next) latest = next;
+    const checked = latest.checkedAt ? `Checked ${agoWords(latest.checkedAt)}` : "";
+    chip.title = (cls === "parked" || cls === "missing") && latest.words && latest.words !== words ? `${latest.words}. ${checked}`
+      : latest.message ? `${latest.message} ${checked}` : `${words}. ${checked}`;
+  };
+  chip.wbTitle();
+  chip.addEventListener("mouseenter", () => chip.wbTitle());
   if (onUpdate && st.behind > 0 && cls !== "parked" && cls !== "missing") {
     const act = el("button", { className: "wb-act", textContent: "Update", type: "button" });
     act.title = `Bring in the latest ${st.base || wb.base}`;
@@ -7983,7 +8003,11 @@ async function openTaskSheet(taskId) {
     const st0 = (wb0 && wb0.status) || {};
     const sig = JSON.stringify([wb0 && { ...wb0, status: { ...st0, checkedAt: null } }, wbStarting.get(taskId) || null,
       busyNow(), detail.project ? detail.project.id : null, detail.task.status]);
-    if (sig === wbSig) return;
+    if (sig === wbSig) {
+      const chip = wbSlot.querySelector(".wb-chip");
+      if (chip && chip.wbTitle) chip.wbTitle(st0);
+      return;
+    }
     wbSig = sig;
     const hadFocus = wbSlot.contains(document.activeElement) ? document.activeElement.dataset.act : null;
     buildWorkbench();
@@ -8006,6 +8030,7 @@ async function openTaskSheet(taskId) {
     const btn = (label, cls, run, title) => {
       const b = el("button", { className: `btn sm ${cls}`.trim(), textContent: label, type: "button" });
       b.dataset.act = label;
+      if (busyNow()) b.setAttribute("aria-disabled", "true");
       if (title) b.title = title;
       b.onclick = run;
       return b;
@@ -8030,7 +8055,9 @@ async function openTaskSheet(taskId) {
     }
 
     const look = wbLook(wb);
-    wbSlot.append(wbChip(wb, () => wbDo(() => wbUpdate(wb))));
+    const chip = wbChip(wb, () => wbDo(() => wbUpdate(wb)));
+    if (busyNow()) chip.querySelector(".wb-act")?.setAttribute("aria-disabled", "true");
+    wbSlot.append(chip);
 
     if (look.unreadable) {
       // No Recreate, Finish or Discard: the folder is there and may be full
@@ -8060,6 +8087,7 @@ async function openTaskSheet(taskId) {
     const open = btn("Open", tone, () => wbOpen(wb, "editor"), "Open in your editor");
     const caret = el("button", { className: `btn sm ${tone}`.trim(), type: "button", title: "Editor, Terminal or Folder" });
     caret.dataset.act = "open-in";
+    if (busyNow()) caret.setAttribute("aria-disabled", "true");
     caret.setAttribute("aria-haspopup", "menu");
     caret.setAttribute("aria-expanded", "false");
     caret.setAttribute("aria-label", "Open in");
@@ -8087,6 +8115,7 @@ async function openTaskSheet(taskId) {
 
     const more = el("button", { className: "icon-btn", type: "button", title: "More" });
     more.dataset.act = "more";
+    if (busyNow()) more.setAttribute("aria-disabled", "true");
     more.setAttribute("aria-haspopup", "menu");
     more.setAttribute("aria-expanded", "false");
     more.setAttribute("aria-label", "More Workbench actions");
