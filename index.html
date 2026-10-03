@@ -16,23 +16,32 @@
        restyles the whole window rather than only what has been rewritten. The
        --rad-* originals are kept alongside for anything built against them
        directly. */
-    --rad-bg:          #fafafa;
+    --rad-bg:          #fbfbfa;
     --rad-surface:     #ffffff;
-    --rad-edge:        #e8e8e9;
-    --rad-edge-strong: #d9d9db;
-    --rad-ink:         #1b1c1e;
-    --rad-ink-muted:   #5d5e61;
-    --rad-ink-faint:   #8a8b8e;
-    --rad-accent:      #ff5800;
-    --rad-accent-ink:  #c84400;
-    --rad-danger:      #d4183d;
-    --rad-success:     #1d8a4e;
+    --rad-edge:        #e2e2de;
+    --rad-edge-strong: #d3d3cd;
+    --rad-ink:         #14150f;
+    --rad-ink-muted:   #5f6156;
+    --rad-ink-faint:   #8e9086;
+    --rad-accent:      #c2410c;
+    --rad-accent-ink:  #9a3412;
+    --rad-danger:      #b4283f;
+    --rad-success:     #1a7a48;
 
     --bg:        var(--rad-bg);
     --surface:   var(--rad-surface);
-    --raised:    #f2f2f3;
+    --raised:    #f2f2f0;
     --line:      var(--rad-edge);
-    --line-soft: #f0f0f1;
+    --line-soft: #ebebe7;
+
+    /* Chrome, and the canvas it frames.
+       The one structural idea in this palette: everything that is the
+       application sits a shade behind everything that is the work. The rail is
+       darkest, the sidebar next, the content is the brightest thing on screen.
+       Without it a window like this reads as one undifferentiated sheet with
+       lines drawn on it, and nothing tells your eye where the work is. */
+    --chrome:      #f4f4f1;
+    --chrome-deep: #eeeee9;
 
     --ink:       var(--rad-ink);
     --ink-dim:   var(--rad-ink-muted);
@@ -72,13 +81,19 @@
     --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
     --s5: 24px; --s6: 32px; --s7: 48px;
 
-    --r-sm: 6px; --r: 10px; --r-lg: 14px;
+    /* Tighter than they were. A large radius reads as friendly and costs
+       density, and this is a window somebody keeps open all day with four
+       agents running in it. */
+    --r-sm: 4px; --r: 6px; --r-lg: 9px;
 
     --font:    'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
     --display: 'Inter Tight', 'Inter', system-ui, sans-serif;
     --mono:    'Sometype Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 
-    --shadow: 0 1px 2px rgba(16, 20, 28, 0.05), 0 4px 16px rgba(16, 20, 28, 0.06);
+    /* Almost nothing. Depth is carried by the chrome and canvas difference
+       above, so a shadow on top of it is a second answer to a question already
+       answered. What is left is only enough to lift a menu off the page. */
+    --shadow: 0 1px 2px rgba(16, 20, 14, 0.06), 0 6px 20px rgba(16, 20, 14, 0.10);
   }
 
   /* The dark set applies in two cases: when the system asks for dark and the
@@ -94,27 +109,35 @@
      ground and the amber and slate labels were nearly unreadable. */
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --rad-bg:      #151618;
-      --rad-surface: #232426;
-      --rad-edge:    #2b2c2f;
-      --rad-ink:     #fafafb;
+      --rad-bg:      #1a1b1d;
+      --rad-surface: #202124;
+      --rad-edge:    #313337;
+      --rad-ink:     #f3f3f0;
 
-      --bg:        #151618;
-      --surface:   #232426;
-      --raised:    #2b2c2f;
-      --line:      #3a3a3d;
-      --line-soft: #2b2c2f;
+      --bg:        #1a1b1d;
+      --surface:   #202124;
+      --raised:    #292a2e;
+      --line:      #3a3c40;
+      --line-soft: #292a2e;
 
-      --ink:       #fafafb;
-      --ink-dim:   #acaeb1;
-      --ink-faint: #7f8083;
+      /* The same idea as light, inverted the same way round: the chrome is
+         darker than the work, not lighter. Reversing it here would put the
+         brightest thing on screen at the edges. */
+      --chrome:      #141517;
+      --chrome-deep: #0f1012;
 
-      /* The accent does not shift between themes. It is the one fixed point in
-         Rad, and the lighter --accent-ink is what carries it on a dark ground
-         where the solid orange would vibrate against the text beside it. */
-      --accent:      #ff5800;
-      --accent-ink:  #ff8a4d;
-      --accent-soft: #2a1a11;
+      --ink:       #f3f3f0;
+      --ink-dim:   #a4a69d;
+      --ink-faint: #76786f;
+
+      /* The accent shifts, which it did not before, because the redesign moved
+         to a deeper burnt orange. #c2410c is right on paper and disappears into
+         a dark ground, so dark gets the lighter sibling and --accent-ink goes
+         lighter again for text. Same hue, two weights: the alternative was one
+         orange that is slightly wrong in both places. */
+      --accent:      #f4762e;
+      --accent-ink:  #fb9a63;
+      --accent-soft: #2c1a11;
       --good:      #96e3a6;
       --warn:      #e0a458;
       --crit:      #e2685f;
@@ -133,27 +156,35 @@
   }
 
   :root[data-theme="dark"] {
-    --rad-bg:      #151618;
-    --rad-surface: #232426;
-    --rad-edge:    #2b2c2f;
-    --rad-ink:     #fafafb;
+    --rad-bg:      #1a1b1d;
+    --rad-surface: #202124;
+    --rad-edge:    #313337;
+    --rad-ink:     #f3f3f0;
 
-    --bg:        #151618;
-    --surface:   #232426;
-    --raised:    #2b2c2f;
-    --line:      #3a3a3d;
-    --line-soft: #2b2c2f;
+    --bg:        #1a1b1d;
+    --surface:   #202124;
+    --raised:    #292a2e;
+    --line:      #3a3c40;
+    --line-soft: #292a2e;
 
-    --ink:       #fafafb;
-    --ink-dim:   #acaeb1;
-    --ink-faint: #7f8083;
+    /* The same idea as light, inverted the same way round: the chrome is
+       darker than the work, not lighter. Reversing it here would put the
+       brightest thing on screen at the edges. */
+    --chrome:      #141517;
+    --chrome-deep: #0f1012;
 
-    /* The accent does not shift between themes. It is the one fixed point in
-       Rad, and the lighter --accent-ink is what carries it on a dark ground
-       where the solid orange would vibrate against the text beside it. */
-    --accent:      #ff5800;
-    --accent-ink:  #ff8a4d;
-    --accent-soft: #2a1a11;
+    --ink:       #f3f3f0;
+    --ink-dim:   #a4a69d;
+    --ink-faint: #76786f;
+
+    /* The accent shifts, which it did not before, because the redesign moved
+       to a deeper burnt orange. #c2410c is right on paper and disappears into
+       a dark ground, so dark gets the lighter sibling and --accent-ink goes
+       lighter again for text. Same hue, two weights: the alternative was one
+       orange that is slightly wrong in both places. */
+    --accent:      #f4762e;
+    --accent-ink:  #fb9a63;
+    --accent-soft: #2c1a11;
     --good:      #96e3a6;
     --warn:      #e0a458;
     --crit:      #e2685f;
