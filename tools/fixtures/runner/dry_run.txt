@@ -1,0 +1,52 @@
+queue 'ready' in project 'run-test' as 'runner', agent '<AGENT>', timeout 900s, lease 20m
+agent runs in <CWD>
+guard.py NOT installed
+DRY RUN, nothing will be claimed or spawned
+2 waiting, 0 held by someone else
+  wait  1 [high] first queued   <- would take this
+  wait  2 [low] second queued
+
+Would spawn, in <CWD>:
+  <AGENT> -n <brief>
+  brief as the last argument, 1254 characters
+
+--- brief for task 1 ---
+You are an agent working one task from the Delphi queue, unattended.
+
+# Task 1: first queued
+
+priority high, project Runner test
+
+## What is being asked
+Do the first thing.
+Carefully.
+
+## The task's Sheet
+Every entry in its ledger (findings, dead ends and decisions that hold for this task) and its latest entries, oldest first. Read it before you start: it is what earlier agents and people already learned.
+
+---
+task: 1
+title: first queued
+project: run-test
+status: todo
+---
+@ claude-code:3: Tried X, it failed with :p1 and $& in it
+> ray: multi
+  line
+
+  ```
+  $ ls
+  ```
+
+## How to finish
+Do the work here, in this working directory.
+
+Your final message is the record. Write it for the next person: what you changed, how you verified it, and anything they need to know before touching this again. It is stored as a comment on the task verbatim.
+
+Do not call queue_complete or queue_release. The runner that started you holds the claim and closes the task with your output. Calling them yourself gives the task two endings.
+
+If you cannot do it, begin your final message with the single word CANNOT, followed by the specific reason. The task goes back to the pool with that reason attached, which is a better outcome than a plausible-looking half job.
+--- end of brief ---
+
+Then: add_comment with the agent's output, and queue_complete.
+On a non-zero exit or after 900s: queue_release with the reason.

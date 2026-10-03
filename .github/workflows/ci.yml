@@ -21,6 +21,43 @@ jobs:
       - name: Run the guard test suite
         run: python3 agent/guard_test.py
 
+  # Every tools/*_test.js and agent/*_test.py, through tools/test_all.js, which is
+  # what `npm test` runs. That includes tools/package_test.js, which copies the
+  # extraResources layout into a temp Resources/ folder and starts the MCP server
+  # from it: the check that would have caught the server shipping without
+  # agent/directives.js.
+  #
+  # Ubuntu rather than macOS. The tests run under Electron's binary with
+  # ELECTRON_RUN_AS_NODE=1, which opens no window, so there is nothing a mac
+  # runner would add except ten times the cost per minute. xvfb is installed for
+  # the day a test declares the full Electron runtime, and test_all.js wraps such
+  # a test in xvfb-run itself, so a plain `npm test` stays the command here and
+  # on a laptop. sqlite3 because the MCP server falls back to the binary on a
+  # Node without node:sqlite, and the tests exercise that route on purpose. A
+  # default branch and an identity because the Workbench tests make throwaway
+  # repositories, and git on a fresh runner has neither.
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools the tests need
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q sqlite3 xvfb
+          git config --global init.defaultBranch main
+          git config --global user.name "Delphi CI"
+          git config --global user.email "ci@delphi.invalid"
+      - run: npm ci
+      - name: npm test
+        run: npm test
+
   syntax:
     name: Syntax
     runs-on: ubuntu-latest
@@ -52,11 +89,14 @@ jobs:
             " && echo "ok  $f"
           done
 
+      # By glob rather than by list. The list this replaced named ten files and
+      # had fallen behind the repository, which is the failure it exists to catch.
       - name: JavaScript
         run: |
-          for f in main.js preload.js db.js app.js paths.js oracle.js embeddings.js vault.js \
-                   agent/mcp_server.js tools/after-pack.js; do
-            [ -f "$f" ] && node --check "$f" && echo "ok  $f"
+          shopt -s nullglob globstar
+          for f in *.js agent/*.js tools/*.js sheet/**/*.js workbench/**/*.js bin/delphi; do
+            [ -f "$f" ] || continue
+            node --check "$f" && echo "ok  $f"
           done
 
       - name: JSON
@@ -78,11 +118,10 @@ jobs:
             for (const signing of [false, true]) {
               if (signing) process.env.CSC_LINK = 'test'; else delete process.env.CSC_LINK;
               delete require.cache[require.resolve('./electron-builder.config.js')];
+              // Whether every path it names exists is checked by
+              // tools/package_test.js in the test job, which knows which paths
+              // are wired ahead of the code that will fill them.
               const config = require('./electron-builder.config.js');
-              for (const file of [...config.files, config.mac.icon, config.win.icon]) {
-                const path = file.replace(/\/\$/, '');
-                if (!fs.existsSync(path)) throw new Error('config refers to a missing path: ' + path);
-              }
               if (signing && !config.mac.notarize) throw new Error('signing mode should notarise');
               if (signing && config.mac.entitlements && !fs.existsSync(config.mac.entitlements)) {
                 throw new Error('missing entitlements: ' + config.mac.entitlements);

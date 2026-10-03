@@ -68,6 +68,105 @@ def rm_targets(cmd: str):
     return [a for a in match.group(1).split() if not a.startswith("-")]
 
 
+# Words that run the rest of the line as a command: wrappers, prefixes and
+# shells. Stripped from the front, in every way they could apply, so that
+# `env X=1 nohup time delphi discard` is judged as `delphi discard`. Each
+# takes its own flags, and a few take one argument besides (timeout's
+# duration, script's file), which may or may not be there.
+WRAPPERS = [re.compile(p) for p in (
+    r"[({]\s*",                                   # a subshell or a group
+    r"!\s+",                                      # negation
+    r"\w+=(?:'[^']*'|\"[^\"]*\"|\S*)\s+",          # an assignment
+    r"(?:sudo|doas)(?:\s+-[a-zA-Z]+)*\s+",
+    r"(?:sudo|doas)(?:\s+-[a-zA-Z]+(?:\s+[^-\s]\S*)?)*\s+",
+    r"env(?:\s+(?:-u\s*\S+|-\S+|\w+=\S*))*\s+",
+    r"command(?:\s+-[pvV]+)*\s+",
+    r"builtin\s+",
+    r"exec(?:\s+-[cl]+|\s+-a\s+\S+)*\s+",
+    r"eval\s+",
+    r"nohup\s+",
+    r"time(?:\s+-p)?\s+",
+    r"nice(?:\s+-n\s*-?\d+|\s+-\d+)?\s+",
+    r"ionice(?:\s+-\S+(?:\s+\d+)?)*\s+",
+    r"timeout(?:\s+-\S+)*\s+\S+\s+",
+    r"stdbuf(?:\s+-\S+)*\s+",
+    r"caffeinate(?:\s+-\S+)*\s+",
+    r"unbuffer(?:\s+-\S+)*\s+",
+    r"spawn(?:\s+-\S+)*\s+",                       # expect's spawn
+    r"xargs(?:\s+-\S+)*\s+",
+    r"xargs(?:\s+-\S+(?:\s+[^-\s]\S*)?)*\s+",
+    r"script(?:\s+-[a-zA-Z]+)*\s+",                 # Linux: script -qc "cmd" file
+    r"script(?:\s+-[a-zA-Z]+)*\s+[^-\s]\S*\s+",      # macOS: script [-q] file cmd
+    r"(?:\S*/)?(?:ba|z|da|k|c|tc|fi)?sh(?:\s+-[a-zA-Z]+)*\s+",
+    r"su(?:\s+-\S*)*\s+",
+    r"[\"']",                                     # the opening quote of sh -c '...'
+)]
+
+# The delphi command itself, however it is named: on PATH, by a path, through
+# node or npx, or found at run time by which or command -v.
+DELPHI = re.compile(
+    r"(?:(?:node|npx|bun|deno\s+run)(?:\s+-\S+)*\s+)?"
+    r"(?:\"?\$\((?:which|command\s+-v|type\s+-p|whence\s+-p)\s+delphi\)\"?"
+    r"|`(?:which|command\s+-v|type\s+-p)\s+delphi`"
+    r"|[\"']?(?:\S*/)?delphi(?:\.js)?[\"']?)"
+    r"\s+[\"']?discard\b"
+)
+
+
+def runs_discard(rest: str, depth: int = 0) -> bool:
+    """Whether this text, read as a command, is delphi discard once wrappers go."""
+    rest = rest.lstrip()
+    if DELPHI.match(rest):
+        return True
+    if depth >= 10:
+        return False
+    for wrapper in WRAPPERS:
+        m = wrapper.match(rest)
+        if m and m.end() and runs_discard(rest[m.end():], depth + 1):
+            return True
+    return False
+
+
+def unmask(cmd: str) -> str:
+    """The command with the cheap disguises taken off.
+
+    A backslash before a letter (\\delphi skips aliases and still runs it), an
+    empty pair of quotes inside a word (de""lphi), and a variable assigned in
+    the same command and then run ($D after D=delphi) all spell delphi to the
+    shell, so they are spelled delphi here before anything is matched.
+    """
+    out = re.sub(r"\\(?=[A-Za-z])", "", cmd)
+    out = re.sub(r"(?<=\w)(?:''|\"\")|(?:''|\"\")(?=\w)", "", out)
+    for name, value in re.findall(r"(?:^|[\s;&|(])(\w+)=[\"']?(\S*delphi(?:\.js)?)[\"']?(?=[\s;&|)]|$)", out):
+        out = re.sub(r"\$\{?" + re.escape(name) + r"\b\}?", value, out)
+    return out
+
+
+# delphi discard started from a program rather than a shell: an argument
+# list with "delphi" and then "discard" in it (python's pty.spawn and
+# subprocess, node's spawn), which no shell word order can see.
+ARGV_DISCARD = re.compile(
+    r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']discard["']"""
+)
+
+
+def is_delphi_discard(cmd: str) -> bool:
+    """Whether delphi discard is run anywhere in this segment, in command position.
+
+    Command position is the start, or just inside a $( ), a backquote, a ( or
+    a <( ), or the quoted argument of an -c flag (sh -c, bash -lc, script -qc,
+    su -c), which runs it. A quoted mention anywhere else (a commit message, a
+    grep pattern, a Sheet entry) is not in command position and is allowed.
+    """
+    cmd = unmask(cmd)
+    if ARGV_DISCARD.search(cmd):
+        return True
+    starts = [0]
+    starts += [m.end() for m in re.finditer(r"\$\(|<\(|`|\(|\{\s", cmd)]
+    starts += [m.end() for m in re.finditer(r"\s-[a-zA-Z]*c\s+[\"']", cmd)]
+    return any(runs_discard(cmd[i:]) for i in starts)
+
+
 def check_segment(cmd: str):
     """Judge one simple command. Returns a refusal reason, or None to allow."""
     c = norm(cmd)
@@ -138,6 +237,25 @@ def check_segment(cmd: str):
     if re.search(r"\bterraform\s+destroy\b", c) and "-target" not in c:
         return "terraform destroy without a target tears down the whole stack."
 
+    # --- Delphi's own Workbenches ---------------------------------------------
+    # Discard removes a Workbench folder. It keeps a copy first, so reaching it
+    # is no longer a loss, but it is still a person's call: agents get no MCP
+    # tool for it, the CLI wants a terminal, a typed task id and a person's
+    # author type, and this is the fence for an agent that finds the CLI and
+    # feeds it all three.
+    if is_delphi_discard(c):
+        return (
+            "delphi discard throws a Workbench away, and that is for a person to "
+            "decide. Say what you would discard and why in the task's Sheet instead."
+        )
+    # DELPHI_CLIENT tells the MCP server the command line is calling, which
+    # unlocks its command line only tools. An agent has no reason to say so.
+    if re.search(r"(?:^|[\s;&|(`])(?:export\s+|env\s+(?:-\S+\s+)*)?DELPHI_CLIENT=", c):
+        return (
+            "Setting DELPHI_CLIENT pretends to be the delphi command line to reach "
+            "tools that are not offered to agents."
+        )
+
     # --- host level ------------------------------------------------------------
     if re.search(r"\b(mkfs|fdisk)\b", c) or re.search(r"\bdiskutil\s+erase", c):
         return "Formatting or partitioning a disk."
@@ -164,7 +282,9 @@ def check_bash(command: str):
             "Download it, look at it, then run it."
         )
 
-    for segment in segments(command):
+    # Unmasked on the whole line first, because a variable assigned in one
+    # segment (D=delphi;) is run in another ($D discard).
+    for segment in segments(unmask(command)):
         reason = check_segment(segment)
         if reason:
             return reason

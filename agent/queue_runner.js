@@ -21,8 +21,8 @@
 
 const { spawn } = require("child_process");
 const path = require("path");
-const fs = require("fs");
-const os = require("os");
+const { splitCommand, resolveBinary, guardStatus } = require("./launch");
+const { openServer: openClient } = require("../sheet/client");
 
 // --- options ----------------------------------------------------------------
 
@@ -50,6 +50,9 @@ const DEFAULTS = {
   once: false,
   promptStdin: false,
   allowUnguarded: false,
+  // Off by default in this release: a Workbench per task is new, and a runner
+  // that starts making branches in somebody's repository should be a choice.
+  workbenches: false,
   verbose: false,
 };
 
@@ -75,6 +78,11 @@ Delphi queue runner: claims queued tasks and spawns a headless agent for each.
   --once                 Take at most one pass, then exit
   --max N                Stop after N tasks
   --server PATH          Path to mcp_server.js
+  --workbenches          Give each task its own Workbench (a folder and a branch of
+                         the project's repository) and run the agent there instead
+                         of in --cwd. The Workbench is left in place for a person
+                         to review and finish. Makes --concurrency above 1 safe in
+                         one repository. Off by default in this release
   --allow-unguarded      Start even when agent/guard.py is not installed as a hook
   --verbose              Log each MCP call
   -h, --help             This
@@ -94,6 +102,7 @@ function parseArgs(argv) {
       case "--once": o.once = true; break;
       case "--prompt-stdin": o.promptStdin = true; break;
       case "--allow-unguarded": o.allowUnguarded = true; break;
+      case "--workbenches": o.workbenches = true; break;
       case "--verbose": o.verbose = true; break;
       case "--queue": o.queue = need(i, flag); i++; break;
       case "--project": o.project = need(i, flag); i++; break;
@@ -142,171 +151,22 @@ function projectFilter(options) {
 const log = (...parts) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...parts);
 const warn = (...parts) => console.error(`[${new Date().toISOString().slice(11, 19)}]`, ...parts);
 
-// --- command line into argv --------------------------------------------------
+// --- command line into argv, the guard, and the server ---------------------
+//
+// splitCommand, resolveBinary and guardStatus live in agent/launch.js, and the
+// MCP client in sheet/client.js, because the delphi command line spawns things
+// and talks to the server too, and two copies of either would drift.
 
-/**
- * Splits an agent command into argv, honouring quotes.
- *
- * Deliberately not a shell: no globbing, no substitution, no operators. The
- * command comes from a config file or an environment variable and the prompt it
- * carries comes from the database, and the two must never meet in a string that
- * something else parses.
- */
-function splitCommand(text) {
-  const out = [];
-  let current = "";
-  let started = false;
-  let quote = null;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (quote) {
-      if (ch === quote) quote = null;
-      else if (ch === "\\" && quote === '"' && i + 1 < text.length) current += text[++i];
-      else current += ch;
-      continue;
-    }
-    if (ch === '"' || ch === "'") { quote = ch; started = true; continue; }
-    if (/\s/.test(ch)) {
-      if (started || current) { out.push(current); current = ""; started = false; }
-      continue;
-    }
-    current += ch;
-    started = true;
-  }
-  if (quote) throw new Error(`Unbalanced ${quote} in the agent command`);
-  if (started || current) out.push(current);
-  return out;
-}
-
-/** Where a binary actually is, or null. Used to fail before claiming anything. */
-function resolveBinary(name) {
-  if (name.includes(path.sep) || name.startsWith(".")) {
-    const full = path.resolve(name);
-    return fs.existsSync(full) ? full : null;
-  }
-  const exts = process.platform === "win32"
-    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";")
-    : [""];
-  for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
-    for (const ext of exts) {
-      const candidate = path.join(dir, name + ext);
-      try { if (fs.existsSync(candidate)) return candidate; } catch {}
-    }
-  }
-  return null;
-}
-
-// --- the guard ---------------------------------------------------------------
-
-/**
- * Whether agent/guard.py is wired in as a PreToolUse hook for Bash.
- *
- * An unattended runner is the case guard.py was written for: nobody is watching
- * the permission prompts because nobody is watching at all. Checked here rather
- * than trusted, because the failure is silent otherwise, and a runner that has
- * been quietly unguarded for a week looks exactly like one that has not.
- */
-function guardStatus(cwd) {
-  const files = [
-    path.join(os.homedir(), ".claude", "settings.json"),
-    path.join(cwd, ".claude", "settings.json"),
-    path.join(cwd, ".claude", "settings.local.json"),
-  ];
-  for (const file of files) {
-    let parsed;
-    try {
-      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    } catch {
-      continue;
-    }
-    const entries = parsed && parsed.hooks && parsed.hooks.PreToolUse;
-    if (!Array.isArray(entries)) continue;
-    for (const entry of entries) {
-      const matcher = String(entry && entry.matcher || "");
-      const body = JSON.stringify(entry && entry.hooks || []);
-      if (/guard\.py/.test(body) && /Bash/.test(matcher)) return { installed: true, file };
-    }
-  }
-  return { installed: false, file: null };
-}
-
-// --- MCP client --------------------------------------------------------------
-
-/**
- * Speaks JSON-RPC 2.0 to agent/mcp_server.js over its stdio transport.
- *
- * One server process for the life of the runner. It handles each line as it
- * arrives, so concurrent calls are safe, and every request carries an id so the
- * answers cannot be mixed up.
- */
+/** The runner's server: the shared client, attributed to this runner. */
 function openServer(options) {
-  if (!fs.existsSync(options.server)) {
-    throw new Error(`No MCP server at ${options.server}. Pass --server or set DELPHI_MCP_SERVER.`);
-  }
-  const env = { ...process.env, DELPHI_ACTOR: options.actor };
-  const child = spawn(process.execPath, [options.server], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env,
+  return openClient({
+    server: options.server,
+    actor: options.actor,
+    clientName: "delphi-queue-runner",
+    verbose: options.verbose,
+    log,
+    warn,
   });
-
-  const pending = new Map();
-  let nextId = 1;
-  let buffer = "";
-  let dead = null;
-
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
-    buffer += chunk;
-    let index;
-    while ((index = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, index).trim();
-      buffer = buffer.slice(index + 1);
-      if (!line) continue;
-      let message;
-      try { message = JSON.parse(line); } catch { continue; }
-      const waiter = pending.get(message.id);
-      if (!waiter) continue;
-      pending.delete(message.id);
-      if (message.error) waiter.reject(new Error(message.error.message || "MCP error"));
-      else waiter.resolve(message.result);
-    }
-  });
-
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => warn("mcp:", String(chunk).trimEnd()));
-
-  const fail = (reason) => {
-    dead = dead || new Error(reason);
-    for (const waiter of pending.values()) waiter.reject(dead);
-    pending.clear();
-  };
-  child.on("error", (error) => fail(`MCP server could not start: ${error.message}`));
-  child.on("exit", (code, signal) => fail(`MCP server exited (${signal || code})`));
-
-  const request = (method, params) => new Promise((resolve, reject) => {
-    if (dead) return reject(dead);
-    const id = nextId++;
-    pending.set(id, { resolve, reject });
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-  });
-
-  return {
-    async start() {
-      await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "delphi-queue-runner", version: "1" } });
-    },
-    /** Calls a tool and unwraps the JSON the server packs into its text content. */
-    async call(tool, args = {}) {
-      if (options.verbose) log(`mcp ${tool}`, JSON.stringify(args));
-      const result = await request("tools/call", { name: tool, arguments: args });
-      const text = result && result.content && result.content[0] && result.content[0].text;
-      if (typeof text !== "string") return null;
-      try { return JSON.parse(text); } catch { return text; }
-    },
-    close() {
-      try { child.stdin.end(); } catch {}
-      try { child.kill(); } catch {}
-    },
-  };
 }
 
 // --- the brief ---------------------------------------------------------------
@@ -328,7 +188,7 @@ function clip(text, limit) {
  * queue: the last agent to touch this probably left the reason it failed, and an
  * agent that starts cold repeats it.
  */
-function buildBrief(claim) {
+function buildBrief(claim, { workbench = null } = {}) {
   const task = claim.task;
   const lines = [];
 
@@ -356,13 +216,35 @@ function buildBrief(claim) {
     lines.push("");
   }
 
-  if (claim.comments && claim.comments.length) {
+  if (claim.sheet && String(claim.sheet).trim()) {
+    // The Sheet as the server gives it: the ledger (promoted findings, dead
+    // ends, decisions) and then the latest entries. The ledger is the part an
+    // agent most needs, and the old "last twelve comments" lost it the moment
+    // a task had more than twelve.
+    lines.push("## The task's Sheet");
+    lines.push("Every entry in its ledger (findings, dead ends and decisions that hold for this task) and its latest entries, oldest first. Read it before you start: it is what earlier agents and people already learned.");
+    if (claim.comments_total > claim.comments_shown) {
+      lines.push(`${claim.comments_total - claim.comments_shown} older entries are not shown; sheet_read with mode full has them.`);
+    }
+    lines.push("");
+    lines.push(clip(String(claim.sheet).trim(), 24000));
+    lines.push("");
+  } else if (claim.comments && claim.comments.length) {
     lines.push("## What has already been said on this task");
     for (const comment of claim.comments.slice(-12)) {
       lines.push(`### ${comment.author} (${comment.created_at})`);
       lines.push(clip(comment.body, 2000));
       lines.push("");
     }
+  }
+
+  if (workbench) {
+    lines.push("## Where you are working");
+    lines.push([
+      `This folder is the task's Workbench: its own copy of the repository, on the branch ${workbench.branch}, so nothing you do here touches anyone else's work.`,
+      "Commit your changes on this branch. Do not switch branches, push, or remove the folder: a person reviews the Workbench and finishes it.",
+    ].join("\n"));
+    lines.push("");
   }
 
   lines.push("## How to finish");
@@ -377,6 +259,73 @@ function buildBrief(claim) {
   ].join("\n"));
 
   return clip(lines.join("\n"), MAX_BRIEF);
+}
+
+// --- the Workbench -------------------------------------------------------------
+
+/**
+ * The task's Workbench, made if it has none, with setup run the first time.
+ * Returns { workbench } to work in, or { refuse } with the reason the task
+ * goes back instead: a parked Workbench is a person's decision to set it
+ * aside, and a missing one needs a person to say whether to put it back.
+ *
+ * Setup is run here, as a recorded command attributed to this runner, rather
+ * than inside the server's tool call, so its output goes to a log like any
+ * other run and a slow npm ci does not hold one MCP request for minutes.
+ */
+// The runner's own link to the server failing. That is not the task's fault
+// and says nothing about its Workbench, so it is thrown on, to the backoff.
+const TRANSPORT = /^MCP server |did not answer/;
+
+async function prepareWorkbench(server, taskId) {
+  let made;
+  try {
+    made = await server.call("workbench_start", { task_id: taskId, run_setup: false });
+  } catch (error) {
+    if (TRANSPORT.test(error.message)) throw error;
+    // Every refusal workbench_start makes (being put away, a folder or branch
+    // in the way, no repository, a bare one, no base branch) needs a person,
+    // and the races it can lose it already retries itself. Thrown on, it
+    // would release the task to the top of the pool and be claimed again at
+    // the next poll, forever. Refused, it is set aside once, like a parked one.
+    return { refuse: `Its Workbench could not be started: ${error.message}` };
+  }
+  for (const line of made.warnings || []) warn(`task ${taskId}: ${line}`);
+  const wb = made.workbench;
+  if (wb.state === "parked") {
+    return { refuse: `Its Workbench is parked: a person set it aside. Resuming it (delphi work ${taskId}) lets agents at it again.` };
+  }
+  if (wb.state === "closing") {
+    return { refuse: `Its Workbench is being put away (a Finish or Discard is in progress or was interrupted). A person decides what happens to it.` };
+  }
+  if (wb.state === "missing") {
+    return { refuse: `Its Workbench folder (${wb.path}) is gone. A person can put it back with delphi work ${taskId}.` };
+  }
+  if (made.created && made.setup_cmd) {
+    const { runEntry } = require("../sheet/run");
+    const resolved = await server.call("sheet_resolve", { task: String(taskId) });
+    const store = {
+      append: (f) => server.call("sheet_append", { task_id: f.taskId, kind: f.kind, body: f.body, meta: f.meta }),
+      update: (id, f) => server.call("sheet_update", { id, meta: f.meta, body: f.body }),
+    };
+    log(`task ${taskId}: setting up its Workbench with ${made.setup_cmd}`);
+    const entry = await runEntry({ store, taskId, command: made.setup_cmd, cwd: wb.path, logDir: resolved.log_dir });
+    if (!entry.meta || entry.meta.state !== "ok") {
+      return { refuse: `Setting up its Workbench failed (${made.setup_cmd}, entry ${entry.id} on the Sheet). The folder is kept.` };
+    }
+  }
+  return { workbench: wb, created: made.created };
+}
+
+/** Whether the task's latest release note already says exactly this. */
+async function lastReleaseWas(server, taskId, reason) {
+  try {
+    const read = await server.call("sheet_read", { task_id: taskId, mode: "tail", n: 20 });
+    const last = (read.entries || []).filter((e) => /^Released: /.test(e.body || "")).pop();
+    return Boolean(last) && last.body === `Released: ${reason}`;
+  } catch {
+    return false;
+  }
 }
 
 // --- running one task --------------------------------------------------------
@@ -523,7 +472,7 @@ async function main() {
   await server.start();
 
   log(`queue '${options.queue}'${options.project ? ` in project '${options.project}'` : ", every project"} as '${options.actor}', agent '${binary}', timeout ${options.timeout}s, lease ${options.lease}m`);
-  log(`agent runs in ${options.cwd}`);
+  log(options.workbenches ? "each task's agent runs in that task's own Workbench" : `agent runs in ${options.cwd}`);
   log(`guard.py ${guard.installed ? `installed via ${guard.file}` : "NOT installed"}`);
 
   if (options.dryRun) {
@@ -533,6 +482,10 @@ async function main() {
   }
 
   const held = new Set();
+  // Tasks this run set aside because their Workbench needs a person. One
+  // coming back (a person set it to todo without sorting it) is not given the
+  // same long note again, and the worker backs off rather than spinning on it.
+  const skipped = new Set();
   const killers = new Set();
   let stopping = false;
   let started = 0;
@@ -573,7 +526,33 @@ async function main() {
     log(`claimed ${id}: ${claim.task.title}`);
 
     try {
-      const result = await runAgent(argv, buildBrief(claim), options, register);
+      let workbench = null;
+      if (options.workbenches) {
+        const prepared = await prepareWorkbench(server, id);
+        if (prepared.refuse) {
+          // queue_next cannot be told to pass a task over, and released it
+          // is at the top of the pool again at the next poll: a runner would
+          // claim and release it all day, burying the Sheet in identical notes
+          // and starving everything behind it. So it is taken out of the pool
+          // as blocked, which queue_next never hands out, with the reason
+          // promoted where a person will see it, and the runner moves on.
+          const repeat = skipped.has(id);
+          skipped.add(id);
+          await server.call("update_task", { id, status: "blocked" });
+          const full = `${prepared.refuse} Marked blocked so the queue moves on; set it back to todo when that is sorted.`;
+          const reason = repeat || await lastReleaseWas(server, id, full)
+            ? "Still blocked for the reason released with above."
+            : full;
+          await server.call("queue_release", { task_id: id, reason: clip(reason, MAX_SUMMARY) });
+          warn(`set ${id} aside: ${prepared.refuse}`);
+          started--;
+          return repeat ? false : "skipped";
+        }
+        workbench = prepared.workbench;
+        log(`task ${id} works in ${workbench.path} on ${workbench.branch}${prepared.created ? " (new)" : ""}`);
+      }
+      const runOptions = workbench ? { ...options, cwd: workbench.path } : options;
+      const result = await runAgent(argv, buildBrief(claim, { workbench }), runOptions, register);
       const seconds = Math.round((Date.now() - startedAt) / 1000);
       const output = (result.stdout || "").trim();
 
@@ -603,7 +582,8 @@ async function main() {
         : `Agent finished in ${seconds}s and said nothing. Worth checking before trusting this one.`;
       await server.call("queue_complete", {
         task_id: id,
-        summary: `${summary}\n\n(Run unattended by ${options.actor} via ${path.basename(binary)}, ${seconds}s.)`,
+        summary: `${summary}\n\n(Run unattended by ${options.actor} via ${path.basename(binary)}, ${seconds}s.` +
+          `${workbench ? ` The work is in its Workbench at ${workbench.path} on ${workbench.branch}, left for a person to review and finish.` : ""})`,
       });
       log(`completed ${id} in ${seconds}s`);
       return true;
@@ -635,6 +615,8 @@ async function main() {
         continue;
       }
       if (worked) idleFor = options.idle;
+      // A task set aside is not a pass: the next one is still there to take.
+      if (worked === "skipped") continue;
       if (options.once) break;
       if (options.max && started >= options.max) break;
       if (worked) continue;
@@ -704,7 +686,10 @@ async function dryRun(server, options, argv, binary) {
   }
 
   const first = await server.call("get_task", { id: take[0].id });
-  const brief = buildBrief({ claimed: first.task.id, task: first.task, project: first.project, subtasks: first.subtasks, comments: first.comments });
+  const brief = buildBrief({
+    claimed: first.task.id, task: first.task, project: first.project, subtasks: first.subtasks, comments: first.comments,
+    sheet: first.sheet, comments_total: first.comments_total, comments_shown: first.comments_shown,
+  });
 
   const shown = options.promptStdin ? argv : (argv.includes("{}") ? argv.map((a) => (a === "{}" ? "<brief>" : a)) : [...argv, "<brief>"]);
   console.log("");
@@ -720,7 +705,13 @@ async function dryRun(server, options, argv, binary) {
   console.log(`On a non-zero exit or after ${options.timeout}s: queue_release with the reason.`);
 }
 
-main().catch((error) => {
-  warn(error.message);
-  process.exit(1);
-});
+// Only when run, not when required: the tests load the brief and the argument
+// parsing from here without starting a runner.
+if (require.main === module) {
+  main().catch((error) => {
+    warn(error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { parseArgs, projectFilter, buildBrief, prepareWorkbench, refusal, describeFailure, clip, splitCommand, resolveBinary, guardStatus };

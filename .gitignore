@@ -23,3 +23,9 @@ import.py
 
 settings.json
 vault/
+
+# Sheet run logs. They live in DATA_DIR, which from a checkout is the checkout
+# itself, so without this every command an agent ran would be one `git add .`
+# from the repository, output, secrets in environment dumps and all. Anchored to
+# the root because tools/fixtures/sheets/ holds test fixtures that are committed.
+/sheets/

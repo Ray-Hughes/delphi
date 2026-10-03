@@ -1,0 +1,10 @@
+---
+task: 5
+title: asking
+project: ops
+status: todo
+---
+? retry strategy: [a] exponential [b] fixed  {id:30 by:ray}
+? which region: [a] us-east-1: primary [b] eu-west-2 [c] ap-south-1 [d] none of these  {id:31 by:claude-code:4}
+= d  {id:32 by:ray ref:31 +}
+  none of them is close enough to the customer

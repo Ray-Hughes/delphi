@@ -1,4 +1,4 @@
-// Markdown mirror of the memory notes.
+// Markdown mirror of the memory notes, and a clean text copy of each task's Sheet.
 //
 // The database is the source of truth. This writes a plain-file copy of it that
 // Obsidian, ripgrep, git or any editor can read, so the knowledge is not trapped
@@ -14,6 +14,8 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const paths = require("./paths");
+const sheetFormat = require("./sheet/format");
+const { makeSheetStore } = require("./sheet/store");
 
 // A folder beside the source in a checkout, and in Documents once installed. The
 // whole point of the mirror is that a person opens it in Obsidian or an editor,
@@ -26,6 +28,10 @@ function slug(text) {
     .replace(/[\/\\:*?"<>|]/g, "-")   // characters filesystems reject
     .replace(/\s+/g, " ")
     .trim()
+    // A name of only dots is a path, not a name: a project called ".." would
+    // write beside the vault instead of in it. A leading dot hides the file
+    // from the very editors the vault is for.
+    .replace(/^\.+/, (dots) => "_".repeat(dots.length))
     .slice(0, 120) || "untitled";
 }
 
@@ -84,6 +90,11 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
   const projects = [...db.listProjects(), ...db.listArchivedProjects()];
   const written = new Set();
   let notes = 0;
+  let pads = 0;
+  let sheets = 0;
+  // Reads only: the store is used for its view of a Sheet, the same one
+  // delphi cat prints, and nothing here writes through it.
+  const sheetStore = db.sqlP ? makeSheetStore({ sql: db.sqlP, actor: "vault" }) : null;
 
   const allTitles = [];
   for (const project of projects) {
@@ -118,6 +129,57 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
       notes++;
     }
 
+    // Pads go into their own folder rather than beside the notes. They are the
+    // working documents, rewritten constantly and often half-finished, and mixing
+    // them into the memory folder would make the thing you open in Obsidian
+    // mostly draft. Not linkified, because a plan quoting a note title verbatim
+    // is a quote, not a reference.
+    const projectPads = db.listScratchpads ? db.listScratchpads(project.id) : [];
+    if (projectPads.length) {
+      const padDir = path.join(dir, "pads");
+      fs.mkdirSync(padDir, { recursive: true });
+      for (const pad of projectPads) {
+        const file = path.join(padDir, `${slug(pad.key || pad.title)}.md`);
+        fs.writeFileSync(file, [
+          frontMatter({
+            title: pad.title,
+            project: project.name,
+            kind: "scratchpad",
+            author: pad.author || undefined,
+            created: pad.created_at,
+            updated: pad.updated_at,
+            id: `pad-${pad.id}`,
+          }),
+          "",
+          `# ${pad.title}`,
+          "",
+          pad.body || "",
+          "",
+        ].join("\n"));
+        written.add(path.resolve(file));
+        pads++;
+      }
+    }
+
+    // Each task's Sheet, clean, the way `delphi cat 42 | pbcopy` gives it: no
+    // ids, no {} metadata, so it reads as the conversation it was and greps
+    // as text. Done tasks too, since that is when a Sheet is most worth
+    // having. A task with nothing on its Sheet gets no file. Named by id
+    // first, so a renamed task replaces its file rather than leaving a twin.
+    const sheetTasks = sheetStore
+      ? db.listTasks({ projectId: project.id, includeDone: true, includeSubtasks: true }).filter((t) => Number(t.comment_count) > 0)
+      : [];
+    if (sheetTasks.length) {
+      const sheetDir = path.join(dir, "sheets");
+      fs.mkdirSync(sheetDir, { recursive: true });
+      for (const task of sheetTasks) {
+        const file = path.join(sheetDir, `${task.id}-${slug(task.title)}.sheet`);
+        fs.writeFileSync(file, sheetFormat.format(sheetStore.sheet(task.id), { clean: true }));
+        written.add(path.resolve(file));
+        sheets++;
+      }
+    }
+
     // An index per project, so the vault is navigable rather than a flat pile,
     // and so open work is visible next to the knowledge about it.
     const tasks = db.listTasks({ projectId: project.id });
@@ -136,6 +198,9 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
       "",
       ...projectNotes.map((n) => `- [[${n.title}]]${n.kind !== "note" ? ` - ${n.kind}` : ""}`),
       projectNotes.length ? "" : "_Nothing stored yet._\n",
+      projectPads.length ? "## Scratchpads\n" : "",
+      ...projectPads.map((p) => `- [pads/${slug(p.key || p.title)}](pads/${slug(p.key || p.title)}.md)${p.author ? ` - ${p.author}` : ""}`),
+      projectPads.length ? "" : "",
       "## Open tasks",
       "",
       ...tasks.map((t) => {
@@ -151,14 +216,22 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
     written.add(path.resolve(indexFile));
   }
 
-  // Remove files for notes that were deleted in the app.
+  // Remove files for notes, pads and Sheets that were deleted in the app.
+  // A .sheet only where this writes them, <project>/sheets/<id>-<title>.sheet:
+  // anywhere else in the vault it is the person's own file (an export, a
+  // copy kept on purpose), not a stale mirror, and is left alone.
   let removed = 0;
+  const ours = (full) => {
+    const rel = path.relative(vault, full).split(path.sep);
+    return rel.length === 3 && rel[1] === "sheets" && /^\d+-.*\.sheet$/.test(rel[2]);
+  };
   const sweep = (dir) => {
     if (!fs.existsSync(dir)) return;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) sweep(full);
-      else if (entry.name.endsWith(".md") && !written.has(path.resolve(full))) {
+      else if (written.has(path.resolve(full))) continue;
+      else if (entry.name.endsWith(".md") || (entry.name.endsWith(".sheet") && ours(full))) {
         fs.unlinkSync(full);
         removed++;
       }
@@ -166,7 +239,7 @@ function exportAll(db, vaultPath = DEFAULT_VAULT) {
   };
   sweep(vault);
 
-  return { vault, projects: projects.length, notes, removed };
+  return { vault, projects: projects.length, notes, pads, sheets, removed };
 }
 
 module.exports = { exportAll, DEFAULT_VAULT };

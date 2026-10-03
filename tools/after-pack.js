@@ -13,10 +13,39 @@
 // This is skipped entirely when a real certificate is configured, because then
 // electron-builder has already signed it properly and re-signing would undo that.
 
+//
+// It also makes sure the command line tool is still executable once it has been
+// copied into Resources, which comes first because it applies to every platform
+// and because changing a file after signing it would be the wrong order.
+
 const { execFileSync } = require("child_process");
+const fs = require("fs");
 const path = require("path");
 
+/**
+ * Resources/bin/delphi has to carry its executable bit, because `make cli` and
+ * anyone following the README symlink it onto PATH and run it directly. Git
+ * records the bit and electron-builder normally keeps it, but "normally" is the
+ * word that hides a broken install, so it is checked here and put back if lost.
+ */
+function ensureCliExecutable(context) {
+  if (context.electronPlatformName === "win32") return;
+  const resources = context.electronPlatformName === "darwin"
+    ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, "Contents", "Resources")
+    : path.join(context.appOutDir, "resources");
+  const cli = path.join(resources, "bin", "delphi");
+  if (!fs.existsSync(cli)) {
+    console.log("  after-pack: no bin/delphi in this build, nothing to make executable");
+    return;
+  }
+  const mode = fs.statSync(cli).mode;
+  if ((mode & 0o111) === 0o111) return;
+  fs.chmodSync(cli, mode | 0o755);
+  console.warn("  after-pack: bin/delphi arrived without its executable bit, and has been given it back");
+}
+
 exports.default = async function afterPack(context) {
+  ensureCliExecutable(context);
   if (context.electronPlatformName !== "darwin") return;
   if (process.env.CSC_LINK || process.env.CSC_NAME) {
     console.log("  after-pack: a signing certificate is configured, leaving the signature alone");

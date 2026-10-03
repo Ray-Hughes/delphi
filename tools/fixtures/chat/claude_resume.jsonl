@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","cwd":"{{CWD}}","session_id":"sess-1111","tools":["Bash"],"model":"claude-sonnet-4-5"}
+{"type":"assistant","message":{"id":"msg_10","type":"message","role":"assistant","content":[{"type":"text","text":"Picked up where we left off."}],"stop_reason":"end_turn"},"parent_tool_use_id":null,"session_id":"sess-1111"}
+{"type":"result","subtype":"success","is_error":false,"result":"Picked up where we left off.","session_id":"sess-1111"}

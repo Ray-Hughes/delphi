@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","cwd":"{{CWD}}","session_id":"sess-3333","tools":["Bash"],"model":"claude-sonnet-4-5"}
+{"type":"assistant","message":{"id":"msg_20","type":"message","role":"assistant","content":[{"type":"text","text":"Starting the long job."}]},"parent_tool_use_id":null,"session_id":"sess-3333"}
+{"type":"assistant","message":{"id":"msg_20","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_20","name":"Bash","input":{"command":"sleep 600"}}]},"parent_tool_use_id":null,"session_id":"sess-3333"}
+{"fake":"hang"}

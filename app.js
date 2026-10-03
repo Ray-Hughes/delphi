@@ -2,12 +2,67 @@
 
 const state = {
   projects: [],
+  // The folders, and which one is open. null is the picker: every workspace
+  // shown, nothing zoomed into.
+  workspaces: [],
+  workspaceId: null,
+  // The projects inside the open workspace. Separate from state.projects, which
+  // stays the whole set, because a project can belong to several folders and
+  // filtering the whole list on every render would ask the database the same
+  // question repeatedly.
+  wsProjects: [],
   projectId: null,     // null means the All view
   view: "new",         // new | overview | tasks | notes | links | history | settings
   showDone: false,
   // Set by the dashboard tiles, so a tile is a way into the list rather than a
   // number you then have to go and find yourself. Cleared whenever the list is
   // reached by any other route.
+  // The open session, and the messages in it. Held here rather than fetched by
+  // the chat renderer so a re-render, which happens on every alert tick, does
+  // not blank a conversation mid-read.
+  sessions: [],
+  sessionId: null,
+  // What this machine can talk to, asked once at boot. Probing spawns login
+  // shells, which is far too slow to repeat on every render.
+  providers: [],
+  // Which half of the pane is showing. Not a view of its own: the chat and the
+  // terminal are two faces of the same place, which is why Cmd+J flips between
+  // them rather than navigating anywhere.
+  // Which face of the pane is showing. "chat" is Delphi's own, "terminal" is the
+  // command runner, and "h:<key>" is somebody else's agent running as a tab.
+  pane: "chat",          // chat | terminal | h:claude-code | h:codex | ...
+  // The registry, with whether each one is actually installed. Asked at boot for
+  // the same reason providers is: resolving a binary spawns a login shell.
+  harnesses: [],
+  // What the running turn has done, this turn only. Tool calls go into the
+  // message as they happen, so this is the live indicator rather than the record.
+  turnTool: null,
+  // Why it has gone quiet, when it has said. An API retrying under load is the
+  // usual answer, and five silent minutes with no explanation is the worst thing
+  // a tab can do.
+  turnStatus: null,
+  termLines: [],         // what the running command has said
+  termBusy: false,
+  termDraft: "",
+  messages: [],
+  // The scratchpads in the open project, and which one is being read. padDetail
+  // is the parsed form the main process hands back: one entry per checkbox line
+  // with the task behind it, plus the tasks the pad no longer mentions.
+  pads: [],
+  padId: null,
+  padDetail: null,
+  // Source rather than the projected view. Per session and not stored, unlike
+  // the memory toggle: reading a pad is the normal case and editing it is the
+  // errand you are on right now.
+  padRaw: false,
+  // Held here for the same reason draft is: render() rebuilds the pane
+  // wholesale, and a body being typed into a textarea would not survive it.
+  padDraft: null,
+  // What is typed but not yet sent. render() rebuilds #content wholesale, so a
+  // draft that lived only in the textarea would be destroyed by an alert
+  // arriving while someone was still typing.
+  draft: "",
+  streaming: false,
   taskFilter: null,    // null | doing | blocked | overdue | done
   theme: "system",     // system | light | dark
   noteView: "formatted", // formatted | raw
@@ -96,6 +151,11 @@ function celebrateDone(row) {
   }
 }
 
+// Open dialogs, newest last. Each listens on the document, so without this
+// one Enter or Escape would answer every dialog stacked on the screen: a done
+// prompt arriving over the commit message box, say. Only the top one answers.
+const dialogStack = [];
+
 /**
  * Asks for one line of text. Resolves to the string, or null if cancelled.
  *
@@ -116,11 +176,14 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
     const input = el("input", { className: "field", value, placeholder, type: "text" });
     const error = el("div", { className: "err-msg", style: "display:none" });
 
+    const me = {};
     let settled = false;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       document.removeEventListener("keydown", onKey, true);
+      const at = dialogStack.indexOf(me);
+      if (at >= 0) dialogStack.splice(at, 1);
       overlay.remove();
       resolve(result);
     };
@@ -142,6 +205,7 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
     // Captured on the document, because the window-level handler treats Escape as
     // "hide the window" and would take the whole app away instead of this box.
     const onKey = (event) => {
+      if (dialogStack[dialogStack.length - 1] !== me) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
@@ -152,6 +216,7 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
         submit();
       }
     };
+    dialogStack.push(me);
     document.addEventListener("keydown", onKey, true);
 
     const cancel = el("button", { className: "btn", textContent: "Cancel", type: "button" });
@@ -405,6 +470,10 @@ function ago(iso) {
 
 async function refresh() {
   state.projects = await window.delphi.projects.list();
+  state.workspaces = await window.delphi.workspaces.list();
+  state.wsProjects = state.workspaceId
+    ? await window.delphi.workspaces.projects(state.workspaceId)
+    : [];
   state.alerts = await loadAlerts();
 
   if (state.query) {
@@ -413,6 +482,8 @@ async function refresh() {
     state.notes = notes;
     state.links = [];
     state.repos = [];
+    state.sessions = [];
+    state.sessionId = null;
     state.organizers = [];
 
     // Meaning-based ranking and the graph, in parallel with the literal match, so
@@ -441,13 +512,27 @@ async function refresh() {
       : state.allTasks.filter((t) => t.status !== "done");
     if (state.projectId) {
       state.notes = await window.delphi.notes.list(state.projectId);
+      state.pads = await window.delphi.pads.list(state.projectId);
+      // Landing on the most recently written pad rather than on nothing, which is
+      // what makes opening the tab feel like picking the work back up.
+      if (!state.pads.some((p) => p.id === state.padId)) {
+        state.padId = state.pads.length ? state.pads[0].id : null;
+        state.padDraft = null;
+      }
+      state.padDetail = state.padId ? await window.delphi.pads.tasks(state.padId) : null;
       state.links = await window.delphi.links.list(state.projectId);
       state.repos = await window.delphi.repos.list(state.projectId);
+      state.sessions = await window.delphi.sessions.list(state.projectId);
       state.organizers = await window.delphi.organizers.list(state.projectId);
     } else {
       state.notes = [];
+      state.pads = [];
+      state.padId = null;
+      state.padDetail = null;
       state.links = [];
       state.repos = [];
+      state.sessions = [];
+      state.sessionId = null;
       state.organizers = [];
     }
   }
@@ -482,6 +567,14 @@ function navigate(next) {
   // A filter belongs to the trip that set it. Any other move into the task list,
   // or out of it, drops the filter rather than leaving a list quietly narrowed.
   if (next.view !== undefined) state.taskFilter = null;
+  // A session belongs to one project, so moving to another has to let go of it.
+  // Without this the chat tab opens showing the previous project's conversation
+  // until something else happens to reload it.
+  if (next.projectId !== undefined && next.projectId !== state.projectId) {
+    state.sessionId = null;
+    state.messages = [];
+    state.draft = "";
+  }
   Object.assign(state, next);
   const to = position();
   if (samePosition(from, to)) return Promise.resolve();
@@ -525,14 +618,265 @@ function goBack() {
   return true;
 }
 
+
+
+/**
+ * The sidebar, which is now the open project's own panel.
+ *
+ * It used to list every project, which is what the rail does. Two lists of the
+ * same thing side by side is one list too many, and it left nowhere for the
+ * things belonging to a single project to live. So this is that: the project,
+ * its folder, its sessions, and the way to start another.
+ */
 function renderSidebar() {
+  renderRail();
   const box = $("projects");
+  const foot = $("sidebar-foot");
+  box.textContent = "";
+  if (foot) foot.textContent = "";
+
+  const workspace = state.workspaces.find((w) => w.id === state.workspaceId) || null;
+
+  // --- the picker ----------------------------------------------------------
+  if (!workspace) {
+    box.append(el("div", { className: "pp-sec" },
+      el("span", { textContent: "Workspaces" }),
+      el("span", { className: "n", textContent: String(state.workspaces.length) })));
+
+    if (!state.workspaces.length) {
+      box.append(el("div", { className: "pp-empty",
+        textContent: "None yet. Use + on the rail to add a folder." }));
+      return;
+    }
+
+    for (const w of state.workspaces) {
+      const row = el("div", { className: "ws-row", tabIndex: 0, role: "button", title: w.path });
+      row.append(el("span", { className: "ws-ico", textContent: w.icon || railLetter(w.name) }));
+      row.append(el("div", { className: "ws-txt" },
+        el("span", { className: "ws-nm", textContent: w.name }),
+        el("span", { className: "ws-p", textContent: w.path })));
+      if (w.project_count) {
+        row.append(el("span", { className: "count", textContent: String(w.project_count) }));
+      }
+      row.onclick = () => zoomInto(w.id);
+      row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); zoomInto(w.id); } };
+      row.oncontextmenu = (e) => { e.preventDefault(); workspaceMenu(w, e.clientX, e.clientY); };
+      box.append(row);
+    }
+    return;
+  }
+
+  // --- inside a workspace --------------------------------------------------
+  const head = el("div", { className: "pp-head" });
+  const name = el("div", { className: "nm" });
+  name.append(el("span", { className: "t", textContent: workspace.name, title: workspace.name }));
+  name.append(el("span", { className: "p", textContent: workspace.path, title: workspace.path }));
+  head.append(name);
+  box.append(head);
+
+  box.append(el("div", { className: "pp-sec" },
+    el("span", { textContent: "Projects" }),
+    el("span", { className: "n", textContent: String(state.wsProjects.length) })));
+
+  const addProject = el("div", { className: "gnew", tabIndex: 0, role: "button" },
+    el("span", { textContent: "+" }), el("span", { textContent: "New project" }));
+  const make = () => createProject(workspace);
+  addProject.onclick = make;
+  addProject.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); make(); } };
+  box.append(addProject);
+
+  if (!state.wsProjects.length) {
+    box.append(el("div", { className: "pp-empty",
+      textContent: "No projects in this workspace yet." }));
+  }
+
+  for (const p of state.wsProjects) {
+    const on = p.id === state.projectId;
+    const row = el("div", { className: "gs" + (on ? " on" : ""), tabIndex: 0, role: "button" });
+    row.append(el("span", { className: "dot", style: `background:${p.colour || "var(--ink-faint)"}` }));
+    row.append(el("span", { className: "nm", textContent: p.name }));
+    if (p.open_count) row.append(el("span", { className: "kbd", textContent: String(p.open_count) }));
+    const open = () => navigate({ projectId: p.id, view: "chat" });
+    row.onclick = open;
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+    row.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
+    box.append(row);
+
+    // The open project's sessions sit under it, indented, so the column reads as
+    // one tree rather than as two lists that happen to be stacked.
+    if (!on) continue;
+    const kids = el("div", { className: "gkids" });
+    const addSession = el("div", { className: "gs sub", tabIndex: 0, role: "button" },
+      el("span", { className: "nm dim", textContent: "+ New session" }));
+    const start = async () => { await newSession(); navigate({ view: "chat" }); };
+    addSession.onclick = start;
+    addSession.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); start(); } };
+    kids.append(addSession);
+
+    for (const sn of state.sessions) {
+      const srow = el("div", {
+        className: "gs sub" + (sn.id === state.sessionId && state.view === "chat" ? " on" : ""),
+        tabIndex: 0, role: "button", title: sn.title || "New session",
+      });
+      srow.append(
+        el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
+        el("span", { className: "nm", textContent: sn.title || "Session" })
+      );
+
+      const openS = async () => {
+        if (state.view !== "chat") { state.sessionId = sn.id; navigate({ view: "chat" }); return; }
+        await openSession(sn.id);
+      };
+
+      // Both actions were on the right click menu only, which is a place nobody
+      // looks. They are on the row now; the menu keeps them too.
+      const rename = el("button", { className: "srow-btn", title: "Rename", textContent: "✎" });
+      rename.onclick = (e) => { e.stopPropagation(); renameSession(sn); };
+
+      const close = el("button", { className: "srow-btn close", title: "Close this session", textContent: "×" });
+      close.onclick = (e) => { e.stopPropagation(); closeSession(sn); };
+
+      srow.append(el("span", { className: "srow-acts" }, rename, close));
+      srow.onclick = openS;
+      srow.ondblclick = (e) => { e.preventDefault(); renameSession(sn); };
+      srow.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openS(); } };
+      srow.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, e.clientX, e.clientY); };
+      kids.append(srow);
+    }
+    box.append(kids);
+  }
+
+  // The repository, under the sessions. Painted async and appended when it
+  // answers, because asking git costs a spawn and the sidebar must not wait on
+  // it. A folder that is not a repository is the ordinary case here, not an
+  // error, so it simply says nothing.
+  const gitBox = el("div", { className: "gitfoot" });
+  box.append(gitBox);
+  paintGit(gitBox, workspace.path);
+
+  if (foot) {
+    const settings = el("button", {
+      className: "btn wide" + (["project", "workspace"].includes(state.view) ? " primary" : ""),
+      textContent: state.projectId ? "Project settings" : "Workspace settings",
+      title: state.projectId ? "Settings for this project" : "Settings for this workspace",
+    });
+    settings.onclick = () => navigate({ view: state.projectId ? "project" : "workspace" });
+    foot.append(settings);
+  }
+}
+
+
+/** Renames a session. Shared by the row, the menu and the double click. */
+async function renameSession(session) {
+  const title = await askText({
+    title: "Rename session",
+    label: "What should this be called?",
+    value: session.title || "",
+    confirmLabel: "Rename",
+  });
+  if (!title) return;
+  await window.delphi.sessions.update(session.id, { title });
+  await refresh();
+}
+
+/**
+ * Closes a session, which deletes it and its messages.
+ *
+ * Asked for first when there is anything to lose. A session nobody spoke in is
+ * the one you made by mistake, and making someone confirm the removal of an
+ * empty box is the sort of prompt people learn to click through.
+ */
+async function closeSession(session) {
+  const spoken = (session.message_count || 0) > 0;
+  if (spoken) {
+    const ok = confirm(
+      `Close "${session.title || "this session"}"?\n\n` +
+      `Its ${session.message_count} message${session.message_count === 1 ? "" : "s"} go with it. ` +
+      "Nothing on disk is touched."
+    );
+    if (!ok) return;
+  }
+  await window.delphi.sessions.remove(session.id);
+  if (state.sessionId === session.id) {
+    state.sessionId = null;
+    state.messages = [];
+  }
+  await refresh();
+}
+
+
+/**
+ * The repository state for a workspace, under its sessions.
+ *
+ * Half of these folders are not repositories, so nothing is drawn at all in that
+ * case rather than an empty shell explaining its own emptiness.
+ */
+async function paintGit(box, folder) {
+  if (!folder) return;
+  let g;
+  try {
+    g = await window.delphi.git.status(folder);
+  } catch {
+    return;
+  }
+  if (!g || !g.repo) return;
   box.textContent = "";
 
-  const allOpen = state.projects.reduce((n, p) => n + p.open_count, 0);
-  box.append(projectRow({ id: null, name: "All work", colour: "var(--ink-faint)", open_count: allOpen }));
+  const head = el("div", { className: "gf-head" });
+  head.append(el("span", {
+    className: "gf-branch",
+    textContent: g.unborn ? "no commits yet" : g.detached ? "detached" : (g.branch || "unknown"),
+    title: g.upstream ? `tracking ${g.upstream}` : "no upstream set",
+  }));
 
-  for (const p of state.projects) box.append(projectRow(p));
+  // Unknown and zero are different answers. Without an upstream there is nothing
+  // to be ahead or behind of, and showing 0 would claim we had checked.
+  if (g.ahead === null || g.behind === null) {
+    head.append(el("span", { className: "gf-sync none", textContent: "no upstream" }));
+  } else {
+    head.append(el("span", { className: "gf-sync" + (g.ahead || g.behind ? " on" : "") },
+      el("span", { textContent: `↑${g.ahead}` }), el("span", { textContent: `↓${g.behind}` })));
+  }
+  box.append(head);
+
+  const row = el("div", { className: "gf-row" });
+  if (g.clean) {
+    row.append(el("span", { className: "hint", textContent: "nothing to commit" }));
+  } else {
+    row.append(el("span", { className: "gf-count", textContent: `${g.changed} uncommitted` }));
+    const commit = el("button", { className: "btn sm", textContent: "Commit" });
+    commit.onclick = async () => {
+      const message = await askText({
+        title: "Commit",
+        label: `${g.changed} file${g.changed === 1 ? "" : "s"} in ${folder.split("/").pop()}. Everything changed is staged.`,
+        placeholder: "What changed, and why",
+        confirmLabel: "Commit",
+      });
+      if (!message) return;
+      try {
+        const made = await window.delphi.git.commit(folder, message, { all: true });
+        await paintGit(box, folder);
+        state.termLines.push({ kind: "meta", text: `committed ${made.short} ${made.subject}` });
+      } catch (error) {
+        // Straight from git, which says useful things: nothing staged, no
+        // identity configured, a hook that refused.
+        await askText({
+          title: "That did not commit",
+          label: String(error.message || error),
+          value: "", allowEmpty: true, confirmLabel: "Close",
+        });
+      }
+    };
+    row.append(commit);
+  }
+  box.append(row);
+}
+
+function sessionMenu(session, x, y) {
+  rowMenu(x, y, [
+    { label: "Rename", run: async () => renameSession(session) },
+    { label: "Close", danger: true, run: async () => closeSession(session) },
+  ]);
 }
 
 function projectRow(p) {
@@ -586,10 +930,15 @@ function renderTabs() {
     : state.projectId
     // "project" rather than "settings", because the All view's own Settings tab
     // already owns that key and the two would fall through to each other.
-    ? [["overview", "Overview"], ["tasks", "Tasks", state.tasks.length],
+    ? [["overview", "Overview"], ["chat", "Chat", state.sessions.length],
+       ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
+       ["pads", "Pads", state.pads.length],
        ["notes", "Memory", state.notes.length], ["links", "Links", state.links.length],
-       ["activity", "Activity"], ["project", "Settings"]]
+       ["activity", "Activity"]]
+    : state.workspaceId
+    ? [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
+       ["queue", "Queue"], ["graph", "Mind map"], ["activity", "Activity"]]
     : [["new", "What's new"], ["tasks", "Tasks", state.tasks.length],
        ["queue", "Queue"],
        ["graph", "Mind map"],
@@ -628,7 +977,9 @@ function render() {
   const valid = state.query
     ? ["oracle", "tasks"]
     : state.projectId
-    ? ["overview", "tasks", "queue", "notes", "links", "activity", "project"]
+    ? ["overview", "chat", "tasks", "queue", "pads", "notes", "links", "activity", "project", "workspace"]
+    : state.workspaceId
+    ? ["new", "tasks", "queue", "graph", "activity", "workspace"]
     : ["new", "tasks", "queue", "graph", "reminders", "history", "settings"];
   if (!valid.includes(state.view)) state.view = valid[0];
 
@@ -666,7 +1017,9 @@ function render() {
     new: renderWhatsNew,
     oracle: renderOracle,
     overview: renderOverview,
+    chat: renderChat,
     tasks: renderTasks,
+    pads: renderPads,
     notes: renderNotes,
     links: renderLinks,
     queue: renderQueue,
@@ -675,6 +1028,7 @@ function render() {
     history: renderHistory,
     activity: renderActivity,
     project: renderProjectSettings,
+    workspace: renderWorkspaceSettings,
     settings: renderSettings,
   })[state.view];
 
@@ -704,13 +1058,49 @@ function render() {
   try {
     const result = view(content);
     if (result && typeof result.then === "function") {
-      result.then(restoreScroll).catch((error) => showViewError(content, error));
+      const done = spinWhile(content);
+      result
+        .then(() => { done(); restoreScroll(); })
+        .catch((error) => { done(); showViewError(content, error); });
     } else {
       restoreScroll();
     }
   } catch (error) {
     showViewError(content, error);
   }
+}
+
+/**
+ * Shows a spinner over a pane while something is loading, and returns the way to
+ * stop it.
+ *
+ * Held back for a moment first. Most of these views resolve in a few
+ * milliseconds, and a spinner that appears and vanishes inside one frame is a
+ * flicker that reads as a fault rather than as progress. Only work that is
+ * actually slow enough to notice gets announced, which in practice means the
+ * settings page, where finding out what this machine can talk to means starting
+ * login shells.
+ *
+ * The pane keeps whatever the view has already put in it, so a partly built page
+ * dims rather than disappearing and coming back.
+ */
+function spinWhile(pane, { delay = 140 } = {}) {
+  let node = null;
+  let cancelled = false;
+
+  const timer = setTimeout(() => {
+    if (cancelled) return;
+    node = el("div", { className: "pane-loading", role: "status" });
+    node.setAttribute("aria-live", "polite");
+    node.append(el("span", { className: "spinner" }), el("span", { textContent: "Loading" }));
+    pane.append(node);
+  }, delay);
+
+  return () => {
+    cancelled = true;
+    clearTimeout(timer);
+    if (node) node.remove();
+  };
 }
 
 // Counts for whatever is selected. Shown in the header on every view so the
@@ -891,22 +1281,68 @@ async function renderOverview(root) {
         className: "kind" + (r.is_primary ? " decision" : ""),
         textContent: r.is_primary ? "primary" : "helper",
       }));
+      const acts = el("div", { className: "repo-acts" });
       row.append(el("div", { className: "grow" },
         el("div", { textContent: r.name }),
-        el("div", { className: "mono", textContent: r.path })));
+        el("div", { className: "mono repo-path", textContent: r.path }),
+        // Under the path rather than beside it: three buttons beside a path in
+        // the narrow column left the path a few characters wide.
+        acts));
       if (!r.is_primary) {
         const mk = el("button", { className: "btn sm", textContent: "Make primary" });
         mk.onclick = async () => { await window.delphi.repos.setPrimary(r.id); refresh(); };
-        row.append(mk);
+        acts.append(mk);
       }
+      const wbSet = el("button", { className: "btn sm", textContent: "Workbench settings" });
+      wbSet.onclick = async () => { if (await repoWorkbenchSettings(r)) refresh(); };
+      acts.append(wbSet);
       const rm = el("button", { className: "btn sm", textContent: "Remove" });
       rm.onclick = async () => { await window.delphi.repos.remove(r.id); refresh(); };
-      row.append(rm);
+      acts.append(rm);
       flush.append(row);
     });
     repoCard.card.append(flush);
   }
   right.append(repoCard.card);
+
+  // --- workbenches ---------------------------------------------------------
+  // The tasks with a folder and branch of their own, and how each one stands.
+  // Each row opens its task, which is where the verbs are.
+  let benches = [];
+  try { benches = await window.delphi.workbench.list({ projectId: project.id }); } catch (error) { console.error("workbench list", error); }
+  const benchCard = card("Workbenches");
+  if (!benches.length) {
+    benchCard.body.append(emptyState("No Workbenches yet", "Start one from a task."));
+  } else {
+    benchCard.card.querySelector(".card-head").append(el("span", { className: "ts-count", textContent: String(benches.length) }));
+    benchCard.body.remove();
+    const flush = el("div", { className: "card-body flush" });
+    for (const wb of benches) {
+      // The title is the row's one way in for the keyboard, a button of its
+      // own, so Update beside it is a separate control and not a button
+      // inside a button. A click anywhere else on the row still opens it.
+      const row = el("div", { className: "list-row clickable wb-row" });
+      const open = el("button", { className: "wb-row-title wb-row-open", type: "button", textContent: wb.task_title });
+      open.setAttribute("aria-label", `Open task ${wb.task_id}, ${wb.task_title}: ${wbLook(wb).words}`);
+      open.onclick = (e) => { e.stopPropagation(); openTaskSheet(wb.task_id); };
+      row.append(el("div", { className: "grow" },
+        open,
+        el("div", { className: "wb-row-sub" },
+          el("span", { className: "mono", textContent: wb.branch }),
+          wb.task_status === "done" ? el("span", { className: "wb-flag", textContent: "task is done" }) : null)),
+        wbChip(wb, async (act) => {
+          act.disabled = true;
+          await wbGuard(wb.task_id, () => wbUpdate(wb));
+          refresh();
+        }));
+      row.onclick = (e) => { if (!e.target.closest("button")) openTaskSheet(wb.task_id); };
+      flush.append(row);
+    }
+    benchCard.card.append(flush);
+  }
+  // In the wide column, after what needs attention: a row carries a title, a
+  // branch and a sentence of status, and the narrow one wrapped all three.
+  left.insertBefore(benchCard.card, memCard.card);
 
   // --- links ---------------------------------------------------------------
   const linkCard = card("Links");
@@ -926,6 +1362,46 @@ async function renderOverview(root) {
     linkCard.card.append(flush);
   }
   right.append(linkCard.card);
+
+  // --- handoffs ------------------------------------------------------------
+  // Work one agent has handed to another. Here rather than on its own tab
+  // because it is not a place you go, it is a thing you notice: most of the time
+  // there is nothing in it, and when there is, it is either running or waiting
+  // for somebody to read the answer.
+  const handoffs = await window.delphi.handoffs.list({ projectId: project.id, limit: 8 })
+    .catch(() => []);
+  if (handoffs.length) {
+    const hCard = card("Between agents");
+    for (const h of handoffs) {
+      const row = el("div", { className: "hoff" });
+      row.append(el("span", { className: `hoff-s ${h.status}`, textContent: h.status }));
+      const body = el("div", { className: "grow" });
+      body.append(el("div", { className: "hoff-t",
+        textContent: `${h.from_harness || "you"} → ${h.to_harness}` }));
+      body.append(el("div", { className: "hint", textContent: h.request.slice(0, 120) }));
+      // The reply is the point of the row, so it is shown rather than hidden
+      // behind a click. Trimmed, because some of them are an essay.
+      if (h.reply && (h.status === "ready" || h.status === "harvested" || h.status === "failed")) {
+        body.append(el("div", { className: "hoff-r", textContent: h.reply.slice(0, 400) }));
+      }
+      row.append(body);
+      if (h.to_session_id) {
+        const open = el("button", { className: "btn sm", textContent: "Open" });
+        open.onclick = async () => {
+          await goTo({ projectId: project.id, view: "chat" });
+          await openSession(h.to_session_id);
+        };
+        row.append(open);
+      }
+      if (h.status === "queued" || h.status === "running") {
+        const stop = el("button", { className: "btn sm", textContent: "Cancel" });
+        stop.onclick = async () => { await window.delphi.handoffs.cancel(h.id); refresh(); };
+        row.append(stop);
+      }
+      hCard.body.append(row);
+    }
+    right.append(hCard.card);
+  }
 
   // --- project settings ----------------------------------------------------
   // The editor itself moved to its own tab. It used to be a form at the bottom of
@@ -1031,6 +1507,136 @@ function settingSection(heading, explanation, ...controls) {
   return box;
 }
 
+
+// A small set rather than a full emoji picker. These are the shapes a folder of
+// work actually is, and a short list you can scan beats a search box you have to
+// think of a word for.
+const WORKSPACE_ICONS = [
+  "◆", "●", "▲", "■", "★", "✦", "⬢", "◈",
+  "🗂", "📦", "🧭", "🛠", "⚙️", "🧪", "📊", "🔌",
+  "🚀", "🩺", "🏛", "📄", "🔐", "🌐", "🧩", "💾",
+];
+
+/**
+ * The workspace's own settings.
+ *
+ * Reached from the sidebar rather than from the row of tabs. Those tabs are
+ * views of the work; this is the folder's configuration, and it is the only
+ * place the letter on the rail tile can be replaced with something chosen.
+ */
+function renderWorkspaceSettings(root) {
+  const workspace = state.workspaces.find((w) => w.id === state.workspaceId);
+  if (!workspace) {
+    root.append(emptyState("No workspace open", "Pick one from the rail first."));
+    return;
+  }
+
+  const live = () => state.workspaces.find((w) => w.id === state.workspaceId) || workspace;
+
+  // --- name ----------------------------------------------------------------
+  const nameInput = el("input", { className: "field", value: workspace.name });
+  nameInput.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); nameInput.blur(); } };
+  nameInput.onblur = async () => {
+    const value = nameInput.value.trim();
+    const now = live();
+    if (!value) { nameInput.value = now.name; return; }
+    if (value === now.name) return;
+    await window.delphi.workspaces.update(now.id, { name: value });
+    await refresh();
+  };
+  root.append(settingSection("Name",
+    "What this folder is called here. The folder on disk keeps its own name; this is only what Delphi shows.",
+    el("div", { className: "row" }, nameInput)));
+
+  // --- icon ----------------------------------------------------------------
+  const grid = el("div", { className: "icon-grid" });
+  const paintIcons = () => {
+    grid.textContent = "";
+    const now = live();
+
+    // The letter is a choice too, not the absence of one, so it sits in the grid
+    // as the first option rather than being what you get by clearing something.
+    const letter = el("button", {
+      className: "icon-opt" + (now.icon ? "" : " on"),
+      type: "button",
+      title: "Use the first letter",
+      textContent: railLetter(now.name),
+    });
+    letter.onclick = async () => {
+      await window.delphi.workspaces.update(now.id, { icon: null });
+      await refresh();
+    };
+    grid.append(letter);
+
+    for (const icon of WORKSPACE_ICONS) {
+      const opt = el("button", {
+        className: "icon-opt" + (now.icon === icon ? " on" : ""),
+        type: "button",
+        textContent: icon,
+        title: icon,
+      });
+      opt.onclick = async () => {
+        await window.delphi.workspaces.update(now.id, { icon });
+        await refresh();
+      };
+      grid.append(opt);
+    }
+  };
+  paintIcons();
+  root.append(settingSection("Icon",
+    "What shows on the rail. Pick one, or keep the first letter of the name.",
+    grid));
+
+  // --- folder --------------------------------------------------------------
+  const folderRow = el("div", { className: "row" });
+  const now = live();
+  folderRow.append(el("span", { className: "mono grow", textContent: now.path, title: now.path }));
+  const there = el("span", { className: "hint", textContent: "checking…" });
+  folderRow.append(there);
+  window.delphi.fs.folderExists(now.path).then((ok) => {
+    there.className = ok ? "ok-msg" : "err-msg";
+    there.textContent = ok ? "found" : "missing";
+  }).catch(() => { there.textContent = ""; });
+  const reveal = el("button", { className: "btn sm", textContent: "Reveal" });
+  reveal.onclick = () => window.delphi.fs.reveal(now.path);
+  folderRow.append(reveal);
+  root.append(settingSection("Folder",
+    "Where this workspace is on disk. It is fixed: a workspace is its folder, so pointing it somewhere else would make it a different workspace.",
+    folderRow));
+
+  // --- projects ------------------------------------------------------------
+  const list = el("div", { className: "row wrap" });
+  if (!state.wsProjects.length) {
+    list.append(el("span", { className: "hint", textContent: "No projects here yet." }));
+  }
+  for (const p of state.wsProjects) {
+    const chip = el("span", { className: "chip", textContent: p.name, title: "Open this project" });
+    chip.onclick = () => navigate({ projectId: p.id, view: "chat" });
+    list.append(chip);
+  }
+  root.append(settingSection("Projects",
+    "The work happening in this folder. A project can also belong to other workspaces, which is set from the project's own settings.",
+    list));
+
+  // --- remove --------------------------------------------------------------
+  const danger = el("button", { className: "btn danger", textContent: "Remove this workspace" });
+  danger.onclick = async () => {
+    // Worth spelling out. "Remove" beside a folder reads as deleting one, and
+    // this deletes nothing on disk and keeps every project that used it.
+    const ok = confirm(
+      `Remove ${live().name} from Delphi?\n\n` +
+      "The folder on disk is not touched, and projects that also live in other " +
+      "workspaces keep working. Only the link from Delphi to this folder goes."
+    );
+    if (!ok) return;
+    await window.delphi.workspaces.remove(live().id);
+    await zoomOut();
+  };
+  root.append(settingSection("Remove",
+    "Forgets this folder. Nothing on disk is deleted and no project is deleted; only the workspace and its links go.",
+    el("div", { className: "row" }, danger)));
+}
+
 function renderProjectSettings(root) {
   const project = currentProject();
   if (!project) return;
@@ -1075,6 +1681,70 @@ function renderProjectSettings(root) {
   root.append(settingSection("Name",
     "What this project is called everywhere it appears: the sidebar, the title, and any task that belongs to it.",
     el("div", { className: "row" }, nameInput), nameMsg));
+
+  // --- workspaces ----------------------------------------------------------
+  // A project is work, and work happens in folders: sometimes one, sometimes
+  // four. SSNR spans caseflow, caseflow-efolder, the MPI person update service
+  // and the veteran API, so this is a list rather than a field.
+  const wsRow = el("div", { className: "row wrap" });
+
+  const paintWorkspaces = async () => {
+    wsRow.textContent = "";
+    const live = currentProject();
+    if (!live) return;
+    const linked = await window.delphi.workspaces.forProject(live.id);
+
+    if (!linked.length) {
+      wsRow.append(el("span", { className: "hint", textContent: "Not in any workspace yet." }));
+    }
+
+    for (const w of linked) {
+      const chip = el("span", { className: "chip ws-chip" + (w.is_primary ? " primary" : "") });
+      chip.append(el("span", { textContent: w.name, title: w.path }));
+      if (w.is_primary) chip.append(el("span", { className: "hint", textContent: "main" }));
+
+      // Left click promotes, so the folder a session defaults to can be changed
+      // without a menu. The x removes the link and never the folder.
+      chip.onclick = async () => {
+        await window.delphi.workspaces.link(live.id, w.id, { primary: true });
+        await paintWorkspaces();
+        await refresh();
+      };
+      chip.title = w.is_primary ? `${w.path}\nThe main folder for this project` : `${w.path}\nClick to make this the main folder`;
+
+      const drop = el("button", { className: "chip-x", textContent: "×", title: "Remove from this workspace" });
+      drop.onclick = async (e) => {
+        e.stopPropagation();
+        await window.delphi.workspaces.unlink(live.id, w.id);
+        await paintWorkspaces();
+        await refresh();
+      };
+      chip.append(drop);
+      wsRow.append(chip);
+    }
+
+    const linkedIds = new Set(linked.map((w) => w.id));
+    const available = state.workspaces.filter((w) => !linkedIds.has(w.id));
+    if (available.length) {
+      const add = el("button", { className: "btn sm", textContent: "+ Add workspace" });
+      add.onclick = (e) => {
+        rowMenu(e.clientX, e.clientY, available.map((w) => ({
+          label: w.name,
+          run: async () => {
+            await window.delphi.workspaces.link(live.id, w.id, { primary: linked.length === 0 });
+            await paintWorkspaces();
+            await refresh();
+          },
+        })));
+      };
+      wsRow.append(add);
+    }
+  };
+  paintWorkspaces();
+
+  root.append(settingSection("Workspaces",
+    "The folders this project's work happens in. One project can span several, which is why this is a list: clicking a chip makes it the main folder, and the x removes the link without touching anything on disk.",
+    wsRow));
 
   // --- summary -------------------------------------------------------------
   const sumMsg = el("span", { className: "hint" });
@@ -1254,11 +1924,14 @@ function confirmDestroy({ project, counts }) {
     const overlay = el("div", { className: "overlay" });
     const box = el("div", { className: "ask" });
 
+    const me = {};
     let settled = false;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       document.removeEventListener("keydown", onKey, true);
+      const at = dialogStack.indexOf(me);
+      if (at >= 0) dialogStack.splice(at, 1);
       overlay.remove();
       resolve(result);
     };
@@ -1312,6 +1985,7 @@ function confirmDestroy({ project, counts }) {
     ok.onclick = () => { if (!ok.disabled) finish({ tasks: mode }); };
 
     const onKey = (event) => {
+      if (dialogStack[dialogStack.length - 1] !== me) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
@@ -1322,6 +1996,7 @@ function confirmDestroy({ project, counts }) {
         if (!ok.disabled) finish({ tasks: mode });
       }
     };
+    dialogStack.push(me);
     document.addEventListener("keydown", onKey, true);
 
     const actions = el("div", { className: "ask-actions" });
@@ -1808,6 +2483,27 @@ function fadeColour(colour, a) {
   return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${a})`;
 }
 
+
+/**
+ * Opens the map on the workspace you are in.
+ *
+ * Only when nothing else is selected, so it cannot pull the view back to the
+ * workspace every time the pane repaints while someone is exploring. The name is
+ * matched against the graph's own nodes rather than assumed to be there: a
+ * workspace nothing has written about yet has no node, and selecting a name that
+ * does not exist would leave the panel reporting an entity it cannot find.
+ */
+function focusWorkspaceNode() {
+  if (mindMap.selected || !state.workspaceId || !mindMap.data) return;
+  const workspace = state.workspaces.find((w) => w.id === state.workspaceId);
+  if (!workspace) return;
+
+  const wanted = [workspace.name, workspace.path.split("/").pop()]
+    .filter(Boolean).map((x) => x.toLowerCase());
+  const hit = (mindMap.data.nodes || []).find((n) => wanted.includes(String(n.name).toLowerCase()));
+  if (hit) mindMap.selected = hit.name;
+}
+
 async function renderMindMap(root) {
   if (!mindMap.data && !mindMap.error) {
     try {
@@ -1816,6 +2512,12 @@ async function renderMindMap(root) {
       mindMap.error = String(error.message || error);
     }
   }
+
+  // The graph is always the whole graph: a connection that leaves the workspace
+  // is the one worth seeing, and hiding it would make the map agree with the
+  // sidebar rather than tell you anything the sidebar cannot. What the workspace
+  // changes is where you start reading, so it opens on itself.
+  focusWorkspaceNode();
 
   const bar = el("div", { className: "oracle-bar" });
   bar.append(el("div", { className: "hint grow", textContent:
@@ -2833,6 +3535,27 @@ function colourMenu(x, y, task, onPick) {
  * Deliberately quieter than a row: in a narrow column there is no room for meta,
  * so it carries the title and only what changes a decision.
  */
+/**
+ * Where a task came from, when it came from a pad.
+ *
+ * The board is a projection of the pads, and this is the way back to the
+ * document being projected. It matters most for the task nobody remembers
+ * filing, because an agent wrote the line rather than a person typing it here.
+ */
+function padChip(t) {
+  const chip = el("span", { className: "t-pad", textContent: "pad", tabIndex: 0, role: "button" });
+  chip.title = "Read out of a scratchpad. Open it.";
+  const go = (e) => {
+    if (e) e.stopPropagation();
+    state.padId = t.pad_id;
+    state.padDraft = null;
+    goTo({ projectId: t.project_id || state.projectId, view: "pads" });
+  };
+  chip.onclick = go;
+  chip.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(e); } };
+  return chip;
+}
+
 function taskCard(t, { draggable = false, showDue = true } = {}) {
   const card = el("div", { className: "tcard" + (t.status === "done" ? " done" : "") + colourClass(t) });
   card.append(el("div", { className: "tcard-title", textContent: t.title }));
@@ -2845,6 +3568,7 @@ function taskCard(t, { draggable = false, showDue = true } = {}) {
   else if (showDue && t.due) foot.append(el("span", { className: "t-due", textContent: t.due }));
   if (t.subtask_count) foot.append(el("span", { className: "t-due", textContent: `${t.subtask_done}/${t.subtask_count}` }));
   if (t.ref) foot.append(el("span", { className: "t-ref", textContent: t.ref }));
+  if (t.pad_id) foot.append(padChip(t));
   if (t.assignee) {
     foot.append(el("span", {
       className: "avatar sm" + (isAgent(t.assignee) ? " agent" : ""),
@@ -3598,7 +4322,7 @@ async function quickLook(taskId) {
     ["Subtasks", detail.subtasks.length
       ? `${detail.subtasks.filter((s) => s.status === "done").length} of ${detail.subtasks.length} done`
       : "none"],
-    ["Comments", String(detail.comments.length)],
+    ["Sheet", detail.comments.length ? plural(detail.comments.length, "entry", "entries") : "nothing yet"],
     ["Created", ago(t.created_at)],
   ];
   const grid = el("div", { className: "qlook-grid" });
@@ -3990,6 +4714,7 @@ function taskRow(t) {
   const sub = el("div", { className: "t-sub" });
   if (!state.projectId && t.project_name) sub.append(projectOwner(t));
   if (t.ref) sub.append(el("span", { className: "t-ref", textContent: t.ref }));
+  if (t.pad_id) sub.append(padChip(t));
   if (t.subtask_count) sub.append(el("span", { textContent: `${t.subtask_done}/${t.subtask_count}` }));
   if (t.comment_count) sub.append(el("span", { textContent: `${t.comment_count} ✦` }));
   if (sub.childNodes.length) body.append(sub);
@@ -4041,6 +4766,249 @@ function taskRow(t) {
 // ---------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Pads
+//
+// The working documents, and the board read out of them. A pad is markdown, and
+// every checkbox line in it is a real task: ticking one here closes the task,
+// closing the task rewrites the line.
+//
+// Which is why this is not just a markdown editor with a preview. The formatted
+// view renders each checkbox line as the task it is, with its id and its status,
+// so the projection is visible. Somebody reading a plan an agent wrote should be
+// able to see, without being told, that the plan is the board.
+// ---------------------------------------------------------------------------
+
+function renderPads(root) {
+  const project = currentProject();
+  if (!project) return;
+
+  const title = el("input", { className: "field", placeholder: "New pad title, then Enter" });
+  title.onkeydown = async (e) => {
+    if (e.key !== "Enter" || !title.value.trim()) return;
+    const pad = await window.delphi.pads.create({ projectId: state.projectId, title: title.value.trim(), author: "you" });
+    state.padId = pad.id;
+    state.padDraft = null;
+    title.value = "";
+    refresh();
+  };
+  root.append(el("div", { className: "add-row" }, title));
+
+  if (!state.pads.length) {
+    root.append(emptyState(
+      "No pads yet",
+      "A pad is the working document for a piece of work: the plan, what you tried, what it did. " +
+      "Agents write here through write_scratchpad, and every checkbox line becomes a task on the board."));
+    return;
+  }
+
+  const wrap = el("div", { className: "pad-wrap" });
+  wrap.append(padList(), padPane());
+  root.append(wrap);
+}
+
+function padList() {
+  const list = el("div", { className: "pad-list" });
+  for (const pad of state.pads) {
+    const row = el("div", {
+      className: "pad-row" + (pad.id === state.padId ? " on" : ""),
+      tabIndex: 0, role: "button",
+    });
+    row.append(el("div", { className: "pad-row-t", textContent: pad.title }));
+    const meta = [pad.author || "you"];
+    if (!pad.derives_tasks) meta.push("no tasks");
+    row.append(el("div", { className: "pad-row-m", textContent: meta.join(" · ") }));
+    const go = () => {
+      if (pad.id === state.padId) return;
+      state.padId = pad.id;
+      state.padDraft = null;
+      refresh();
+    };
+    row.onclick = go;
+    row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    list.append(row);
+  }
+  return list;
+}
+
+function padPane() {
+  const pad = state.pads.find((p) => p.id === state.padId);
+  const pane = el("div", { className: "pad-pane" });
+  if (!pad) return pane;
+
+  // --- head ----------------------------------------------------------------
+  const head = el("div", { className: "pad-head" });
+  const name = el("input", { className: "pad-title", value: pad.title });
+  name.onblur = async () => {
+    if (name.value.trim() && name.value !== pad.title) {
+      await window.delphi.pads.write(pad.id, { title: name.value.trim() });
+      refresh();
+    }
+  };
+  head.append(name);
+
+  const seg = el("div", { className: "seg", role: "group" });
+  seg.setAttribute("aria-label", "Pad display");
+  for (const [raw, label] of [[false, "Board"], [true, "Markdown"]]) {
+    const button = el("button", { type: "button", textContent: label });
+    button.setAttribute("aria-pressed", String(state.padRaw === raw));
+    button.onclick = () => { if (state.padRaw !== raw) { state.padRaw = raw; state.padDraft = null; render(); } };
+    seg.append(button);
+  }
+  head.append(seg);
+
+  // Off means the pad is a sketch: options nobody has agreed to should not fill
+  // the board with work.
+  const derive = el("button", {
+    className: "btn sm" + (pad.derives_tasks ? " on" : ""),
+    textContent: pad.derives_tasks ? "Files tasks" : "Notes only",
+    title: "Whether checkbox lines in this pad become tasks",
+  });
+  derive.onclick = async () => {
+    await window.delphi.pads.write(pad.id, { derives_tasks: pad.derives_tasks ? 0 : 1 });
+    refresh();
+  };
+  head.append(derive);
+
+  const del = el("button", { className: "btn sm", textContent: "×", title: "Delete this pad. Its tasks stay." });
+  del.onclick = async () => {
+    if (!confirm(`Delete "${pad.title}"? The tasks it filed stay on the board.`)) return;
+    await window.delphi.pads.remove(pad.id);
+    state.padId = null;
+    state.padDraft = null;
+    refresh();
+  };
+  head.append(del);
+  pane.append(head);
+
+  // --- body ----------------------------------------------------------------
+  if (state.padRaw) {
+    const box = el("textarea", {
+      className: "pad-source",
+      value: state.padDraft != null ? state.padDraft : pad.body,
+      spellcheck: false,
+    });
+    box.oninput = () => { state.padDraft = box.value; };
+    // On blur rather than per keystroke. Every write re-reads the board from the
+    // pad, and doing that on each character would file a task for every prefix
+    // of a line somebody was still typing.
+    box.onblur = async () => {
+      if (state.padDraft == null || state.padDraft === pad.body) return;
+      const body = state.padDraft;
+      state.padDraft = null;
+      await window.delphi.pads.write(pad.id, { body, author: "you" });
+      refresh();
+    };
+    pane.append(box);
+    pane.append(el("div", { className: "hint", textContent:
+      "The <!--d:123--> markers are how a line and its task stay the same thing. Edit around them." }));
+    return pane;
+  }
+
+  pane.append(padBoard(pad));
+  return pane;
+}
+
+/**
+ * The pad as it reads, with its checkbox lines live.
+ *
+ * Prose is passed through the markdown renderer in runs, so a heading is still a
+ * heading. A checkbox line is not: it is rendered as its task, because that is
+ * what it is, and ticking it here goes through the same update the board uses.
+ */
+function padBoard(pad) {
+  const box = el("div", { className: "pad-board" });
+  const detail = state.padDetail && state.padDetail.padId !== undefined
+    ? state.padDetail
+    : state.padDetail || { lines: [], dropped: [] };
+
+  const byLine = new Map((detail.lines || []).map((l) => [l.index, l]));
+  const source = (pad.body || "").split("\n");
+  let prose = [];
+
+  const flush = () => {
+    const text = prose.join("\n").trim();
+    prose = [];
+    if (text) box.append(el("div", { className: "pad-prose" }, renderMarkdown(text)));
+  };
+
+  source.forEach((line, index) => {
+    const entry = byLine.get(index);
+    if (!entry) { prose.push(line); return; }
+    flush();
+    box.append(padLine(entry));
+  });
+  flush();
+
+  if (!source.join("").trim()) {
+    box.append(el("div", { className: "hint", textContent:
+      "Empty. Switch to Markdown and write the plan as checkbox lines." }));
+  }
+
+  if (detail.dropped && detail.dropped.length) {
+    // Named rather than hidden. A rewrite that dropped six lines is the moment
+    // somebody goes looking for where their tasks went, and this is the answer.
+    box.append(el("div", { className: "pad-dropped" },
+      el("div", { className: "pad-dropped-h", textContent:
+        `${plural(detail.dropped.length, "task", "tasks")} no longer in this pad` }),
+      el("div", { className: "hint", textContent:
+        "Still on the board. A pad that stops mentioning a task does not close it." }),
+      ...detail.dropped.map((t) => {
+        const row = el("div", { className: "pad-drop", tabIndex: 0, role: "button" },
+          el("span", { className: "pad-drop-s", textContent: t.status }),
+          el("span", { textContent: t.title }));
+        const go = () => goTo({ projectId: state.projectId, view: "tasks" });
+        row.onclick = go;
+        row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+        return row;
+      })));
+  }
+
+  return box;
+}
+
+function padLine(entry) {
+  const task = entry.task;
+  const row = el("div", {
+    className: "pad-line d" + Math.min(entry.depth, 4) + (entry.done ? " done" : ""),
+  });
+
+  const tick = el("input", { type: "checkbox", checked: entry.done });
+  tick.disabled = !task;
+  tick.onchange = async () => {
+    if (!task) return;
+    // Through the task, not through the pad. updateTask writes the line back, so
+    // there is one path that changes a status and one place that decides what a
+    // status change means.
+    await window.delphi.tasks.update(task.id, { status: tick.checked ? "done" : "todo" });
+    refresh();
+  };
+  row.append(tick);
+
+  row.append(el("span", { className: "pad-line-t", textContent: entry.title }));
+
+  if (entry.assignee) row.append(el("span", { className: "chip", textContent: `@${entry.assignee}` }));
+  if (entry.priority === "high") row.append(el("span", { className: "chip hi", textContent: "high" }));
+  // The board's word for it, when the board and the checkbox disagree. A task
+  // somebody moved to doing reads as doing here rather than as simply unticked.
+  if (task && task.status !== "todo" && task.status !== "done") {
+    row.append(el("span", { className: "chip st", textContent: task.status }));
+  }
+  if (task) {
+    const id = el("span", { className: "pad-line-id", textContent: `#${task.id}`, tabIndex: 0, role: "button" });
+    id.title = "Open on the board";
+    const go = () => goTo({ projectId: state.projectId, view: "tasks" });
+    id.onclick = go;
+    id.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    row.append(id);
+  } else {
+    row.append(el("span", { className: "pad-line-id", textContent: "not filed", title:
+      "This pad does not file tasks. Turn it on in the header." }));
+  }
+
+  return row;
+}
 
 function renderNotes(root) {
   const title = el("input", { className: "field", placeholder: "New memory note title, then Enter" });
@@ -4224,6 +5192,168 @@ let openSheet = null;
  * length, and a write per character would fight the vault rebuild that follows
  * each change.
  */
+/**
+ * The editor for one harness definition.
+ *
+ * This is the escape hatch that makes the registry worth having. When Codex
+ * renames a flag between releases, or somebody wants Delphi to drive Aider or
+ * Goose or something written this afternoon, the answer is a row here rather
+ * than a version of Delphi.
+ *
+ * Deliberately plain. The argv is a JSON list and it is shown as one, because
+ * anything that hid it behind checkboxes could only express the flags somebody
+ * thought of in advance, which is the problem this is solving.
+ */
+/**
+ * An argv template, laid out to be read.
+ *
+ * One line per argument, with a group kept on its own line rather than exploded.
+ * JSON.stringify with an indent puts every element of every nested list on a
+ * line of its own, which turns a nine argument template into forty lines and
+ * hides the shape it has.
+ */
+function formatArgv(list) {
+  const lines = list.map((item) =>
+    `  ${Array.isArray(item) ? `[${item.map((t) => JSON.stringify(t)).join(", ")}]` : JSON.stringify(item)}`);
+  return `[\n${lines.join(",\n")}\n]`;
+}
+
+function openHarnessSheet(harness, done) {
+  if (openSheet) closeNoteSheet();
+
+  const overlay = el("div", { className: "overlay" });
+  const sheet = el("div", { className: "sheet", role: "dialog" });
+  sheet.setAttribute("aria-modal", "true");
+
+  const head = el("div", { className: "sheet-head" });
+  const label = el("input", { value: harness ? harness.label : "", placeholder: "Name, e.g. Aider" });
+  head.append(el("span", { className: "kind reference", textContent: harness ? harness.kind : "custom" }), label);
+  const status = el("span", { className: "hint" });
+  const close = el("button", { className: "icon-btn", title: "Close (Escape)" });
+  close.setAttribute("aria-label", "Close");
+  close.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" ' +
+    'stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+  head.append(status, close);
+  sheet.append(head);
+
+  const body = el("div", { className: "sheet-body hsheet" });
+
+  const field = (title, blurb, node) => {
+    body.append(el("label", { className: "hfield" },
+      el("b", { textContent: title }),
+      el("span", { className: "hint", textContent: blurb }),
+      node));
+    return node;
+  };
+
+  const command = field("Command",
+    "A bare name is looked up through a login shell, which is how a version manager's copy is found. An absolute path is used as given.",
+    el("input", { className: "field", value: harness ? (harness.command || "") : "", placeholder: "codex", spellcheck: false }));
+
+  const args = field("Arguments",
+    "A JSON list. A nested list is a group that drops out when a placeholder in it has no value, so an optional flag and its value stay together. " +
+    "{prompt} {model} {system} {resume} {cwd} are substituted, {mcpFlags} becomes however many arguments this agent needs to be told about Delphi's MCP server, " +
+    "and {if:autoAllow} or {ifnot:autoAllow} gate a group.",
+    el("textarea", {
+      className: "hargs", spellcheck: false,
+      value: harness ? formatArgv(JSON.parse(harness.args_json)) : '[\n  "-p", "{prompt}"\n]',
+    }));
+
+  const parser = field("Output",
+    "How its output is read. Anything that just prints an answer is text.",
+    el("select", { className: "btn sm" }));
+  for (const [value, text] of [
+    ["text", "Plain text"],
+    ["claude-stream-json", "Claude Code stream-json"],
+    ["codex-json", "Codex JSONL"],
+    ["copilot-json", "Copilot JSONL"],
+  ]) parser.append(el("option", { value, textContent: text, selected: harness && harness.parser === value }));
+
+  const mcp = field("Delphi's MCP server",
+    "How this agent is told about the tracker. Without it the tab still works, and the agent cannot see the pads, the board or anything else.",
+    el("select", { className: "btn sm" }));
+  for (const [value, text] of [
+    ["none", "Not connected"],
+    ["flag:--mcp-config", "A config file, via --mcp-config"],
+    ["flag:--additional-mcp-config|@", "A config file, via --additional-mcp-config @path"],
+    ["codex-config", "Codex style, via -c mcp_servers"],
+  ]) mcp.append(el("option", { value, textContent: text, selected: harness && harness.mcp_style === value }));
+
+  sheet.append(body);
+
+  const foot = el("div", { className: "sheet-foot" });
+  const save = el("button", { className: "btn primary", textContent: "Save" });
+  save.onclick = async () => {
+    try {
+      // Parsed here as well as in db.js, so the error lands next to the box it
+      // came from rather than as an exception from an IPC call.
+      JSON.parse(args.value);
+    } catch (error) {
+      status.textContent = `The arguments are not valid JSON: ${error.message}`;
+      return;
+    }
+    try {
+      if (harness) {
+        await window.delphi.harnesses.update(harness.id, {
+          label: label.value.trim() || harness.label,
+          command: command.value.trim(),
+          args_json: args.value,
+          parser: parser.value,
+          mcp_style: mcp.value,
+        });
+      } else {
+        await window.delphi.harnesses.create({
+          key: label.value.trim(),
+          label: label.value.trim(),
+          command: command.value.trim(),
+          args: JSON.parse(args.value),
+          parser: parser.value,
+          mcpStyle: mcp.value,
+        });
+      }
+    } catch (error) {
+      status.textContent = String(error.message || error);
+      return;
+    }
+    shut();
+    if (done) done();
+  };
+  foot.append(save);
+
+  if (harness && harness.kind === "custom") {
+    const remove = el("button", { className: "btn sm", textContent: "Delete" });
+    remove.onclick = async () => {
+      await window.delphi.harnesses.remove(harness.id);
+      shut();
+      if (done) done();
+    };
+    foot.append(remove);
+  }
+  // A built-in is never deleted, only turned off, so its definition can come
+  // back. Said here rather than left as a missing button.
+  if (harness && harness.kind === "builtin") {
+    foot.append(el("span", { className: "hint", textContent:
+      "A built-in agent is turned off rather than deleted. Leave it unedited and Delphi keeps its definition current." }));
+  }
+  sheet.append(foot);
+
+  const shut = () => {
+    overlay.remove();
+    openSheet = null;
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); shut(); } };
+  document.addEventListener("keydown", onKey);
+  close.onclick = shut;
+  overlay.onclick = (e) => { if (e.target === overlay) shut(); };
+
+  overlay.append(sheet);
+  document.body.append(overlay);
+  openSheet = { close: shut };
+  label.focus();
+}
+
 function openNoteSheet(note) {
   if (openSheet) closeNoteSheet();
 
@@ -5118,6 +6248,184 @@ const partLabel = (p) =>
 async function renderSettings(root) {
   const settings = await window.delphi.settings.get();
 
+  // --- AI ------------------------------------------------------------------
+  // Three ways in, and they are not equivalent. A CLI login spends a
+  // subscription the person already pays for and this app never holds the
+  // credential. An API key bills separately and has to be stored. Both are
+  // offered rather than one being hidden, because which is right depends on what
+  // they already have.
+  const aiBox = el("div", { className: "setting" });
+  aiBox.append(el("h3", { textContent: "AI" }));
+  aiBox.append(el("p", {
+    textContent: "Which agent the chat talks to. Signing in through a command line tool uses the subscription you already pay for, and no credential is stored here. An API key is billed separately and is kept encrypted by the operating system.",
+  }));
+
+  const providerList = el("div", { className: "provider-list" });
+  aiBox.append(providerList);
+
+  const paintProviders = async (force = false) => {
+    providerList.textContent = "";
+    // This is the slow one: it starts a login shell per tool to ask whether each
+    // is signed in. Saying so beats an empty box that looks like the answer.
+    providerList.append(el("div", { className: "provider-probing" },
+      el("span", { className: "spinner" }),
+      el("span", { textContent: "Checking what this machine can reach" })));
+    let providers = [];
+    try {
+      providers = await window.delphi.ai.providers(force);
+      state.providers = providers;
+    } catch (error) {
+      providerList.append(el("div", { className: "err-msg", textContent: String(error.message || error) }));
+      return;
+    }
+
+    for (const p of providers) {
+      const row = el("div", { className: "provider" });
+      row.append(el("span", { className: "pdot" + (p.ready ? " on" : "") }));
+      const text = el("div", { className: "grow" });
+      text.append(el("div", { className: "pname", textContent: p.label }));
+      text.append(el("div", { className: "hint", textContent: p.detail }));
+      row.append(text);
+
+      // Each unready provider says what would fix it, and gives the command
+      // rather than describing it. Signing in needs a terminal in every case, so
+      // the button copies the line instead of pretending it can do it here.
+      if (!p.ready) {
+        let fix = null;
+        if (p.id === "claude-cli") fix = "claude";
+        else if (p.id === "copilot" && p.host) fix = `gh auth login --hostname ${p.host} --web`;
+
+        if (fix) {
+          const copy = el("button", { className: "btn sm", textContent: "Copy command" });
+          copy.onclick = async () => {
+            await navigator.clipboard.writeText(fix);
+            copy.textContent = "Copied";
+            setTimeout(() => { copy.textContent = "Copy command"; }, 1400);
+          };
+          row.append(el("code", { className: "mono pfix", textContent: fix }), copy);
+        }
+      }
+      providerList.append(row);
+    }
+
+    const recheck = el("button", { className: "btn sm", textContent: "Check again" });
+    recheck.onclick = async () => { await paintProviders(true); };
+    providerList.append(el("div", { className: "provider-foot" }, recheck));
+  };
+  await paintProviders();
+
+  // --- the key -------------------------------------------------------------
+  const keyMsg = el("span", { className: "hint" });
+  const keyRow = el("div", { className: "row" });
+  const keyField = el("input", {
+    className: "field grow",
+    type: "password",
+    placeholder: "sk-ant-...",
+    autocomplete: "off",
+    spellcheck: false,
+  });
+
+  const paintKey = async () => {
+    const has = await window.delphi.ai.hasKey();
+    keyField.placeholder = has ? "A key is saved" : "sk-ant-...";
+    keyField.value = "";
+    clearBtn.style.display = has ? "" : "none";
+  };
+
+  const saveBtn = el("button", { className: "btn primary", textContent: "Save key" });
+  saveBtn.onclick = async () => {
+    const value = keyField.value.trim();
+    if (!value) { keyMsg.className = "err-msg"; keyMsg.textContent = "Paste a key first."; return; }
+    try {
+      await window.delphi.ai.setKey(value);
+      keyMsg.className = "ok-msg";
+      keyMsg.textContent = "Saved, encrypted by the operating system.";
+      await paintKey();
+      await paintProviders();
+    } catch (error) {
+      keyMsg.className = "err-msg";
+      keyMsg.textContent = String(error.message || error);
+    }
+  };
+
+  const clearBtn = el("button", { className: "btn sm danger", textContent: "Remove" });
+  clearBtn.onclick = async () => {
+    await window.delphi.ai.setKey(null);
+    keyMsg.className = "hint";
+    keyMsg.textContent = "Key removed.";
+    await paintKey();
+    await paintProviders();
+  };
+
+  keyRow.append(keyField, saveBtn, clearBtn);
+  await paintKey();
+
+  aiBox.append(el("div", { className: "setting-sub" },
+    el("h4", { textContent: "Anthropic API key" }),
+    el("p", { className: "hint",
+      textContent: "Only needed if you would rather not use a command line login. It never leaves this machine and is written to the keychain, not to settings.json." }),
+    keyRow, keyMsg));
+
+  root.append(aiBox);
+
+  // --- harnesses -----------------------------------------------------------
+  // The other agents, as rows you can edit. This is the difference between an
+  // app that integrates with three tools and one that is a layer above any of
+  // them: when a CLI renames a flag, the fix is here rather than in a release.
+  const harnessBox = el("div", { className: "setting" });
+  harnessBox.append(el("h3", { textContent: "Agents" }));
+  harnessBox.append(el("p", {
+    textContent: "The coding agents that can run as a tab inside a project. Each one runs in the project's folder with Delphi's own MCP server attached, so it can read the pads, file tasks, and be seen doing it in History. Delphi never holds their credentials: each signs in its own way and Delphi only runs the binary.",
+  }));
+
+  const harnessList = el("div", { className: "provider-list" });
+  harnessBox.append(harnessList);
+
+  const paintHarnesses = async (force = false) => {
+    harnessList.textContent = "";
+    harnessList.append(el("div", { className: "provider-probing" },
+      el("span", { className: "spinner" }),
+      el("span", { textContent: "Looking for the agents on this machine" })));
+    let rows = [];
+    try {
+      rows = await window.delphi.harnesses.list(force);
+      state.harnesses = rows;
+    } catch (error) {
+      harnessList.append(el("div", { className: "err-msg", textContent: String(error.message || error) }));
+      return;
+    }
+    harnessList.textContent = "";
+
+    for (const h of rows) {
+      const row = el("div", { className: "provider" });
+      row.append(el("span", { className: "pdot" + (h.ready && h.enabled ? " on" : "") }));
+      const text = el("div", { className: "grow" });
+      text.append(el("div", { className: "pname", textContent: h.label }));
+      text.append(el("div", { className: "hint", textContent: h.enabled ? (h.path || h.detail) : "turned off" }));
+      row.append(text);
+
+      const edit = el("button", { className: "btn sm", textContent: "Edit" });
+      edit.onclick = () => openHarnessSheet(h, () => paintHarnesses(true));
+      row.append(edit);
+
+      const toggle = el("button", { className: "btn sm", textContent: h.enabled ? "Turn off" : "Turn on" });
+      toggle.onclick = async () => {
+        await window.delphi.harnesses.update(h.id, { enabled: h.enabled ? 0 : 1 });
+        await paintHarnesses();
+      };
+      row.append(toggle);
+      harnessList.append(row);
+    }
+
+    const add = el("button", { className: "btn sm", textContent: "Add an agent" });
+    add.onclick = () => openHarnessSheet(null, () => paintHarnesses(true));
+    const recheck = el("button", { className: "btn sm", textContent: "Check again" });
+    recheck.onclick = async () => { await paintHarnesses(true); };
+    harnessList.append(el("div", { className: "provider-foot" }, add, recheck));
+  };
+  await paintHarnesses();
+  root.append(harnessBox);
+
   // --- appearance ----------------------------------------------------------
   const appearance = el("div", { className: "setting" });
   appearance.append(el("h3", { textContent: "Appearance" }));
@@ -5274,6 +6582,68 @@ async function renderSettings(root) {
 
   // --- reminders -----------------------------------------------------------
   root.append(remindersSettings(settings));
+
+  // --- workbenches ---------------------------------------------------------
+  // The two settings every Workbench reads. Saved on change, like the rest of
+  // this page, and checked by the main process, whose refusal is shown as is.
+  const benchBox = el("div", { className: "setting" });
+  benchBox.append(el("h3", { textContent: "Workbenches" }));
+  benchBox.append(el("p", {
+    textContent: "A Workbench is a task's own folder and branch, so two pieces of work never share a checkout. These apply to every project; each repository's base branch, setup command and copied files are under Workbench settings on the project's Overview.",
+  }));
+
+  const benchField = ({ id, label, hint, value, placeholder, key }) => {
+    const input = el("input", { className: "field mono-in", id, value: value || "", placeholder, spellcheck: false, autocomplete: "off" });
+    const msg = el("span", { className: "hint" });
+    let saved = value || "";
+    input.onchange = async () => {
+      try {
+        const updated = await window.delphi.settings.set({ [key]: input.value.trim() || null });
+        Object.assign(settings, updated);
+        saved = input.value.trim();
+        msg.className = "ok-msg";
+        msg.textContent = "Saved";
+      } catch (e) {
+        msg.className = "err-msg";
+        msg.textContent = e.message;
+        input.value = saved;
+      }
+    };
+    const sub = el("div", { className: "setting-sub" },
+      el("h4", {}, el("label", { htmlFor: id, textContent: label })),
+      el("p", { className: "hint", textContent: hint }),
+      el("div", { className: "row" }, input, msg));
+    return { sub, input };
+  };
+
+  const editor = benchField({
+    id: "wb-editor", key: "workbenchEditor", value: settings.workbenchEditor, placeholder: "code",
+    label: "Editor command",
+    hint: "What Open and Open > Editor run, with the Workbench folder added on the end. Leave it empty for VS Code's code when it is installed, or else whatever the system opens a folder with. The terminal Sheet's W uses $VISUAL or $EDITOR instead.",
+  });
+  benchBox.append(editor.sub);
+
+  const prefix = benchField({
+    id: "wb-prefix", key: "workbenchBranchPrefix", value: settings.workbenchBranchPrefix, placeholder: settings.workbenchBranchPrefixDefault || "your username",
+    label: "Branch prefix",
+    hint: `What every Workbench branch starts with, so a shared remote shows whose branch is whose. Leave it empty for your username on this computer${settings.workbenchBranchPrefixDefault ? ` (${settings.workbenchBranchPrefixDefault})` : ""}.`,
+  });
+  // The same cleaning workbench/naming.js gives a prefix, so the example is
+  // the name git will really be given.
+  const cleanPrefix = (text) => String(text || "").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/\.{2,}/g, ".")
+    .replace(/^[.-]+|[.-]+$/g, "").replace(/\.lock$/i, "").slice(0, 40);
+  const example = el("p", { className: "hint wb-example" });
+  const paintExample = () => {
+    example.textContent = "";
+    example.append("A task 42 called \"Fix the zip DLQ backlog\" gets ",
+      el("span", { className: "mono", textContent: `${cleanPrefix(prefix.input.value) || settings.workbenchBranchPrefixDefault || "<your username>"}/42-fix-the-zip-dlq-backlog` }),
+      ", or leads with its ticket, such as EF-1288, when it has one.");
+  };
+  prefix.input.addEventListener("input", paintExample);
+  paintExample();
+  prefix.sub.append(example);
+  benchBox.append(prefix.sub);
+  root.append(benchBox);
 
   // --- vault ---------------------------------------------------------------
   const v = el("div", { className: "setting" });
@@ -5459,8 +6829,93 @@ const STATUSES = [
   ["done", "Done"],
 ];
 
-/** Names that belong to software rather than to a person. */
-const isAgent = (name) => /claude|copilot|codex|cursor|agent|gpt|bot/i.test(String(name || ""));
+/**
+ * Names that belong to software rather than to a person.
+ *
+ * The same test as inferAuthorType in sheet/format.js. Keep the two identical,
+ * or the rail and the text format will disagree about who said something. The
+ * colon is what an actor launched by Delphi carries (claude-code:12).
+ */
+const isAgent = (name) => /claude|copilot|codex|cursor|agent|gpt|bot|runner|:/i.test(String(name || ""));
+
+/** An entry's author is software. What the writer recorded wins over the name. */
+const entryIsAgent = (entry) => entry.author_type ? entry.author_type !== "human" : isAgent(entry.author);
+
+// The text format's sigils, so the rail reads the way `delphi cat` prints.
+const SIGILS = { say: ">", agent: "@", run: "$", ask: "?", decide: "=", note: "!" };
+const KIND_WORD = { say: "said", agent: "agent said", run: "ran", ask: "asked", decide: "decided", note: "note" };
+const NOTE_KINDS = ["decision", "gotcha", "reference", "note"];
+
+// Whether the rail shows the ledger or everything. Per window rather than per
+// task: someone reviewing ledgers wants the next task opened the same way.
+let railLedger = false;
+
+/**
+ * Terminal colour and cursor codes out of text that is about to be shown. The
+ * main process strips logs already; this is for meta written by an agent,
+ * which nothing upstream has to have cleaned.
+ */
+const stripAnsi = (text) => String(text == null ? "" : text)
+  .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+  .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
+  .replace(/\x1b[@-Z\\-_]/g, "")
+  .replace(/\x1b/g, "");
+
+/** How long a run has been going, to the second, for the clock on a running entry. */
+function elapsed(fromIso) {
+  const s = Math.max(0, Math.round((Date.now() - new Date(String(fromIso).replace(" ", "T") + "Z").getTime()) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+const isRunning = (entry) => entry.kind === "run" && !!entry.meta && entry.meta.state === "running";
+
+/** A run's duration as a person would say it: 340ms, 1.2s, 3m 4s. */
+function duration(ms) {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+// Fixed markup, never anything from the database, which is why innerHTML is
+// acceptable for these and nowhere near an entry's text.
+const TS_ICONS = {
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  minus: '<path d="M5 12h14"/>',
+  file: '<path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/>',
+  x: '<path d="M18 6L6 18M6 6l12 12"/>',
+  caret: '<path d="M6 9l6 6 6-6"/>',
+  dots: '<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>',
+};
+function tsIcon(name, width = 2) {
+  const holder = document.createElement("span");
+  holder.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${TS_ICONS[name]}</svg>`;
+  return holder.firstChild;
+}
+
+/** One Sheet entry as a line of a brief, by kind, so a run or an ask still reads. */
+function entryBriefLine(entry, all) {
+  const flat = (text) => String(text || "").replace(/\s+/g, " ").trim();
+  if (entry.kind === "run") {
+    const m = entry.meta || {};
+    const result = m.state ? ` (${m.state}${m.state === "fail" && m.code != null ? `:${m.code}` : ""})` : "";
+    return `${entry.author} ran: ${flat(entry.body)}${result}`;
+  }
+  if (entry.kind === "ask") {
+    const options = (entry.meta && Array.isArray(entry.meta.options)) ? entry.meta.options : [];
+    return `${entry.author} asked: ${flat(entry.body)} ${options.map((o) => `[${o.key}] ${o.label}`).join(" ")}`.trim();
+  }
+  if (entry.kind === "decide") {
+    const lines = String(entry.body || "").split("\n");
+    const ask = all.find((e) => e.id === entry.ref_id);
+    const label = (entry.meta && entry.meta.label) || "";
+    const why = flat(lines.slice(1).join(" "));
+    return `${entry.author} decided [${(entry.meta && entry.meta.choice) || lines[0]}] ${label}` +
+      `${ask ? ` on "${flat(ask.body)}"` : ""}${why ? `: ${why}` : ""}`;
+  }
+  return `${entry.author}${entry.kind === "note" ? " (note)" : ""}: ${flat(entry.body)}`;
+}
 
 /**
  * A gap in words.
@@ -5507,7 +6962,7 @@ function handoffText(detail) {
 
   if (detail.comments.length) {
     lines.push("", "Discussion so far:");
-    for (const c of detail.comments) lines.push(`  ${c.author}: ${c.body.replace(/\s+/g, " ").trim()}`);
+    for (const c of detail.comments) lines.push(`  ${entryBriefLine(c, detail.comments)}`);
   }
 
   if (detail.events.length > 1) {
@@ -5529,6 +6984,894 @@ function handoffText(detail) {
 
   return lines.join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Workbenches
+//
+// A task's own folder and branch. The verbs live in workbench/workbench.js and
+// arrive here as plain-English results or plain-English errors; the window's
+// job is to ask before anything that could lose work and to show those words
+// as they were written, never to translate them back into git.
+// ---------------------------------------------------------------------------
+
+// Kept at module scope rather than in the task panel, because a Start's setup
+// can outlive the panel it was started from and should still read as Starting
+// when the task is opened again. taskId -> { phase, text }.
+const wbStarting = new Map();
+
+/**
+ * A message that has to be read, not glanced at: an error from git, a warning
+ * from Start, the outcome of Finish. The header flash is gone in a second and a
+ * half, which suits "saved" and not "the push was refused because...". Shown
+ * over everything, including a dialog, and for longer the more there is to read.
+ */
+let toastTimer = null;
+function notify(text, { error = false } = {}) {
+  const words = String(text && text.message ? text.message : text || "").trim();
+  if (!words) return;
+  let toast = document.querySelector(".wb-toast");
+  if (!toast) {
+    toast = el("div", { className: "wb-toast" });
+    toast.onclick = () => toast.remove();
+    document.body.append(toast);
+  }
+  toast.className = "wb-toast" + (error ? " err" : "");
+  toast.setAttribute("role", error ? "alert" : "status");
+  toast.textContent = words;
+  clearTimeout(toastTimer);
+  const ms = Math.min(14000, 3000 + words.length * 45);
+  toastTimer = setTimeout(() => toast.remove(), ms);
+}
+const notifyError = (error) => {
+  // A CLOSING refusal that has gone on for minutes is probably an interrupted
+  // Finish or Discard, and the Sheet's note says where the folder went.
+  const closing = error && error.code === "CLOSING" && error.details ? error.details.closing : null;
+  const hint = closing && closingLong(closing) ? " The Sheet says where the folder is." : "";
+  notify(`${error && error.message ? error.message : error}${hint}`, { error: true });
+};
+
+// Long enough that a Finish or Discard is not just slow but was interrupted.
+const CLOSING_LONG_MS = 3 * 60 * 1000;
+
+/** Whether a closing began more than a few minutes ago. at is SQLite's UTC "YYYY-MM-DD HH:MM:SS". */
+function closingLong(closing) {
+  if (!closing || !closing.at) return false;
+  const text = String(closing.at);
+  const at = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(text) ? text : text.replace(" ", "T") + "Z");
+  return Number.isFinite(at) && Date.now() - at > CLOSING_LONG_MS;
+}
+
+
+/**
+ * A question with buttons. Resolves to the chosen action's value, or to
+ * cancelValue on Escape or a click outside.
+ *
+ * Enter does what it does on the focused control: a focused button presses
+ * itself, so tabbing to Cancel and pressing Enter cancels. Only in a text
+ * field does Enter mean the primary action, and only when it is enabled,
+ * which is what keeps a typed-confirm Discard from going early. Focus stays
+ * inside while it is open and goes back where it was when it closes.
+ */
+function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, className = "" }) {
+  return new Promise((resolve) => {
+    const overlay = el("div", { className: "overlay" });
+    const box = el("div", { className: `ask wb-dialog ${className}`.trim(), role: "dialog" });
+    box.setAttribute("aria-modal", "true");
+    box.setAttribute("aria-label", title);
+    const returnTo = document.activeElement;
+    const me = { box };
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKey, true);
+      const at = dialogStack.indexOf(me);
+      if (at >= 0) dialogStack.splice(at, 1);
+      overlay.remove();
+      // The control that opened it may have been redrawn meanwhile (the
+      // Workbench header is, after most verbs); its data-act finds the new one.
+      let back = returnTo && returnTo.isConnected ? returnTo : null;
+      if (!back && returnTo && returnTo.dataset && returnTo.dataset.act) {
+        back = document.querySelector(`.wb [data-act="${CSS.escape(returnTo.dataset.act)}"]`);
+      }
+      if (back && typeof back.focus === "function") back.focus({ preventScroll: true });
+      resolve(value);
+    };
+    const buttons = actions.map((a) => {
+      const b = el("button", { className: `btn ${a.kind || ""}`.trim(), textContent: a.label, type: "button" });
+      b.onclick = () => { if (!b.disabled) finish(a.value); };
+      if (a.bind) a.bind(b);
+      return b;
+    });
+    const primary = buttons[actions.findIndex((a) => a.kind === "primary" || a.kind === "danger")] || null;
+    const focusables = () => [...box.querySelectorAll("button, input, select, textarea, [tabindex]")]
+      .filter((n) => !n.disabled && n.tabIndex >= 0 && n.offsetParent !== null);
+    const onKey = (event) => {
+      if (dialogStack[dialogStack.length - 1] !== me) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(cancelValue);
+      } else if (event.key === "Enter" && !event.isComposing) {
+        event.stopPropagation();
+        const t = event.target;
+        const typing = t && t.tagName === "INPUT" && !["checkbox", "radio", "button", "submit"].includes(t.type);
+        if (typing) {
+          event.preventDefault();
+          if (primary && !primary.disabled) primary.click();
+        }
+        // Anything else keeps its own Enter: a button presses itself.
+      } else if (event.key === "Tab") {
+        const list = focusables();
+        if (!list.length) { event.preventDefault(); return; }
+        const at = list.indexOf(document.activeElement);
+        if (event.shiftKey && (at <= 0)) { event.preventDefault(); list[list.length - 1].focus(); }
+        else if (!event.shiftKey && (at === -1 || at === list.length - 1)) { event.preventDefault(); list[0].focus(); }
+      }
+    };
+    dialogStack.push(me);
+    document.addEventListener("keydown", onKey, true);
+    box.append(el("h3", { textContent: title }));
+    if (lead) box.append(el("p", { className: "wb-lead", textContent: lead }));
+    for (const node of body) if (node) box.append(node);
+    box.append(el("div", { className: "ask-actions" }, buttons));
+    overlay.append(box);
+    overlay.onclick = (event) => { if (event.target === overlay) finish(cancelValue); };
+    document.body.append(overlay);
+    const focus = box.querySelector("input") || primary || buttons[buttons.length - 1];
+    if (focus) focus.focus();
+  });
+}
+
+/** A list of file names or commits, cut short with a count of the rest. */
+function wbList(items, render, cap = 8) {
+  const ul = el("ul");
+  for (const item of items.slice(0, cap)) ul.append(el("li", {}, render(item)));
+  if (items.length > cap) ul.append(el("li", { className: "hint", textContent: `and ${items.length - cap} more` }));
+  return ul;
+}
+
+/** How long ago an ISO time was, for the chip's "checked" line. */
+function agoWords(iso) {
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (!Number.isFinite(s)) return "";
+  if (s < 60) return `${s}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+
+/** Which of the chip's looks a Workbench gets: one per state, in words, never git's. */
+function wbLook(wb) {
+  const st = wb.status || {};
+  // A folder that is there but cannot be read: drawn like Missing, in the
+  // module's own words, because Finish and Discard both refuse it. Asked
+  // first, since the folder decides and not the row.
+  // Mid Finish or Discard, or interrupted in one: nothing may be done to it
+  // until that ends, so it is drawn plainly and offers nothing.
+  if (wb.state === "closing" || st.state === "closing") return { cls: "closing", words: "Being put away", closing: wb.closing || st.closing || null };
+  if (st.state === "unreadable") return { cls: "missing", words: st.words || "Unreadable", unreadable: true };
+  if (wb.state === "missing" || st.state === "missing") return { cls: "missing", words: "Missing" };
+  if (wb.state === "parked") return { cls: "parked", words: "Parked" };
+  return { cls: st.state || "ready", words: st.words || "Ready" };
+}
+
+/**
+ * The status chip. Update rides inside it when the branch is behind, because
+ * that is the moment it means something; under More it is always there.
+ */
+function wbChip(wb, onUpdate) {
+  const st = wb.status || {};
+  const { cls, words } = wbLook(wb);
+  const chip = el("span", { className: `wb-chip ${cls}` }, el("span", { className: "wb-words", textContent: words }));
+  // The words in full as well, since a narrow row cuts them short. Worked
+  // out again on hover and on each refresh, so "Checked 4s ago" stays true
+  // without the chip being rebuilt; wbTitle takes the newest status.
+  let latest = st;
+  const closing = wbLook(wb).closing;
+  chip.wbTitle = (next) => {
+    if (next) latest = next;
+    if (cls === "closing") {
+      chip.title = `A ${closing ? closing.mode : "Finish or Discard"} is in progress${closing && closing.actor ? `, begun by ${closing.actor}` : ""}.${closingLong(closing) ? " The Sheet says where the folder is." : ""}`;
+      return;
+    }
+    const checked = latest.checkedAt ? `Checked ${agoWords(latest.checkedAt)}` : "";
+    chip.title = (cls === "parked" || cls === "missing") && latest.words && latest.words !== words ? `${latest.words}. ${checked}`
+      : latest.message ? `${latest.message} ${checked}` : `${words}. ${checked}`;
+  };
+  chip.wbTitle();
+  chip.addEventListener("mouseenter", () => chip.wbTitle());
+  if (onUpdate && st.behind > 0 && cls !== "parked" && cls !== "missing" && cls !== "closing") {
+    const act = el("button", { className: "wb-act", textContent: "Update", type: "button" });
+    act.title = `Bring in the latest ${st.base || wb.base}`;
+    act.onclick = (e) => { e.stopPropagation(); onUpdate(act); };
+    chip.append(act);
+  }
+  return chip;
+}
+
+// Tasks whose Workbench has a verb running, from any surface: the task
+// panel, a done prompt, the Overview. One flag per task, so a double click,
+// or a Finish from a prompt while the panel has one going, starts nothing.
+const wbBusyTasks = new Set();
+
+/** Runs fn unless this task's Workbench is already busy; resolves to its result, or undefined when skipped. */
+async function wbGuard(taskId, fn) {
+  const key = Number(taskId);
+  if (wbBusyTasks.has(key)) return undefined;
+  wbBusyTasks.add(key);
+  const repaint = () => { if (openSheet && openSheet.taskId === key && openSheet.wbRepaint) openSheet.wbRepaint(); };
+  repaint();
+  try { return await fn(); } finally {
+    wbBusyTasks.delete(key);
+    repaint();
+  }
+}
+
+/** Update from base, said in the module's own words whichever way it went. */
+async function wbUpdate(wb) {
+  try {
+    const r = await window.delphi.workbench.update(wb.id);
+    if (r.ok) notify(`Updated from ${wb.base}. ${r.words}`);
+    else notifyError(r.conflict && r.conflict.files && r.conflict.files.length
+      ? `${r.words} Clashing: ${r.conflict.files.join(", ")}.` : r.words);
+  } catch (error) { notifyError(error); }
+}
+
+/**
+ * Finish, without ever losing work.
+ *
+ * The module refuses a Finish with unsaved changes or unshared commits, and it
+ * is right to. This walks the person through each refusal before it happens,
+ * asking at every step, so the folder is only removed once its work is safe on
+ * the remote. Every step can be cancelled and nothing is done behind a dialog.
+ */
+function finishWorkbench(wbId, taskId, opts = {}) {
+  return wbGuard(taskId, () => finishFlow(wbId, taskId, opts));
+}
+
+async function finishFlow(wbId, taskId, { title = "", after = null } = {}) {
+  const done = async () => { if (after) await after(); };
+  const wbApi = window.delphi.workbench;
+  try {
+    let st = await wbApi.status(wbId, { fresh: true });
+
+    // Mid-rebase, commits on no branch, a folder git cannot read: nothing a
+    // dialog here can fix. Finish refuses all three before it touches
+    // anything, so asking it is how its own sentence reaches the person.
+    if (st.state === "unreadable" || st.operation || st.lonely) {
+      await wbApi.finish(wbId);
+      return;
+    }
+
+    // A repository inside the folder, or a file Delphi cannot read, stops
+    // Finish outright, and asked first: a nested repository looks like an
+    // unsaved folder, and committing it would record a link to it and none
+    // of its files.
+    const first = await wbApi.finishPlan(wbId);
+    if (first.blocked) { await wbStop(first.blocked.code === "NESTED" ? "Other repositories are inside this folder" : "Finish cannot go ahead", first.blocked.message, first.nested && first.nested.length ? first.nested : first.unreadable); return; }
+
+    // Hidden changes (assume-unchanged, skip-worktree) are unsaved work that
+    // an ordinary commit leaves behind, so committing here would not clear
+    // them. Finish's own refusal explains them; it refuses before touching
+    // anything, so asking it is safe.
+    if (st.hidden && st.hidden.length) {
+      try { await wbApi.finish(wbId); } catch (error) {
+        if (error.code !== "UNSAVED") throw error;
+        const hidden = (error.details && error.details.hidden) || st.hidden;
+        await wbStop("Hidden changes in the folder", error.message, hidden);
+      }
+      return;
+    }
+    if (st.unsaved) {
+      const files = el("div", { className: "grp" },
+        el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(st.unsaved) }),
+          st.unsaved === 1 ? "unsaved change" : "unsaved changes"),
+        wbList(st.files || [], (f) => el("span", { className: "mono", textContent: f })));
+      const go = await wbDialog({
+        title: "Save the changes first?",
+        lead: "Finish only removes a folder when everything in it is saved. Commit them to the branch, or cancel and keep working.",
+        body: [files],
+        actions: [{ label: "Cancel", value: null }, { label: "Commit them", value: "commit", kind: "primary" }],
+      });
+      if (go !== "commit") return;
+      const message = await askText({
+        title: "Commit message",
+        label: "Every changed file goes into one commit on the Workbench's branch.",
+        value: title, confirmLabel: "Commit",
+      });
+      if (!message) return;
+      st = await wbApi.commit(wbId, message);
+      await done();
+    }
+
+    if (st.ahead) {
+      const go = await wbDialog({
+        title: `${plural(st.ahead, "commit", "commits")} not shared yet`,
+        lead: `Finish only removes a folder whose work is safe on the remote. Push the branch to share ${st.ahead === 1 ? "it" : "them"}.`,
+        actions: [{ label: "Cancel", value: null }, { label: "Push", value: "push", kind: "primary" }],
+      });
+      if (go !== "push") return;
+      const pushed = await wbApi.push(wbId);
+      await done();
+      if (!pushed.ok) { notifyError(pushed.reason); return; }
+    }
+
+    // Files git does not keep (a build, an .env that was edited) go with the
+    // folder. Read again after the commit and push, before the pull request
+    // is offered, so nobody opens one and then learns Finish cannot go ahead.
+    const plan = await wbApi.finishPlan(wbId);
+    if (plan.blocked) { await wbStop(plan.blocked.code === "NESTED" ? "Other repositories are inside this folder" : "Finish cannot go ahead", plan.blocked.message, plan.nested && plan.nested.length ? plan.nested : plan.unreadable); return; }
+
+    const pr = await wbApi.pr(wbId);
+    if (pr.via) {
+      const go = await wbDialog({
+        title: "Open a pull request?",
+        lead: pr.via === "gh"
+          ? "The branch is on the remote. GitHub's command line can open the pull request now, or find the one already open."
+          : "The branch is on the remote. This opens the host's page for starting a pull request.",
+        actions: [
+          { label: "Cancel", value: null },
+          { label: "Finish without one", value: "skip" },
+          { label: "Open pull request", value: "pr", kind: "primary" },
+        ],
+      });
+      if (!go) return;
+      if (go === "pr") {
+        const made = await wbApi.pr(wbId, { create: true });
+        // No pull request and no page to open one on: stop here, with the
+        // folder still in place, rather than finish as though it had worked.
+        if (!made.url) { notifyError(made.reason || "Could not open a pull request."); return; }
+        window.delphi.openExternal(made.url);
+        if (made.reason) notify(made.reason);
+      }
+    }
+
+    let confirm = null;
+    if (plan.needsConfirm) {
+      if (!(await confirmIgnored(plan))) return;
+      confirm = plan.confirm;
+    }
+    // The token agrees to exactly the files that were shown. When the folder
+    // changed since, Finish refuses with the new list and a new token, and the
+    // person is asked again about what is there now.
+    let r = null;
+    for (let tries = 0; !r; tries++) {
+      try {
+        r = await wbApi.finish(wbId, confirm ? { confirm } : {});
+      } catch (error) {
+        if (error.code !== "IGNORED" || !error.details || !error.details.confirm || tries >= 4) throw error;
+        if (!(await confirmIgnored(error.details, { changed: true }))) return;
+        confirm = error.details.confirm;
+      }
+    }
+    notify(`Finished. The folder is gone and the branch ${r.branch} is kept.${keptWords(r)}${cleanupWords(r)}`);
+    noticeKept(r);
+    await done();
+
+    if (r.taskStatus === "doing") {
+      const mark = await wbDialog({
+        title: `Mark task ${taskId} done?`,
+        lead: "The Workbench is finished and the task is still in progress.",
+        actions: [{ label: "Leave it", value: null }, { label: "Mark done", value: "done", kind: "primary" }],
+      });
+      if (mark === "done") {
+        await window.delphi.tasks.update(taskId, { status: "done" });
+        await done();
+      }
+    }
+  } catch (error) {
+    if (error.code === "BUSY") await showBusy(taskId, error);
+    else notifyError(error);
+    await done();
+  }
+}
+
+/**
+ * What was kept, in a line. The command to get it back is long, and the
+ * Sheet already carries it in the module's own note, so the toast points
+ * there rather than repeating a path nobody can read in a toast.
+ */
+function keptWords(r) {
+  if (!r || !r.recover) return "";
+  const until = r.until || (/until (\S+)/.exec(r.recover) || [])[1];
+  return ` A copy is kept${until ? ` until ${until}` : ""}; the Sheet says how to get it back.`;
+}
+
+/** The old folder is emptied in the background; said in passing, never waited on. */
+function cleanupWords(r) {
+  return r && r.cleanup && r.cleanup.pending ? " Removing the old folder in the background." : "";
+}
+
+/**
+ * Something changed in the old folder after the copy was made, so it was
+ * kept rather than deleted. Not an error, nothing was lost, but it is a
+ * folder the person now has to look through, so it gets its own dialog
+ * with where it is. The Sheet has the module's note too.
+ */
+function noticeKept(r) {
+  const c = r && r.cleanup;
+  if (!c || !c.kept) return;
+  const changed = Array.isArray(c.changed) ? c.changed : [];
+  wbDialog({
+    title: "The old folder was kept",
+    lead: `${changed.length ? `${changed.length === 1 ? "A file" : "Some files"} changed after the copy was made` : "Something changed after the copy was made"}, so the folder was not deleted. Look through it, then delete it yourself.`,
+    body: [
+      el("p", { className: "wb-lead" }, "It is at ", el("span", { className: "mono", textContent: String(c.kept) })),
+      changed.length ? el("div", { className: "grp" }, el("div", { className: "grp-h" }, "Changed after the copy"),
+        wbList(changed, (f) => el("span", { className: "mono", textContent: f }))) : null,
+    ],
+    actions: [{ label: "OK", value: null, kind: "primary" }],
+  });
+}
+
+/**
+ * BUSY because something is running in the folder: the module's sentence,
+ * and each thing it names. A `$` run on this task can be shown or stopped
+ * from here; anything else (an agent's claim, another task's run) is
+ * listed so the person knows what to wait for.
+ */
+async function showBusy(taskId, error) {
+  const running = (error.details && Array.isArray(error.details.running)) ? error.details.running : [];
+  if (!running.length) { notifyError(error); return; }
+  let mine = new Set();
+  try {
+    const d = await window.delphi.tasks.detail(taskId);
+    mine = new Set(((d && d.comments) || []).filter(isRunning).map((c) => c.id));
+  } catch {}
+  let jump = null;
+  const rows = running.map((text) => {
+    const m = /\(entry (\d+)\)\s*$/.exec(String(text));
+    const id = m ? Number(m[1]) : null;
+    const li = el("li", {}, el("span", { className: "mono", textContent: String(text) }));
+    if (id != null && mine.has(id)) {
+      const show = el("button", { className: "ts-linkbtn", type: "button", textContent: "Show" });
+      show.onclick = () => { jump = id; li.closest(".wb-dialog").querySelector(".ask-actions .btn").click(); };
+      const stop = el("button", { className: "ts-linkbtn ts-stop", type: "button", textContent: "Stop" });
+      stop.onclick = async () => {
+        try {
+          await window.delphi.sheets.interrupt(id);
+          stop.textContent = "Stopping";
+          stop.disabled = true;
+        } catch (e) { notifyError(e); }
+      };
+      li.append(el("span", { className: "wb-li-acts" }, show, stop));
+    }
+    return li;
+  });
+  await wbDialog({
+    title: "Something is still running in the folder",
+    lead: error.message,
+    body: [el("div", { className: "grp" }, el("ul", {}, rows))],
+    actions: [{ label: "OK", value: null, kind: "primary" }],
+  });
+  if (jump != null) {
+    if (!(openSheet && openSheet.taskId === Number(taskId))) await openTaskSheet(taskId);
+    if (openSheet && openSheet.showEntry) openSheet.showEntry(jump);
+  }
+}
+
+/** A byte count as a person reads it. */
+function sizeWords(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1024 / 1024).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+/** What a snapshot leaves out, said before anyone agrees to it. */
+function notKeptGroup(notKept) {
+  if (!notKept || !notKept.length) return null;
+  // The only things a Finish or Discard loses for good, so they lead in the
+  // danger colour and say so in as many words.
+  return el("div", { className: "grp lost" },
+    el("div", { className: "grp-h" }, "Not kept, gone for good"),
+    wbList(notKept, (f) => [el("span", { className: "mono", textContent: f.path || f }), f.why ? el("span", { className: "hint", textContent: f.why }) : null]));
+}
+
+/** A refusal that nothing in a dialog can fix: the module's words, and what they name. */
+function wbStop(title, message, items = []) {
+  return wbDialog({
+    title,
+    lead: message,
+    body: items && items.length ? [el("div", { className: "grp" }, wbList(items, (p) => el("span", { className: "mono", textContent: p })))] : [],
+    actions: [{ label: "OK", value: null, kind: "primary" }],
+  });
+}
+
+/**
+ * The "these can go" step of Finish: the ignored folders and the copied files
+ * that differ from the main checkout, named, with what is kept and for how long.
+ */
+function confirmIgnored(plan, { changed: again = false } = {}) {
+  const body = [];
+  if (again) body.push(el("p", { className: "wb-lead", textContent: "The folder changed since you were last asked. This is what is there now." }));
+  body.push(notKeptGroup(plan.notKept));
+  const ignored = plan.ignored || [];
+  if (ignored.length) {
+    body.push(el("div", { className: "grp" },
+      el("div", { className: "grp-h" }, "Files git does not keep"),
+      wbList(ignored, (g) => [el("span", { className: "mono", textContent: g.dir }),
+        el("span", { className: "hint", textContent: `${plural(g.count, "file", "files")}, ${sizeWords(g.bytes)}` })])));
+  }
+  const changed = plan.changedCopies || [];
+  if (changed.length) {
+    body.push(el("div", { className: "grp" },
+      el("div", { className: "grp-h" }, "Copied in at Start, and changed since"),
+      wbList(changed, (f) => [el("span", { className: "mono", textContent: f }),
+        el("span", { className: "hint", textContent: "differs from the main checkout" })])));
+  }
+  body.push(el("p", { className: "wb-lead", textContent: plan.notKept && plan.notKept.length
+    ? "A copy of the rest is kept for 30 days, and Finish says how to get it back."
+    : "A copy of them is kept for 30 days, and Finish says how to get it back." }));
+  return wbDialog({
+    title: "These go with the folder",
+    lead: "The branch keeps your commits, but not these. Finishing removes them.",
+    body,
+    actions: [{ label: "Cancel", value: false }, { label: "These can go", value: true, kind: "primary" }],
+    cancelValue: false,
+  });
+}
+
+/** A recover command as a block that can be copied, from the module's own sentence. */
+function recoverBlock(text) {
+  const words = String(text || "");
+  const at = words.indexOf("To get it back:");
+  const command = at >= 0 ? words.slice(at + "To get it back:".length).trim() : words;
+  const b = el("button", { className: "ts-act", type: "button", title: "Copy the command" });
+  b.setAttribute("aria-label", "Copy the command");
+  b.append(tsIcon("copy"));
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(command); b.classList.add("done"); setTimeout(() => b.classList.remove("done"), 1200); } catch (error) { notifyError(error); }
+  };
+  return el("div", { className: "wb-cmd" }, el("code", { textContent: command }), b);
+}
+
+/**
+ * Discard: the one verb that throws work away. It shows everything that would
+ * go, from the module's own plan, and stays disabled until the task's number
+ * is typed exactly.
+ */
+function discardWorkbench(wbId, taskId, opts = {}) {
+  return wbGuard(taskId, () => discardFlow(wbId, taskId, opts));
+}
+
+async function discardFlow(wbId, taskId, { after = null } = {}) {
+  let plan;
+  try { plan = await window.delphi.workbench.discardPlan(wbId); } catch (error) { notifyError(error); return; }
+  // A folder git cannot read is left alone by Discard, which is right: there
+  // is no way to keep a copy of what cannot be read. Said, with nothing to type.
+  const blocked = plan.blocked || (plan.unreadable ? { message: plan.unreadable } : null);
+  if (blocked) {
+    await wbStop(`Task ${taskId}'s Workbench cannot be discarded now`, blocked.message,
+      plan.nested && plan.nested.length ? plan.nested : []);
+    return;
+  }
+  const count = (n, one, many) => el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(n) }), n === 1 ? one : many);
+  const commitRow = (c) => [
+    el("span", { className: "mono", style: "color:var(--ink-faint)", textContent: String(c.sha).slice(0, 7) }),
+    el("span", { textContent: c.subject || "" }),
+  ];
+  const body = [];
+  if (plan.folderGone) body.push(el("p", { className: "wb-lead", textContent: `The folder is already gone (${plan.path}). Discard closes the Workbench and keeps the branch's commits.` }));
+  if (plan.operation) body.push(el("p", { className: "wb-lead", textContent: `The folder is in the middle of ${plan.operation}. Its state as it is now is what gets kept.` }));
+  // What the copy cannot hold goes first: the one part of a Discard that
+  // is not coming back.
+  body.push(notKeptGroup(plan.notKept));
+  const hidden = new Set(plan.hidden || []);
+  if (plan.unsaved.length) body.push(el("div", { className: "grp" }, count(plan.unsaved.length, "unsaved change", "unsaved changes"),
+    wbList(plan.unsaved, (f) => [el("span", { className: "mono", textContent: f }),
+      hidden.has(f) ? el("span", { className: "hint", textContent: "hidden from git status" }) : null])));
+  if (plan.commits.length) body.push(el("div", { className: "grp" }, count(plan.commits.length, "commit that exists only here", "commits that exist only here"),
+    wbList(plan.commits, commitRow)));
+  const detached = plan.detached || [];
+  if (detached.length) body.push(el("div", { className: "grp" }, count(detached.length, "commit on no branch", "commits on no branch"),
+    wbList(detached, commitRow)));
+  const ignored = plan.ignored || [];
+  if (ignored.length) body.push(el("div", { className: "grp" }, el("div", { className: "grp-h" }, "Files git does not keep"),
+    wbList(ignored, (g) => [el("span", { className: "mono", textContent: g.dir }),
+      el("span", { className: "hint", textContent: `${plural(g.count, "file", "files")}, ${sizeWords(g.bytes)}` })])));
+  if (!plan.unsaved.length && !plan.commits.length && !detached.length && !ignored.length && !plan.folderGone) {
+    body.push(el("p", { className: "wb-lead", textContent: "Nothing in it exists only here." }));
+  }
+  body.push(plan.branchPushed
+    ? el("p", { className: "wb-lead" }, "The branch ", el("span", { className: "mono", textContent: plan.branch }),
+        " is on the remote as ", el("span", { className: "mono", textContent: plan.remote }), ", so it is kept.")
+    : el("p", { className: "wb-lead" }, "The branch ", el("span", { className: "mono", textContent: plan.branch }),
+        " was never pushed, so it goes, with the rest kept in the copy."));
+  if (plan.recover) {
+    body.push(el("p", { className: "wb-lead" }, "Kept until ", el("strong", { textContent: plan.until }), "; to get it back:"), recoverBlock(plan.recover));
+  }
+  const want = String(taskId);
+  const input = el("input", { className: "field", type: "text", autocomplete: "off", spellcheck: false });
+  input.setAttribute("aria-label", `Type ${want} to confirm`);
+  body.push(el("div", { className: "confirm" },
+    el("label", {}, "Type ", el("strong", { textContent: want }), " to confirm"), input));
+  let go = null;
+  input.oninput = () => {
+    const ok = input.value === want;
+    go.disabled = !ok;
+    input.classList.toggle("match", ok);
+  };
+  const choice = await wbDialog({
+    title: `Discard the Workbench for task ${taskId}?`,
+    lead: plan.notKept && plan.notKept.length
+      ? "This deletes the folder. Everything in it except what is marked gone for good is copied aside first, so it can be got back for a while."
+      : "This deletes the folder. Everything in it is copied aside first, so it can be got back for a while.",
+    body,
+    actions: [
+      { label: "Cancel", value: null },
+      { label: "Discard", value: "discard", kind: "danger", bind: (b) => { go = b; b.disabled = true; } },
+    ],
+  });
+  if (choice !== "discard") return;
+  try {
+    const r = await window.delphi.workbench.discard(wbId, input.value, plan.confirm ? { confirm: plan.confirm } : {});
+    // The Sheet has the same sentence, from the module's own note.
+    notify(`Discarded.${keptWords(r)}${cleanupWords(r)}`);
+    noticeKept(r);
+  } catch (error) {
+    if (error.code === "BUSY") { await showBusy(taskId, error); if (after) await after(); return; }
+    // The folder changed since the plan was read, so what was agreed to is
+    // not what is there. Said, then asked again from a fresh plan.
+    notifyError(error);
+    if (error.code === "IGNORED") return discardFlow(wbId, taskId, { after });
+  }
+  if (after) await after();
+}
+
+/**
+ * A repository's Workbench settings: where a Workbench branches from, what
+ * runs once its folder exists, and which untracked files are copied in.
+ *
+ * A null base branch or setup command means Delphi works it out at Start, and
+ * the first Start writes the detected command back here. Each field says which
+ * it is showing, so nobody edits a value thinking it was typed by a person.
+ */
+async function repoWorkbenchSettings(repo) {
+  let refused = null;
+  let values = { base: repo.base_branch || "", setup: repo.setup_cmd == null ? "" : repo.setup_cmd, copy: repo.copy_files == null ? "" : repo.copy_files };
+  for (;;) {
+    const field = (id, value, placeholder) => el("input", { className: "field mono-in", id, value, placeholder, spellcheck: false, autocomplete: "off" });
+    const base = field("wb-base", values.base, "origin's default branch, then main");
+    const setup = field("wb-setup", values.setup, repo.setup_cmd == null ? "worked out at the first Start" : "nothing runs");
+    const copy = field("wb-copy", values.copy, ".env,.env.local");
+    const tag = (text) => el("span", { className: "wb-tag", textContent: text });
+    const row = (input, label, state, hint) => el("div", { className: "wb-field" },
+      el("label", { htmlFor: input.id }, label, state ? tag(state) : null), input, el("div", { className: "hint", textContent: hint }));
+    const choice = await wbDialog({
+      title: `Workbench settings for ${repo.name}`,
+      lead: repo.path,
+      className: "wb-settings",
+      body: [
+        row(base, "Base branch", repo.base_branch ? null : "detected",
+          "Where every Workbench branch starts from, and what Update brings in. Empty means detect: origin's default branch, then main, then master."),
+        row(setup, "Setup command", repo.setup_cmd == null ? "detected at Start" : Number(repo.setup_cmd_detected) === 1 ? "detected" : null,
+          repo.setup_cmd == null
+            ? "Runs in a new Workbench once its folder exists. Delphi looks at the lockfiles at the first Start and writes what it finds here."
+            : Number(repo.setup_cmd_detected) === 1
+              ? "Runs in a new Workbench once its folder exists. This is what Delphi found; edit it and it is yours. Empty runs nothing."
+              : "Runs in a new Workbench once its folder exists, as last set. Empty runs nothing."),
+        row(copy, "Files to copy", repo.copy_files == null ? "default" : null,
+          "Untracked files copied from the main checkout into each new Workbench, comma separated. Never overwrites, and only files inside the repository."),
+        refused ? el("div", { className: "err-msg", role: "alert", textContent: refused }) : null,
+      ],
+      actions: [{ label: "Cancel", value: null }, { label: "Save", value: "save", kind: "primary" }],
+    });
+    if (choice !== "save") return false;
+    values = { base: base.value.trim(), setup: setup.value.trim(), copy: copy.value.trim() };
+    const fields = { base_branch: values.base || null, copy_files: values.copy || null };
+    // An empty setup field means "run nothing" once something was detected or
+    // typed, and leaves "detect at Start" alone when nothing ever was.
+    if (!(repo.setup_cmd == null && !values.setup)) fields.setup_cmd = values.setup;
+    try {
+      await window.delphi.repos.update(repo.id, fields);
+      notify(`Workbench settings saved for ${repo.name}.`);
+      return true;
+    } catch (error) {
+      // Asked again with what was typed, and the refusal inside the dialog,
+      // so a refused branch name is a fix rather than starting over.
+      refused = String(error.message || error);
+    }
+  }
+}
+
+/** Which repository a Start should use, when the project has more than one. */
+function pickRepo(list) {
+  let chosen = list.find((c) => c.is_primary) || list[0];
+  const choices = el("div", { className: "destroy-choices" });
+  list.forEach((c, i) => {
+    const id = `wb-repo-${i}`;
+    const radio = el("input", { type: "radio", name: "wb-repo", id, checked: c === chosen });
+    radio.onchange = () => { if (radio.checked) chosen = c; };
+    choices.append(el("label", { className: "destroy-choice", htmlFor: id }, radio,
+      el("span", {},
+        el("span", { className: "destroy-choice-label" }, c.name, c.is_primary ? el("span", { className: "pill muted", textContent: "primary", style: "margin-left:6px" }) : null),
+        el("span", { className: "mono", textContent: c.path }))));
+  });
+  return wbDialog({
+    title: "Which repository?",
+    lead: "This project has several. The Workbench gets its own folder and branch in the one you pick.",
+    body: [choices],
+    actions: [{ label: "Cancel", value: false }, { label: "Start working", value: true, kind: "primary" }],
+    cancelValue: false,
+  }).then((ok) => (ok ? chosen : null));
+}
+
+// Subscribed once, here, because preload has no way to unsubscribe. Starting
+// is remembered per task; an open task panel is told so it can redraw.
+window.delphi.onWorkbenchEvent((e) => {
+  if (e.phase === "ready" || e.phase === "failed") wbStarting.delete(e.taskId);
+  else wbStarting.set(e.taskId, e);
+  if (e.phase === "failed") notifyError(e.text);
+  if (openSheet && openSheet.taskId === e.taskId && openSheet.wbEvent) openSheet.wbEvent(e);
+});
+
+// Done prompts Finish. Not now changes nothing: the task stays done and the
+// Workbench stays as it is.
+// One at a time: marking several tasks done at once sends one prompt each,
+// and stacked they would all be answered by the first keypress. Each waits
+// for the one before it, and is skipped if its Workbench went meanwhile.
+let promptQueue = Promise.resolve();
+window.delphi.onWorkbenchPrompt((p) => {
+  promptQueue = promptQueue.then(() => donePrompt(p)).catch((error) => notifyError(error));
+});
+
+async function donePrompt(p) {
+  const still = await window.delphi.workbench.forTask(p.taskId).catch(() => null);
+  if (!still || still.id !== p.workbenchId) return;
+  const go = await wbDialog({
+    title: "Finish the Workbench too?",
+    lead: `Task ${p.taskId} is done, and its Workbench is still open.`,
+    body: [el("div", { className: "grp" },
+      el("div", { className: "wb-row-title", textContent: p.taskTitle }),
+      el("div", { className: "mono", textContent: p.branch }),
+      el("div", { className: "mono", style: "color:var(--ink-faint)", textContent: p.path }))],
+    actions: [{ label: "Not now", value: null }, { label: "Finish", value: "finish", kind: "primary" }],
+  });
+  if (go !== "finish") return;
+  await finishWorkbench(p.workbenchId, p.taskId, {
+    title: p.taskTitle,
+    after: async () => { if (openSheet && openSheet.live) await openSheet.live(); refresh(); },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Composer runs: live output
+//
+// Output arrives in pieces as it is written, for as long as the command runs,
+// and a build can write tens of megabytes. Nothing here holds more than the
+// last RUN_KEEP lines, and the DOM is written at most once a frame, so a
+// runaway command cannot take the window down with it. The whole log is on
+// disk regardless; this is only the view of its end.
+// ---------------------------------------------------------------------------
+
+const RUN_KEEP = 2000;
+const RUN_PENDING_CAP = 4 * 1024 * 1024;
+const RUN_PARTIAL_CAP = 64 * 1024;
+const runBuffers = new Map();   // entryId -> buffer, for runs started in this window
+const runKills = new Map();     // entryId -> presses of Stop so far
+// Runs that ended, since a quick one can finish before sheets.run has even
+// answered, and a buffer made after that would wait for an end already past.
+const runsEnded = new Set();
+
+function runBuffer(entryId, taskId) {
+  let b = runBuffers.get(entryId);
+  if (!b) {
+    b = { entryId, taskId, lines: [], partial: "", dropped: 0, pending: [], size: 0, frame: 0, pre: null, follow: true, scroll: 0 };
+    runBuffers.set(entryId, b);
+  }
+  return b;
+}
+
+// A carriage return redraws the line in a terminal, which is how progress
+// bars work. Keeping only what follows the last one shows what a terminal
+// would be showing, rather than every frame of the bar.
+const runLine = (raw) => {
+  const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+  const at = line.lastIndexOf("\r");
+  return stripAnsi(at >= 0 ? line.slice(at + 1) : line);
+};
+
+function runTake(b) {
+  if (!b.pending.length) return;
+  let text = b.partial + b.pending.join("");
+  b.pending = [];
+  b.size = 0;
+  // More arrived in one frame than will ever be shown. Everything before the
+  // last stretch is counted and dropped without being split into lines.
+  if (text.length > RUN_PENDING_CAP) {
+    const cut = text.indexOf("\n", text.length - RUN_PENDING_CAP);
+    const from = cut >= 0 ? cut + 1 : text.length - RUN_PENDING_CAP;
+    for (let i = text.indexOf("\n"); i >= 0 && i < from; i = text.indexOf("\n", i + 1)) b.dropped += 1;
+    b.dropped += b.lines.length;
+    b.lines = [];
+    text = text.slice(from);
+  }
+  const parts = text.split("\n");
+  b.partial = parts.pop();
+  if (b.partial.length > RUN_PARTIAL_CAP) b.partial = b.partial.slice(-RUN_PARTIAL_CAP);
+  for (const p of parts) b.lines.push(runLine(p));
+  if (b.lines.length > RUN_KEEP) {
+    const over = b.lines.length - RUN_KEEP;
+    b.lines.splice(0, over);
+    b.dropped += over;
+  }
+}
+
+function runPaint(b) {
+  const pre = b.pre;
+  if (!pre || !pre.isConnected) return;
+  pre.textContent = "";
+  if (b.truncated) {
+    pre.append(el("span", { className: "cut", textContent: "Showing the last part. The full log opens when it finishes.\n" }));
+  } else if (b.dropped) {
+    pre.append(el("span", { className: "cut", textContent: `Showing the last ${plural(b.lines.length, "line", "lines")}. The whole log is kept.\n` }));
+  }
+  const tail = b.partial ? runLine(b.partial) : "";
+  const text = b.lines.join("\n") + (tail ? (b.lines.length ? "\n" : "") + tail : "");
+  if (text) pre.append(document.createTextNode(text));
+  else pre.append(el("span", { className: "cut", textContent: "Waiting for output" }));
+  if (b.follow) pre.scrollTop = pre.scrollHeight;
+  else pre.scrollTop = b.scroll;
+}
+
+function runFlush(b) {
+  b.frame = 0;
+  runTake(b);
+  runPaint(b);
+}
+
+/** The persistent output node for a live run, so a row rebuilt by the clock keeps it, scroll and all. */
+function runPre(b) {
+  if (!b.pre) {
+    const pre = el("pre", { className: "ts-run-out full live" });
+    pre.setAttribute("tabindex", "0");
+    pre.setAttribute("aria-label", "Command output, live");
+    pre.addEventListener("scroll", () => {
+      b.follow = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+      b.scroll = pre.scrollTop;
+    });
+    b.pre = pre;
+  }
+  requestAnimationFrame(() => runPaint(b));
+  return b.pre;
+}
+
+window.delphi.onSheetRunOutput(({ entryId, taskId, chunk, chunks, truncated }) => {
+  const b = runBuffer(entryId, taskId);
+  // The main process may batch pieces, and may skip some when they come too
+  // fast; skipped output is in the log, which is read in full once it ends.
+  chunk = Array.isArray(chunks) ? chunks.join("") : String(chunk || "");
+  if (truncated) {
+    // The batch was cut at its front, so it starts part way through a line,
+    // and the line held over from before it never got its end. Both go.
+    b.truncated = true;
+    runTake(b);
+    b.partial = "";
+    const nl = chunk.indexOf("\n");
+    chunk = nl >= 0 ? chunk.slice(nl + 1) : "";
+    if (!chunk) return;
+  }
+  b.pending.push(chunk);
+  b.size += chunk.length;
+  // Folded in early when a single frame's worth is already more than will be
+  // kept, so the pending list itself cannot grow without bound.
+  if (b.size > RUN_PENDING_CAP * 2) runTake(b);
+  if (!b.frame) b.frame = requestAnimationFrame(() => runFlush(b));
+});
+
+window.delphi.onSheetRunDone(({ entryId, taskId, entry }) => {
+  const b = runBuffers.get(entryId);
+  if (b) {
+    if (b.frame) cancelAnimationFrame(b.frame);
+    runFlush(b);
+  }
+  if (openSheet && openSheet.taskId === taskId && openSheet.runDone) openSheet.runDone(entryId, b, entry);
+  runBuffers.delete(entryId);
+  runKills.delete(entryId);
+  runsEnded.add(entryId);
+  if (runsEnded.size > 200) runsEnded.delete(runsEnded.values().next().value);
+});
 
 /**
  * Opens one task as a workspace.
@@ -5565,6 +7908,10 @@ async function openTaskSheet(taskId) {
   sheet.append(top, body);
 
   const flashHost = el("span", { className: "hint" });
+  // Where the Workbench controls go, between the flash and Copy brief. One
+  // node kept across paintTop, so whatever paints it owns its own redraws and
+  // a menu open on it survives a live refresh of the header.
+  const wbSlot = el("div", { className: "wb" });
   const flash = (text) => {
     flashHost.textContent = text;
     setTimeout(() => { if (flashHost.textContent === text) flashHost.textContent = ""; }, 1500);
@@ -5609,7 +7956,7 @@ async function openTaskSheet(taskId) {
     } else {
       crumbs.append(el("span", { className: "crumb-now", textContent: `task ${detail.task.id}` }));
     }
-    top.append(crumbs, el("span", { className: "spacer" }), flashHost);
+    top.append(crumbs, el("span", { className: "spacer" }), flashHost, wbSlot, el("span", { className: "wb-sep" }));
 
     const hand = el("button", { className: "btn sm", textContent: "Copy brief" });
     hand.title = "Copies this task, its discussion and its history as a brief an agent can act on";
@@ -5639,6 +7986,346 @@ async function openTaskSheet(taskId) {
     close.onclick = () => closeSheet();
 
     top.append(hand, del, close);
+  }
+
+  // --- workbench ------------------------------------------------------------
+
+  // The advanced disclosure, when More has asked for it: { id, data }.
+  let wbAdv = null;
+  const advHost = el("div");
+  // Whether a verb is running on this task's Workbench, here or from a
+  // done prompt: the one flag every entry point checks (see wbGuard).
+  const busyNow = () => wbBusyTasks.has(taskId);
+  // The advanced section as the person left it: collapsed stays collapsed.
+  let wbAdvOpen = true;
+
+  const wbAfter = async () => { await reload(); refresh(); };
+
+  /** Runs one Workbench verb with the cluster disabled, and says what went wrong in the module's words. */
+  async function wbDo(fn) {
+    const ran = await wbGuard(taskId, async () => {
+      try { await fn(); } catch (error) { notifyError(error); }
+      return true;
+    });
+    if (ran) await wbAfter();
+  }
+
+  function wbStart() {
+    // Guarded from the first click, before the candidates are even asked
+    // for, so a double click cannot open two pickers or start twice.
+    return wbGuard(taskId, wbStartNow);
+  }
+
+  async function wbStartNow() {
+    let opts = {};
+    try {
+      const list = await window.delphi.workbench.candidates(taskId);
+      if (list.length > 1) {
+        const pick = await pickRepo(list);
+        if (!pick) return;
+        opts = pick.repo_id != null ? { repoId: pick.repo_id } : { path: pick.path };
+      }
+    } catch (error) { notifyError(error); return; }
+    // Set before the call, because the module's own phases arrive while it is
+    // still running, and a Start with no setup is over before it returns.
+    wbStarting.set(taskId, { phase: "starting", text: "Starting" });
+    paintWorkbench();
+    try {
+      const made = await window.delphi.workbench.start(taskId, opts);
+      if (made.warnings && made.warnings.length) notify(made.warnings.join(" "));
+    } catch (error) {
+      wbStarting.delete(taskId);
+      notifyError(error);
+    }
+    await wbAfter();
+  }
+
+  /**
+   * A menu under a button, right edges aligned, the way the mockup hangs
+   * them. Keyboard handling is openFileMenu's: focus moves in, the arrows
+   * move through it, Escape closes only the menu and hands focus back to its
+   * button, and Tab leaves.
+   */
+  function wbMenu(button, items, fromKeyboard = false) {
+    const box = button.getBoundingClientRect();
+    button.setAttribute("aria-expanded", "true");
+    const menu = rowMenu(box.left, box.bottom + 4, items, {
+      className: "wb-menu",
+      // Focus goes back to the button the menu hangs from, so a dialog an
+      // item opens has somewhere to return focus to when it closes.
+      onClose: () => {
+        button.setAttribute("aria-expanded", "false");
+        if (button.isConnected && (!document.activeElement || document.activeElement === document.body)) button.focus({ preventScroll: true });
+      },
+    });
+    menu.setAttribute("role", "menu");
+    menu.style.left = `${Math.max(8, box.right - menu.offsetWidth)}px`;
+    const choices = [...menu.querySelectorAll(".ctx-item")];
+    for (const c of choices) c.setAttribute("role", "menuitem");
+    menu.addEventListener("keydown", (e) => {
+      const at = choices.indexOf(document.activeElement);
+      if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); closeRowMenu(); button.focus(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); choices[(at + 1) % choices.length].focus(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); choices[(at - 1 + choices.length) % choices.length].focus(); }
+      else if (e.key === "Tab") closeRowMenu();
+    });
+    if (fromKeyboard) choices[0]?.focus();
+    else { menu.tabIndex = -1; menu.focus(); }
+    return menu;
+  }
+
+  function wbMenuItem(label, hint, run, danger = false) {
+    const b = el("button", { className: "ctx-item" + (danger ? " danger" : ""), type: "button" },
+      el("span", { textContent: label }), hint ? el("span", { className: "hint", textContent: hint }) : null);
+    b.onclick = async () => { closeRowMenu(); await run(); };
+    return b;
+  }
+
+  async function wbOpen(wb, target) {
+    try {
+      const r = await window.delphi.workbench.open(wb.id, target);
+      flash(`opened in ${r.via === "folder" ? "the file browser" : r.via}`);
+    } catch (error) { notifyError(error); }
+  }
+
+  async function wbShowAdvanced(wb) {
+    try {
+      wbAdv = { id: wb.id, data: await window.delphi.workbench.advanced(wb.id) };
+      wbAdvOpen = true;
+    } catch (error) { notifyError(error); return; }
+    paintAdvanced();
+    advHost.scrollIntoView({ block: "nearest", behavior: motionOff() ? "auto" : "smooth" });
+  }
+
+  // What the cluster was last drawn from. A refresh that changes none of it
+  // leaves the buttons alone, so focus and an open menu stay where they are.
+  let wbSig = null;
+  function paintWorkbench() {
+    const wb0 = detail.workbench;
+    const st0 = (wb0 && wb0.status) || {};
+    const sig = JSON.stringify([wb0 && { ...wb0, status: { ...st0, checkedAt: null } }, wbStarting.get(taskId) || null,
+      busyNow(), detail.project ? detail.project.id : null, detail.task.status]);
+    if (sig === wbSig) {
+      const chip = wbSlot.querySelector(".wb-chip");
+      if (chip && chip.wbTitle) chip.wbTitle(st0);
+      return;
+    }
+    wbSig = sig;
+    const hadFocus = wbSlot.contains(document.activeElement) ? document.activeElement.dataset.act : null;
+    buildWorkbench();
+    if (hadFocus) {
+      const again = wbSlot.querySelector(`[data-act="${hadFocus}"]`);
+      if (again && !again.disabled) again.focus({ preventScroll: true });
+    }
+  }
+
+  function buildWorkbench() {
+    wbSlot.textContent = "";
+    // Busy is aria-disabled rather than disabled: a disabled button drops
+    // focus to the page, and the verb that made it busy is about to open a
+    // dialog that hands focus back here. A second press is a no-op anyway,
+    // since every verb goes through wbGuard.
+    wbSlot.classList.toggle("busy", busyNow());
+    wbSlot.setAttribute("aria-busy", String(busyNow()));
+    const wb = detail.workbench;
+    const starting = wbStarting.get(taskId);
+    const btn = (label, cls, run, title) => {
+      const b = el("button", { className: `btn sm ${cls}`.trim(), textContent: label, type: "button" });
+      b.dataset.act = label;
+      if (busyNow()) b.setAttribute("aria-disabled", "true");
+      if (title) b.title = title;
+      b.onclick = run;
+      return b;
+    };
+
+    if (starting) {
+      // The module says "Running npm ci"; the chip says which kind of running.
+      const text = starting.phase === "setup" && /^Running /.test(starting.text || "")
+        ? `Running setup: ${starting.text.slice(8)}` : starting.text || "Starting";
+      wbSlot.append(el("span", { className: "wb-chip starting", role: "status" }, el("span", { className: "spinner" }), text),
+        btn("Start working", "", null));
+      wbSlot.lastChild.disabled = true;
+      return;
+    }
+    if (!wb) {
+      // A task outside every project has nowhere to start one, so it gets no button.
+      if (detail.project && detail.task.status !== "done") {
+        wbSlot.append(btn("Start working", "primary", wbStart,
+          "A folder and a branch of its own for this task, so it never shares a checkout"));
+      }
+      return;
+    }
+
+    const look = wbLook(wb);
+    const chip = wbChip(wb, () => wbDo(() => wbUpdate(wb)));
+    if (busyNow()) chip.querySelector(".wb-act")?.setAttribute("aria-disabled", "true");
+    wbSlot.append(chip);
+
+    if (look.cls === "closing") {
+      if (closingLong(look.closing)) wbSlot.append(el("span", { className: "hint", textContent: "The Sheet says where the folder is" }));
+      return;
+    }
+    if (look.unreadable) {
+      // No Recreate, Finish or Discard: the folder is there and may be full
+      // of work. Opening it is the one useful thing, and the banner says why.
+      wbSlot.append(btn("Open folder", "", () => wbOpen(wb, "folder")));
+      return;
+    }
+    if (look.cls === "missing") {
+      wbSlot.append(
+        btn("Recreate", "primary", () => wbDo(async () => {
+          await window.delphi.workbench.recreate(wb.id);
+          flash("folder recreated");
+        }), `Puts the folder back at ${wb.path}, on ${wb.branch}`),
+        btn("Forget", "", async () => {
+          const go = await wbDialog({
+            title: "Forget this Workbench?",
+            lead: `The folder is already gone. The branch ${wb.branch} is left exactly as it is.`,
+            actions: [{ label: "Cancel", value: null }, { label: "Forget", value: "forget", kind: "primary" }],
+          });
+          if (go) wbDo(() => window.delphi.workbench.forget(wb.id));
+        }));
+      return;
+    }
+
+    const parked = wb.state === "parked";
+    const tone = parked ? "" : "primary";
+    const open = btn("Open", tone, () => wbOpen(wb, "editor"), "Open in your editor");
+    const caret = el("button", { className: `btn sm ${tone}`.trim(), type: "button", title: "Editor, Terminal or Folder" });
+    caret.dataset.act = "open-in";
+    if (busyNow()) caret.setAttribute("aria-disabled", "true");
+    caret.setAttribute("aria-haspopup", "menu");
+    caret.setAttribute("aria-expanded", "false");
+    caret.setAttribute("aria-label", "Open in");
+    caret.append(tsIcon("caret", 2.6));
+    const mac = document.body.classList.contains("mac");
+    caret.onclick = (e) => {
+      e.stopPropagation();
+      wbMenu(caret, [
+        wbMenuItem("Editor", "code", () => wbOpen(wb, "editor")),
+        wbMenuItem("Terminal", "Terminal", () => wbOpen(wb, "terminal")),
+        wbMenuItem("Folder", mac ? "Finder" : "files", () => wbOpen(wb, "folder")),
+      ], e.detail === 0);
+    };
+    const split = el("span", { className: "wb-split" }, open, caret);
+
+    if (parked) {
+      wbSlot.append(btn("Resume", "primary", () => wbDo(async () => {
+        await window.delphi.workbench.resume(wb.id);
+        flash("resumed");
+      })), split);
+    } else {
+      wbSlot.append(split, btn("Finish", "", () => finishWorkbench(wb.id, taskId, { title: detail.task.title, after: reload }),
+        "Save, share and put the folder away. The branch is kept."));
+    }
+
+    const more = el("button", { className: "icon-btn", type: "button", title: "More" });
+    more.dataset.act = "more";
+    if (busyNow()) more.setAttribute("aria-disabled", "true");
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", "false");
+    more.setAttribute("aria-label", "More Workbench actions");
+    more.append(tsIcon("dots", 2.4));
+    more.onclick = (e) => {
+      e.stopPropagation();
+      const showing = wbAdv && wbAdv.id === wb.id;
+      wbMenu(more, [
+        parked
+          ? wbMenuItem("Resume", null, () => wbDo(() => window.delphi.workbench.resume(wb.id)))
+          : wbMenuItem("Park", null, () => wbDo(async () => {
+              await window.delphi.workbench.park(wb.id);
+              flash("parked");
+            })),
+        wbMenuItem(`Update from ${wb.base}`, null, () => wbDo(() => wbUpdate(wb))),
+        wbMenuItem(showing ? "Hide advanced" : "Show advanced", null, () => {
+          if (showing) { wbAdv = null; paintAdvanced(); } else wbShowAdvanced(wb);
+        }),
+        "-",
+        wbMenuItem("Discard...", null, () => discardWorkbench(wb.id, taskId, { after: wbAfter }), true),
+      ], e.detail === 0);
+    };
+    wbSlot.append(more);
+  }
+
+  /**
+   * What a Workbench is underneath, for the person learning it: the real
+   * branch and folder, and the git commands each button stands for. Only from
+   * More, never in the way.
+   */
+  let advSig = null;
+  function paintAdvanced() {
+    const wb = detail.workbench;
+    // Redrawn only when what it shows changes, so a refresh keeps focus on a
+    // copy button and never reopens a section the person collapsed.
+    const st1 = (wb && wb.status) || {};
+    const sig = JSON.stringify([wbAdv, wb ? wb.id : null, st1.state, st1.message, st1.words, st1.operation, wb ? wb.closing : null]);
+    if (sig === advSig) return;
+    advSig = sig;
+    advHost.textContent = "";
+    // The module's explanation, where it can be read, when the folder is
+    // unreadable or stopped in the middle of something.
+    const st = (wb && wb.status) || {};
+    if (st.state === "unreadable" && st.message) {
+      advHost.append(el("div", { className: "wb-banner err", role: "status", textContent: st.message }));
+    } else if (wb && (wb.state === "closing" || st.state === "closing")) {
+      // Shown without asking, since More is not offered while it lasts.
+      const c = wb.closing || st.closing || {};
+      const grid = el("div", { className: "wb-adv-grid" });
+      for (const [k, v] of [["Doing", c.mode === "discard" ? "Discard" : c.mode === "finish" ? "Finish" : ""],
+        ["Begun by", c.actor || ""], ["At", c.at ? `${c.at} UTC` : ""], ["Folder now at", c.trash || ""], ["Copy", c.ref || ""]]) {
+        if (v) grid.append(el("span", { className: "k", textContent: k }), el("span", { className: "v", textContent: v }), el("span"));
+      }
+      advHost.append(el("div", { className: "wb-adv wb-closing" },
+        el("div", { className: "wb-adv-body", style: "padding-top:var(--s3)" },
+          el("p", { className: "wb-lead", textContent: closingLong(c)
+            ? "Being put away for a while now, so it was probably interrupted. Housekeeping finishes or undoes it; the Sheet says where the folder is."
+            : "Being put away. Nothing can be done to it until that ends." }),
+          grid)));
+    } else if (st.state === "busy" && st.operation) {
+      advHost.append(el("div", { className: "wb-banner", role: "status",
+        textContent: `${st.words}. Finish and Update wait until it is finished or stopped in the folder.` }));
+    }
+    if (!wbAdv || !wb || wb.id !== wbAdv.id) { wbAdv = null; return; }
+    const a = wbAdv.data;
+    const copyBtn = (text, label) => {
+      const b = el("button", { className: "ts-act", title: label, type: "button" });
+      b.setAttribute("aria-label", label);
+      b.append(tsIcon("copy"));
+      b.onclick = async () => {
+        try { await navigator.clipboard.writeText(text); railCopied(b, "Copied"); } catch (error) { notifyError(error); }
+      };
+      return b;
+    };
+    const adv = el("details", { className: "wb-adv", open: wbAdvOpen });
+    adv.addEventListener("toggle", () => { wbAdvOpen = adv.open; });
+    const tw = el("span", { className: "tw", textContent: "▶" });
+    tw.setAttribute("aria-hidden", "true");
+    adv.append(el("summary", {}, tw, "Workbench, advanced", el("span", { className: "grow" }),
+      el("span", { className: "wb-adv-why", textContent: "What Delphi did, in git's words" })));
+    const grid = el("div", { className: "wb-adv-grid" });
+    for (const [k, v] of [["Branch", a.branch], ["Folder", a.path], ["Based on", a.base], ["Repository", a.repo]]) {
+      grid.append(el("span", { className: "k", textContent: k }), el("span", { className: "v", textContent: v || "" }),
+        copyBtn(v || "", `Copy ${k.toLowerCase()}`));
+    }
+    const body = el("div", { className: "wb-adv-body" }, grid, el("h5", { textContent: "The git commands behind each button" }));
+    const why = (cmd) => (/^cd /.test(cmd) ? "go to the folder"
+      : / status$/.test(cmd) ? "the status words"
+      : / push /.test(cmd) ? "Push, before Finish"
+      : / worktree list$/.test(cmd) ? "every Workbench here"
+      : / worktree remove /.test(cmd) ? "Finish" : "");
+    for (const cmd of a.commands || []) {
+      body.append(el("div", { className: "wb-cmd" }, el("code", { textContent: cmd }),
+        el("span", { className: "why", textContent: why(cmd) }), copyBtn(cmd, "Copy command")));
+    }
+    if (a.unmanaged && a.unmanaged.length) {
+      body.append(el("h5", { textContent: "Folders found here that Delphi does not manage" }));
+      for (const u of a.unmanaged) {
+        body.append(el("div", { className: "wb-cmd" }, el("code", { textContent: u.path }),
+          el("span", { className: "why", textContent: u.branch || "" })));
+      }
+    }
+    adv.append(body);
+    advHost.append(adv);
   }
 
   // --- title ----------------------------------------------------------------
@@ -5991,67 +8678,593 @@ async function openTaskSheet(taskId) {
     paneBox.append(list);
   }
 
-  // --- rail: comments -------------------------------------------------------
+  // --- rail: the Sheet ------------------------------------------------------
 
   const railHead = el("div", { className: "ts-rail-head" });
   const railList = el("div", { className: "ts-comments" });
+  railList.setAttribute("role", "log");
+  railList.setAttribute("aria-label", "Sheet entries");
   const railFoot = el("div", { className: "ts-composer" });
 
-  function paintRail() {
-    railHead.textContent = "";
-    railHead.append(el("h4", { textContent: "Comments" }));
-    if (detail.comments.length) railHead.append(el("span", { className: "ts-count", textContent: String(detail.comments.length) }));
+  // Per entry view state, kept across repaints so a live refresh does not
+  // collapse output somebody was reading.
+  const outputOpen = new Set();
+  const outputText = new Map();   // id -> {text, truncated} or {error}
+  // id -> {sig, node}. A row whose signature is unchanged keeps its node, so a
+  // refresh leaves focus, hover and selection where they were.
+  const rowCache = new Map();
+  let railPainted = false;
 
-    railList.textContent = "";
-    if (!detail.comments.length) {
-      railList.append(el("div", { className: "hint pad",
-        textContent: "Nothing said yet. Agents write here too, and what they leave is what the next one reads." }));
-    }
-    for (const c of detail.comments) {
-      const agent = isAgent(c.author);
-      const row = el("div", { className: "ts-comment" });
-      const who = el("div", { className: "ts-comment-who" },
-        el("span", { className: "avatar" + (agent ? " agent" : ""), textContent: String(c.author || "?").slice(0, 1).toUpperCase() }),
-        el("span", { className: "ts-comment-author", textContent: c.author }),
-        agent ? el("span", { className: "agent-tag", textContent: "agent" }) : null,
-        el("span", { className: "hint", textContent: `${gap(c.created_at)} ago` }));
-      const kill = el("button", { className: "ts-kill", textContent: "×", title: "Delete comment" });
-      kill.onclick = async () => { await window.delphi.tasks.uncomment(c.id); await reload(); };
-      who.append(kill);
-      row.append(who, renderMarkdown(c.body));
-      railList.append(row);
-    }
-    railList.scrollTop = railList.scrollHeight;
+  const entryById = (id) => detail.comments.find((c) => c.id === id) || null;
+
+  function railCopied(button, label) {
+    const before = button.title;
+    button.title = label;
+    button.classList.add("done");
+    setTimeout(() => { button.title = before; button.classList.remove("done"); }, 1200);
   }
 
-  const composer = el("textarea", { className: "ts-composer-box", placeholder: "Write a comment" });
-  composer.setAttribute("aria-label", "New comment");
-  const post = async () => {
-    if (!composer.value.trim()) return;
-    await window.delphi.tasks.comment(taskId, composer.value, "you");
-    composer.value = "";
-    await reload();
-  };
-  composer.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); post(); } };
+  async function loadOutput(id) {
+    try {
+      const log = await window.delphi.sheets.log(id);
+      outputText.set(id, { text: stripAnsi(log.text || ""), truncated: !!log.truncated });
+    } catch (error) {
+      outputText.set(id, { error: String(error.message || error) });
+    }
+    paintRail();
+  }
+
+  function openFileMenu(button, row, entry, fromKeyboard) {
+    const box = button.getBoundingClientRect();
+    const items = [el("div", { className: "ctx-head", textContent: "File as" })];
+    for (const kind of NOTE_KINDS) {
+      items.push({
+        label: kind[0].toUpperCase() + kind.slice(1),
+        run: async () => {
+          try {
+            await window.delphi.sheets.file(entry.id, kind, null);
+            flash(`filed as ${kind}`);
+          } catch (error) { flash(String(error.message || error)); }
+          await reload();
+        },
+      });
+    }
+    button.setAttribute("aria-expanded", "true");
+    row.classList.add("menu-open");
+    const menu = rowMenu(box.right - 168, box.bottom + 4, items, {
+      className: "ts-entry-menu",
+      onClose: () => {
+        button.setAttribute("aria-expanded", "false");
+        row.classList.remove("menu-open");
+      },
+    });
+    menu.setAttribute("role", "menu");
+    const choices = [...menu.querySelectorAll(".ctx-item")];
+    for (const c of choices) c.setAttribute("role", "menuitem");
+    // Escape is caught here, before it reaches the document handler that
+    // closes the whole task panel.
+    menu.addEventListener("keydown", (e) => {
+      const at = choices.indexOf(document.activeElement);
+      if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); closeRowMenu(); button.focus(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); choices[(at + 1) % choices.length].focus(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); choices[(at - 1 + choices.length) % choices.length].focus(); }
+      else if (e.key === "Tab") { closeRowMenu(); }
+    });
+    // Focus moves in only for the keyboard; a click leaves it where the
+    // pointer is, so the first item does not light up as though chosen.
+    if (fromKeyboard) choices[0]?.focus();
+    else {
+      // The menu itself takes focus instead, so Escape and the arrows still
+      // reach its handler.
+      menu.tabIndex = -1;
+      menu.focus();
+    }
+  }
+
+  function entryActions(entry, row) {
+    const acts = el("span", { className: "ts-entry-acts" });
+    const act = (key, label, icon, extra = "") => {
+      const b = el("button", { className: `ts-act ${extra}`.trim(), title: label });
+      b.setAttribute("aria-label", label);
+      b.dataset.act = key;
+      b.append(tsIcon(icon, icon === "plus" || icon === "minus" || icon === "x" ? 2.2 : 2));
+      acts.append(b);
+      return b;
+    };
+
+    const promoted = !!entry.promoted;
+    const pro = act("promote", promoted ? "Take it out of the ledger" : "Promote to the ledger",
+      promoted ? "minus" : "plus", promoted ? "on" : "");
+    pro.setAttribute("aria-pressed", String(promoted));
+    pro.onclick = async () => {
+      try { await window.delphi.sheets.promote(entry.id, !promoted); } catch (error) { flash(String(error.message || error)); }
+      await reload();
+    };
+
+    // Filing is once only: the entry keeps its note, and a second note from
+    // the same words would be a duplicate in search and in the graph.
+    if (!entry.note_id) {
+      const file = act("file", "File as a project note", "file");
+      file.setAttribute("aria-haspopup", "menu");
+      file.setAttribute("aria-expanded", "false");
+      file.onclick = (e) => { e.stopPropagation(); openFileMenu(file, row, entry, e.detail === 0); };
+    }
+
+    const copyLabel = entry.kind === "run" ? "Copy the command (Shift for output too)" : "Copy";
+    const cp = act("copy", copyLabel, "copy");
+    cp.onclick = async (e) => {
+      try {
+        await window.delphi.sheets.copy(entry.id, { withOutput: entry.kind === "run" && e.shiftKey });
+        railCopied(cp, "Copied");
+      } catch (error) { flash(String(error.message || error)); }
+    };
+
+    const kill = act("delete", "Delete entry", "x", "kill");
+    kill.onclick = async () => { await window.delphi.tasks.uncomment(entry.id); await reload(); };
+    return acts;
+  }
+
+  function runBody(entry, body) {
+    const meta = entry.meta || {};
+    // An agent's multi-line command is stored as its first line, with the
+    // whole script in meta.script. The line stays short here; hovering, Copy
+    // and Show output all give the script.
+    const script = typeof (entry.meta || {}).script === "string" && entry.meta.script.trim() ? entry.meta.script : null;
+    body.append(el("div", { className: "ts-run-cmd", textContent: entry.body, title: script || entry.body }));
+    const line = el("div", { className: "ts-run-meta" });
+    const state = meta.state;
+    if (state === "ok" || state === "fail" || state === "running") {
+      const code = meta.code === null || meta.code === undefined ? "" : `:${meta.code}`;
+      line.append(el("span", { className: `ts-run-state ${state}`, textContent: state === "fail" ? `fail${code}` : state }));
+    }
+    if (state === "running") {
+      // Ticked in place by the rail clock, never by rebuilding the row: a
+      // rebuild a second would swallow a click on Stop and drop a selection.
+      const clock = el("span", { className: "ts-run-clock", textContent: `${elapsed(entry.created_at)} so far` });
+      clock.dataset.from = String(entry.created_at);
+      line.append(clock);
+    }
+    // Only a run this window started can be stopped from it: the main process
+    // holds its process group, and nobody else's run is this window's to end.
+    const live = state === "running" ? runBuffers.get(entry.id) || null : null;
+    if (live) {
+      const presses = runKills.get(entry.id) || 0;
+      const stop = el("button", { className: "ts-linkbtn ts-stop", type: "button", textContent: presses ? "Kill" : "Stop" });
+      stop.dataset.act = "stop";
+      stop.title = presses ? "It has not stopped. Kill it outright." : "Interrupt it, as Ctrl-C would";
+      stop.onclick = async () => {
+        try {
+          await window.delphi.sheets.interrupt(entry.id);
+          runKills.set(entry.id, presses + 1);
+        } catch (error) { notifyError(error); }
+        paintRail();
+      };
+      line.append(stop);
+    }
+    else {
+      if (Number.isFinite(meta.dur_ms)) line.append(el("span", { textContent: duration(meta.dur_ms) }));
+      if (Number.isFinite(meta.lines)) line.append(el("span", { textContent: plural(meta.lines, "line", "lines") }));
+    }
+
+    // Short output arrives inline in meta.out and is shown as is. Anything
+    // longer stays in its log file until asked for, because a build log is
+    // not something to pull into every repaint of the rail.
+    // Not inline when there is a script: the log the main process returns
+    // leads with it, so the expanded view shows what ran, then what it said.
+    const inline = !script && typeof meta.out === "string" && meta.out ? stripAnsi(meta.out) : "";
+    const open = outputOpen.has(entry.id);
+    if (!inline && (meta.lines > 0 || state === "running" || script)) {
+      const toggle = el("button", { className: "ts-linkbtn", textContent: open ? "Hide output" : "Show output" });
+      toggle.dataset.act = "output";
+      toggle.setAttribute("aria-expanded", String(open));
+      toggle.onclick = () => {
+        if (open) { outputOpen.delete(entry.id); paintRail(); return; }
+        outputOpen.add(entry.id);
+        outputText.delete(entry.id);
+        paintRail();
+        // A live run already has everything it said since it started.
+        if (!runBuffers.has(entry.id)) loadOutput(entry.id);
+      };
+      line.append(toggle);
+    }
+    body.append(line);
+
+    if (inline) body.append(el("pre", { className: "ts-run-out", textContent: inline }));
+    else if (open && live) body.append(runPre(live));
+    else if (open) {
+      const got = outputText.get(entry.id);
+      const pre = el("pre", { className: "ts-run-out full" });
+      pre.setAttribute("tabindex", "0");
+      pre.setAttribute("aria-label", "Command output");
+      if (!got) pre.append(el("span", { className: "cut", textContent: "Reading the log" }));
+      else if (got.error) pre.append(el("span", { className: "cut", textContent: `Could not read the log: ${got.error}` }));
+      else {
+        if (got.truncated) pre.append(el("span", { className: "cut", textContent: "Earlier output cut, this is the end of the log\n" }));
+        pre.append(document.createTextNode(got.text || ""));
+        // Opened at the end, because the end of a log is where the error is.
+        requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
+        if (!got.text) pre.append(el("span", { className: "cut", textContent: "No output was kept" }));
+      }
+      body.append(pre);
+    }
+  }
+
+  function askBody(entry, body, answer) {
+    body.append(el("div", { className: "ts-ask-q", textContent: entry.body }));
+    const options = (entry.meta && Array.isArray(entry.meta.options)) ? entry.meta.options : [];
+    const chosen = answer ? String((answer.meta && answer.meta.choice) || String(answer.body || "").split("\n")[0]).trim().toLowerCase() : null;
+    const opts = el("div", { className: "ts-ask-opts" + (answer ? " decided" : "") });
+    opts.setAttribute("role", "group");
+    opts.setAttribute("aria-label", answer ? "Options, decided" : "Choose an answer");
+    for (const option of options) {
+      const key = String(option.key).toLowerCase();
+      const isChosen = chosen === key;
+      const b = el("button", { className: "ts-opt" + (isChosen ? " chosen" : "") },
+        el("span", { className: "ts-opt-key", textContent: option.key }), String(option.label), isChosen ? " ✓" : null);
+      b.dataset.act = `opt-${key}`;
+      if (answer) {
+        b.disabled = true;
+        b.setAttribute("aria-label", `${option.label}${isChosen ? ", chosen" : ""}`);
+      } else {
+        b.title = `Decide: ${option.label}`;
+        b.onclick = async () => {
+          try { await window.delphi.sheets.decide(entry.id, option.key, null); } catch (error) { flash(String(error.message || error)); }
+          await reload();
+        };
+      }
+      opts.append(b);
+    }
+    body.append(opts);
+    if (answer) {
+      body.append(el("div", { className: "hint", style: "margin-top:5px",
+        textContent: `Decided by ${answer.author} ${gap(answer.created_at)} ago` }));
+    }
+  }
+
+  function decideBody(entry, body) {
+    const meta = entry.meta || {};
+    const lines = String(entry.body || "").split("\n");
+    const key = String(meta.choice || lines[0] || "").trim();
+    const ask = entry.ref_id ? entryById(entry.ref_id) : null;
+    let label = meta.label || "";
+    if (!label && ask && ask.meta && Array.isArray(ask.meta.options)) {
+      const hit = ask.meta.options.find((o) => String(o.key).toLowerCase() === key.toLowerCase());
+      if (hit) label = hit.label;
+    }
+    const head = el("div", { className: "ts-decide-head" }, "Decided ",
+      el("span", { className: "ts-opt-key", textContent: key }), label ? el("strong", { textContent: label }) : null);
+    if (ask) {
+      const ref = el("button", { className: "ts-linkbtn ts-ref", textContent: `on ${ask.body}` });
+      ref.title = "Show the question";
+      ref.dataset.act = "ref";
+      ref.onclick = () => {
+        const target = railList.querySelector(`.ts-entry[data-id="${ask.id}"]`);
+        if (!target) return;
+        target.scrollIntoView({ block: "center", behavior: motionOff() ? "auto" : "smooth" });
+        target.classList.add("flash");
+        setTimeout(() => target.classList.remove("flash"), 1400);
+      };
+      head.append(ref);
+    }
+    body.append(head);
+    const why = lines.slice(1).join("\n").trim();
+    if (why) body.append(renderMarkdown(why));
+  }
+
+  function entryNode(entry, ctx) {
+    const agent = entryIsAgent(entry);
+    const k = entry.kind === "say" ? (agent ? "agent" : "say") : (SIGILS[entry.kind] ? entry.kind : "say");
+    const row = el("div", { className: `ts-entry k-${k}` });
+    row.dataset.id = String(entry.id);
+    const inLedger = ctx.ledgerIds.has(entry.id);
+    const mark = el("span", { className: "ts-ledger-mark", textContent: inLedger ? "+" : "" });
+    if (inLedger) { mark.title = "In the ledger"; mark.setAttribute("aria-label", "In the ledger"); }
+    else mark.setAttribute("aria-hidden", "true");
+    const sigil = el("span", { className: "ts-sigil", textContent: SIGILS[k] });
+    sigil.setAttribute("aria-label", KIND_WORD[k]);
+    sigil.title = KIND_WORD[k];
+    row.append(mark, sigil);
+
+    const main = el("div", { className: "ts-entry-main" });
+    const tag = agent ? (entry.author_type === "tool" ? "tool" : "agent") : null;
+    const when = isRunning(entry) ? "now" : `${gap(entry.created_at)} ago`;
+    main.append(el("div", { className: "ts-entry-who" },
+      el("span", { className: "ts-entry-author", textContent: entry.author || "?", title: entry.author || "" }),
+      tag ? el("span", { className: "agent-tag", textContent: tag }) : null,
+      el("span", { className: "hint", textContent: when, title: String(entry.created_at || "") }),
+      entryActions(entry, row)));
+
+    const body = el("div", { className: "ts-entry-body" });
+    if (entry.kind === "run") runBody(entry, body);
+    else if (entry.kind === "ask") askBody(entry, body, ctx.answers.get(entry.id) || null);
+    else if (entry.kind === "decide") decideBody(entry, body);
+    else body.append(renderMarkdown(entry.body));
+    if (entry.note_id) {
+      const where = detail.project ? `filed to ${detail.project.name} notes` : "filed as a note";
+      body.append(el("div", { className: "ts-filed" },
+        el("span", { className: `kind ${entry.note_kind || "note"}`, textContent: entry.note_kind || "note" }),
+        el("span", { className: "hint", textContent: where })));
+    }
+    main.append(body);
+    row.append(main);
+    row.setAttribute("aria-label", `${KIND_WORD[k]} by ${entry.author || "unknown"}, ${when}`);
+    return row;
+  }
+
+  function paintRail({ stick = false } = {}) {
+    const entries = detail.comments;
+    // The ledger by the store's rule (sheet/store.js LEDGER_WHERE): promoted
+    // entries, every decision that answers a question, and the question each
+    // answers. Worked out here from the entries already loaded, rather than a
+    // second read on every refresh.
+    const answers = new Map();
+    for (const e of entries) if (e.kind === "decide" && e.ref_id) answers.set(e.ref_id, e);
+    const ledgerIds = new Set();
+    for (const e of entries) {
+      if (e.promoted || (e.kind === "decide" && e.ref_id) || answers.has(e.id)) ledgerIds.add(e.id);
+    }
+    const ctx = { answers, ledgerIds };
+    paintRailHead(entries.length, ledgerIds.size);
+    paintRailList(entries, ctx, stick);
+  }
+
+  // Redrawn only when what it says changes, so the clock's ticks never take
+  // focus off the toggle or the copy button.
+  let railHeadSig = null;
+  function paintRailHead(total, ledgerSize) {
+    const sig = [total, ledgerSize, railLedger].join("/");
+    if (sig === railHeadSig) return;
+    const hadFocus = railHead.contains(document.activeElement) ? document.activeElement.dataset.act : null;
+    railHeadSig = sig;
+    railHead.textContent = "";
+    const all = el("button", { textContent: "All" });
+    all.setAttribute("aria-pressed", String(!railLedger));
+    const led = el("button", {}, "Ledger ", el("span", { className: "ts-count", textContent: String(ledgerSize) }));
+    led.setAttribute("aria-pressed", String(railLedger));
+    all.dataset.act = "all";
+    led.dataset.act = "ledger";
+    all.onclick = () => { if (railLedger) { railLedger = false; paintRail({ stick: true }); } };
+    led.onclick = () => { if (!railLedger) { railLedger = true; paintRail({ stick: true }); } };
+    const seg = el("div", { className: "seg ts-ledger-toggle" }, all, led);
+    seg.setAttribute("role", "group");
+    seg.setAttribute("aria-label", "Show");
+    const copyAll = el("button", { className: "icon-btn" });
+    const copyAllLabel = railLedger ? "Copy the ledger as clean text" : "Copy the whole Sheet as clean text";
+    copyAll.title = copyAllLabel;
+    copyAll.setAttribute("aria-label", copyAllLabel);
+    copyAll.dataset.act = "copy-all";
+    copyAll.append(tsIcon("copy"));
+    copyAll.onclick = async () => {
+      try {
+        await window.delphi.sheets.copyAll(taskId, { ledger: railLedger });
+        copyAll.classList.add("on");
+        copyAll.title = "Copied";
+        setTimeout(() => { copyAll.classList.remove("on"); copyAll.title = copyAllLabel; }, 1200);
+      } catch (error) { flash(String(error.message || error)); }
+    };
+    railHead.append(el("h4", { textContent: "Sheet" }));
+    if (total) railHead.append(el("span", { className: "ts-count", textContent: String(total) }));
+    railHead.append(el("span", { className: "grow" }), seg, copyAll);
+    if (hadFocus) railHead.querySelector(`[data-act="${hadFocus}"]`)?.focus();
+  }
+
+  const railHint = el("div", { className: "hint pad" });
+  function paintRailList(entries, { answers, ledgerIds }, stick) {
+    const ctx = { answers, ledgerIds };
+
+    const shown = railLedger ? entries.filter((e) => ledgerIds.has(e.id)) : entries;
+    const nearBottom = railList.scrollHeight - railList.scrollTop - railList.clientHeight < 40;
+    const focused = railList.contains(document.activeElement) ? document.activeElement : null;
+    const focusedRow = focused ? focused.closest(".ts-entry") : null;
+    const focusedAct = focused && focused.dataset ? focused.dataset.act : null;
+
+    const wanted = [];
+    const keep = new Set();
+    for (const entry of shown) {
+      const answer = answers.get(entry.id);
+      // Everything a row draws from, so an unchanged row is never rebuilt.
+      // The time words are in it, which is what keeps "5m ago" honest.
+      const sig = JSON.stringify([entry, ledgerIds.has(entry.id), answer ? [answer.id, answer.body, answer.meta, answer.author, gap(answer.created_at)] : null,
+        isRunning(entry) ? "now" : gap(entry.created_at), outputOpen.has(entry.id),
+        runBuffers.has(entry.id), runKills.get(entry.id) || 0, outputText.get(entry.id) || null,
+        entry.ref_id ? (entryById(entry.ref_id) || {}).body : null, detail.project ? detail.project.name : null]);
+      const cached = rowCache.get(entry.id);
+      const node = cached && cached.sig === sig ? cached.node : entryNode(entry, ctx);
+      rowCache.set(entry.id, { sig, node });
+      keep.add(entry.id);
+      wanted.push(node);
+    }
+    for (const id of [...rowCache.keys()]) if (!keep.has(id)) rowCache.delete(id);
+
+    let hint = "";
+    if (!shown.length) {
+      hint = railLedger
+        ? "Nothing in the ledger yet. Promote an entry to keep it here: the ledger is what the next agent reads first."
+        : "Nothing written yet. Agents write here too, and what they leave is what the next one reads.";
+    } else if (railLedger) {
+      hint = "The ledger is what the next agent reads first. Promote an entry to keep it here.";
+    }
+    if (hint) {
+      if (railHint.textContent !== hint) railHint.textContent = hint;
+      wanted.push(railHint);
+    }
+
+    // Reconciled in place rather than cleared and refilled: an untouched row
+    // keeps its node, so focus stays put and nothing visibly redraws.
+    wanted.forEach((node, i) => {
+      const at = railList.children[i];
+      if (at !== node) railList.insertBefore(node, at || null);
+    });
+    while (railList.children.length > wanted.length) railList.lastElementChild.remove();
+
+    if (focusedRow && !focusedRow.isConnected) {
+      const again = railList.querySelector(`.ts-entry[data-id="${focusedRow.dataset.id}"]`);
+      const target = again && (focusedAct ? again.querySelector(`[data-act="${focusedAct}"]`) : null);
+      if (target) target.focus({ preventScroll: true });
+      else if (again) again.querySelector("button")?.focus({ preventScroll: true });
+    }
+    if (!railPainted || stick || nearBottom) railList.scrollTop = railList.scrollHeight;
+    railPainted = true;
+  }
+
+  // The rail's clocks. A running entry's elapsed time ticks every second,
+  // written into its own text node; "5m ago" only needs keeping honest once
+  // a minute, by the reconciling repaint, which rebuilds only the rows whose
+  // words changed.
+  let tickCount = 0;
+  const railClock = setInterval(() => {
+    if (!overlay.isConnected) { clearInterval(railClock); return; }
+    tickCount += 1;
+    for (const clock of railList.querySelectorAll(".ts-run-clock")) {
+      const text = `${elapsed(clock.dataset.from)} so far`;
+      if (clock.firstChild && clock.firstChild.data !== text) clock.firstChild.data = text;
+    }
+    if (tickCount % 60 === 0) paintRail();
+  }, 1000);
+
+  // --- composer ---
+
+  const composerKind = el("div", { className: "ts-composer-kind" });
+  composerKind.setAttribute("aria-live", "polite");
+  const composer = el("textarea", { className: "ts-composer-box", placeholder: "Write to the Sheet" });
+  composer.setAttribute("aria-label", "Write to the Sheet");
   const send = el("button", { className: "btn primary sm", textContent: "Comment" });
+
+  /**
+   * What the box will post, read from its prefix. The same prefixes the text
+   * format uses for the same kinds, so nothing new has to be learned.
+   */
+  function composed() {
+    const v = composer.value;
+    if (/^\$ /.test(v)) {
+      const command = v.slice(2).trim();
+      // Said before Enter, because where a command runs is the thing most
+      // worth knowing about it. The main process picks the same way: the
+      // Workbench, then the project's folders, then home.
+      const wb = detail.workbench;
+      const where = wb && wb.state !== "missing" ? "the Workbench folder"
+        : detail.project ? "the project's folder" : "your home folder";
+      return { kind: "run", ok: !!command, say: `Runs in ${where}, output is kept`, label: "Run", command };
+    }
+    if (/^! /.test(v)) {
+      const text = v.slice(2).trim();
+      return { kind: "note", ok: !!text, say: "Posts a note", label: "Note", body: text };
+    }
+    if (/^\? /.test(v)) {
+      const parts = v.slice(2).split("|").map((s) => s.trim()).filter(Boolean);
+      const n = parts.length - 1;
+      const ok = n >= 2 && n <= 4;
+      return {
+        kind: "ask", ok, label: "Ask", question: parts[0], options: parts.slice(1),
+        say: ok ? `Asks "${parts[0]}" with ${n} options, a to ${"abcd"[n - 1]}` : "An ask needs 2 to 4 options: ? question | a | b",
+      };
+    }
+    return { kind: "say", ok: !!v.trim(), say: "Posts a comment", label: "Comment", body: v };
+  }
+
+  function senseComposer(error = null) {
+    const c = composed();
+    composerKind.textContent = "";
+    composerKind.className = `ts-composer-kind k-${c.kind}`;
+    composerKind.append(el("span", { className: "ts-sigil", textContent: SIGILS[c.kind] }), error || c.say);
+    composer.classList.toggle("mono-in", c.kind === "run");
+    send.textContent = c.label;
+    send.disabled = !c.ok || sending;
+  }
+
+  // Set from the moment a send starts until it has landed, so Enter held
+  // down or a double click cannot post twice or run a command twice.
+  let sending = false;
+  const post = async () => {
+    if (sending) return;
+    const c = composed();
+    if (!c.ok) return;
+    sending = true;
+    send.disabled = true;
+    try {
+      if (c.kind === "run") {
+        // Resolves once the command has started, or been refused by the
+        // guard; its output follows on onSheetRunOutput. Opened straight
+        // away, because whoever typed it is waiting to see what it says.
+        const entry = await window.delphi.sheets.run(taskId, c.command);
+        if (entry && entry.id != null) {
+          outputOpen.add(entry.id);
+          if (isRunning(entry) && !runsEnded.has(entry.id)) runBuffer(entry.id, taskId);
+        }
+      } else if (c.kind === "ask") await window.delphi.sheets.ask(taskId, c.question, c.options);
+      else await window.delphi.sheets.append(taskId, { kind: c.kind, body: c.body });
+    } catch (error) {
+      sending = false;
+      senseComposer(String(error.message || error));
+      return;
+    }
+    sending = false;
+    composer.value = "";
+    senseComposer();
+    detail = await window.delphi.tasks.detail(taskId) || detail;
+    paintAll({ stick: true });
+  };
+  composer.oninput = () => senseComposer();
+  composer.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); post(); } };
   send.onclick = post;
-  railFoot.append(composer, el("div", { className: "ts-composer-row" },
-    el("span", { className: "hint", textContent: "Enter to send" }), send));
+  railFoot.append(composerKind, composer, el("div", { className: "ts-composer-row" },
+    el("span", { className: "hint", textContent: "$ runs  ·  ! notes  ·  ? q | a | b asks" }), send));
+  senseComposer();
 
   // --- assemble -------------------------------------------------------------
 
-  function paintAll() {
+  function paintAll({ stick = false } = {}) {
     paintTop();
+    paintWorkbench();
+    paintAdvanced();
     paintRing();
     paintMeta();
     paintDesc();
     paintTabs();
     paintPane();
-    paintRail();
+    paintRail({ stick });
     if (document.activeElement !== title) title.value = detail.task.title;
   }
 
-  main.append(titleRow, meta, desc, tabs, paneBox);
+  /**
+   * A write from somewhere else: an agent, the CLI, another window.
+   *
+   * Only what changed is redrawn, and nothing that holds something being typed:
+   * a description being edited, a chip's inline field, the subtask box. The
+   * composer is never redrawn at all, so a draft survives any number of these.
+   * Coalesced, because a busy agent can land several writes in one breath.
+   */
+  let liveBusy = false;
+  let liveAgain = false;
+  async function live() {
+    if (liveBusy) { liveAgain = true; return; }
+    liveBusy = true;
+    try {
+      do {
+        liveAgain = false;
+        const next = await window.delphi.tasks.detail(taskId);
+        if (openSheet !== handle) return;
+        if (!next) return;
+        if (JSON.stringify(next) === JSON.stringify(detail)) continue;
+        detail = next;
+        const holding = (box) => box.contains(document.activeElement);
+        paintTop();
+        paintWorkbench();
+        paintAdvanced();
+        paintRing();
+        if (!holding(meta)) paintMeta();
+        if (!editingDesc) paintDesc();
+        paintTabs();
+        if (!holding(paneBox)) paintPane();
+        paintRail();
+        if (document.activeElement !== title) title.value = detail.task.title;
+      } while (liveAgain);
+    } finally {
+      liveBusy = false;
+    }
+  }
+
+  main.append(titleRow, meta, desc, advHost, tabs, paneBox);
   rail.append(railHead, railList, railFoot);
   overlay.append(sheet);
   document.body.append(overlay);
@@ -6071,7 +9284,37 @@ async function openTaskSheet(taskId) {
   };
 
   overlay.onclick = (e) => { if (e.target === overlay) closeSheet(); };
-  openSheet = { overlay, close: closeSheet };
+  const handle = {
+    overlay, close: closeSheet, live, taskId,
+    wbRepaint: () => paintWorkbench(),
+    // From a BUSY refusal: bring a running entry into view with its output open.
+    showEntry: (id) => {
+      outputOpen.add(id);
+      paintRail();
+      const row = railList.querySelector(`.ts-entry[data-id="${id}"]`);
+      if (!row) return;
+      row.scrollIntoView({ block: "center", behavior: motionOff() ? "auto" : "smooth" });
+      row.classList.add("flash");
+      setTimeout(() => row.classList.remove("flash"), 1400);
+      row.querySelector("[data-act=stop], button")?.focus({ preventScroll: true });
+    },
+    // A Start phase for this task: redraw the chip, and once it is over, the
+    // whole panel, since the Workbench row now exists.
+    wbEvent: (e) => { paintWorkbench(); if (e.phase === "ready" || e.phase === "failed") reload(); },
+    // A run from this window finished. What was streamed stays on screen as
+    // the expanded output, so finishing does not blank what was being read.
+    runDone: (entryId, buffer) => {
+      if (buffer && buffer.truncated && outputOpen.has(entryId)) {
+        outputText.delete(entryId);
+        loadOutput(entryId);
+      } else if (buffer && outputOpen.has(entryId)) {
+        const tail = buffer.partial ? runLine(buffer.partial) : "";
+        outputText.set(entryId, { text: buffer.lines.join("\n") + (tail ? "\n" + tail : ""), truncated: buffer.dropped > 0 });
+      }
+      reload();
+    },
+  };
+  openSheet = handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -6090,36 +9333,1435 @@ $("search").addEventListener("input", (e) => {
   }, 140);
 });
 
-async function createProject() {
+
+// ---------------------------------------------------------------------------
+// Project rail
+//
+// The far-left column of project tiles, the way Slack and Granular both do it.
+// It is painted from renderSidebar so the rail and the sidebar list are built in
+// one pass and cannot end up disagreeing about which project is open.
+
+/** The letter shown when a project has no icon of its own. */
+const railLetter = (name) => {
+  const first = String(name || "?").trim()[0];
+  return (first || "?").toUpperCase();
+};
+
+/**
+ * The rail, which has two states.
+ *
+ * Zoomed out, it shows every workspace: the picker. Zoomed in, the chosen one
+ * has moved to the top under the mark and the rest are gone. That movement is
+ * the whole point of the interaction, so it is animated rather than swapped:
+ * the tile you clicked travels to where it is going, which is what tells you
+ * the others were put away rather than lost.
+ *
+ * Done with FLIP. The tiles are measured where they are, the rail is rebuilt in
+ * its new state, and each surviving tile is transformed back to where it was and
+ * released. That way the animation always matches the layout, however the layout
+ * was reached.
+ */
+// Which workspace is being dragged, if any. Module scope rather than state,
+// because it lives and dies inside one gesture and nothing renders from it.
+let dragging = null;
+
+function renderRail() {
+  const rail = $("rail");
+  if (!rail) return;
+
+  // Where every tile is now, before anything moves.
+  const before = new Map();
+  for (const node of rail.querySelectorAll("[data-ws]")) {
+    before.set(node.dataset.ws, node.getBoundingClientRect().top);
+  }
+
+  rail.textContent = "";
+
+  const home = el("button", {
+    className: "rail-mark" + (state.workspaceId === null && state.projectId === null ? " on" : ""),
+    type: "button",
+    title: "All workspaces",
+  });
+  home.append(el("img", { src: "assets/mark-64.png", width: 26, height: 26, alt: "Delphi" }));
+  home.onclick = () => zoomOut();
+  rail.append(home, el("div", { className: "rail-div" }));
+
+  const open = state.workspaces.find((w) => w.id === state.workspaceId) || null;
+  // Zoomed in shows only the one that is open, so the column reads as "you are
+  // here" rather than as a list with one item highlighted.
+  const shown = open ? [open] : state.workspaces;
+
+  for (const w of shown) {
+    const tile = el("div", {
+      className: "rail-tile" + (w.id === state.workspaceId ? " on" : ""),
+      tabIndex: 0,
+      role: "button",
+      title: open ? `${w.name}\n${w.path}\nClick to switch workspace` : `${w.name}\n${w.path}`,
+    });
+    tile.dataset.ws = String(w.id);
+    tile.dataset.name = w.name;
+    tile.textContent = w.icon || railLetter(w.name);
+
+    // Draggable only in the picker. Zoomed in there is one tile, and dragging it
+    // could only ever put it back where it was.
+    if (!open) {
+      tile.draggable = true;
+      tile.ondragstart = (e) => {
+        beginDrag(rail, w.id);
+        tile.classList.add("dragging");
+        e.dataTransfer.effectAllowed = "move";
+        // Firefox refuses to start a drag unless something is on the transfer.
+        e.dataTransfer.setData("text/plain", String(w.id));
+      };
+      tile.ondragend = () => endDrag(rail);
+    }
+    if (w.colour && !w.icon) tile.style.color = w.colour;
+
+    // Clicking the open one goes back to the picker, which is how you switch
+    // without a separate control taking up room in a 48px column.
+    const go = () => (w.id === state.workspaceId ? zoomOut() : zoomInto(w.id));
+    tile.onclick = go;
+    tile.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    tile.oncontextmenu = (e) => { e.preventDefault(); workspaceMenu(w, e.clientX, e.clientY); };
+    rail.append(tile);
+
+    window.delphi.fs.folderExists(w.path)
+      .then((there) => { if (!there) tile.classList.add("lost"); })
+      .catch(() => {});
+  }
+
+  // The column reacts to the drag as a whole. Per-tile handlers could only draw
+  // a line on the tile under the pointer, which is not enough to see where the
+  // thing will land; the tiles move aside instead, which is.
+  if (!open && state.workspaces.length > 1) {
+    rail.ondragover = (e) => {
+      if (dragging === null) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      shiftForDrop(rail, dropIndexAt(e.clientY));
+    };
+    rail.ondragleave = (e) => {
+      // Only when the pointer has actually left the rail, not when it crosses
+      // from one tile to the next inside it.
+      if (e.relatedTarget && rail.contains(e.relatedTarget)) return;
+      shiftForDrop(rail, null);
+    };
+    rail.ondrop = async (e) => {
+      if (dragging === null) return;
+      e.preventDefault();
+      const at = dropIndexAt(e.clientY);
+      const moved = dragging;
+      endDrag(rail);
+      await reorderWorkspaceTo(moved, at);
+    };
+  }
+
+  const add = el("div", {
+    className: "rail-tile rail-add",
+    tabIndex: 0,
+    role: "button",
+    title: "Add a workspace",
+  });
+  add.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
+  add.onclick = addWorkspace;
+  add.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); addWorkspace(); } };
+  rail.append(el("div", { className: "rail-sp" }), el("div", { className: "rail-div" }), add);
+
+  // Second half of the FLIP: put each surviving tile back where it was, then let
+  // it travel. Skipped entirely when motion is off, in which case the layout
+  // simply changes, which is the correct behaviour rather than a lesser one.
+  if (motionOff()) return;
+  for (const node of rail.querySelectorAll("[data-ws]")) {
+    const was = before.get(node.dataset.ws);
+    if (was === undefined) continue;
+    const delta = was - node.getBoundingClientRect().top;
+    if (!delta) continue;
+    node.style.transform = `translateY(${delta}px)`;
+    node.style.transition = "none";
+    requestAnimationFrame(() => {
+      node.style.transition = "transform 260ms cubic-bezier(.2,.7,.3,1)";
+      node.style.transform = "";
+    });
+  }
+}
+
+
+
+// A tile is 36px square with 8px between them, so one step is a whole slot.
+const RAIL_STEP = 44;
+
+// Measured once, when the drag starts. The tiles move while it is happening, so
+// reading their live positions to decide where the pointer is would be reading
+// the effect of the last decision: the gap chases the pointer and jitters.
+let dragBase = null;   // [{ id, mid }] in column order, unshifted
+let dragFrom = null;   // the dragged tile's index in that column
+
+function beginDrag(rail, id) {
+  dragging = id;
+  const tiles = [...rail.querySelectorAll("[data-ws]")];
+  dragBase = tiles.map((n) => {
+    const box = n.getBoundingClientRect();
+    return { id: Number(n.dataset.ws), mid: box.top + box.height / 2 };
+  });
+  dragFrom = dragBase.findIndex((t) => t.id === id);
+}
+
+/**
+ * Where the dragged tile would land, as an index among the tiles that are not it.
+ *
+ * Against the baseline midpoints, so crossing halfway past a tile is what moves
+ * the gap, and the answer does not depend on how far things have already slid.
+ */
+function dropIndexAt(y) {
+  if (!dragBase) return 0;
+  const others = dragBase.filter((t) => t.id !== dragging);
+  for (let i = 0; i < others.length; i++) {
+    if (y < others[i].mid) return i;
+  }
+  return others.length;
+}
+
+/**
+ * Moves the tiles that the drop would displace, and only those.
+ *
+ * The dragged tile stays where it is, faded, still taking up its slot. That is
+ * the part the first attempt got wrong: it opened a gap at the target while the
+ * original slot was still occupied, so the column showed two gaps and something
+ * appeared to move the instant anything was picked up.
+ *
+ * Each tile is asked where it sits now and where it would sit afterwards, and
+ * moved by the difference. When the drop would not change the order, every
+ * difference is zero and nothing moves, which is the behaviour you actually want:
+ * the column is still until hovering somewhere that means something.
+ */
+function shiftForDrop(rail, at) {
+  if (dragFrom === null) return;
+  const others = [...rail.querySelectorAll("[data-ws]")]
+    .filter((n) => Number(n.dataset.ws) !== dragging);
+
+  others.forEach((node, i) => {
+    node.classList.add("shifting");
+    if (at === null) { node.style.transform = ""; return; }
+    // Its slot now, and its slot after the move. Tiles before the dragged one
+    // keep their index; tiles after it sit one lower than their index suggests.
+    const now = i < dragFrom ? i : i + 1;
+    const next = i < at ? i : i + 1;
+    const delta = next - now;
+    node.style.transform = delta ? `translateY(${delta * RAIL_STEP}px)` : "";
+  });
+}
+
+/** Puts everything back and forgets the drag. */
+function endDrag(rail) {
+  dragging = null;
+  dragBase = null;
+  dragFrom = null;
+  for (const node of rail.querySelectorAll("[data-ws]")) {
+    node.classList.remove("dragging", "shifting");
+    node.style.transform = "";
+  }
+}
+
+/** Moves a workspace to a position in the column. */
+async function reorderWorkspaceTo(movedId, index) {
+  const order = state.workspaces.map((w) => w.id).filter((id) => id !== movedId);
+  order.splice(Math.max(0, Math.min(index, order.length)), 0, movedId);
+  // The whole column is renumbered rather than the moved row alone. Nudging one
+  // value works until two rows share an order, and then the sequence depends on
+  // whatever the database returns second.
+  await Promise.all(order.map((id, i) =>
+    window.delphi.workspaces.update(id, { sort_order: (i + 1) * 10 })));
+  await refresh();
+}
+
+/** Opens a workspace, and lands on the project you were last in if it fits. */
+async function zoomInto(workspaceId) {
+  mindMap.selected = null;
+  mindMap.context = null;
+  state.workspaceId = workspaceId;
+  const inside = await window.delphi.workspaces.projects(workspaceId);
+  state.wsProjects = inside;
+  // Staying on a project that does not belong to this folder would show its
+  // sessions under a workspace they have nothing to do with.
+  if (!inside.some((p) => p.id === state.projectId)) {
+    state.projectId = inside.length === 1 ? inside[0].id : null;
+    state.sessionId = null;
+    state.messages = [];
+  }
+  state.view = state.projectId ? "chat" : "new";
+  await refresh();
+}
+
+/** Back to the picker. */
+async function zoomOut() {
+  // So the map does not stay pinned to the workspace that was just left.
+  mindMap.selected = null;
+  mindMap.context = null;
+  state.workspaceId = null;
+  state.wsProjects = [];
+  state.projectId = null;
+  state.sessionId = null;
+  state.messages = [];
+  state.view = "new";
+  await refresh();
+}
+
+/** Adds a folder as a workspace. */
+async function addWorkspace() {
+  const folder = await window.delphi.dialog.pickFolder(
+    "Choose a folder, or make a new one",
+    { defaultPath: lastWorkspaceParent(), buttonLabel: "Use this folder" }
+  );
+  if (!folder) return;
+  const created = await window.delphi.workspaces.create({ path: folder });
+  await refresh();
+  await zoomInto(created.id);
+}
+
+/** Where the picker should open: beside the workspaces already known. */
+function lastWorkspaceParent() {
+  for (let i = state.workspaces.length - 1; i >= 0; i--) {
+    const cut = state.workspaces[i].path.lastIndexOf("/");
+    if (cut > 0) return state.workspaces[i].path.slice(0, cut);
+  }
+  return null;
+}
+
+function workspaceMenu(w, x, y) {
+  rowMenu(x, y, [
+    { label: "Reveal in Finder", run: async () => window.delphi.fs.reveal(w.path) },
+    {
+      label: "Rename",
+      run: async () => {
+        const name = await askText({
+          title: "Rename workspace", label: "What should this folder be called here?",
+          value: w.name, confirmLabel: "Rename",
+        });
+        if (!name) return;
+        await window.delphi.workspaces.update(w.id, { name });
+        await refresh();
+      },
+    },
+    "-",
+    {
+      label: "Remove from Delphi",
+      danger: true,
+      run: async () => {
+        // Says what it does not do, because "remove" next to a folder reads as
+        // deleting one.
+        await window.delphi.workspaces.remove(w.id);
+        if (state.workspaceId === w.id) await zoomOut(); else await refresh();
+      },
+    },
+  ]);
+}
+// ---------------------------------------------------------------------------
+// Chat
+//
+// A session is a conversation held against a project. The layout is Granular's:
+// a stream where only the person's turns are bubbles, a composer with no send
+// button, a row of model and permission chips, and a token meter.
+
+// The personas, and what each one actually changes.
+//
+// A persona is a system prompt and nothing more. It is worth being plain about
+// that: it does not give an agent different abilities, it tells the same agent
+// what kind of help is wanted, which is the difference between a reply that
+// starts writing code and one that starts asking what the goal is.
+const AGENTS = [
+  {
+    id: "boss",
+    label: "Boss Agent",
+    blurb: "Plans the work and hands it out",
+    prompt:
+      "You coordinate work rather than doing all of it yourself. Start by making sure you " +
+      "understand what is actually being asked, and say what you would do before doing it. " +
+      "Break a large request into pieces, name which piece you are on, and say plainly when " +
+      "a piece is blocked or belongs to someone else. Prefer asking one sharp question over " +
+      "guessing at an ambiguous requirement.",
+  },
+  {
+    id: "builder",
+    label: "Builder",
+    blurb: "Writes and changes code",
+    prompt:
+      "You write and change code in this project. Match the surrounding style rather than " +
+      "importing your own. Explain why a change is the right one, not what the lines do. " +
+      "When something is risky or irreversible, say so before doing it. If you cannot verify " +
+      "a change, say that rather than implying it works.",
+  },
+  {
+    id: "designer",
+    label: "Designer",
+    blurb: "Interface, layout and visual detail",
+    prompt:
+      "You work on how things look and how they are used. Reason about hierarchy, spacing, " +
+      "contrast and state before reaching for colour. Respect the design tokens already in " +
+      "the project instead of introducing new values. Consider the empty, loading, error and " +
+      "too-much-content cases, which is where interfaces usually fail.",
+  },
+  {
+    id: "content",
+    label: "Content creator",
+    blurb: "Writing, docs and copy",
+    prompt:
+      "You write prose: documentation, copy, release notes, explanations. Write plainly, in " +
+      "the voice already used in this project. Lead with what the reader needs. Do not pad, " +
+      "and do not use em dashes or en dashes; plain hyphens only.",
+  },
+  {
+    id: "data",
+    label: "Data analyst",
+    blurb: "Queries, numbers and what they mean",
+    prompt:
+      "You work with data. State the question before the answer, show the query or the method " +
+      "you used, and give the numbers with enough context to judge them. Be explicit about " +
+      "what a figure does not tell us and where it could be misleading.",
+  },
+  {
+    id: "assistant",
+    label: "Personal assistant",
+    blurb: "Errands, summaries and tracking",
+    prompt:
+      "You handle the small things: summarising, drafting, chasing, keeping track. Be brief. " +
+      "Give the answer first and the detail underneath, and offer to do the next obvious step " +
+      "rather than describing how it could be done.",
+  },
+];
+
+const agentById = (id) => AGENTS.find((a) => a.id === id) || AGENTS[0];
+
+const STARTERS = [
+  ["Design System", "Colors, type, spacing, defined once"],
+  ["Project Brain", "A living roadmap from your docs"],
+  ["Live Dashboard", "Your daily numbers on one page"],
+  ["Deep Research", "A sourced point of view"],
+];
+
+const currentSession = () => state.sessions.find((x) => x.id === state.sessionId) || null;
+
+async function openSession(id) {
+  resetHistory();
+  state.sessionId = id;
+  state.messages = id ? await window.delphi.messages.list(id) : [];
+  // The strip follows the session, not the other way around. Picking a Codex
+  // conversation out of the sidebar has to land on the Codex tab, or the tab
+  // showing and the conversation showing disagree.
+  const session = state.sessions.find((x) => x.id === id);
+  if (state.pane !== "terminal") state.pane = session && session.harness ? `h:${session.harness}` : "chat";
+  render();
+}
+
+/**
+ * Opens the tab for one harness, making its session if there is not one yet.
+ *
+ * A tab is a session, so switching to Codex means finding this project's most
+ * recent Codex conversation rather than starting a new one every time. That is
+ * what makes the strip feel like tabs instead of like a launcher.
+ */
+async function openHarness(key) {
+  const project = currentProject();
+  if (!project) return;
+  state.pane = `h:${key}`;
+  const existing = state.sessions.find((x) => x.harness === key);
+  if (existing) { await openSession(existing.id); return; }
+
+  const harness = state.harnesses.find((h) => h.key === key);
+  const created = await window.delphi.sessions.create({
+    projectId: project.id,
+    title: harness ? harness.label : key,
+    harness: key,
+    workspaceId: state.workspaceId,
+    cwd: sessionFolder({ workspace_id: state.workspaceId }),
+  });
+  state.sessions = await window.delphi.sessions.list(project.id);
+  await openSession(created.id);
+}
+
+
+/**
+ * The folder a session runs in.
+ *
+ * Recorded on the session, because a project spanning four repos has no single
+ * answer. Falls back to the workspace currently open, then to the project's old
+ * path column for sessions made before workspaces existed.
+ */
+function sessionFolder(session) {
+  if (session && session.workspace_id) {
+    const w = state.workspaces.find((x) => x.id === session.workspace_id);
+    if (w) return w.path;
+  }
+  const open = state.workspaces.find((w) => w.id === state.workspaceId);
+  if (open) return open.path;
+  const project = currentProject();
+  return project && project.path ? project.path : null;
+}
+
+async function newSession() {
+  const project = currentProject();
+  if (!project) return;
+  const created = await window.delphi.sessions.create({
+    projectId: project.id,
+    // The Boss is the safe default: it plans and asks before it acts, which is
+    // the right first behaviour when nobody has chosen anything yet.
+    agent: "boss",
+    provider: null,
+    // The folder it runs in, which is the workspace it was started from. A
+    // project can span four repos, so this cannot be derived from the project
+    // afterwards: only the person starting the session knows which one they
+    // meant, and being in that workspace is them saying so.
+    workspaceId: state.workspaceId,
+  });
+  state.sessions = await window.delphi.sessions.list(project.id);
+  await openSession(created.id);
+}
+
+
+// Aliases the CLI understands, plus the explicit ids. "Auto" means send nothing
+// and let the tool pick, which is what it does best.
+const MODELS = [
+  [null, "Auto"],
+  ["opus", "Opus"],
+  ["sonnet", "Sonnet"],
+  ["haiku", "Haiku"],
+];
+
+/** The folder a session runs in, named for a sentence. */
+function runningInLabel(session) {
+  const folder = sessionFolder(session);
+  return folder ? folder.split("/").pop() : "this project";
+}
+
+
+// ---------------------------------------------------------------------------
+// Terminal
+//
+// Not a real terminal, and it says so. A true one needs a pty, which needs a
+// native module, and this app deliberately has none: the README's claim that
+// there is nothing to rebuild when Electron updates is the reason it keeps
+// working. So this runs commands and shows what they print. Anything that draws
+// its own screen, vim or top, will not work here.
+
+/** The id the running command is filed under, one per session. */
+const termId = () => `s${state.sessionId || 0}`;
+
+async function runCommand(command) {
+  const text = String(command || "").trim();
+  if (!text || state.termBusy) return;
+  const folder = sessionFolder(currentSession());
+  if (!folder) {
+    state.termLines.push({ kind: "err", text: "This project has no folder, so there is nowhere to run a command." });
+    render();
+    return;
+  }
+
+  state.termDraft = "";
+  resetHistory();
+  state.termLines.push({ kind: "cmd", text });
+  state.termBusy = true;
+  render();
+
+  try {
+    await window.delphi.term.start({ id: termId(), cwd: folder, command: text });
+  } catch (error) {
+    state.termBusy = false;
+    state.termLines.push({ kind: "err", text: String(error.message || error) });
+    render();
+  }
+}
+
+// Registered once, at module scope, for the same reason the model stream is.
+let termPaint = null;
+window.delphi.onTermEvent((event) => {
+  if (event.id !== termId()) return;
+
+  if (event.type === "output") {
+    const last = state.termLines[state.termLines.length - 1];
+    // Appended to the previous chunk rather than pushed as a new line, because a
+    // stream arrives in arbitrary pieces and one write is not one line.
+    if (last && last.kind === "out") last.text += event.text;
+    else state.termLines.push({ kind: "out", text: event.text });
+  } else if (event.type === "error") {
+    state.termLines.push({ kind: "err", text: event.message });
+  } else if (event.type === "exit") {
+    state.termBusy = false;
+    const bits = [];
+    if (event.code !== 0) bits.push(`exit ${event.code}`);
+    if (event.signal) bits.push(event.signal);
+    if (event.dropped) bits.push(`${Math.round(event.dropped / 1024)}KB of output dropped`);
+    if (bits.length) state.termLines.push({ kind: "meta", text: bits.join(" · ") });
+  }
+
+  // On a frame, not per chunk. A build printing thousands of lines would
+  // otherwise re-render the window for each one.
+  if (!termPaint) {
+    termPaint = requestAnimationFrame(() => {
+      termPaint = null;
+      if (state.view === "chat" && state.pane === "terminal") render();
+    });
+  }
+});
+
+/** ~/va/caseflow rather than the whole path, which is what a shell shows. */
+function shortPath(folder) {
+  if (!folder) return "";
+  const home = "/Users/";
+  if (!folder.startsWith(home)) return folder;
+  const rest = folder.slice(home.length).split("/").slice(1).join("/");
+  return rest ? `~/${rest}` : "~";
+}
+
+function renderTerminal(wrap) {
+  const folder = sessionFolder(currentSession());
+  const where = shortPath(folder);
+
+  // One dark surface holding the scrollback and the prompt, rather than an
+  // output box with a form field under it. A terminal is a single screen you
+  // type into, and the separation was the thing making it read as chat.
+  const screen = el("div", { className: "term" });
+  const out = el("div", { className: "term-out" });
+
+  if (!state.termLines.length) {
+    out.append(el("div", { className: "term-empty" },
+      el("div", { textContent: folder
+        ? "Real commands, real output."
+        : "No folder linked to this workspace, so there is nothing to run in." }),
+      el("div", { textContent: "Anything that draws its own screen, like vim or top, will not work here." })));
+  }
+
+  for (const line of state.termLines) {
+    if (line.kind === "cmd") {
+      out.append(el("div", { className: "term-cmd" },
+        el("span", { className: "term-where", textContent: where }),
+        el("span", { className: "term-sigil", textContent: "%" }),
+        el("span", { className: "term-typed", textContent: line.text })));
+    } else {
+      out.append(el("pre", { className: `term-line ${line.kind}`, textContent: line.text }));
+    }
+  }
+
+  // The prompt is the last line of the scrollback, not a separate control, so
+  // the caret sits where the next output will appear.
+  const prompt = el("div", { className: "term-prompt-row" });
+  prompt.append(
+    el("span", { className: "term-where", textContent: where }),
+    el("span", { className: "term-sigil", textContent: state.termBusy ? "…" : "%" })
+  );
+
+  const box = el("textarea", {
+    className: "term-input",
+    rows: 1,
+    placeholder: state.termBusy ? "" : "",
+    value: state.termDraft,
+    spellcheck: false,
+    disabled: !folder,
+  });
+  box.oninput = () => {
+    state.termDraft = box.value;
+    box.style.height = "auto";
+    box.style.height = `${box.scrollHeight}px`;
+  };
+  box.onkeydown = (e) => {
+    if (e.key === "Escape") { e.stopPropagation(); box.blur(); return; }
+    const ran = state.termLines.filter((l) => l.kind === "cmd").map((l) => l.text).reverse();
+    if (!state.termBusy && recallHistory(e, box, ran, (text) => { state.termDraft = text; })) return;
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      // While something runs, Enter feeds it a line rather than starting a
+      // second command on top of the first.
+      if (state.termBusy) {
+        window.delphi.term.write(termId(), `${box.value}\n`);
+        box.value = "";
+        state.termDraft = "";
+        return;
+      }
+      runCommand(box.value);
+    }
+  };
+  prompt.append(box);
+
+  if (state.termBusy) {
+    const stop = el("button", { className: "term-stop", textContent: "stop" });
+    stop.title = "Stop the running command";
+    stop.onclick = () => window.delphi.term.stop(termId());
+    prompt.append(stop);
+  }
+
+  out.append(prompt);
+  screen.append(out);
+  screen.onmousedown = (e) => {
+    // Only when the click was on the surface itself. Selecting output text has
+    // to keep working, so a click that landed on a line is left alone.
+    if (e.target === screen || e.target === out) {
+      e.preventDefault();
+      box.focus();
+    }
+  };
+  wrap.append(screen);
+
+  requestAnimationFrame(() => {
+    out.scrollTop = out.scrollHeight;
+    if (folder) box.focus();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Recalling what you typed
+//
+// Up walks back through what you sent, Down walks forward, and coming back past
+// the newest restores whatever you were part way through writing. That last part
+// is the one people notice when it is missing: without it, pressing Up once
+// destroys an unsent message.
+//
+// Only from the first line, so Up still moves the caret inside a reply being
+// composed over several lines, which is what it does in every other text box.
+
+let histIndex = -1;      // -1 is "not browsing"
+let histSaved = "";      // the draft that was in progress when browsing started
+
+/** Resets the walk. Called whenever the composer's contents come from elsewhere. */
+function resetHistory() {
+  histIndex = -1;
+  histSaved = "";
+}
+
+/**
+ * Handles Up and Down in a composer.
+ *
+ * Returns true when it took the key, so the caller can leave it alone otherwise.
+ * `entries` is newest first. `apply` is given the text to show.
+ */
+function recallHistory(e, box, entries, apply) {
+  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return false;
+  if (!entries.length) return false;
+
+  const caret = box.selectionStart;
+  const before = box.value.slice(0, caret);
+  const onFirstLine = !before.includes("\n");
+  const onLastLine = !box.value.slice(caret).includes("\n");
+
+  if (e.key === "ArrowUp") {
+    if (!onFirstLine) return false;
+    if (histIndex === -1) histSaved = box.value;
+    if (histIndex >= entries.length - 1) return false;
+    histIndex += 1;
+  } else {
+    if (!onLastLine || histIndex === -1) return false;
+    histIndex -= 1;
+  }
+
+  const text = histIndex === -1 ? histSaved : entries[histIndex];
+  e.preventDefault();
+  apply(text);
+  box.value = text;
+  // Caret to the end, which is where you want it when the point is to edit and
+  // send again rather than to read.
+  requestAnimationFrame(() => {
+    box.focus();
+    box.setSelectionRange(text.length, text.length);
+    box.style.height = "auto";
+    box.style.height = `${Math.min(box.scrollHeight, 160)}px`;
+  });
+  return true;
+}
+
+
+/**
+ * Shown between asking and the first word coming back.
+ *
+ * A model can take several seconds to start, and an empty element for that long
+ * reads as a question that went nowhere. After a few seconds it starts counting,
+ * because a wait you can see the length of is a wait rather than a hang.
+ */
+function thinkingIndicator() {
+  const box = el("div", { className: "thinking" });
+  const dots = el("span", { className: "thinking-dots" });
+  dots.append(el("i"), el("i"), el("i"));
+  const label = el("span", { className: "thinking-label", textContent: "Thinking" });
+  box.append(dots, label);
+
+  const started = Date.now();
+  const tick = setInterval(() => {
+    // Removed from the document the moment the first text lands, since the
+    // stream replaces the whole node, so this is how the timer learns to stop.
+    if (!box.isConnected) { clearInterval(tick); return; }
+    const seconds = Math.round((Date.now() - started) / 1000);
+    // What it is doing, when it has said. A harness that has been quiet for
+    // ninety seconds because it is running a test suite looks identical to one
+    // that has hung, and the tool name is the difference.
+    if (state.turnStatus) { label.textContent = `${state.turnStatus}, ${seconds}s`; return; }
+    const doing = state.turnTool && state.turnTool !== "thinking" ? `Running ${state.turnTool}` : "Thinking";
+    label.textContent = seconds >= 4 ? `${doing}, ${seconds}s` : doing;
+  }, 1000);
+
+  return box;
+}
+
+function renderChat(root) {
+  const project = currentProject();
+  if (!project) return;
+
+  // Opening the tab lands on the most recent conversation rather than on
+  // nothing, which is what makes it feel like coming back to a session.
+  if (!state.sessionId && state.sessions.length) {
+    openSession(state.sessions[0].id);
+    return;
+  }
+
+  const wrap = el("div", { className: "chat" });
+
+  // Faces of one place, so this is a switch rather than navigation. Delphi's own
+  // chat, then one tab per agent that is actually installed, then the terminal.
+  //
+  // A tab is a session. Clicking Codex opens this project's Codex conversation,
+  // or starts one, and every one of them runs in the same folder with the same
+  // tracker wired in. That is the whole idea: the harnesses are the tabs, and
+  // Delphi is the thing above them.
+  const tabs = el("div", { className: "pane-tabs" });
+
+  const paneTab = (id, label, { busy = false, on = false, run = null } = {}) => {
+    const t = el("div", {
+      className: "pane-tab" + (state.pane === id ? " on" : ""),
+      tabIndex: 0, role: "button",
+    }, el("span", { textContent: label }));
+    if (busy) t.append(el("span", { className: "sd live" }));
+    if (run === "failed") t.append(el("span", { className: "sd bad", title: "The last turn failed" }));
+    const go = () => {
+      if (on) { on(); return; }
+      state.pane = id;
+      render();
+    };
+    t.onclick = go;
+    t.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    tabs.append(t);
+    return t;
+  };
+
+  paneTab("chat", "Delphi", {
+    on: () => {
+      state.pane = "chat";
+      // Back to a conversation this tab owns, rather than leaving a Codex
+      // transcript on screen under Delphi's own name.
+      const own = state.sessions.find((x) => !x.harness);
+      if (own && own.id !== state.sessionId) { openSession(own.id); return; }
+      render();
+    },
+  });
+
+  for (const h of state.harnesses) {
+    if (!h.enabled || !h.ready) continue;
+    const session = state.sessions.find((x) => x.harness === h.key);
+    paneTab(`h:${h.key}`, h.label, {
+      // state.streaming as well as the stored state, because a turn in flight
+      // has not been written back to the row yet and the dot is the only thing
+      // saying the tab you are not looking at is working.
+      busy: Boolean(session && (session.run_state === "running" ||
+                                (state.streaming && session.id === state.sessionId))),
+      run: session ? session.run_state : null,
+      on: () => openHarness(h.key),
+    });
+  }
+
+  paneTab("terminal", "Terminal", { busy: state.termBusy });
+
+  // The ones that are not installed, said once rather than as dead tabs. A tab
+  // that is always there and never works teaches people to stop reading the row.
+  const missing = state.harnesses.filter((h) => h.enabled && !h.ready);
+  if (missing.length) {
+    const note = el("span", {
+      className: "pane-miss",
+      textContent: `${missing.length} not installed`,
+      title: missing.map((h) => `${h.label}: ${h.detail}`).join("\n"),
+      tabIndex: 0, role: "button",
+    });
+    const go = () => goTo({ projectId: null, view: "settings" });
+    note.onclick = go;
+    note.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+    tabs.append(note);
+  }
+
+  tabs.append(el("span", { className: "pane-kbd", textContent: "⌘J" }));
+  wrap.append(tabs);
+
+  if (state.pane === "terminal") {
+    renderTerminal(wrap);
+    root.append(wrap);
+    return;
+  }
+
+  // --- stream -------------------------------------------------------------
+  const stream = el("div", { className: "gstream" });
+  if (!state.sessionId) {
+    stream.append(emptyState(
+      "No session yet",
+      "Start one from the sidebar. It will belong to this project, and run in this workspace."));
+  } else if (!state.messages.length) {
+    const empty = el("div", { className: "gempty" });
+    empty.append(
+      el("div", { className: "ge-k", textContent: "delphi agent" }),
+      el("div", { className: "ge-t", textContent: "Ask in plain English. The work runs against this project's folder." })
+    );
+    const cards = el("div", { className: "ge-cards" });
+    for (const [title, blurb] of STARTERS) {
+      const card = el("div", { className: "ge-card", tabIndex: 0, role: "button" },
+        el("b", { textContent: title }), el("span", { textContent: blurb }));
+      const use = () => { state.draft = title; render(); };
+      card.onclick = use;
+      card.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); use(); } };
+      cards.append(card);
+    }
+    empty.append(cards);
+    empty.append(el("div", { className: "ge-conn", textContent: project.path || "No folder linked yet" }));
+    stream.append(empty);
+  } else {
+    for (const m of state.messages) {
+      if (m.error) {
+        stream.append(el("div", { className: "gmsg err", textContent: m.error }));
+        continue;
+      }
+      if (m.role === "user") {
+        stream.append(el("div", { className: "gmsg you", textContent: m.content }));
+      } else {
+        // The agent's turn is markdown, rendered with the same renderer the
+        // memory notes use rather than a second one that would drift from it.
+        const body = el("div", { className: "gmsg ai" });
+        const live = m.id === streamingMessageId;
+        if (live && !streamShown) {
+          // Nothing has come back yet. Without this the turn is an empty
+          // element, so the window looks like it did not hear the question.
+          body.append(thinkingIndicator());
+        } else {
+          body.append(renderMarkdown(live ? streamShown : (m.content || "")));
+        }
+        stream.append(body);
+        // The one still arriving is handed to the stream, so it can grow this
+        // node rather than asking for a repaint per token.
+        if (live) adoptStreamNode(body);
+      }
+    }
+  }
+  wrap.append(stream);
+
+  // --- composer -----------------------------------------------------------
+  const comp = el("div", { className: "gcomp" });
+  const box = el("textarea", {
+    rows: 1,
+    placeholder: state.streaming ? "Waiting for a reply…" : "Ask for anything…",
+    value: state.draft,
+    spellcheck: false,
+  });
+  const grow = () => { box.style.height = "auto"; box.style.height = `${Math.min(box.scrollHeight, 160)}px`; };
+  box.oninput = () => { state.draft = box.value; grow(); };
+  box.onkeydown = (e) => {
+    // Enter sends, Shift+Enter breaks the line. Escape is swallowed rather than
+    // hiding the whole window, which is what it does everywhere else.
+    if (e.key === "Escape") { e.stopPropagation(); box.blur(); return; }
+    // Newest first, which is the order Up walks.
+    const sent = state.messages.filter((m) => m.role === "user").map((m) => m.content).reverse();
+    if (recallHistory(e, box, sent, (text) => { state.draft = text; })) return;
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  };
+  comp.append(box);
+  wrap.append(comp);
+
+  // --- model row and meter ------------------------------------------------
+  const session = currentSession();
+  const model = el("div", { className: "gmodel" });
+  // Named from what this machine can actually reach rather than from what the
+  // session recorded, so a chip never claims a connection that is not there.
+  // A harness session does not use a provider: it drives a CLI of its own, and
+  // offering to switch it to an API key would be offering something that does
+  // nothing. The chip names the harness instead, and where it is running.
+  const harness = session && session.harness
+    ? state.harnesses.find((h) => h.key === session.harness) || null
+    : null;
+
+  if (harness) {
+    const conn = el("div", {
+      className: "gconn" + (harness.ready ? "" : " open"),
+      title: harness.ready
+        ? `${harness.path || harness.command}, resumed by session id`
+        : harness.detail,
+    },
+      el("span", { className: "mk", textContent: harness.ready ? "✦" : "!" }),
+      el("span", { textContent: harness.label }));
+    model.append(conn);
+  } else {
+    const ready = state.providers.filter((x) => x.ready);
+    const chosen = (session && session.provider && ready.find((x) => x.id === session.provider))
+      || ready[0] || null;
+    const conn = el("div", {
+      className: "gconn" + (chosen ? "" : " open"),
+      tabIndex: 0, role: "button",
+      title: chosen ? chosen.detail : "Nothing is connected yet. Click to choose.",
+    },
+      el("span", { className: "mk", textContent: chosen ? "✦" : "!" }),
+      el("span", { textContent: chosen ? chosen.label : "Not connected" }),
+      el("span", { className: "cv", textContent: "▾" }));
+    conn.onclick = (e) => providerMenu(e.clientX, e.clientY);
+    model.append(conn);
+  }
+  // Every chip does something. Two of the ones here before were decoration, and
+  // a control that looks live and is not is worse than no control.
+  const autoAllow = session && session.auto_allow === 1;
+  // "Ask first" is the honest label for Delphi's own chat, where a refused tool
+  // comes back and can be allowed. A harness runs headless: there is nobody to
+  // ask, so the same switch is the difference between an agent that can only
+  // read and one that can change the folder. Saying "ask first" there would be
+  // promising a prompt that never arrives.
+  const tools = el("div", {
+    className: "gpill bd" + (autoAllow ? " hot" : ""),
+    tabIndex: 0, role: "button",
+    title: harness
+      ? autoAllow
+        ? `${harness.label} may read and change files in this folder without asking`
+        : `${harness.label} can read this folder but not change it. There is no prompt in a tab: click to allow.`
+      : autoAllow
+      ? "The agent may read and write files in this folder without asking"
+      : "The agent can talk, but cannot touch files. Click to allow tools.",
+  }, el("span", {
+    textContent: harness
+      ? (autoAllow ? "Full access" : "Read only")
+      : (autoAllow ? "Auto-allow" : "Ask first"),
+  }));
+  tools.onclick = async () => {
+    if (!session) return;
+    // Turning it on is the dangerous direction, so that is the one that asks.
+    if (!autoAllow) {
+      const ok = confirm(
+        "Let the agent use tools without asking?\n\n" +
+        `It will be able to read and change files in ${runningInLabel(session)} on its own. ` +
+        "Turn this off again from the same chip."
+      );
+      if (!ok) return;
+    }
+    await window.delphi.sessions.update(session.id, { auto_allow: autoAllow ? 0 : 1 });
+    await refresh();
+  };
+  model.append(tools);
+
+  // A persona is a system prompt, and only a harness whose template has a
+  // {system} placeholder can carry one. Offering the menu on the others would be
+  // offering a choice that changes nothing.
+  const takesPersona = !harness || /\{system\}/.test(String(harness.args_json || ""));
+  const persona = agentById(session && session.agent);
+  const personaPill = takesPersona ? el("div", {
+    className: "gpill bd", tabIndex: 0, role: "button", title: persona.blurb,
+  }, el("span", { textContent: persona.label }), el("span", { className: "cv", textContent: "▾" })) : null;
+  if (personaPill) {
+    personaPill.onclick = (e) => {
+      rowMenu(e.clientX, e.clientY, AGENTS.map((a) => ({
+        label: `${a.label}  ${a.blurb}`,
+        run: async () => {
+          if (!session) return;
+          await window.delphi.sessions.update(session.id, { agent: a.id });
+          await refresh();
+        },
+      })));
+    };
+    model.append(personaPill);
+  }
+
+  const chosenModel = (session && session.model) || "Auto";
+  const modelPill = el("div", {
+    className: "gpill", tabIndex: 0, role: "button", title: "Which model answers",
+  }, el("span", { className: "mono2", textContent: chosenModel }), el("span", { className: "cv", textContent: "▾" }));
+  modelPill.onclick = (e) => {
+    rowMenu(e.clientX, e.clientY, MODELS.map(([value, label]) => ({
+      label,
+      run: async () => {
+        if (!session) return;
+        await window.delphi.sessions.update(session.id, { model: value });
+        await refresh();
+      },
+    })));
+  };
+  model.append(modelPill);
+  wrap.append(model);
+
+  const used = session ? (session.tokens_in || 0) + (session.tokens_out || 0) : 0;
+  const meter = el("div", { className: "gmeter" });
+  const runningIn = sessionFolder(session);
+  meter.append(el("span", {
+    textContent: runningIn ? `${project.name} · ${runningIn.split("/").pop()}` : `${project.name} (no folder)`,
+    title: runningIn || "No folder linked, so an agent has no working directory",
+  }));
+  const right = el("div", { className: "ml" });
+  right.append(
+    el("span", { textContent: used ? `${(used / 1000).toFixed(1)}k tokens` : "0 tokens" }),
+    el("div", { className: "bar" }, el("span", { style: `width:${Math.min(100, used / 5000)}%` }))
+  );
+  meter.append(right);
+  wrap.append(meter);
+
+  root.append(wrap);
+
+  // Focus and caret restored after the rebuild, or typing into a chat while an
+  // alert ticks would move the cursor to the front of the draft.
+  if (state.draft || state.sessionId) {
+    requestAnimationFrame(() => {
+      grow();
+      if (document.activeElement !== box && state.draft) {
+        box.focus();
+        box.setSelectionRange(box.value.length, box.value.length);
+      }
+      stream.scrollTop = stream.scrollHeight;
+    });
+  }
+}
+
+/** Which agent this session talks to. */
+function providerMenu(x, y) {
+  const session = currentSession();
+  const items = state.providers.map((p) => ({
+    label: p.ready ? p.label : `${p.label}  (${p.detail})`,
+    run: async () => {
+      if (!p.ready) {
+        // Saying why beats refusing silently, and the reason is usually one
+        // command away from being fixed.
+        await askText({ title: p.label, label: p.detail, value: "", allowEmpty: true, confirmLabel: "Close" });
+        return;
+      }
+      if (session) await window.delphi.sessions.update(session.id, { provider: p.id });
+      await refresh();
+    },
+  }));
+  rowMenu(x, y, items.length ? items : [{ label: "Nothing available", run: async () => {} }]);
+}
+
+async function sendMessage() {
+  const text = state.draft.trim();
+  if (!text || state.streaming) return;
+  let sessionId = state.sessionId;
+  if (!sessionId) {
+    await newSession();
+    sessionId = state.sessionId;
+    if (!sessionId) return;
+  }
+
+  // Checked before the turn is written, so a message is not left hanging with no
+  // reply and no reason. The error goes into the transcript rather than into an
+  // alert, because that is where the person is looking.
+  //
+  // A harness session is checked against the registry instead, since it does not
+  // use any of the providers: it drives a CLI of its own.
+  const harnessKey = (currentSession() || {}).harness || null;
+  const ready = harnessKey
+    ? state.harnesses.filter((h) => h.key === harnessKey && h.enabled && h.ready)
+    : state.providers.filter((p) => p.ready);
+  if (!ready.length) {
+    state.draft = "";
+    await window.delphi.messages.append({ sessionId, role: "user", content: text });
+    const harness = harnessKey ? state.harnesses.find((h) => h.key === harnessKey) : null;
+    const why = harness
+      ? `${harness.label}: ${harness.enabled ? harness.detail : "turned off in Settings"}`
+      : state.providers.length
+      ? state.providers.map((p) => `${p.label}: ${p.detail}`).join("\n")
+      : "Nothing was found on this machine.";
+    await window.delphi.messages.append({
+      sessionId, role: "assistant", content: "",
+      error: (harness
+        ? `${harness.label} cannot run, so there is nothing to answer.`
+        : "No AI is configured, so there is nothing to answer.") +
+             `\n\n${why}\n\n` +
+             "Set one up in All Work, then Settings, then AI.",
+    });
+    state.messages = await window.delphi.messages.list(sessionId);
+    state.sessions = await window.delphi.sessions.list(state.projectId);
+    render();
+    return;
+  }
+
+  state.draft = "";
+  resetHistory();
+  await window.delphi.messages.append({ sessionId, role: "user", content: text });
+
+  // The first thing said names the session, so the list reads as a set of
+  // topics rather than a column of "New session".
+  const session = currentSession();
+  if (session && (!session.title || session.title === "New session")) {
+    const title = text.length > 48 ? `${text.slice(0, 45)}…` : text;
+    await window.delphi.sessions.update(sessionId, { title });
+  }
+
+  state.messages = await window.delphi.messages.list(sessionId);
+  state.sessions = await window.delphi.sessions.list(state.projectId);
+
+  // The assistant's row is created empty and grown as the reply arrives, so an
+  // interrupted stream leaves what it managed to say rather than nothing.
+  const reply = await window.delphi.messages.append({ sessionId, role: "assistant", content: "" });
+  state.messages.push(reply);
+  streamingMessageId = reply.id;
+  state.streaming = true;
+  render();
+
+  const project = currentProject();
+  const open = currentSession();
+  const folder = sessionFolder(open);
+  try {
+    if (harnessKey) {
+      // Only the new turn goes over. The CLI keeps its own conversation and is
+      // resumed by id, which is both cheaper and better than folding the
+      // transcript into one prompt the way the built-in path has to.
+      //
+      // The persona goes with it on the first turn only, since it is a system
+      // prompt and a resumed conversation already has one. A harness whose
+      // template has no {system} placeholder drops it, which is why the pill is
+      // hidden for those.
+      await window.delphi.harnesses.start({
+        sessionId,
+        prompt: text,
+        system: open && open.native_id ? null : [
+          agentById(open && open.agent).prompt,
+          folder
+            ? `You are working on the project "${project.name}", in ${folder}. Delphi's MCP server is connected: keep your working document there with write_scratchpad, and its checkbox lines become tasks on the board.`
+            : `You are working on the project "${project.name}".`,
+        ].join("\n\n"),
+      });
+      return;
+    }
+    await window.delphi.ai.send({
+      sessionId,
+      provider: open && open.provider ? open.provider : "claude-cli",
+      model: open && open.model ? open.model : null,
+      system: [
+        agentById(open && open.agent).prompt,
+        folder
+          ? `You are helping with the project "${project.name}", working in ${folder}.`
+          : `You are helping with the project "${project.name}". It has no folder linked, so do not assume a working directory.`,
+      ].join("\n\n"),
+      messages: state.messages
+        .filter((m) => m.id !== reply.id && !m.error)
+        .map((m) => ({ role: m.role, content: m.content })),
+      cwd: folder,
+      autoAllow: open ? open.auto_allow === 1 : false,
+    });
+  } catch (error) {
+    await window.delphi.messages.update(reply.id, { error: String(error.message || error) });
+    state.streaming = false;
+    streamingMessageId = null;
+    state.messages = await window.delphi.messages.list(sessionId);
+    render();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The reply, arriving
+//
+// Registered once, at module scope. The bridge offers no way to remove a
+// listener, so registering inside a renderer would add another copy on every
+// repaint and each token would be handled as many times as the view had been
+// drawn.
+
+let streamingMessageId = null;
+let streamBuffer = "";      // everything received so far
+let streamShown = "";       // everything put on screen so far
+let streamUsage = { input: 0, output: 0 };
+let streamTimer = null;
+let streamNode = null;      // the message element being grown
+let streamDone = false;     // the stream has ended, the drain may not have
+
+/**
+ * Registers the element a reply is being written into.
+ *
+ * Held so the stream can update that one node instead of asking the whole window
+ * to repaint. That was the real cause of the choppiness: every token ran
+ * render(), which rebuilds the rail, the sidebar, the tabs and the entire content
+ * pane. The text was arriving smoothly and the window could not keep up with
+ * drawing it.
+ */
+function adoptStreamNode(node) {
+  streamNode = node;
+}
+
+/**
+ * Puts a little more of the reply on screen, once per frame.
+ *
+ * The buffer does not empty in one go even when it could. A model reply arrives
+ * in bursts, several hundred characters at a time, and writing each burst whole
+ * is what makes it read as lurching rather than as typing. Releasing a share of
+ * what is waiting spreads a burst over a few frames while still draining fast
+ * when a lot is queued, so it never falls behind.
+ */
+function drainStream() {
+  streamTimer = null;
+  if (!streamNode) return;
+
+  const waiting = streamBuffer.length - streamShown.length;
+  if (waiting > 0) {
+    // A proportion, with a floor so short bursts still move, and a ceiling so a
+    // very large one does not arrive as a single jump.
+    const take = Math.max(3, Math.min(220, Math.ceil(waiting / 5)));
+    streamShown = streamBuffer.slice(0, streamShown.length + take);
+
+    streamNode.textContent = "";
+    streamNode.append(renderMarkdown(streamShown));
+
+    // Kept at the bottom only if it was already there, so reading back through a
+    // long reply is not fought by the reply still arriving.
+    const stream = streamNode.closest(".gstream");
+    if (stream && stream.scrollHeight - stream.scrollTop - stream.clientHeight < 120) {
+      stream.scrollTop = stream.scrollHeight;
+    }
+  }
+
+  if (streamBuffer.length > streamShown.length) {
+    streamTimer = requestAnimationFrame(drainStream);
+  } else if (streamDone) {
+    finishStream();
+  }
+}
+
+async function finishStream() {
+  const id = streamingMessageId;
+  if (!id) return;
+  streamingMessageId = null;
+  streamNode = null;
+  streamDone = false;
+  state.streaming = false;
+
+  if (streamBuffer) await window.delphi.messages.update(id, { content: streamBuffer });
+  if (streamUsage.input || streamUsage.output) {
+    await window.delphi.sessions.addUsage(state.sessionId, streamUsage);
+  }
+  streamBuffer = "";
+  streamShown = "";
+  streamUsage = { input: 0, output: 0 };
+
+  state.messages = await window.delphi.messages.list(state.sessionId);
+  state.sessions = await window.delphi.sessions.list(state.projectId);
+  render();
+}
+
+window.delphi.onAiEvent(async (event) => {
+  if (!streamingMessageId || event.sessionId !== state.sessionId) return;
+
+  if (event.type === "text") {
+    streamBuffer += event.text;
+    const row = state.messages.find((m) => m.id === streamingMessageId);
+    if (row) row.content = streamBuffer;
+    if (!streamTimer) streamTimer = requestAnimationFrame(drainStream);
+    return;
+  }
+
+  if (event.type === "usage") {
+    streamUsage = { input: event.input || 0, output: event.output || streamUsage.output };
+    return;
+  }
+
+  // What it did, in the transcript, where it happened. Written into the message
+  // rather than kept beside it, because in a month the useful question is "what
+  // did Codex actually run", and an answer that only existed while the turn was
+  // live is no answer.
+  if (event.type === "tool") {
+    state.turnTool = event.name;
+    const detail = event.detail ? ` \`${String(event.detail).replace(/`/g, "")}\`` : "";
+    const gap = streamBuffer && !streamBuffer.endsWith("\n\n") ? "\n\n" : "";
+    streamBuffer += `${gap}> ▸ **${event.name}**${detail}\n\n`;
+    const row = state.messages.find((m) => m.id === streamingMessageId);
+    if (row) row.content = streamBuffer;
+    if (!streamTimer) streamTimer = requestAnimationFrame(drainStream);
+    return;
+  }
+
+  // Reasoning is shown while it happens and not kept. It is long, it is not the
+  // answer, and a transcript full of it is harder to read afterwards, not easier.
+  if (event.type === "thinking") {
+    state.turnTool = "thinking";
+    return;
+  }
+
+  // Why it has gone quiet. Not kept either, for the same reason, but it is the
+  // difference between a tab that looks busy and one that looks broken.
+  if (event.type === "status") {
+    state.turnStatus = event.text;
+    return;
+  }
+
+  // The CLI's own conversation id. Recorded by the main process; nothing here
+  // has to do anything with it beyond not treating it as an error.
+  if (event.type === "session") return;
+
+  if (event.type === "error") {
+    await window.delphi.messages.update(streamingMessageId, { error: event.message });
+    return;
+  }
+
+  if (event.type === "done") {
+    state.turnTool = null;
+    state.turnStatus = null;
+    // The stream is over, the drain may not be. Letting it finish is what stops
+    // the last few words being replaced by the final render before they appear.
+    streamDone = true;
+    if (!streamTimer && streamBuffer.length <= streamShown.length) await finishStream();
+  }
+});
+
+
+/**
+ * Makes a project, which now means making or choosing a folder.
+ *
+ * Two ways in, because there are two situations. The work already exists in a
+ * folder, in which case pointing at it is the whole job. Or it does not exist
+ * yet, in which case a name is typed and the folder is made, and the only thing
+ * still to decide is where to put it.
+ */
+/**
+ * Makes a project inside a workspace.
+ *
+ * The folder question moved up a level: a workspace is a folder, and a project
+ * is a piece of work happening in one or more of them. So this asks for a name,
+ * which is the only thing a project is, and links it to the workspace it was
+ * started from. It can be linked to others afterwards, which is the whole point
+ * of the join: SSNR is one project across four repos, not four projects.
+ */
+async function createProject(workspace) {
+  const ws = workspace || state.workspaces.find((w) => w.id === state.workspaceId);
+  // Reachable from the application menu, which does not know whether a workspace
+  // is open. Saying so beats a menu item that appears to do nothing.
+  if (!ws) {
+    await askText({
+      title: "Open a workspace first",
+      label: "A project lives in a workspace. Pick one from the rail, or add a folder with + first.",
+      value: "", allowEmpty: true, confirmLabel: "Close",
+    });
+    return null;
+  }
+
   const name = await askText({
-    title: "New project",
-    label: "What is this project called? You can rename it later.",
-    placeholder: "Hearing transcripts",
+    title: `New project in ${ws.name}`,
+    label: "What is this piece of work called? It can span other workspaces later.",
+    placeholder: "SSNR / MPI Person Update",
+    confirmLabel: "Create",
   });
   if (!name) return null;
 
-  const key = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  let key = base || `p${Date.now()}`;
+  if (state.projects.some((p) => p.key === key)) {
+    let n = 2;
+    while (state.projects.some((p) => p.key === `${base}-${n}`)) n += 1;
+    key = `${base}-${n}`;
+  }
+
   try {
     const created = await window.delphi.projects.create({
-      key: key || `p${Date.now()}`,
+      key,
       name,
       colour: PROJECT_COLOURS[state.projects.length % PROJECT_COLOURS.length],
     });
+    await window.delphi.workspaces.link(created.id, ws.id, { primary: true });
     state.projectId = created.id;
-    state.view = "overview";
+    state.view = "chat";
     await refresh();
     return created;
   } catch (error) {
-    // The slug is unique, and two projects named closely enough can produce the
-    // same one. Saying so beats a button that appears to do nothing, which is
-    // exactly the failure this whole path just had.
     alert(`Could not create the project: ${error.message}`);
     return null;
   }
 }
-
-$("new-project").onclick = createProject;
-
 $("back").onclick = () => goBack();
 
 // The side buttons on a mouse, which people expect to mean back and forward.
@@ -6144,6 +10786,11 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
+  if (e.key === "Escape" && openMenu) {
+    // A menu is innermost of all: Escape closes it and nothing behind it.
+    closeRowMenu();
+    return;
+  }
   if (e.key === "Escape") {
     // The sheet is the innermost thing open, so it closes first. Without this,
     // Escape would hide the whole window and lose unsaved edits.
@@ -6156,6 +10803,13 @@ document.addEventListener("keydown", (e) => {
       return;
     }
     window.delphi.hide();
+  }
+  // Only where there are two panes to flip between.
+  if ((e.metaKey || e.ctrlKey) && e.key === "j" && state.view === "chat") {
+    e.preventDefault();
+    state.pane = state.pane === "chat" ? "terminal" : "chat";
+    render();
+    return;
   }
   if ((e.metaKey || e.ctrlKey) && e.key === "f") {
     e.preventDefault();
@@ -6288,6 +10942,13 @@ window.delphi.onMenu(async ({ action, view, theme }) => {
 
 window.delphi.onShown(() => { refresh(); $("search").focus(); });
 window.delphi.onAlertsChanged(() => refresh());
+// Subscribed once, here, because preload has no way to unsubscribe: an open
+// task panel exposes live() and anything else open ignores it.
+window.delphi.onDbChanged(() => { if (openSheet && openSheet.live) openSheet.live(); });
+// Coming back to the window is when someone has been editing in the
+// Workbench, so its status words are asked again then. The module caches each
+// answer for ten seconds, so this never turns into git in a loop.
+window.addEventListener("focus", () => { if (openSheet && openSheet.live) openSheet.live(); });
 window.delphi.onFocusTask(({ projectId }) => {
   if (projectId) { state.projectId = projectId; state.view = "tasks"; }
   refresh();
@@ -6301,6 +10962,19 @@ window.delphi.onFocusTask(({ projectId }) => {
  * are the behaviour the app had before these settings existed.
  */
 async function boot() {
+  // Asked once, here. Probing spawns login shells, so it cannot be done per
+  // render, and leaving it to the settings page meant the chat reported "not
+  // connected" until someone happened to open settings.
+  window.delphi.ai.providers()
+    .then((p) => { state.providers = p; if (state.view === "chat") render(); })
+    .catch(() => {});
+  // Same reason, same once: resolving a binary through a login shell is far too
+  // slow to do on a render, and the strip needs to know which agents exist
+  // before it can draw a tab for each of them.
+  window.delphi.harnesses.list()
+    .then((h) => { state.harnesses = h; if (state.view === "chat") render(); })
+    .catch(() => {});
+
   try {
     const settings = await window.delphi.settings.get();
     applyTheme(settings.theme);

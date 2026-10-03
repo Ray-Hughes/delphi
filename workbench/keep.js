@@ -1,0 +1,625 @@
+/**
+ * Keeping a copy of a Workbench folder before it goes, so that removing one
+ * never loses work, whoever asked for it.
+ *
+ * Discard used to be the one verb that threw work away, guarded by a typed
+ * confirm and the hope that only a person would reach it. Hope is not a
+ * boundary: an agent with a shell can reach anything a person can. So the
+ * folder is copied into the repository first, as a commit that no branch
+ * points at, under refs/delphi/discarded/<task>-<id>. Reaching Discard then
+ * costs nothing that cannot be got back for KEEP_DAYS.
+ *
+ * The copy is made with a temporary index and commit-tree, which touch
+ * neither the folder, its real index, its branch nor HEAD: whatever goes
+ * wrong while keeping, the folder is exactly as it was, and the verb that
+ * asked refuses rather than carry on without a copy.
+ *
+ * What is kept:
+ *
+ * - every tracked change and every untracked file, whatever its size: those
+ *   are the work.
+ * - ignored files, except reproducible output (REPRODUCIBLE: dependency
+ *   installs and caches a command makes again), any single file over
+ *   PER_FILE_MAX, and anything past TOTAL_MAX in all. What is not kept is
+ *   listed before anyone confirms, so nothing goes unnamed.
+ *
+ * The same rules decide what Finish asks about: an ignored file that is not
+ * reproducible, or a copied file (.env) that differs from the main checkout's,
+ * is named, and Finish goes ahead only on an explicit "these can go", keeping
+ * a copy under refs/delphi/finished/ all the same. That confirmation is a
+ * token over the exact list (confirmToken), so a list that changed after the
+ * person read it is refused rather than taken as agreed.
+ *
+ * What cannot be kept refuses outright, before anything is removed: a git
+ * repository inside the folder (its history and its uncommitted work are not
+ * files a commit can hold), and anything Delphi cannot read. A copy that
+ * turns out to be missing a file it was meant to hold is refused the same
+ * way, after write-tree and before the folder goes.
+ *
+ * Pure node and workbench/git.js, so the command line runs it in process.
+ */
+
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+const KEEP_DAYS = 30;
+const PER_FILE_MAX = 10 * 1024 * 1024;
+const TOTAL_MAX = 100 * 1024 * 1024;
+// Entries visited inside ignored folders before giving up counting. A folder
+// past it is reported whole as not kept, rather than walked for minutes.
+const WALK_MAX = 50000;
+const NAMESPACES = { discarded: "refs/delphi/discarded/", finished: "refs/delphi/finished/" };
+
+// Folders whose contents a command makes again: installs, caches and test
+// output. Deliberately not build, dist or out: people keep notes and hand
+// edited files in those often enough that they are asked about instead.
+const REPRODUCIBLE_DIRS = new Set([
+  "node_modules", "bower_components", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+  ".ruff_cache", ".tox", ".nox", ".gradle", ".next", ".nuxt", ".svelte-kit", ".parcel-cache", ".turbo",
+  ".angular", ".cache", ".nyc_output", "coverage", "target", "DerivedData", "Pods", ".terraform", ".eggs",
+]);
+const REPRODUCIBLE_FILES = /^(?:\.DS_Store|Thumbs\.db|desktop\.ini)$|\.py[co]$/;
+
+/** Whether an ignored path is something a command makes again. */
+function reproducible(rel) {
+  const parts = String(rel).replace(/\/+$/, "").split("/");
+  if (parts.some((p) => REPRODUCIBLE_DIRS.has(p) || p.endsWith(".egg-info"))) return true;
+  return REPRODUCIBLE_FILES.test(parts[parts.length - 1]);
+}
+
+function sameFile(a, b) {
+  try {
+    const sa = fs.statSync(a);
+    const sb = fs.statSync(b);
+    if (!sa.isFile() || !sb.isFile() || sa.size !== sb.size) return false;
+    return fs.readFileSync(a).equals(fs.readFileSync(b));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The folder's ignored files, sorted into what a person must hear about and
+ * what may go unremarked.
+ *
+ *   files     every ignored file that is not reproducible: [{ path, size }]
+ *   groups    the same, summarised by top level folder: [{ dir, count, bytes }]
+ *   changedCopies  copy-list files (.env) that differ from the main checkout's
+ *   keep      the paths a snapshot takes
+ *   notKept   what a snapshot leaves out, and why: [{ path, why }]
+ *
+ * A copy-list file identical to the main checkout's is reproducible (Start
+ * copies it again) and is not listed.
+ */
+async function ignoredReport(git, folder, { main = null, copy = [] } = {}) {
+  const listed = await git.ignoredPaths(folder);
+  if (!listed.ok) return { ok: false, reason: listed.reason };
+  const copies = new Set(copy.map((c) => String(c).replace(/^\.\//, "")));
+  const files = [];
+  const notKept = [];
+  const changedCopies = [];
+  const nested = [];
+  const unreadable = [];
+  let visited = 0;
+
+  const walk = (rel) => {
+    let entries;
+    try { entries = fs.readdirSync(path.join(folder, rel), { withFileTypes: true }); } catch { unreadable.push(`${rel}/`); return; }
+    for (const e of entries) {
+      const child = rel ? `${rel}/${e.name}` : e.name;
+      // A repository inside an ignored folder: its own history and its own
+      // uncommitted work, none of which a commit of files can hold.
+      if (e.name === ".git") { nested.push(`${rel}/`); continue; }
+      if (reproducible(child)) continue;
+      if (++visited > WALK_MAX) { notKept.push({ path: `${child}${e.isDirectory() ? "/" : ""}`, why: "too many files to go through" }); continue; }
+      if (e.isDirectory()) walk(child);
+      else add(child);
+    }
+  };
+  const add = (rel) => {
+    let size = 0;
+    let stat;
+    try { stat = fs.lstatSync(path.join(folder, rel)); size = stat.size; } catch { return; }
+    if (stat.isFile()) {
+      try { fs.accessSync(path.join(folder, rel), fs.constants.R_OK); } catch { unreadable.push(rel); return; }
+    }
+    if (copies.has(rel) && main) {
+      if (sameFile(path.join(folder, rel), path.join(main, rel))) return;
+      changedCopies.push(rel);
+    }
+    files.push({ path: rel, size });
+  };
+
+  for (const entry of listed.paths) {
+    if (reproducible(entry)) continue;
+    if (entry.endsWith("/")) walk(entry.slice(0, -1));
+    else add(entry);
+  }
+
+  const keep = [];
+  let total = 0;
+  for (const f of files) {
+    if (f.size > PER_FILE_MAX) { notKept.push({ path: f.path, why: `larger than ${PER_FILE_MAX / 1024 / 1024} MB` }); continue; }
+    if (total + f.size > TOTAL_MAX) { notKept.push({ path: f.path, why: `past ${TOTAL_MAX / 1024 / 1024} MB of ignored files in all` }); continue; }
+    total += f.size;
+    keep.push(f.path);
+  }
+
+  const byDir = new Map();
+  for (const f of files) {
+    const slash = f.path.indexOf("/");
+    const dir = slash === -1 ? f.path : f.path.slice(0, slash + 1);
+    const g = byDir.get(dir) || { dir, count: 0, bytes: 0 };
+    g.count++;
+    g.bytes += f.size;
+    byDir.set(dir, g);
+  }
+  return { ok: true, files, groups: [...byDir.values()], changedCopies, keep, notKept, nested, unreadable };
+}
+
+/**
+ * The repositories inside a folder, which no copy can hold: initialised
+ * submodules (gitlinks with a .git of their own), untracked repositories
+ * (git status lists one as a single folder, and with -uall that is the only
+ * kind of folder it lists), and repositories inside ignored folders (found by
+ * ignoredReport's walk).
+ */
+function nestedRepos(folder, { gitlinks = [], untracked = [], report = null } = {}) {
+  const found = new Set();
+  const submodules = [];
+  const hasGit = (rel) => { try { fs.lstatSync(path.join(folder, rel, ".git")); return true; } catch { return false; } };
+  for (const g of gitlinks) {
+    if (!hasGit(g)) continue;
+    const name = `${g.replace(/\/+$/, "")}/`;
+    found.add(name);
+    submodules.push(name);
+  }
+  for (const u of untracked) if (u.endsWith("/") && hasGit(u)) found.add(u);
+  for (const n of (report && report.nested) || []) found.add(n);
+  // The list, with which of them are submodules alongside: those are put
+  // away with git submodule deinit, not moved.
+  return Object.assign([...found].sort(), { submodules: submodules.sort() });
+}
+
+/**
+ * A short token for exactly what a person agreed could go: every listed
+ * ignored file and every path that would not be kept. Finish and Discard
+ * recompute it and refuse on any difference, so a confirmation is never
+ * stretched over files the person was not shown.
+ */
+function confirmToken(report, workbenchId = null) {
+  // The Workbench's id is in it too, so a "yes" given for one Workbench's
+  // files is never taken for another's that happens to list the same names.
+  const list = { workbench: workbenchId == null ? null : Number(workbenchId),
+    files: (report.files || []).map((f) => f.path).sort(), notKept: (report.notKept || []).map((n) => n.path).sort() };
+  return crypto.createHash("sha256").update(JSON.stringify(list)).digest("hex").slice(0, 32);
+}
+
+/** Where a Workbench's copy goes. One per Workbench and verb, so a second never overwrites a first. */
+function refFor(kind, wb) {
+  return `${NAMESPACES[kind]}${Number(wb.task_id)}-${Number(wb.id)}`;
+}
+
+const q = (p) => (/^[A-Za-z0-9_./:@+-]+$/.test(String(p)) ? String(p) : `'${String(p).replace(/'/g, "'\\''")}'`);
+
+/**
+ * A folder and a branch to recover into that are free now: the original
+ * folder may hold a new Workbench for the same task by the time anyone
+ * recovers, and a second Discard of that task wants a recovery of its own.
+ * Both carry the Workbench id, and a number after it if even that is taken.
+ */
+async function freeNames(git, { repo, folder, branch, id }) {
+  for (let n = 1; n < 100; n++) {
+    const tail = `recovered-${Number(id)}${n > 1 ? `-${n}` : ""}`;
+    const dir = `${folder}-${tail}`;
+    const name = `${branch}-${tail}`;
+    if (fs.existsSync(dir)) continue;
+    if (await git.refExists(repo, `refs/heads/${name}`)) continue;
+    return { dir, name };
+  }
+  return { dir: `${folder}-recovered-${Number(id)}-${Date.now()}`, name: `${branch}-recovered-${Number(id)}-${Date.now()}` };
+}
+
+/**
+ * The sentence that says what was kept and the one command that puts it
+ * back. When something was not kept it says so by name: "everything" is
+ * never claimed for a copy that is missing anything.
+ */
+function recoverText({ ref, repo, until, dir, name, notKept = [] }) {
+  const missing = notKept.map((n) => n.path || n);
+  const what = missing.length
+    ? `Everything in it except ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? `, and ${missing.length - 5} more` : ""} (not kept: too large or too many) is kept until ${until} as ${ref}.`
+    : `Everything in it is kept until ${until} as ${ref}.`;
+  return `${what} To get it back: git -C ${q(repo)} worktree add -b ${q(name)} ${q(dir)} ${ref}`;
+}
+
+async function recoverFor(git, { ref, repo, folder, branch, id, until, notKept = [] }) {
+  const { dir, name } = await freeNames(git, { repo, folder, branch, id });
+  return recoverText({ ref, repo, until, dir, name, notKept });
+}
+
+function untilDate(days = KEEP_DAYS, now = Date.now()) {
+  return new Date(now + days * 86400000).toISOString().slice(0, 10);
+}
+
+/**
+ * Commits the folder as it is (tracked changes, untracked files and the
+ * listed ignored ones) onto a commit no branch points at, and names it ref.
+ *
+ * Its first parent is the folder's HEAD and its second the branch's tip when
+ * that differs, so commits on a detached HEAD and commits on a branch about
+ * to be deleted are both reachable from the one ref. With no folder (it was
+ * deleted by hand) the branch tip alone is kept, and with neither an empty
+ * commit records that there was nothing.
+ *
+ * Refuses, changing nothing, if the ref already exists.
+ */
+async function snapshot(git, { repo, folder = null, branch, ref: wanted, keep = [], hidden = [], expect = [], message }) {
+  const rev = async (dir, spec) => {
+    const r = await git.run(dir, ["rev-parse", "--verify", "--quiet", spec]);
+    return r.ok ? r.stdout.trim() : null;
+  };
+  // A copy of this name left by an older database (ids start again) is
+  // somebody's work too: never replaced, the new one takes the next name.
+  let ref = wanted;
+  for (let n = 2; await rev(repo, ref); n++) ref = `${wanted}-${n}`;
+  const head = folder ? await rev(folder, "HEAD^{commit}") : null;
+  const tip = await rev(repo, `refs/heads/${branch}^{commit}`);
+  const env = {
+    GIT_AUTHOR_NAME: "Delphi", GIT_AUTHOR_EMAIL: "delphi@localhost",
+    GIT_COMMITTER_NAME: "Delphi", GIT_COMMITTER_EMAIL: "delphi@localhost",
+    GIT_LITERAL_PATHSPECS: "1",
+  };
+
+  let tree = null;
+  if (folder) {
+    const indexOut = await git.run(folder, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    if (!indexOut.ok) return { ok: false, reason: git.plain(indexOut, "Git cannot read this folder.", { strict: true }) };
+    const index = indexOut.stdout.trim();
+    const temp = `${index}.delphi-keep-${process.pid}-${Date.now()}`;
+    const withIndex = { ...env, GIT_INDEX_FILE: temp };
+    try {
+      // The real index copied rather than rebuilt, so git trusts its record of
+      // unchanged files and does not read the whole tree again. A missing or
+      // unreadable one falls back to HEAD's tree, which is merely slower.
+      let seeded = false;
+      try { fs.copyFileSync(index, temp); seeded = true; } catch {}
+      if (!seeded && head) {
+        const r = await git.runWith(folder, ["read-tree", head], { env: withIndex });
+        if (!r.ok) return { ok: false, reason: git.plain(r, "Could not read the folder's last commit.", { strict: true }) };
+      }
+      // Files git was told not to look at (assume-unchanged, skip-worktree)
+      // are looked at here: their flags are cleared in the copy's index only,
+      // or add would skip exactly the edits nobody can see.
+      // One flag per call: given both, update-index applies only the last.
+      for (const flag of hidden.length ? ["--no-assume-unchanged", "--no-skip-worktree"] : []) {
+        const r = await git.runWith(folder, ["update-index", flag, "-z", "--stdin"], { env: withIndex, input: `${hidden.join("\0")}\0` });
+        if (!r.ok) return { ok: false, reason: git.plain(r, "Could not read the hidden changes.", { strict: true }) };
+      }
+      let r = await git.runWith(folder, ["add", "--all", "--", "."], { env: withIndex, timeout: 10 * 60000 });
+      if (!r.ok) return { ok: false, reason: git.plain(r, "Could not read every file in the folder.", { strict: true }) };
+      if (keep.length) {
+        // With core.precomposeunicode (macOS) git reads every name composed,
+        // so a name the walk found decomposed is only matched in NFC. A path
+        // list on stdin is not converted for us the way argv is.
+        const pre = await git.run(folder, ["config", "--bool", "core.precomposeunicode"]);
+        const names = pre.ok && pre.stdout.trim() === "true" ? keep.map((k) => k.normalize("NFC")) : keep;
+        r = await git.runWith(folder, ["add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"],
+          { env: withIndex, input: `${names.join("\0")}\0`, timeout: 10 * 60000 });
+        if (!r.ok) return { ok: false, reason: git.plain(r, "Could not read the ignored files.", { strict: true }) };
+      }
+      r = await git.runWith(folder, ["write-tree"], { env: withIndex });
+      if (!r.ok) return { ok: false, reason: git.plain(r, "Could not record the folder's files.", { strict: true }) };
+      tree = r.stdout.trim();
+      // Checked, not trusted: every file the copy was meant to hold is in
+      // it, or the folder stays. add skips what it cannot see (a repository
+      // inside the folder, a file it was not allowed to open) with at most a
+      // warning, and a copy with a hole in it is worse than no copy, because
+      // it is believed.
+      const wantIn = [...new Set([...keep, ...expect.filter((p) => !p.endsWith("/")), ...hidden])];
+      // A hidden change is checked by content, not presence: the file was in
+      // the tree all along, with the old text.
+      for (const h of hidden) {
+        const want = await git.runWith(folder, ["hash-object", "--", h]);
+        const got = await git.runWith(folder, ["rev-parse", "--verify", "--quiet", `${tree}:${h}`]);
+        if (fs.existsSync(path.join(folder, h)) && (!want.ok || !got.ok || want.stdout.trim() !== got.stdout.trim())) {
+          return { ok: false, reason: `The copy would not hold the change to ${h}.` };
+        }
+      }
+      if (wantIn.length) {
+        const listed = await git.runWith(folder, ["ls-tree", "-r", "-z", "--name-only", tree], { timeout: 10 * 60000 });
+        if (!listed.ok) return { ok: false, reason: "Could not check the copy." };
+        // Compared in NFC on both sides: macOS hands back a name as it was
+        // written (often NFD, "café" as e + accent), git stores it composed,
+        // and the two are the same file.
+        const inTree = new Set(listed.stdout.split("\0").filter(Boolean).map((p) => p.normalize("NFC")));
+        const lost = wantIn.filter((p) => !inTree.has(p.normalize("NFC")) && fs.existsSync(path.join(folder, p)));
+        if (lost.length) {
+          return { ok: false, reason: `The copy would be missing ${lost.slice(0, 5).join(", ")}${lost.length > 5 ? `, and ${lost.length - 5} more` : ""}.` };
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(temp); } catch {}
+    }
+  } else if (tip) {
+    tree = await rev(repo, `${tip}^{tree}`);
+  } else {
+    const r = await git.runWith(repo, ["mktree"], { input: "" });
+    tree = r.ok ? r.stdout.trim() : null;
+  }
+  if (!tree) return { ok: false, reason: "Could not record the folder's files." };
+
+  const parents = [...new Set([head, tip].filter(Boolean))];
+  const made = await git.runWith(repo, ["commit-tree", "--no-gpg-sign", tree, ...parents.flatMap((p) => ["-p", p]), "-m", message], { env });
+  if (!made.ok) return { ok: false, reason: git.plain(made, "Could not record the copy.", { strict: true }) };
+  const sha = made.stdout.trim();
+  // An empty old value: the ref is only created, never moved.
+  const named = await git.run(repo, ["update-ref", "-m", "delphi: kept before removing a Workbench", ref, sha, ""], { write: true });
+  if (!named.ok || await rev(repo, ref) !== sha) return { ok: false, reason: git.plain(named, "Could not name the copy.", { strict: true }) };
+  return { ok: true, ref, sha, head, tip, kept: keep.length };
+}
+
+/**
+ * Deletes kept copies older than KEEP_DAYS, by the date the copy was made.
+ * Each is deleted only if it still points where it was read, so a copy made
+ * a moment ago under a reused name is never the one removed.
+ */
+async function expire(git, repo, { days = KEEP_DAYS, now = Date.now() } = {}) {
+  const r = await git.run(repo, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(committerdate:unix)",
+    NAMESPACES.discarded, NAMESPACES.finished]);
+  if (!r.ok) return [];
+  const cutoff = now / 1000 - days * 86400;
+  const gone = [];
+  for (const line of r.stdout.split("\n").filter(Boolean)) {
+    const [ref, sha, when] = line.split("\0");
+    if (!(Number(when) < cutoff)) continue;
+    const d = await git.run(repo, ["update-ref", "-d", ref, sha], { write: true });
+    if (d.ok) gone.push(ref);
+  }
+  return gone;
+}
+
+// ---------------------------------------------------------------------------
+// Moving a folder aside, then emptying it
+//
+// Removing a folder in place can fail half way (a read-only directory from a
+// Go module cache, a process still writing into it) and leave neither the
+// folder nor its registration nor any record of the copy. So a folder is
+// renamed aside first, which is one atomic step on one filesystem, the
+// Workbench is recorded as closed at once, and the slow delete comes last,
+// where failing costs nothing but disk space.
+
+const TRASH = ".trash";
+
+/** Where a Workbench folder is moved aside to: a sibling, so the move is a rename. */
+function trashPath(folder, id, now = Date.now()) {
+  return path.join(path.dirname(folder), TRASH, `${Number(id)}-${now}`);
+}
+
+/**
+ * Renames the folder aside and drops git's registration of it. Throws,
+ * having moved nothing, if the rename fails.
+ */
+async function moveAside(git, { repo, folder, id, manifest = {}, to: given = null }) {
+  const to = given || trashPath(folder, id);
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  // The manifest is written before the move, so there is never a moved
+  // folder without one: it is what lets housekeeping finish the job (record
+  // it, check it, delete it) if this process dies half way.
+  const record = `${to}.json`;
+  fs.writeFileSync(record, JSON.stringify({ ...manifest, workbench: Number(id), folder, trash: to, moved_at: Date.now() }, null, 2));
+  try {
+    fs.renameSync(folder, to);
+  } catch (error) {
+    try { fs.unlinkSync(record); } catch {}
+    throw error;
+  }
+  // Cut loose from git at once. Its .git file names the registration under
+  // .git/worktrees, which a new Workbench for the same task reuses: left as
+  // it is, git run in the moved folder would read and write the new one.
+  try { fs.renameSync(path.join(to, ".git"), path.join(to, ".git.was")); } catch {}
+  // The registration now points at a folder that is gone, which is exactly
+  // what forgetRegistration clears, for this folder only.
+  await git.forgetRegistration(repo, folder);
+  return to;
+}
+
+/**
+ * The volume's own idea of now, from a probe file's mtime: what changedSince
+ * compares file times with, so a clock that differs from the disk's (a
+ * network share, a VM) cannot hide a write.
+ */
+function volumeNow(folder) {
+  const dir = path.join(path.dirname(folder), TRASH);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, `.probe-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+    fs.writeFileSync(probe, "");
+    const at = fs.statSync(probe).mtimeMs;
+    fs.unlinkSync(probe);
+    return at;
+  } catch {
+    return Date.now() - 2000;
+  }
+}
+
+/** A .trash entry's manifest, or null when it has none (and so is never deleted). */
+function readManifest(trash) {
+  try { return JSON.parse(fs.readFileSync(`${trash}.json`, "utf8")); } catch { return null; }
+}
+
+/** Every entry in a .trash folder that Delphi made: the folder, its manifest if any, whether it is kept. */
+function trashEntries(root) {
+  const dir = path.join(root, TRASH);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  return names.filter((n) => /^\d+-\d{13}$/.test(n)).map((n) => {
+    const trash = path.join(dir, n);
+    return { trash, id: Number(n.split("-")[0]), manifest: readManifest(trash), kept: fs.existsSync(`${trash}.kept`) };
+  });
+}
+
+// A lock older than this is someone's that died without letting go.
+const LOCK_STALE_MS = 60 * 60 * 1000;
+
+/**
+ * Takes the one lock on a .trash entry (an O_EXCL file beside it), or
+ * returns null when someone else holds it: two housekeeping runs, or the
+ * app emptying a folder while a terminal's housekeeping looks at it, must
+ * never both record, note or delete. A lock whose process is gone (same
+ * machine) or that is over an hour old is broken and taken.
+ */
+function takeLock(trash) {
+  const file = `${trash}.lock`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(file, "wx");
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: require("os").hostname(), at: Date.now() }));
+      fs.closeSync(fd);
+      return () => { try { fs.unlinkSync(file); } catch {} };
+    } catch (error) {
+      if (error.code !== "EEXIST") return null;
+      let info = null;
+      let age = 0;
+      try { info = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+      try { age = Date.now() - fs.statSync(file).mtimeMs; } catch {}
+      const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+      const stale = info
+        ? (info.host === require("os").hostname() && !alive(Number(info.pid))) || Date.now() - Number(info.at) > LOCK_STALE_MS
+        : age > 10000;
+      if (!stale) return null;
+      try { fs.unlinkSync(file); } catch {}
+    }
+  }
+  return null;
+}
+
+/** A git blob id computed here, for files in a folder git no longer knows. */
+function blobId(full, stat) {
+  const body = stat.isSymbolicLink() ? Buffer.from(fs.readlinkSync(full)) : fs.readFileSync(full);
+  return crypto.createHash("sha1").update(`blob ${body.length}\0`).update(body).digest("hex");
+}
+
+/**
+ * Files in the moved folder that are not in the copy as they are now: new
+ * since the copy, or changed. Only files touched since the copy began are
+ * hashed, so a large tree costs a walk, not a read. Reproducible output and
+ * the files a person agreed could go are not counted. A folder that cannot be
+ * read counts as changed: what is in it is unknown.
+ */
+async function changedSince(git, { repo, trash, tree, since, notKept = [], copy = [] }) {
+  const listed = await git.runWith(repo, ["ls-tree", "-r", "-z", tree], { timeout: 10 * 60000 });
+  if (!listed.ok) return ["(the copy could not be read back)"];
+  const inCopy = new Map();
+  for (const rec of listed.stdout.split("\0").filter(Boolean)) {
+    const tab = rec.indexOf("\t");
+    const [, , sha] = rec.slice(0, tab).split(" ");
+    inCopy.set(rec.slice(tab + 1).normalize("NFC"), sha);
+  }
+  const agreed = new Set(notKept.map((n) => String(n.path || n).normalize("NFC")));
+  // Folders that hold something in the copy. A reproducible-looking folder
+  // (target/, coverage/) is skipped only when nothing in it is in the copy:
+  // the same rule the copy used, which skips reproducible output only among
+  // ignored files, never a tracked src/target/main.c.
+  const holds = new Set();
+  for (const p of inCopy.keys()) {
+    const parts = p.split("/");
+    for (let i = 1; i < parts.length; i++) holds.add(parts.slice(0, i).join("/"));
+  }
+  // Whether git would ignore a path, asked of the moved folder's own
+  // .gitignore files through the repository's git folder, with --no-index so
+  // no index anywhere is read or written. Reproducible output is only ever
+  // skipped when it is also ignored: an untracked src/coverage/notes.md is
+  // work, whatever its folder is called.
+  const common = await git.run(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const ignoredHere = async (rels) => {
+    if (!rels.length || !common.ok) return new Set();
+    const r = await git.runWith(trash, ["--git-dir", common.stdout.trim(), "--work-tree", trash, "check-ignore", "--no-index", "-z", "--stdin"],
+      { input: `${rels.join("\0")}\0` });
+    return new Set(r.stdout.split("\0").filter(Boolean));
+  };
+  const changed = [];
+  const walk = async (rel) => {
+    let entries;
+    try { entries = fs.readdirSync(path.join(trash, rel), { withFileTypes: true }); } catch { changed.push(`${rel}/`); return; }
+    const looks = entries.map((e) => (rel ? `${rel}/${e.name}` : e.name)).filter((c) => reproducible(c) && !inCopy.has(c.normalize("NFC")) && !holds.has(c.normalize("NFC")));
+    const skip = await ignoredHere(looks);
+    for (const e of entries) {
+      const child = rel ? `${rel}/${e.name}` : e.name;
+      if (!rel && (e.name === ".git" || e.name === ".git.was")) continue;
+      const key = child.normalize("NFC");
+      const full = path.join(trash, child);
+      if (skip.has(child) || skip.has(`${child}/`)) continue;
+      if (e.isDirectory()) { await walk(child); continue; }
+      if (agreed.has(key)) continue;
+      let stat;
+      try { stat = fs.lstatSync(full); } catch { continue; }
+      // ctime as well as mtime: a tool can set mtime back (cp -p, tar,
+      // rsync -t) but not ctime. since is the volume's clock (volumeNow).
+      if (Math.max(stat.mtimeMs, stat.ctimeMs) < since) continue;
+      const sha = inCopy.get(key);
+      // A copied file (.env) still the same as the main checkout's is one
+      // Start copies again, so it was never meant to be in the copy.
+      if (!sha && copy.includes(child) && sameFile(full, path.join(repo, child))) continue;
+      let now = null;
+      try { now = blobId(full, stat); } catch {}
+      if (!sha || sha !== now) changed.push(key);
+    }
+  };
+  await walk("");
+  return changed;
+}
+
+/** Deletes a folder, making each directory writable first (read-only caches). */
+function deleteTree(root) {
+  const open = (dir) => {
+    try {
+      const st = fs.lstatSync(dir);
+      if (!st.isDirectory()) return;
+      if ((st.mode & 0o700) !== 0o700) fs.chmodSync(dir, st.mode | 0o700);
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) if (e.isDirectory()) open(path.join(dir, e.name));
+    } catch {}
+  };
+  open(root);
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 2 });
+}
+
+/**
+ * Empties a folder moved aside, unless anything in it changed after the copy
+ * was made: then it is kept where it is, a .kept marker beside it so
+ * housekeeping leaves it alone, and the caller tells the person.
+ */
+async function emptyTrash(git, { repo, trash, tree, since, notKept = [], copy = [], locked = false }) {
+  if (!trash || !fs.existsSync(trash)) return { deleted: true, kept: null, changed: [] };
+  if (!locked) {
+    const release = takeLock(trash);
+    // Someone else is on it; they finish the job, and nothing is said twice.
+    if (!release) return { deleted: false, kept: null, changed: [], busy: true };
+    try { return await emptyTrash(git, { repo, trash, tree, since, notKept, copy, locked: true }); } finally { release(); }
+  }
+  if (!fs.existsSync(trash)) return { deleted: true, kept: null, changed: [] };
+  if (fs.existsSync(`${trash}.kept`)) return { deleted: false, kept: trash, changed: [], already: true };
+  const changed = await changedSince(git, { repo, trash, tree, since, notKept, copy });
+  if (changed.length) {
+    try { fs.writeFileSync(`${trash}.kept`, `Kept because these changed after the copy was made:\n${changed.join("\n")}\n`); } catch {}
+    return { deleted: false, kept: trash, changed };
+  }
+  try {
+    // Marked first: a delete that stops part way leaves a folder that no
+    // longer matches its copy, and the marker is what tells housekeeping it
+    // was already checked and is only to be finished off.
+    try { fs.writeFileSync(`${trash}.deleting`, ""); } catch {}
+    deleteTree(trash);
+    for (const ext of [".json", ".deleting"]) { try { fs.unlinkSync(`${trash}${ext}`); } catch {} }
+    return { deleted: true, kept: null, changed: [] };
+  } catch (error) {
+    return { deleted: false, kept: null, changed: [], reason: String(error.code || error.message) };
+  }
+}
+
+module.exports = {
+  TRASH, trashPath, moveAside, volumeNow, readManifest, trashEntries, takeLock, changedSince, deleteTree, emptyTrash,
+  KEEP_DAYS, PER_FILE_MAX, TOTAL_MAX, WALK_MAX, NAMESPACES, REPRODUCIBLE_DIRS,
+  reproducible, ignoredReport, nestedRepos, confirmToken, refFor, freeNames, recoverText, recoverFor, untilDate, snapshot, expire,
+};

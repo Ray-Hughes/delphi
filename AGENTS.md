@@ -16,6 +16,18 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `add_task` | Create a task |
 | `update_task` | Change status, priority, detail, or move between projects |
 | `add_note` | Store a decision, gotcha or reference against a project |
+| `list_scratchpads` | The working documents in a project. Call before writing one |
+| `read_scratchpad` | One pad in full: what the last session was in the middle of |
+| `write_scratchpad` | Write the working document. Checkbox lines in it become tasks |
+| `append_scratchpad` | Add to the end of a pad without reading it first |
+| `patch_scratchpad` | Replace one section, found by its heading |
+| `list_agents` | The other agents on this machine that work can be handed to |
+| `handoff_send` | Hand a piece of work to another agent. You are woken with the reply |
+| `handoff_status` | What has been handed to and from you, and the replies |
+| `lock_acquire` | Take a lease on a file, a branch, a migration, so two agents do not collide |
+| `lock_release` | Give one back |
+| `lock_status` | What is held in a project, and by whom |
+| `timer_set` | Ask to be given a turn later, instead of waiting in a loop |
 | `search` | Text matching across tasks and notes |
 | `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
 | `oracle_entities` | What the graph knows about, most referenced first |
@@ -28,6 +40,21 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `queue_complete` | Finish a claimed task with a summary |
 | `queue_release` | Give a claimed task back, with a reason |
 | `queue_extend` | Push your lease out because you are still working |
+| `sheet_read` | A task's Sheet: the tail, the ledger, or all of it. Pass the cursor back to poll |
+| `sheet_get` | One entry by its id, with its task id |
+| `sheet_append` | Write on a task's Sheet: `say` a finding, `note` something done, record a `run` |
+| `sheet_update` | Finish a run entry with its result, or edit an entry |
+| `sheet_promote` | Put an entry in the task's ledger, or take it out |
+| `sheet_file` | Turn an entry into a project note, so other tasks find it too |
+| `sheet_ask` | Ask a question with two to four answers, when someone has to choose |
+| `sheet_decide` | Answer one. The decision goes into the ledger by itself |
+| `sheet_resolve` | Find a task from an id, legacy id or ref, and the folder its commands run in |
+| `workbench_start` | Give a task its own folder and branch, and get the path to work in |
+| `workbench_status` | Whether a Workbench has unsaved changes, unshared commits, or is behind |
+| `workbench_finish` | Put a Workbench away once its work is committed and pushed |
+| `workbench_list` | The live Workbenches, with their status in words |
+
+There is no tool to discard a Workbench, on purpose. See Safety.
 
 Every write is attributed. Set `DELPHI_ACTOR` in the server's environment to name the
 agent, and its changes appear in the History tab labelled with that name. Give each
@@ -121,6 +148,14 @@ During the work:
   and the reasoning behind it, a trap that cost time, why an obvious approach was
   rejected, an exact value that is hard to find again. Use `kind` of `decision`,
   `gotcha` or `reference` as appropriate.
+- Keep your working document in a scratchpad, through `write_scratchpad`, and write the
+  plan in it as checkbox lines. They become real tasks, so a plan in a pad is a plan on
+  the board. Do not also call `add_task` for work that is already in the pad: that files
+  it twice.
+- While working a task, write what you find on its Sheet with `sheet_append`. Promote
+  (`promote: true`) anything that changes what the next agent should do: a finding, a
+  dead end, a decision. If it would matter on a different task too, `sheet_file` it as
+  well, so it becomes a project note search and the graph can find.
 
 Do not ask permission before recording any of this. Record it, then mention in one line
 what you recorded.
@@ -130,12 +165,54 @@ restatements of what the code already says plainly.
 
 ---
 
-## Using the tracker as the scratchpad
+## Scratchpads, and the board read out of them
+
+A scratchpad is the working document for a piece of work: the plan, what was
+tried, what it did, what is still open. Every agent already keeps one. Until
+these existed it kept it somewhere Delphi could not see, which meant it died
+with the session.
+
+`write_scratchpad` puts it in the tracker instead, and `list_scratchpads` is how
+you find the one that is already there rather than starting a second one beside
+it. `append_scratchpad` and `patch_scratchpad` are the safe writes when another
+agent may be working the same pad: neither can overwrite what the other added.
+
+The part worth understanding is that the board is a projection of the pads. A
+checkbox line is a task:
+
+```
+- [ ] wire the codex adapter @ray !high
+- [x] a finished one
+  - [ ] an indented line is a subtask of the one above
+```
+
+`@name` sets the assignee, `!high` the priority, indentation the parent. Ticking
+a line closes its task; closing the task rewrites the line. So the plan and the
+board cannot drift, and nobody has to file anything twice.
+
+Delphi marks each line it has filed with an `<!--d:123-->` comment. It is
+invisible when the markdown renders and it is how a line and its task stay the
+same thing across a rewording. Edit around them. If you drop them, lines are
+matched back to their tasks by exact text, which recovers most of it but not a
+line you reworded in the same pass.
+
+Two rules exist so this cannot lose work. A line that disappears from a pad does
+not delete its task; it stays on the board, and the pad shows what it dropped.
+And an unticked box does not drag a task out of `doing` or `blocked`: the pad
+owns done or not done, the board owns the rest.
+
+A pad can be turned off as a source with `derives_tasks: false`, for a sketch
+full of options nobody has agreed to yet.
+
+Notes are still notes. A pad is where you are thinking; a note is what you
+concluded, and `add_note` still owns those.
+
+### The scratchpad switch
 
 Settings has a switch called **Agent scratchpad**. Off by default. Turned on,
-every agent connected to this database is told to write its drafts, plans and
-working documents here as notes instead of to temporary files, and given a
-default project to put them in.
+every agent connected to this database is told to keep its plans and working
+documents here rather than in temporary files, and given a default project to
+put them in.
 
 The point is that the default is otherwise a temp directory, which is emptied
 between sessions and invisible to every other agent sharing this tracker. You
@@ -151,7 +228,7 @@ switch writes to all of them:
 | `tools/list` → tool descriptions | Whenever the model considers a tool | Where the behaviour comes from |
 | `tools/call` → result | While the agent is already working | Last chance to correct course |
 
-The middle one does the work. A directive sitting in `add_note`'s own description
+The middle one does the work. A directive sitting in `write_scratchpad`'s own description
 is read at the moment the model is deciding where to put something.
 
 Turning it on or off reaches agents that are already connected, within a few
@@ -161,6 +238,74 @@ re-reads the descriptions. Wording lives in `agent/directives.js`.
 
 It deliberately does not cover files that have to be files to work: scripts an
 agent executes, generated documents, anything a command needs a path for.
+
+## Sheets
+
+A task's discussion is its Sheet: a list of entries, each a kind. `say` is a remark
+or finding, `note` a short marker of something done (a file edited, a deploy made),
+`run` a shell command with its result, `ask` a question with two to four answers, and
+`decide` the answer. Comments and Sheet entries are the same thing; `add_comment`
+writes a `say`.
+
+The **ledger** is the part of a Sheet the next agent reads first: every entry that was
+promoted, plus every decision and the question it answers. `get_task` and `queue_next`
+return the ledger plus the last 20 entries, as entries in `comments` and as text in
+`sheet`, with `comments_total` saying how many there are in all. Call `sheet_read` with
+`mode: "full"` when you need the rest. Its `after_id` and `since` cursor are how you
+poll for new entries; dedupe by id, because `since` is inclusive.
+
+Promote sparingly and on purpose. A ledger that holds everything is a ledger nobody
+reads, and the reason it exists is so an agent arriving cold gets the three things
+that matter rather than two hundred lines. `sheet_file` is for what outlives the
+task: it makes a project note of the entry and promotes it as well.
+
+A `run` entry you record yourself is a record, not an execution: Delphi does not run
+it. Commands a person runs from a Sheet, or through `delphi run`, are checked by the
+guard first and their output is kept in a log.
+
+## Workbenches
+
+A Workbench is a task's own folder and branch, beside the repository in
+`<repo>.workbenches/`, so two tasks never share one checkout. `workbench_start` makes
+one, or returns the one the task already has, and gives you its path: run your
+commands there. Read the `warnings` it returns; they say when the remote could not be
+reached and the local copy was used.
+
+Finishing is usually a person's job, after review. `workbench_finish` refuses rather
+than lose anything: while something is unsaved or unpushed, while a rebase is part
+way through, or while the folder holds files git does not keep. Do not work around a
+refusal; say what it said in the Sheet. `ignored_ok` is a person saying those files
+can go, and only a person says it, so ask in the Sheet with `sheet_ask`.
+
+When you set a task with a live Workbench to `done` through `update_task` or
+`queue_complete`, the result carries a `workbench` notice. It means what it says: a
+person will Finish it, so do not remove the folder or the branch yourself.
+
+## Working alongside other agents
+
+Delphi can run Claude Code, Codex and Copilot as tabs in the same project, and
+they all speak to this same server. Three tools exist because of that.
+
+`handoff_send` gives a piece of work to another agent: "have Codex review this
+branch". It returns immediately with an id. Delphi runs the request in that
+agent's own session, keeps the reply, and gives you a fresh turn with the answer
+when it lands. So hand it over and finish your turn. Do not poll, do not sleep,
+do not wait in a loop: your turn ending is the normal and expected thing, and you
+will be woken.
+
+`timer_set` is the same idea for anything else that finishes on its own clock: a
+build, a deploy, a long test run. Start it, set a timer, end your turn. It only
+works from inside a Delphi tab, because there has to be a session to wake.
+
+`lock_acquire` is a lease on something two of you could collide over: a file, a
+branch, a migration, the dev server. It expires, because an agent that takes one
+and dies must not hold it forever, and you extend it by asking again. Check the
+answer before you carry on: `held: false` means somebody else has it and says
+who and until when.
+
+Delphi stops running handoffs by itself after twelve finish in one project in an
+hour. Two agents that each wake the other are a loop that spends money at machine
+speed with nobody watching, and the limit is the thing that notices.
 
 ## Taking work from the queue
 
@@ -192,13 +337,16 @@ queue_release(task_id, reason)    could not finish, and why
 
 Four rules that make this work when more than one agent is doing it:
 
-**Read before starting.** The claim returns the discussion and the history along with
-the task. Someone may have already tried this and left you the reason it failed.
+**Read before starting.** The claim returns the task's Sheet (the ledger plus the last
+20 entries, in `comments` and as text in `sheet`, with `comments_total`) and its
+history. Someone may have already tried this and left you the reason it failed.
 
 **Write before finishing.** `queue_complete` takes a summary, and that summary is what
 the next person reads. Write it for them, not for a changelog. "Fixed" tells them
 nothing; "the provider ignores the idempotency key on refunds, so this needs the same
-change in the refund path" saves them the afternoon you just spent.
+change in the refund path" saves them the afternoon you just spent. It is promoted into
+the task's ledger automatically, and so is a `queue_release` reason, because both are
+what the next agent most needs.
 
 **Release honestly.** If you are stuck, `queue_release` with the specific reason. A task
 released without one gets picked up and abandoned again by the next agent, and then the
@@ -212,6 +360,11 @@ mysteriously reset itself: the queue view reports the sweep, and the task's own 
 records which agent lost the claim.
 
 Do not claim more than one task at a time. Finish or release before taking another.
+
+`agent/queue_runner.js` works the queue unattended, one agent run per task. With
+`--workbenches` it gives each task its own Workbench and runs the agent there, leaving
+the Workbench for a person to review and finish. That is what makes `--concurrency`
+above 1 safe in one repository. It is off by default in this release.
 
 ## Delegation
 
@@ -245,3 +398,17 @@ Install it by pointing a `PreToolUse` hook at it in `~/.claude/settings.json`:
 It denies rather than prompts, and has no override flag on purpose. If something
 genuinely needs doing that it blocks, run it yourself in a terminal. Run
 `python3 agent/guard_test.py` to see exactly what it stops and what it lets past.
+
+It is a Claude Code hook, so it only sees what Claude Code runs. Copilot and Codex do
+not consult it.
+
+**Agents cannot Discard a Workbench.** Throwing an attempt away is a person's call.
+There is no MCP tool for it. `delphi discard` needs a person at a terminal typing the
+task's number, and refuses outright in a session that says it is an agent's. The guard
+blocks `delphi discard` however it is reached, and blocks setting `DELPHI_CLIENT`,
+which is how an agent would pretend to be the `delphi` command to reach the tools only
+the command line is given. None of these alone is a boundary, and nothing depends on
+them being one: Discard keeps a copy of everything in the folder for 30 days before it
+removes anything. They exist so that an agent which gets that far is told plainly that
+it is not its decision. If you think something should be discarded, say so and why in
+the task's Sheet.

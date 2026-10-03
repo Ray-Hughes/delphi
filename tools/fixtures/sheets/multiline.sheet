@@ -1,0 +1,24 @@
+---
+task: 7
+title: multiline bodies
+project: core
+status: todo
+---
+> ray: first line
+  second line
+
+  after a blank line
+    indented four
+   
+  the line above is one space of content
+@ claude-code:12: summary  {id:3 +}
+  - point one
+  - point two
+!  leading space on the first line is content  {id:4 by:ray}
+  middle
+
+  end
+= b  {id:5 by:ray ref:2 +}
+  because the fixed one is simpler
+  and unicode survives: caf\u00e9 is not escaped, café is
+> you:  {id:6}

@@ -10,6 +10,8 @@ const { DatabaseSync } = require("node:sqlite");
 const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
+const pads = require("./pads");
+const schemaLater = require("./agent/schema_later");
 
 // Beside the source when run from a checkout, in the per-user data directory when
 // run from an installer. See paths.js: the packaged source directory is a
@@ -32,56 +34,123 @@ function open() {
   const schema = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
   // Columns first, then the schema. schema.sql indexes some of these columns, and
   // an index on a column that does not exist yet is an error that stops the whole
-  // file, so an older database would fail to open at all.
-  addLaterColumns(db);
+  // file, so an older database would fail to open at all. See agent/schema_later.js
+  // for why the list lives there: the MCP server runs the same one.
+  //
+  // apply() never throws, because the server would rather serve without a column
+  // than not serve. The app has always refused to open a database it could not
+  // bring up to date, and still does, so the first failure is raised here.
+  const later = schemaLater.apply((statement) => db.prepare(statement).all());
+  if (later.errors.length) {
+    const first = later.errors[0];
+    throw new Error(`Could not bring the database up to date: ${first.message} (${first.statement.split("\n")[0]})`);
+  }
   db.exec(schema);
+  // After the schema, because on a fresh database the table it rebuilds has just
+  // been created with the right constraint and there is nothing to do.
+  widenAuditEntities(db);
+  // Safe to call here: db is already assigned, so the helpers this goes through
+  // find the connection rather than recursing into open(). Guarded because a
+  // database that adopts nothing still works, and one that refuses to open does
+  // not.
+  try {
+    adoptProjectPaths();
+  } catch (error) {
+    console.error("could not adopt project paths into workspaces", error);
+  }
   return db;
 }
 
 /**
- * Adds columns that arrived after a database was first created.
+ * Widens the CHECK on audit.entity, once.
  *
- * schema.sql stays idempotent because everything in it is CREATE ... IF NOT
- * EXISTS, but SQLite has no ADD COLUMN IF NOT EXISTS, so a new column on an
- * existing table cannot live there alone. Rather than bring in a migration
- * framework and a version table for what has so far only ever been added
- * columns, each one is named here and applied when it is missing.
+ * The audit table names the kinds of thing that can be written, and scratchpads
+ * are a new one. A CHECK constraint cannot be altered, so the only way to change
+ * it is the twelve step rebuild SQLite documents: make the new table, copy, drop
+ * the old, rename, put the indexes back.
  *
- * The column is also declared in schema.sql, so a fresh database gets it from
- * there and this finds nothing to do. Anything more structural than an added
- * column should get a real migration rather than an entry here.
+ * This is the first thing in the file more structural than an added column, and
+ * it is worth the risk rather than the alternative. The alternative was to file
+ * pad writes under 'note', which would make the History tab lie about what
+ * happened, in the one feature whose whole selling point is that it does not.
+ *
+ * Guarded on the stored SQL rather than a version number, so it is idempotent
+ * without a migrations table: if the constraint already names scratchpad, this
+ * has run.
  */
-const LATER_COLUMNS = [
-  ["tasks", "parent_id", "INTEGER REFERENCES tasks(id) ON DELETE CASCADE"],
-  ["tasks", "assignee", "TEXT"],
-  ["projects", "task_view", "TEXT NOT NULL DEFAULT 'list'"],
-  ["tasks", "queue", "TEXT"],
-  ["tasks", "claimed_by", "TEXT"],
-  ["tasks", "claim_expires", "TEXT"],
-  // Names a table schema.sql has not created yet, which is legal: SQLite
-  // resolves foreign key targets when a row is written, not when the column is
-  // declared, and the CREATE TABLE lands a few statements later in the same open.
-  ["tasks", "organizer_id", "INTEGER REFERENCES organizers(id) ON DELETE SET NULL"],
-  ["tasks", "external_key", "TEXT"],
-  ["comments", "external_key", "TEXT"],
-  ["organizers", "external_key", "TEXT"],
-  ["tasks", "colour", "TEXT"],
-];
-
-function addLaterColumns(db) {
-  for (const [table, column, definition] of LATER_COLUMNS) {
-    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
-    // No rows means the table does not exist yet, which is a brand new database.
-    // schema.sql is about to create it with the column already in place.
-    if (!columns.length) continue;
-    if (columns.some((c) => c.name === column)) continue;
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
+function widenAuditEntities(db) {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit'").get();
+  if (!row || !row.sql || row.sql.includes("'scratchpad'")) return;
+  // foreign_keys cannot be changed inside a transaction, hence the order. Nothing
+  // references audit, so this is belt and braces rather than load bearing.
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec(`
+    BEGIN;
+    CREATE TABLE audit_rebuilt (
+      id          INTEGER PRIMARY KEY,
+      at          TEXT NOT NULL DEFAULT (datetime('now')),
+      action      TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete')),
+      entity      TEXT NOT NULL CHECK (entity IN ('task', 'note', 'project', 'link',
+                                                  'scratchpad', 'session', 'handoff')),
+      entity_id   INTEGER,
+      summary     TEXT NOT NULL,
+      label       TEXT,
+      before_json TEXT,
+      after_json  TEXT,
+      undone      INTEGER NOT NULL DEFAULT 0,
+      undone_at   TEXT
+    );
+    INSERT INTO audit_rebuilt
+      (id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at)
+      SELECT id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at
+      FROM audit;
+    DROP TABLE audit;
+    ALTER TABLE audit_rebuilt RENAME TO audit;
+    CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
+    COMMIT;
+  `);
+  db.exec("PRAGMA foreign_keys = ON");
 }
 
 const all = (sql, params = {}) => open().prepare(sql).all(params);
 const one = (sql, params = {}) => open().prepare(sql).get(params);
 const run = (sql, params = {}) => open().prepare(sql).run(params);
+
+/**
+ * Runs a query written in the MCP server's style, :p1 to :pN, with real binding.
+ *
+ * The stores under sheet/ and workbench/ are shared with the server rather than
+ * twinned, and take whichever sql() they are handed. The server substitutes
+ * literals because one of its routes is a sqlite3 subprocess; this binds, which
+ * is the better thing to do when there is a handle to bind against. One regex
+ * pass with a replacement function, so nothing in a value is ever looked at.
+ *
+ * Values are coerced the way the server's literal() renders them, so a store
+ * sees the same thing stored whichever side wrote it: a boolean is 1 or 0, a
+ * number that is not finite is NULL, and anything else that is not a number or
+ * a string is turned into one rather than refused.
+ */
+function sqlP(query, params = []) {
+  // The same count rule as the server's sql(): node:sqlite would bind a
+  // missing value as NULL and ignore a spare one, and the server's route
+  // would do neither the same way, so a mismatch throws on both.
+  let highest = 0;
+  const statement = String(query).replace(/:p(\d+)/g, (match, n) => {
+    const index = Number(n);
+    if (index < 1 || index > params.length) throw new Error(`sqlP(): ${match} has no value (${params.length} given)`);
+    if (index > highest) highest = index;
+    return `?${n}`;
+  });
+  if (highest !== params.length) throw new Error(`sqlP(): ${params.length} values given for ${highest} placeholders`);
+  const values = params.map((v) => {
+    if (v === null || v === undefined) return null;
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "boolean") return v ? 1 : 0;
+    if (typeof v === "bigint" || typeof v === "string") return v;
+    return String(v);
+  });
+  return open().prepare(statement).all(...values);
+}
 
 // Audit summaries are read by people, so they say "1 task" rather than "1 tasks".
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -95,7 +164,13 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 // not in the log.
 // ---------------------------------------------------------------------------
 
-const TABLES = { task: "tasks", note: "notes", project: "projects", link: "links" };
+const TABLES = {
+  task: "tasks", note: "notes", project: "projects", link: "links",
+  // Listed here and not only in the CHECK, because this is what makes a pad edit
+  // reversible. An agent that rewrites your plan badly should be one undo away
+  // from having not done that.
+  scratchpad: "scratchpads",
+};
 
 const rowOf = (entity, id) =>
   id == null ? null : one(`SELECT * FROM ${TABLES[entity]} WHERE id = :id`, { id });
@@ -138,6 +213,8 @@ function describeUpdate(entity, before, after) {
       changes.push("moved project");
     } else if (key === "organizer_id") {
       changes.push(after[key] == null ? "taken out of its epic" : "filed under an epic");
+    } else if (key === "body" && entity === "scratchpad") {
+      changes.push("wrote to the pad");
     } else if (key === "body" || key === "detail") {
       changes.push(`edited ${key}`);
     } else {
@@ -203,6 +280,11 @@ const RESTORE_ORDER = {
     ["__notes", "notes"],
     ["__links", "links"],
     ["__repos", "repos"],
+    // Sessions before their messages, same rule as everything above: the child
+    // has a foreign key pointing at the parent and nothing to point at if the
+    // parent is not back yet.
+    ["__sessions", "sessions"],
+    ["__messages", "messages"],
   ],
 };
 
@@ -278,6 +360,11 @@ function undo(auditId) {
   conn.exec("BEGIN");
   try {
     applyUndo(entry);
+    // Putting a pad body back leaves the board reading from text that is no
+    // longer there, so the projection is taken again from the restored body.
+    // Inside the same transaction as the restore, for the reason writeScratchpad
+    // gives: half a sync is worse than none.
+    if (entry.entity === "scratchpad" && entry.action !== "delete") deriveInPlace(entry.entity_id);
     run("UPDATE audit SET undone = 1, undone_at = datetime('now') WHERE id = :id", { id: auditId });
     conn.exec("COMMIT");
   } catch (error) {
@@ -464,7 +551,7 @@ function getProject(id) {
   return one("SELECT * FROM projects WHERE id = :id", { id });
 }
 
-function createProject({ key, name, summary = null, colour = "#7c8698" }) {
+function createProject({ key, name, summary = null, colour = "#7c8698", path = null, icon = null }) {
   const slug = slugKey(key);
   if (!slug) throw new Error("A project key needs at least one letter or digit");
 
@@ -485,9 +572,9 @@ function createProject({ key, name, summary = null, colour = "#7c8698" }) {
     "SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM projects WHERE sort_order < 99"
   ).n;
   const r = run(
-    `INSERT INTO projects (key, name, summary, colour, sort_order)
-     VALUES (:key, :name, :summary, :colour, :sort_order)`,
-    { key: slug, name, summary, colour, sort_order: order }
+    `INSERT INTO projects (key, name, summary, colour, path, icon, sort_order)
+     VALUES (:key, :name, :summary, :colour, :path, :icon, :sort_order)`,
+    { key: slug, name, summary, colour, path, icon, sort_order: order }
   );
   const created = getProject(Number(r.lastInsertRowid));
   record({ action: "create", entity: "project", entityId: created.id,
@@ -496,7 +583,7 @@ function createProject({ key, name, summary = null, colour = "#7c8698" }) {
 }
 
 function updateProject(id, fields) {
-  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view"];
+  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view", "path", "icon"];
   if (fields.task_view !== undefined && !TASK_VIEWS.includes(fields.task_view)) {
     throw new Error(`task_view must be one of ${TASK_VIEWS.join(", ")}`);
   }
@@ -663,6 +750,16 @@ function deleteProjectRows(id, { tasks = "keep" } = {}) {
   before.__notes = all("SELECT * FROM notes WHERE project_id = :id", { id });
   before.__links = all("SELECT * FROM links WHERE project_id = :id", { id });
   before.__repos = all("SELECT * FROM repos WHERE project_id = :id", { id });
+  // Sessions cascade from the project and messages cascade from the session, so
+  // without copying both here a deleted project takes every conversation with it
+  // and undo brings the project back empty.
+  before.__sessions = all("SELECT * FROM sessions WHERE project_id = :id", { id });
+  before.__messages = all(
+    `SELECT m.* FROM messages m
+      JOIN sessions s ON s.id = m.session_id
+     WHERE s.project_id = :id`,
+    { id }
+  );
 
   // By id rather than by project_id, so the rows deleted are exactly the rows
   // copied above. Deleting by project_id would let the cascade reach subtasks
@@ -678,6 +775,7 @@ function deleteProjectRows(id, { tasks = "keep" } = {}) {
     links: before.__links.length,
     organizers: before.__organizers.length,
     repos: before.__repos.length,
+    sessions: before.__sessions.length,
   };
   record({
     action: "delete",
@@ -904,6 +1002,11 @@ function updateTask(id, fields, { actor = null } = {}) {
   record({ action: "update", entity: "task", entityId: id,
            summary: describeUpdate("task", before, after), label: after.title,
            before, after });
+  // The other half of the pad sync. After the audit row rather than before, so
+  // the log reads in the order things happened, and unconditional rather than
+  // gated on a flag the caller passes: ticking a task on the board has to tick
+  // the line in the document whichever screen the tick came from.
+  writeBackToPad(after, before);
   return after;
 }
 
@@ -1147,6 +1250,20 @@ function completeClaim(id, { agent = null, note = null } = {}) {
 const listComments = (taskId) =>
   all("SELECT * FROM comments WHERE task_id = :taskId ORDER BY id", { taskId });
 
+/**
+ * The task's comments as Sheet entries: kind, meta parsed, author type
+ * resolved, the filed note's kind joined. The same shape sheet/store.js hands
+ * the MCP tools, built by the same toEntry, so the rail and an agent read one
+ * thing. listComments stays as it was for the vault and undo, which want rows.
+ */
+function sheetEntries(taskId) {
+  const { toEntry } = require("./sheet/store");
+  return all(
+    `SELECT c.*, n.kind AS note_kind FROM comments c LEFT JOIN notes n ON n.id = c.note_id
+      WHERE c.task_id = :taskId ORDER BY c.id`, { taskId }
+  ).map(toEntry);
+}
+
 function createComment({ taskId, body, author = "you" }) {
   if (!body || !String(body).trim()) throw new Error("A comment needs something in it");
   const r = run(
@@ -1202,7 +1319,7 @@ function taskDetail(id) {
     // change of epic without a second call. The sheet opens from All work and
     // from search too, where the project's organizers are not already loaded.
     organizers: task.project_id ? listOrganizers(task.project_id) : [],
-    comments: listComments(id),
+    comments: sheetEntries(id),
     events: statusEvents(id),
     subtasks: subtasks(id),
   };
@@ -1281,6 +1398,310 @@ function deleteNote(id) {
            summary: "deleted", label: before ? before.title : null, before });
 }
 
+// ---------------------------------------------------------------------------
+// Scratchpads, and the tasks derived from them
+//
+// The board is a projection of the pads. A checkbox line in a pad is a task row,
+// and the two are kept in step in both directions: writing the pad updates the
+// tasks, and updating a task rewrites its line.
+//
+// Two rules keep that from being destructive, and both were chosen against the
+// obvious alternative.
+//
+// A line that disappears does not delete its task. An agent tidying its own
+// notes, or replacing a plan wholesale, would otherwise be able to empty a
+// board. The task is left, and reads as dropped from the pad because nothing in
+// the pad anchors it any more.
+//
+// An unticked box does not force a task back to todo. See pads.statusFor: a
+// checkbox has two states and a task has four, so the pad owns "done or not"
+// and the board owns the rest.
+//
+// pads.js has the grammar and no database access. This has the rows and no
+// parsing. The split is what makes the grammar testable.
+// ---------------------------------------------------------------------------
+
+// Derivation writes tasks, and writing a task writes back to the pad. Without
+// this the first pad write would recurse until the stack gave out. Set for the
+// duration of a derivation, which is the only time a task update is already the
+// consequence of a pad the caller is holding.
+let deriving = false;
+
+const listScratchpads = (projectId) =>
+  all(
+    `SELECT * FROM scratchpads WHERE project_id = :projectId
+     ORDER BY pinned DESC, updated_at DESC`,
+    { projectId }
+  );
+
+const getScratchpad = (id) => one("SELECT * FROM scratchpads WHERE id = :id", { id });
+
+const scratchpadByKey = (projectId, key) =>
+  one("SELECT * FROM scratchpads WHERE project_id = :projectId AND key = :key", { projectId, key });
+
+/**
+ * A key that is unique within its project.
+ *
+ * An agent naming a pad "plan" in two projects is asking for two pads, not one,
+ * which is why the uniqueness is scoped. Within a project a collision is a
+ * different pad wanting the same name, and it gets a number.
+ */
+function padKey(projectId, title, key = null) {
+  const base = slugKey(key || title) || "pad";
+  let candidate = base;
+  let n = 2;
+  while (scratchpadByKey(projectId, candidate)) candidate = `${base}-${n++}`;
+  return candidate;
+}
+
+function createScratchpad({ projectId, title, body = "", key = null, author = null, sessionId = null, derivesTasks = true }) {
+  const r = run(
+    `INSERT INTO scratchpads (project_id, key, title, body, author, session_id, derives_tasks)
+     VALUES (:projectId, :key, :title, :body, :author, :sessionId, :derivesTasks)`,
+    {
+      projectId, key: padKey(projectId, title, key), title, body, author,
+      sessionId, derivesTasks: derivesTasks ? 1 : 0,
+    }
+  );
+  const created = getScratchpad(Number(r.lastInsertRowid));
+  record({ action: "create", entity: "scratchpad", entityId: created.id,
+           summary: "created", label: created.title, after: created });
+  return derive(created.id);
+}
+
+/**
+ * Replaces a pad's body, and re-reads the board from it.
+ *
+ * One transaction over the write and the derivation, so a pad and its tasks can
+ * never be half in step. That matters more here than anywhere else in this file:
+ * the failure would be silent, and the thing left behind would be a board that
+ * disagrees with the document everybody is reading.
+ */
+function writeScratchpad(id, fields = {}) {
+  const allowed = ["title", "body", "author", "pinned", "derives_tasks", "session_id"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return getScratchpad(id);
+  const before = rowOf("scratchpad", id);
+  if (!before) throw new Error("No such scratchpad");
+
+  const conn = open();
+  conn.exec("BEGIN");
+  try {
+    run(
+      `UPDATE scratchpads SET ${sets.map((k) => `${k} = :${k}`).join(", ")},
+       updated_at = datetime('now') WHERE id = :id`,
+      { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id }
+    );
+    deriveInPlace(id);
+    conn.exec("COMMIT");
+  } catch (error) {
+    conn.exec("ROLLBACK");
+    throw error;
+  }
+
+  const after = getScratchpad(id);
+  record({ action: "update", entity: "scratchpad", entityId: id,
+           summary: describeUpdate("scratchpad", before, after), label: after.title,
+           before, after });
+  return after;
+}
+
+/** Adds to the end of a pad. The common agent write, and it cannot lose anything. */
+function appendScratchpad(id, text) {
+  const pad = getScratchpad(id);
+  if (!pad) throw new Error("No such scratchpad");
+  const joiner = !pad.body || pad.body.endsWith("\n") ? "" : "\n";
+  return writeScratchpad(id, { body: `${pad.body}${joiner}${text}` });
+}
+
+/**
+ * Replaces one markdown section, found by its heading.
+ *
+ * Here so two agents working the same pad do not have to read, edit and write
+ * the whole document to change their own part of it, which is the write that
+ * loses the other one's work. The heading is matched on its text, at any level,
+ * and the section runs to the next heading of the same level or higher.
+ */
+function patchScratchpad(id, heading, text) {
+  const pad = getScratchpad(id);
+  if (!pad) throw new Error("No such scratchpad");
+  const lines = pad.body.split("\n");
+  const wanted = String(heading).trim().toLowerCase().replace(/^#+\s*/, "");
+
+  let start = -1;
+  let level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+    if (m && m[2].trim().toLowerCase() === wanted) { start = i; level = m[1].length; break; }
+  }
+  // A heading that is not there is added rather than refused. An agent asking to
+  // patch a section it has not written yet means to write it, and making that an
+  // error would only teach it to read the whole pad first.
+  if (start === -1) return appendScratchpad(id, `\n## ${heading}\n\n${text}\n`);
+
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    const m = /^(#{1,6})\s+/.exec(lines[i]);
+    if (m && m[1].length <= level) { end = i; break; }
+  }
+  const body = [...lines.slice(0, start + 1), "", text, "", ...lines.slice(end)].join("\n");
+  return writeScratchpad(id, { body });
+}
+
+function deleteScratchpad(id) {
+  const before = rowOf("scratchpad", id);
+  // The tasks outlive the pad, by the ON DELETE SET NULL on tasks.pad_id. Said
+  // out loud because the opposite is what people expect from a cascade, and the
+  // opposite is how a board gets emptied by a tidy-up.
+  run("DELETE FROM scratchpads WHERE id = :id", { id });
+  record({ action: "delete", entity: "scratchpad", entityId: id,
+           summary: "deleted", label: before ? before.title : null, before });
+}
+
+/**
+ * Reads a pad's checkbox lines into tasks, and anchors them.
+ *
+ * Runs inside whatever transaction the caller has open, which is why it does not
+ * start one. deriveInPlace is the half that touches rows; derive is the wrapper
+ * that returns the pad afterwards.
+ */
+function deriveInPlace(padId) {
+  const pad = getScratchpad(padId);
+  if (!pad || !pad.derives_tasks) return pad;
+
+  deriving = true;
+  try {
+    let body = pad.body;
+    // Re-parsed after every write, because anchoring a line changes its text and
+    // the entries hold the offsets they were parsed at.
+    let entries = pads.parse(body);
+    const idByEntry = new Map();
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const parentId = entry.parentIndex != null ? idByEntry.get(entry.parentIndex) ?? null : null;
+      let task = entry.taskId ? one("SELECT * FROM tasks WHERE id = :id", { id: entry.taskId }) : null;
+
+      // An anchor pointing at a task that has been deleted, or at one belonging
+      // to another pad, is stale text rather than an instruction. Dropped, and
+      // the line is treated as new.
+      if (task && task.pad_id !== pad.id) task = null;
+
+      if (!task) task = rebind(pad, entry, body);
+
+      if (task) {
+        const changes = {};
+        if (task.title !== entry.title && entry.title) changes.title = entry.title;
+        const status = pads.statusFor(entry.done, task.status);
+        if (status !== task.status) changes.status = status;
+        if (entry.assignee && entry.assignee !== task.assignee) changes.assignee = entry.assignee;
+        if (entry.priority && entry.priority !== task.priority) changes.priority = entry.priority;
+        if (parentId !== (task.parent_id ?? null)) changes.parent_id = parentId;
+        if (Object.keys(changes).length) task = updateTask(task.id, changes, { actor: pad.author });
+      } else {
+        task = createTask({
+          projectId: pad.project_id,
+          title: entry.title || "Untitled",
+          status: entry.done ? "done" : "todo",
+          priority: entry.priority || "med",
+          assignee: entry.assignee || null,
+          parentId,
+          actor: pad.author,
+        });
+      }
+
+      run("UPDATE tasks SET pad_id = :padId, external_key = :key WHERE id = :id",
+          { padId: pad.id, key: `pad:${pad.id}:${task.id}`, id: task.id });
+      idByEntry.set(entry.at, task.id);
+
+      if (entry.taskId !== task.id) {
+        body = pads.anchorLine(body, entry, task.id);
+        entries = pads.parse(body);
+      }
+    }
+
+    if (body !== pad.body) {
+      run("UPDATE scratchpads SET body = :body WHERE id = :id", { body, id: pad.id });
+    }
+  } finally {
+    deriving = false;
+  }
+  return getScratchpad(padId);
+}
+
+/**
+ * Finds the task an unanchored line used to be.
+ *
+ * The failure this exists for: an agent rewrites a pad from scratch and the
+ * anchors go with the old text. Without this, every line comes back as new work
+ * and the board doubles. With it, a line whose words exactly match a task this
+ * pad owns, and which nothing else in the pad currently claims, is recognised as
+ * that task again.
+ *
+ * Exact title match only. Fuzzy matching here would mean a plan that reworded
+ * two similar items could silently merge them, and a wrong merge is much harder
+ * to notice than a duplicate.
+ */
+function rebind(pad, entry, body) {
+  if (!entry.title) return null;
+  const claimed = pads.anchoredIds(body);
+  const candidates = all(
+    "SELECT * FROM tasks WHERE pad_id = :padId AND title = :title ORDER BY id",
+    { padId: pad.id, title: entry.title }
+  );
+  return candidates.find((t) => !claimed.has(t.id)) || null;
+}
+
+const derive = (padId) => deriveInPlace(padId);
+
+/**
+ * Rewrites a task's line in its pad.
+ *
+ * The other direction of the sync, called from updateTask. Silent when the task
+ * has no pad, when the pad has gone, or when we are already inside a derivation,
+ * which is the case that would otherwise loop.
+ */
+function writeBackToPad(task, before) {
+  if (deriving || !task || !task.pad_id) return;
+  const pad = getScratchpad(task.pad_id);
+  if (!pad || !pad.derives_tasks) return;
+  const entry = pads.parse(pad.body).find((e) => e.taskId === task.id);
+  if (!entry) return;
+
+  const fields = {};
+  if (!before || before.status !== task.status) fields.done = task.status === "done";
+  if (!before || before.title !== task.title) fields.title = task.title;
+  if (!before || before.assignee !== task.assignee) fields.assignee = task.assignee || null;
+  if (!before || before.priority !== task.priority) fields.priority = task.priority;
+  if (!Object.keys(fields).length) return;
+
+  const body = pads.writeLine(pad.body, entry, fields);
+  if (body === pad.body) return;
+  run("UPDATE scratchpads SET body = :body, updated_at = datetime('now') WHERE id = :id",
+      { body, id: pad.id });
+}
+
+/**
+ * A pad's lines, each with the task behind it, for the editor to render.
+ *
+ * Also names the tasks the pad no longer mentions, which is the honest way to
+ * show what a rewrite dropped: they are still on the board, and this is where
+ * someone would go looking for why.
+ */
+function scratchpadTasks(padId) {
+  const pad = getScratchpad(padId);
+  if (!pad) return { lines: [], dropped: [] };
+  const entries = pads.parse(pad.body);
+  const anchored = new Set(entries.map((e) => e.taskId).filter(Boolean));
+  const lines = entries.map((e) => ({
+    ...e,
+    task: e.taskId ? one("SELECT * FROM tasks WHERE id = :id", { id: e.taskId }) : null,
+  }));
+  const dropped = all("SELECT * FROM tasks WHERE pad_id = :padId ORDER BY id", { padId })
+    .filter((t) => !anchored.has(t.id));
+  return { lines, dropped };
+}
+
 function listLinks(projectId) {
   return all("SELECT * FROM links WHERE project_id = :projectId ORDER BY id", { projectId });
 }
@@ -1335,7 +1756,27 @@ function search(query) {
       { like }
     );
   }
-  return { tasks, notes };
+  // Pads join the same search, through their own index. A working document is
+  // often the only place a decision was written down before it became one, so
+  // leaving them out would make search quietly worse the more the agents use it.
+  let padHits = [];
+  try {
+    padHits = all(
+      `SELECT s.*, p.name AS project_name, p.colour AS project_colour
+       FROM pads_fts f JOIN scratchpads s ON s.id = f.rowid
+       LEFT JOIN projects p ON p.id = s.project_id
+       WHERE pads_fts MATCH :q ORDER BY rank LIMIT 50`,
+      { q: `${q}*` }
+    );
+  } catch {
+    padHits = all(
+      `SELECT s.*, p.name AS project_name, p.colour AS project_colour
+       FROM scratchpads s LEFT JOIN projects p ON p.id = s.project_id
+       WHERE s.title LIKE :like OR s.body LIKE :like LIMIT 50`,
+      { like }
+    );
+  }
+  return { tasks, notes, pads: padHits };
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,8 +1793,30 @@ function dueAlerts() {
     JOIN tasks t ON t.id = a.task_id
     LEFT JOIN projects p ON p.id = t.project_id
     WHERE a.status IN ('pending', 'snoozed')
+      AND a.kind = 'reminder'
       AND a.fire_at <= datetime('now')
       AND t.status != 'done'
+    ORDER BY a.fire_at
+  `);
+}
+
+/**
+ * Timers that are due: a session being woken rather than a person nudged.
+ *
+ * A separate query rather than a flag on the one above, because the join
+ * differs. A reminder is about a task and is pointless once the task is done; a
+ * timer is about a session and usually has no task at all, so the inner join
+ * that makes the reminder query correct would silently drop every one of these.
+ */
+function dueTimers() {
+  return all(`
+    SELECT a.*, s.project_id, s.harness, s.title AS session_title
+    FROM alerts a
+    JOIN sessions s ON s.id = a.session_id
+    WHERE a.status IN ('pending', 'snoozed')
+      AND a.kind != 'reminder'
+      AND a.fire_at <= datetime('now')
+      AND s.status = 'active'
     ORDER BY a.fire_at
   `);
 }
@@ -1379,15 +1842,24 @@ function listAlerts({ includeFinished = true, taskId = null } = {}) {
   `, taskId ? { taskId } : {});
 }
 
-function createAlert({ taskId, fireAt, message = null, repeatEveryMinutes = null }) {
+function createAlert({ taskId = null, fireAt, message = null, repeatEveryMinutes = null,
+                      sessionId = null, kind = "reminder", payload = null }) {
   const r = run(
-    `INSERT INTO alerts (task_id, fire_at, message, repeat_every_minutes)
-     VALUES (:taskId, :fireAt, :message, :repeatEveryMinutes)`,
-    { taskId, fireAt, message, repeatEveryMinutes }
+    `INSERT INTO alerts (task_id, fire_at, message, repeat_every_minutes, session_id, kind, payload)
+     VALUES (:taskId, :fireAt, :message, :repeatEveryMinutes, :sessionId, :kind, :payload)`,
+    {
+      taskId, fireAt, message, repeatEveryMinutes, sessionId, kind,
+      payload: payload && typeof payload === "object" ? JSON.stringify(payload) : payload,
+    }
   );
   const created = one("SELECT * FROM alerts WHERE id = :id", { id: Number(r.lastInsertRowid) });
-  record({ action: "create", entity: "task", entityId: taskId,
-           summary: `reminder set for ${fireAt}`, label: message || null, after: created });
+  // A reminder is a thing somebody set and may want to undo. A timer is
+  // plumbing: one is written every time an agent waits on another, and putting
+  // those in History would bury the changes worth reading.
+  if (kind === "reminder") {
+    record({ action: "create", entity: "task", entityId: taskId,
+             summary: `reminder set for ${fireAt}`, label: message || null, after: created });
+  }
   return created;
 }
 
@@ -1581,11 +2053,555 @@ function updateExternalComment(id, body) {
   return one("SELECT * FROM comments WHERE id = :id", { id });
 }
 
+
+// ---------------------------------------------------------------------------
+// Sessions
+//
+// A session is a conversation with an agent, held against a project. It is
+// stored rather than kept in memory because a session that does not survive a
+// restart is a chat window, and the whole point of calling it a session is that
+// you can come back to it.
+//
+// Messages are written as they arrive, including a partial assistant reply, so
+// a stream that is interrupted leaves what it managed to say rather than
+// nothing. That is why appendMessage and updateMessage are separate: one starts
+// a turn, the other grows it.
+
+function listSessions(projectId) {
+  return all(
+    `SELECT s.*,
+            (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
+            (SELECT m.content FROM messages m
+              WHERE m.session_id = s.id AND m.role = 'user'
+              ORDER BY m.id LIMIT 1) AS opener
+     FROM sessions s
+     WHERE s.project_id = :projectId AND s.status != 'archived'
+     ORDER BY s.updated_at DESC, s.id DESC`,
+    { projectId }
+  );
+}
+
+const getSession = (id) => one("SELECT * FROM sessions WHERE id = :id", { id });
+
+/**
+ * The next unused "Session N" in a project.
+ *
+ * Numbered rather than all called the same thing, because a column of four rows
+ * reading "New session" tells you nothing about which is which. Taken from the
+ * highest number already used rather than from the count, so deleting Session 2
+ * does not make the next one collide with Session 3.
+ *
+ * A first message renames the session to what was asked, so this is what a
+ * session is called only until it has been used.
+ */
+function nextSessionName(projectId) {
+  const rows = all("SELECT title FROM sessions WHERE project_id = :projectId", { projectId });
+  let highest = 0;
+  for (const r of rows) {
+    const m = /^Session (\d+)$/.exec(String(r.title || "").trim());
+    if (m) highest = Math.max(highest, Number(m[1]));
+  }
+  return `Session ${highest + 1}`;
+}
+
+function createSession({
+  projectId, title = null, agent = null, provider = null, model = null,
+  workspaceId = null, harness = null, cwd = null,
+}) {
+  if (!projectId) throw new Error("A session needs a project");
+  const r = run(
+    `INSERT INTO sessions (project_id, workspace_id, title, agent, provider, model, harness, cwd)
+     VALUES (:projectId, :workspaceId, :title, :agent, :provider, :model, :harness, :cwd)`,
+    {
+      projectId, workspaceId, title: title || nextSessionName(projectId),
+      agent, provider, model, harness, cwd,
+    }
+  );
+  // Not audited, even though the entity CHECK now admits 'session'. Undo replays
+  // a stored "before" row, which is meaningless for a conversation, and a
+  // deleted session takes its messages with it either way. What is worth
+  // auditing is what the session did, and every one of those writes comes back
+  // through the MCP server under the harness's own actor name.
+  return getSession(Number(r.lastInsertRowid));
+}
+
+const RUN_STATES = ["idle", "running", "failed"];
+
+function updateSession(id, fields) {
+  const allowed = ["title", "agent", "provider", "model", "status", "tokens_in", "tokens_out",
+                   "workspace_id", "auto_allow", "harness", "native_id", "cwd", "run_state",
+                   "last_run_at"];
+  // Validated here rather than by a CHECK, because ALTER TABLE could not have
+  // added the constraint to a database that already exists and one rule that
+  // holds on new installs only is worse than none.
+  if (fields.run_state != null && !RUN_STATES.includes(fields.run_state)) {
+    throw new Error(`run_state must be one of ${RUN_STATES.join(", ")}`);
+  }
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return getSession(id);
+  const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
+  run(`UPDATE sessions SET ${assignments}, updated_at = datetime('now') WHERE id = :id`, {
+    ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
+    id,
+  });
+  return getSession(id);
+}
+
+// ---------------------------------------------------------------------------
+// The harness registry
+//
+// Rows rather than code, so a flag that moves in the next Codex release is an
+// edit in Settings and not a release of this. harness.js holds the four built-in
+// definitions and the machinery that runs them; this holds the copies a person
+// can change.
+// ---------------------------------------------------------------------------
+
+const listHarnesses = ({ includeDisabled = true } = {}) =>
+  all(`SELECT * FROM harnesses ${includeDisabled ? "" : "WHERE enabled = 1"}
+       ORDER BY sort_order, id`);
+
+const getHarness = (key) => one("SELECT * FROM harnesses WHERE key = :key", { key });
+
+/**
+ * Puts the built-in harnesses in, and keeps the untouched ones current.
+ *
+ * The obvious version of this is INSERT OR IGNORE, and it is wrong in a way that
+ * only shows up later: these CLIs move, so a shipped definition will need fixing,
+ * and a row that is never updated means everybody who installed before the fix
+ * keeps the broken flag forever. The first version of the Copilot row passed its
+ * MCP config file without the @ prefix that CLI needs, and every existing
+ * database would have kept doing that.
+ *
+ * The other obvious version, overwriting on every launch, is worse: somebody who
+ * edited a command line had a reason, and silently reverting it is the failure
+ * this whole table exists to avoid.
+ *
+ * So each row remembers what it was last seeded with. If it still matches, it
+ * has not been touched and takes the new definition. If it does not, somebody
+ * changed it and it is left exactly as they left it.
+ */
+function seedHarnesses(definitions) {
+  definitions.forEach((h, i) => {
+    const seeded = JSON.stringify({
+      label: h.label, command: h.command || null, args: h.args,
+      parser: h.parser, mcp_style: h.mcp_style,
+    });
+    const existing = getHarness(h.key);
+    if (!existing) {
+      run(
+        `INSERT INTO harnesses (key, label, kind, command, args_json, parser, mcp_style, enabled, sort_order, seeded_json)
+         VALUES (:key, :label, 'builtin', :command, :args, :parser, :mcpStyle, :enabled, :sort, :seeded)`,
+        {
+          key: h.key, label: h.label, command: h.command || null,
+          args: JSON.stringify(h.args), parser: h.parser, mcpStyle: h.mcp_style,
+          enabled: h.enabled === undefined ? 1 : h.enabled, sort: (i + 1) * 10, seeded,
+        }
+      );
+      return;
+    }
+    if (existing.kind !== "builtin") return;
+    const current = JSON.stringify({
+      label: existing.label, command: existing.command, args: JSON.parse(existing.args_json),
+      parser: existing.parser, mcp_style: existing.mcp_style,
+    });
+    // A row with no snapshot predates this and is treated as untouched, which is
+    // true: there was no way to edit one before there was a settings panel.
+    const untouched = !existing.seeded_json || existing.seeded_json === current;
+    if (!untouched) return;
+    // enabled is deliberately not in the snapshot and not written here. Turning a
+    // harness off is a preference, not an edit to its definition, and it has to
+    // survive a definition that changes underneath it.
+    run(
+      `UPDATE harnesses SET label = :label, command = :command, args_json = :args,
+       parser = :parser, mcp_style = :mcpStyle, seeded_json = :seeded,
+       updated_at = datetime('now') WHERE id = :id`,
+      {
+        label: h.label, command: h.command || null, args: JSON.stringify(h.args),
+        parser: h.parser, mcpStyle: h.mcp_style, seeded, id: existing.id,
+      }
+    );
+  });
+  return listHarnesses();
+}
+
+const PARSERS = ["claude-stream-json", "codex-json", "copilot-json", "text"];
+
+function updateHarness(id, fields) {
+  const allowed = ["label", "command", "args_json", "parser", "mcp_style", "enabled", "sort_order"];
+  if (fields.parser != null && !PARSERS.includes(fields.parser)) {
+    throw new Error(`parser must be one of ${PARSERS.join(", ")}`);
+  }
+  // Rejected here rather than at spawn time. A malformed template fails inside a
+  // child process, where the only symptom is a harness that never answers.
+  if (fields.args_json != null) {
+    let parsed;
+    try { parsed = JSON.parse(fields.args_json); } catch { throw new Error("The argv template is not valid JSON"); }
+    if (!Array.isArray(parsed)) throw new Error("The argv template must be a list");
+  }
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return one("SELECT * FROM harnesses WHERE id = :id", { id });
+  run(`UPDATE harnesses SET ${sets.map((k) => `${k} = :${k}`).join(", ")},
+       updated_at = datetime('now') WHERE id = :id`,
+      { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id });
+  return one("SELECT * FROM harnesses WHERE id = :id", { id });
+}
+
+function createHarness({ key, label, command, args, parser = "text", mcpStyle = "none" }) {
+  const slug = slugKey(key || label);
+  if (!slug) throw new Error("A harness needs a key");
+  if (getHarness(slug)) throw new Error(`A harness with the key '${slug}' already exists`);
+  run(
+    `INSERT INTO harnesses (key, label, kind, command, args_json, parser, mcp_style, sort_order)
+     VALUES (:key, :label, 'custom', :command, :args, :parser, :mcpStyle,
+             (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM harnesses))`,
+    {
+      key: slug, label: label || slug, command: command || null,
+      args: JSON.stringify(args || ["-p", "{prompt}"]), parser, mcpStyle,
+    }
+  );
+  return getHarness(slug);
+}
+
+/** Built-ins are disabled rather than removed, so the definition can come back. */
+function deleteHarness(id) {
+  const row = one("SELECT * FROM harnesses WHERE id = :id", { id });
+  if (!row) return;
+  if (row.kind === "builtin") return updateHarness(id, { enabled: 0 });
+  run("DELETE FROM harnesses WHERE id = :id", { id });
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Handoffs
+//
+// One agent asking another. The row outlives the turn that created it, which is
+// the point: the sender's turn ends in seconds and the answer arrives in
+// minutes, so there has to be somewhere durable for it to arrive.
+// ---------------------------------------------------------------------------
+
+const getHandoff = (id) => one("SELECT * FROM handoffs WHERE id = :id", { id });
+
+const listHandoffs = ({ projectId = null, sessionId = null, status = null, limit = 50 } = {}) => {
+  // Only the parameters the query names are bound: node:sqlite refuses a
+  // named parameter the statement does not use, so binding all four at once
+  // failed on every call that left a filter out.
+  const where = [];
+  const params = { limit: Math.max(1, Math.min(Number(limit) || 50, 500)) };
+  if (projectId != null) { where.push("h.project_id = :projectId"); params.projectId = projectId; }
+  if (sessionId != null) { where.push("(h.from_session_id = :sessionId OR h.to_session_id = :sessionId)"); params.sessionId = sessionId; }
+  if (status) { where.push("h.status = :status"); params.status = status; }
+  return all(
+    `SELECT h.*, t.title AS task_title,
+            f.title AS from_title, f.harness AS from_harness,
+            r.title AS to_title
+     FROM handoffs h
+     LEFT JOIN tasks t ON t.id = h.task_id
+     LEFT JOIN sessions f ON f.id = h.from_session_id
+     LEFT JOIN sessions r ON r.id = h.to_session_id
+     ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+     ORDER BY h.id DESC LIMIT :limit`,
+    params
+  );
+};
+
+function createHandoff({ projectId, fromSessionId = null, toHarness, request, taskId = null, context = null, wake = true }) {
+  if (!projectId) throw new Error("A handoff needs a project");
+  if (!toHarness) throw new Error("A handoff needs somebody to hand to");
+  if (!request || !String(request).trim()) throw new Error("A handoff needs a request");
+  const r = run(
+    `INSERT INTO handoffs (project_id, from_session_id, to_harness, task_id, request, context_json, wake)
+     VALUES (:projectId, :fromSessionId, :toHarness, :taskId, :request, :context, :wake)`,
+    {
+      projectId, fromSessionId, toHarness: String(toHarness), taskId,
+      request: String(request),
+      context: context ? JSON.stringify(context) : null,
+      wake: wake ? 1 : 0,
+    }
+  );
+  const created = getHandoff(Number(r.lastInsertRowid));
+  record({ action: "create", entity: "handoff", entityId: created.id,
+           summary: `asked ${created.to_harness}`, label: created.request.slice(0, 80), after: created });
+  return created;
+}
+
+/**
+ * Moves a handoff along.
+ *
+ * Every transition goes through here so the timestamps cannot drift from the
+ * status they describe, which is the same reason status_events is written by
+ * updateTask rather than by its callers.
+ */
+function updateHandoff(id, fields) {
+  const before = getHandoff(id);
+  if (!before) throw new Error("No such handoff");
+  const allowed = ["status", "reply", "to_session_id", "wake"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return before;
+  const stamps =
+    fields.status === "running" ? ", started_at = datetime('now')"
+    : ["ready", "failed", "cancelled"].includes(fields.status) ? ", finished_at = datetime('now')"
+    : "";
+  run(`UPDATE handoffs SET ${sets.map((k) => `${k} = :${k}`).join(", ")}${stamps} WHERE id = :id`,
+      { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id });
+  const after = getHandoff(id);
+  if (before.status !== after.status) {
+    record({ action: "update", entity: "handoff", entityId: id,
+             summary: `${before.status} to ${after.status}`, label: after.request.slice(0, 80),
+             before, after });
+  }
+  return after;
+}
+
+/** Everything queued, oldest first, for whatever is going to run them. */
+const pendingHandoffs = () =>
+  all("SELECT * FROM handoffs WHERE status = 'queued' ORDER BY id");
+
+/**
+ * How many handoffs this project has finished in the last hour.
+ *
+ * The circuit breaker. Two agents can hand work to each other, and each reply
+ * wakes the other with a turn of its own, so a polite pair saying "thanks, one
+ * more thing" is a loop that spends real money at machine speed with nobody
+ * watching. Counting completions rather than tracking a chain depth, because the
+ * MCP server writes these rows from a separate process and any depth it was
+ * asked to carry would be a number an agent could get wrong.
+ */
+const handoffsSince = (projectId, hours = 1) =>
+  one(
+    `SELECT COUNT(*) AS n FROM handoffs
+     WHERE project_id = :projectId AND finished_at IS NOT NULL
+       AND finished_at > datetime('now', :window)`,
+    { projectId, window: `-${hours} hours` }
+  ).n;
+
+// ---------------------------------------------------------------------------
+// Locks
+//
+// The task claim, generalised. A lease and not a mutex: an agent that takes one
+// and dies must not hold it forever, so everything here expires and the acquire
+// is allowed to take over anything that has.
+// ---------------------------------------------------------------------------
+
+const LOCK_MINUTES = 15;
+
+/**
+ * Takes a lock, or reports who has it.
+ *
+ * One statement for the insert and one for the takeover, both relying on the
+ * unique index, so two agents asking at the same moment cannot both win. The
+ * read afterwards says who actually holds it, which is the answer either way.
+ */
+function acquireLock({ projectId, key, holder, note = null, minutes = LOCK_MINUTES }) {
+  if (!projectId || !key || !holder) throw new Error("A lock needs a project, a key and a holder");
+  run(
+    `INSERT INTO locks (project_id, key, holder, note, expires_at)
+     VALUES (:projectId, :key, :holder, :note, datetime('now', :window))
+     ON CONFLICT (project_id, key) DO UPDATE SET
+       holder = excluded.holder, note = excluded.note, expires_at = excluded.expires_at,
+       created_at = datetime('now')
+     WHERE locks.expires_at <= datetime('now') OR locks.holder = excluded.holder`,
+    { projectId, key: String(key), holder, note, window: `+${Math.max(1, minutes)} minutes` }
+  );
+  const row = one("SELECT * FROM locks WHERE project_id = :projectId AND key = :key",
+                  { projectId, key: String(key) });
+  return { held: row.holder === holder, lock: row };
+}
+
+function releaseLock({ projectId, key, holder }) {
+  const r = run(
+    "DELETE FROM locks WHERE project_id = :projectId AND key = :key AND holder = :holder",
+    { projectId, key: String(key), holder }
+  );
+  return { released: Number(r.changes) > 0 };
+}
+
+/** What is held right now. Expired rows are swept rather than reported. */
+function listLocks(projectId = null) {
+  run("DELETE FROM locks WHERE expires_at <= datetime('now')");
+  return all(
+    `SELECT * FROM locks ${projectId != null ? "WHERE project_id = :projectId" : ""} ORDER BY key`,
+    { projectId }
+  );
+}
+
+function deleteSession(id) {
+  const before = getSession(id);
+  if (!before) return null;
+  // Messages go with it through ON DELETE CASCADE. Not audited, for the reason
+  // given in createSession.
+  run("DELETE FROM sessions WHERE id = :id", { id });
+  return before;
+}
+
+const listMessages = (sessionId) =>
+  all("SELECT * FROM messages WHERE session_id = :sessionId ORDER BY id", { sessionId });
+
+function appendMessage({ sessionId, role, content = "", tokens = null, error = null }) {
+  if (!sessionId) throw new Error("A message needs a session");
+  const r = run(
+    `INSERT INTO messages (session_id, role, content, tokens, error)
+     VALUES (:sessionId, :role, :content, :tokens, :error)`,
+    { sessionId, role, content, tokens, error }
+  );
+  // Touched so the session list stays in most-recent order without the caller
+  // having to remember to do it.
+  run("UPDATE sessions SET updated_at = datetime('now') WHERE id = :id", { id: sessionId });
+  return one("SELECT * FROM messages WHERE id = :id", { id: Number(r.lastInsertRowid) });
+}
+
+function updateMessage(id, fields) {
+  const allowed = ["content", "tokens", "error"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return one("SELECT * FROM messages WHERE id = :id", { id });
+  const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
+  run(`UPDATE messages SET ${assignments} WHERE id = :id`, {
+    ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
+    id,
+  });
+  return one("SELECT * FROM messages WHERE id = :id", { id });
+}
+
+/** Adds a completed turn's usage to the session's running totals. */
+function addSessionUsage(id, { input = 0, output = 0 }) {
+  run(
+    `UPDATE sessions SET tokens_in = tokens_in + :input, tokens_out = tokens_out + :output,
+                         updated_at = datetime('now')
+     WHERE id = :id`,
+    { id, input, output }
+  );
+  return getSession(id);
+}
+
+
+// ---------------------------------------------------------------------------
+// Workspaces
+//
+// A folder, as a thing in its own right, joined to projects many to many. See
+// the comment above the table in schema.sql for why it has to be a join and not
+// a column.
+
+const listWorkspaces = () =>
+  all(`SELECT w.*,
+              (SELECT COUNT(*) FROM project_workspaces pw WHERE pw.workspace_id = w.id) AS project_count
+       FROM workspaces w ORDER BY w.sort_order, w.name`);
+
+const getWorkspace = (id) => one("SELECT * FROM workspaces WHERE id = :id", { id });
+const workspaceByPath = (path) => one("SELECT * FROM workspaces WHERE path = :path", { path });
+
+function createWorkspace({ name, path, icon = null, colour = null }) {
+  if (!path) throw new Error("A workspace needs a folder");
+  const clean = String(path).replace(/\/+$/, "");
+
+  // Choosing a folder that is already a workspace means opening it, not making a
+  // second one. Returned rather than thrown so the caller does not have to tell
+  // "already exists" apart from a real failure.
+  const already = workspaceByPath(clean);
+  if (already) return already;
+
+  const label = name || clean.split("/").pop() || clean;
+  const base = slugKey(label) || `w${Date.now()}`;
+  let key = base;
+  // Two folders of the same name in different places are ordinary, so the slug
+  // is suffixed rather than the second one refused.
+  let n = 2;
+  while (one("SELECT 1 AS x FROM workspaces WHERE key = :key", { key })) {
+    key = `${base}-${n}`;
+    n += 1;
+  }
+
+  const order = one("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM workspaces").n;
+  const r = run(
+    `INSERT INTO workspaces (key, name, path, icon, colour, sort_order)
+     VALUES (:key, :name, :path, :icon, :colour, :sort_order)`,
+    { key, name: label, path: clean, icon, colour, sort_order: order }
+  );
+  return getWorkspace(Number(r.lastInsertRowid));
+}
+
+function updateWorkspace(id, fields) {
+  const allowed = ["name", "path", "icon", "colour", "sort_order"];
+  const sets = Object.keys(fields).filter((k) => allowed.includes(k));
+  if (!sets.length) return getWorkspace(id);
+  const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
+  run(`UPDATE workspaces SET ${assignments}, updated_at = datetime('now') WHERE id = :id`, {
+    ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
+    id,
+  });
+  return getWorkspace(id);
+}
+
+function deleteWorkspace(id) {
+  const before = getWorkspace(id);
+  if (!before) return null;
+  // The join goes with it through ON DELETE CASCADE. The projects do not: work
+  // that spanned four folders still exists when one of them is forgotten, and
+  // the folder on disk is never touched.
+  run("DELETE FROM workspaces WHERE id = :id", { id });
+  return before;
+}
+
+/** The projects that touch a folder. */
+const projectsInWorkspace = (workspaceId) =>
+  all(`SELECT p.*, pw.is_primary,
+              (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status != 'done') AS open_count,
+              (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id) AS note_count
+       FROM projects p
+       JOIN project_workspaces pw ON pw.project_id = p.id
+       WHERE pw.workspace_id = :workspaceId AND p.status != 'archived'
+       ORDER BY p.sort_order, p.name`,
+    { workspaceId });
+
+/** The folders a project touches, primary first. */
+const workspacesForProject = (projectId) =>
+  all(`SELECT w.*, pw.is_primary
+       FROM workspaces w
+       JOIN project_workspaces pw ON pw.workspace_id = w.id
+       WHERE pw.project_id = :projectId
+       ORDER BY pw.is_primary DESC, w.name`,
+    { projectId });
+
+function linkProjectWorkspace(projectId, workspaceId, { primary = false } = {}) {
+  run(`INSERT OR IGNORE INTO project_workspaces (project_id, workspace_id, is_primary)
+       VALUES (:projectId, :workspaceId, :primary)`,
+      { projectId, workspaceId, primary: primary ? 1 : 0 });
+  if (primary) {
+    run("UPDATE project_workspaces SET is_primary = 0 WHERE project_id = :projectId", { projectId });
+    run(`UPDATE project_workspaces SET is_primary = 1
+         WHERE project_id = :projectId AND workspace_id = :workspaceId`, { projectId, workspaceId });
+  }
+  return workspacesForProject(projectId);
+}
+
+const unlinkProjectWorkspace = (projectId, workspaceId) => {
+  run(`DELETE FROM project_workspaces
+       WHERE project_id = :projectId AND workspace_id = :workspaceId`, { projectId, workspaceId });
+  return workspacesForProject(projectId);
+};
+
+/**
+ * Turns the old one folder per project column into workspaces.
+ *
+ * Runs once at open and is safe to repeat: createWorkspace returns the existing
+ * row for a path it already holds, and the link is INSERT OR IGNORE. projects.
+ * path is left in place rather than dropped, because SQLite cannot drop a column
+ * on an old database and a stale copy that nothing reads is harmless.
+ */
+function adoptProjectPaths() {
+  const withPath = all("SELECT id, name, path, icon FROM projects WHERE path IS NOT NULL AND path != ''");
+  for (const p of withPath) {
+    const w = createWorkspace({ name: p.path.split("/").pop(), path: p.path, icon: p.icon });
+    linkProjectWorkspace(p.id, w.id, { primary: true });
+  }
+  return withPath.length;
+}
+
 module.exports = {
   DB_PATH,
   // The graph builder works against the connection directly, so it is exposed
   // rather than every graph query being proxied through this module.
   handle: open,
+  // For the stores shared with the MCP server. See sqlP.
+  sqlP,
   listProjects, listArchivedProjects, getProject, createProject, updateProject, deleteProject,
   projectContents,
   listTasks, createTask, updateTask,
@@ -1599,11 +2615,21 @@ module.exports = {
   taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
   setQueue, queueState, claimNext, releaseClaim, completeClaim, extendClaim, reclaimExpired,
   listNotes, createNote, updateNote, deleteNote,
+  listScratchpads, getScratchpad, scratchpadByKey, createScratchpad, writeScratchpad,
+  appendScratchpad, patchScratchpad, deleteScratchpad, scratchpadTasks, derive,
   listLinks, createLink, deleteLink,
   search, stats,
   listAudit, projectActivity, undo, undoLast,
   recentItems,
-  dueAlerts, listAlerts, createAlert, updateAlert, deleteAlert,
+  dueAlerts, dueTimers, listAlerts, createAlert, updateAlert, deleteAlert,
   markFired, snoozeAlert, actOnAlert,
   listRepos, createRepo, setPrimaryRepo, deleteRepo,
+  listWorkspaces, getWorkspace, workspaceByPath, createWorkspace, updateWorkspace, deleteWorkspace,
+  projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
+  adoptProjectPaths,
+  listSessions, getSession, createSession, updateSession, deleteSession,
+  listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness,
+  listHandoffs, getHandoff, createHandoff, updateHandoff, pendingHandoffs, handoffsSince,
+  acquireLock, releaseLock, listLocks,
+  listMessages, appendMessage, updateMessage, addSessionUsage,
 };
