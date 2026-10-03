@@ -2085,6 +2085,7 @@
   .wb-chip.unsaved  { --wb: var(--run-busy); color: var(--run-busy); border-color: color-mix(in srgb, var(--run-busy) 45%, var(--line)); }
   .wb-chip.unshared { --wb: var(--accent); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
   .wb-chip.behind   { --wb: var(--kind-run); }
+  .wb-chip.busy     { --wb: var(--run-busy); color: var(--run-busy); border-color: color-mix(in srgb, var(--run-busy) 45%, var(--line)); }
   .wb-chip.parked   { --wb: var(--ink-faint); background: var(--raised); }
   .wb-chip.missing  { --wb: var(--run-fail); color: var(--run-fail); border-color: color-mix(in srgb, var(--run-fail) 45%, var(--line)); }
   .wb-chip.starting::before { display: none; }
@@ -2128,7 +2129,15 @@
   /* A question asked over the task panel leaves the panel visible behind it,
      so it is plain which task it is about. */
   .overlay ~ .overlay { background: color-mix(in srgb, black 22%, transparent); }
-  .wb-dialog { width: min(480px, 100%); }
+  .wb-dialog { width: min(520px, 100%); max-height: calc(100vh - 64px); overflow-y: auto; }
+  .wb-dialog li .hint { margin-left: auto; white-space: nowrap; }
+  .wb-dialog .wb-cmd code { color: var(--ink); }
+  .wb-banner {
+    margin-bottom: var(--s4); padding: 9px var(--s4); border-radius: var(--r); font-size: 12.5px; line-height: 1.5;
+    color: var(--ink-dim); background: color-mix(in srgb, var(--run-busy) 8%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--run-busy) 35%, var(--line));
+  }
+  .wb-banner.err { background: color-mix(in srgb, var(--run-fail) 7%, var(--surface)); border-color: color-mix(in srgb, var(--run-fail) 40%, var(--line)); }
   .wb-dialog .wb-lead { font-size: 12.5px; color: var(--ink-dim); line-height: 1.5; }
   .wb-dialog ul { margin: 4px 0 0; padding: 0; list-style: none; max-height: 168px; overflow-y: auto; }
   .wb-dialog li { display: flex; gap: var(--s2); padding: 3px 0; font-size: 12.5px; }

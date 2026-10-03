@@ -6940,6 +6940,8 @@ const notifyError = (error) => notify(error, { error: true });
  */
 function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, className = "" }) {
   return new Promise((resolve) => {
+    // A toast left over from the last step would sit on top of this one.
+    document.querySelector(".wb-toast")?.remove();
     const overlay = el("div", { className: "overlay" });
     const box = el("div", { className: `ask wb-dialog ${className}`.trim(), role: "dialog" });
     box.setAttribute("aria-modal", "true");
@@ -7003,10 +7005,11 @@ function agoWords(iso) {
 /** Which of the chip's looks a Workbench gets: one per state, in words, never git's. */
 function wbLook(wb) {
   const st = wb.status || {};
-  if (wb.state === "missing" || st.state === "missing") return { cls: "missing", words: "Missing" };
   // A folder that is there but cannot be read: drawn like Missing, in the
-  // module's own words, because Finish and Discard both refuse it.
+  // module's own words, because Finish and Discard both refuse it. Asked
+  // first, since the folder decides and not the row.
   if (st.state === "unreadable") return { cls: "missing", words: st.words || "Unreadable", unreadable: true };
+  if (wb.state === "missing" || st.state === "missing") return { cls: "missing", words: "Missing" };
   if (wb.state === "parked") return { cls: "parked", words: "Parked" };
   return { cls: st.state || "ready", words: st.words || "Ready" };
 }
@@ -7055,6 +7058,14 @@ async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) 
   const wbApi = window.delphi.workbench;
   try {
     let st = await wbApi.status(wbId, { fresh: true });
+
+    // Mid-rebase, commits on no branch, a folder git cannot read: nothing a
+    // dialog here can fix. Finish refuses all three before it touches
+    // anything, so asking it is how its own sentence reaches the person.
+    if (st.state === "unreadable" || st.operation || st.lonely) {
+      await wbApi.finish(wbId);
+      return;
+    }
 
     if (st.unsaved) {
       const files = el("div", { className: "grp" },
@@ -7114,8 +7125,26 @@ async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) 
       }
     }
 
-    const r = await wbApi.finish(wbId);
-    notify(`Finished. The folder is gone and the branch ${r.branch} is kept.`);
+    // Files git does not keep (node_modules, a build, an .env that was
+    // edited) go with the folder. Asked about first, by name, because the
+    // branch carries none of them.
+    const plan = await wbApi.finishPlan(wbId);
+    let ignoredOk = false;
+    if (plan.needsConfirm) {
+      if (!(await confirmIgnored(plan))) return;
+      ignoredOk = true;
+    }
+    let r;
+    try {
+      r = await wbApi.finish(wbId, ignoredOk ? { ignoredOk: true } : {});
+    } catch (error) {
+      // Something new appeared between the plan and the finish: ask again
+      // from the refusal's own list, once.
+      if (error.code !== "IGNORED" || ignoredOk || !error.details) throw error;
+      if (!(await confirmIgnored(error.details))) return;
+      r = await wbApi.finish(wbId, { ignoredOk: true });
+    }
+    notify(`Finished. The folder is gone and the branch ${r.branch} is kept.${keptWords(r)}`);
     await done();
 
     if (r.taskStatus === "doing") {
@@ -7136,6 +7165,79 @@ async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) 
 }
 
 /**
+ * What was kept, in a line. The command to get it back is long, and the
+ * Sheet already carries it in the module's own note, so the toast points
+ * there rather than repeating a path nobody can read in a toast.
+ */
+function keptWords(r) {
+  if (!r || !r.recover) return "";
+  const until = r.until || (/until (\S+)/.exec(r.recover) || [])[1];
+  return ` A copy is kept${until ? ` until ${until}` : ""}; the Sheet says how to get it back.`;
+}
+
+/** A byte count as a person reads it. */
+function sizeWords(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1024 / 1024).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+/** What a snapshot leaves out, said before anyone agrees to it. */
+function notKeptGroup(notKept) {
+  if (!notKept || !notKept.length) return null;
+  return el("div", { className: "grp" },
+    el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(notKept.length) }),
+      notKept.length === 1 ? "file not kept in the copy" : "files not kept in the copy"),
+    wbList(notKept, (f) => [el("span", { className: "mono", textContent: f.path }), el("span", { className: "hint", textContent: f.why })]));
+}
+
+/**
+ * The "these can go" step of Finish: the ignored folders and the copied files
+ * that differ from the main checkout, named, with what is kept and for how long.
+ */
+function confirmIgnored(plan) {
+  const body = [];
+  const ignored = plan.ignored || [];
+  if (ignored.length) {
+    body.push(el("div", { className: "grp" },
+      el("div", { className: "grp-h" }, "Files git does not keep"),
+      wbList(ignored, (g) => [el("span", { className: "mono", textContent: g.dir }),
+        el("span", { className: "hint", textContent: `${plural(g.count, "file", "files")}, ${sizeWords(g.bytes)}` })])));
+  }
+  const changed = plan.changedCopies || [];
+  if (changed.length) {
+    body.push(el("div", { className: "grp" },
+      el("div", { className: "grp-h" }, "Copied in at Start, and changed since"),
+      wbList(changed, (f) => [el("span", { className: "mono", textContent: f }),
+        el("span", { className: "hint", textContent: "differs from the main checkout" })])));
+  }
+  body.push(notKeptGroup(plan.notKept));
+  body.push(el("p", { className: "wb-lead", textContent: "A copy of them is kept for 30 days, and Finish says how to get it back." }));
+  return wbDialog({
+    title: "These go with the folder",
+    lead: "The branch keeps your commits, but not these. Finishing removes them.",
+    body,
+    actions: [{ label: "Cancel", value: false }, { label: "These can go", value: true, kind: "primary" }],
+    cancelValue: false,
+  });
+}
+
+/** A recover command as a block that can be copied, from the module's own sentence. */
+function recoverBlock(text) {
+  const words = String(text || "");
+  const at = words.indexOf("To get it back:");
+  const command = at >= 0 ? words.slice(at + "To get it back:".length).trim() : words;
+  const b = el("button", { className: "ts-act", type: "button", title: "Copy the command" });
+  b.setAttribute("aria-label", "Copy the command");
+  b.append(tsIcon("copy"));
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(command); b.classList.add("done"); setTimeout(() => b.classList.remove("done"), 1200); } catch (error) { notifyError(error); }
+  };
+  return el("div", { className: "wb-cmd" }, el("code", { textContent: command }), b);
+}
+
+/**
  * Discard: the one verb that throws work away. It shows everything that would
  * go, from the module's own plan, and stays disabled until the task's number
  * is typed exactly.
@@ -7143,52 +7245,49 @@ async function finishWorkbench(wbId, taskId, { title = "", after = null } = {}) 
 async function discardWorkbench(wbId, taskId, { after = null } = {}) {
   let plan;
   try { plan = await window.delphi.workbench.discardPlan(wbId); } catch (error) { notifyError(error); return; }
+  // A folder git cannot read is left alone by Discard, which is right: there
+  // is no way to keep a copy of what cannot be read. Said, with nothing to type.
+  if (plan.unreadable) {
+    await wbDialog({
+      title: `Task ${taskId}'s Workbench cannot be discarded now`,
+      lead: plan.unreadable,
+      actions: [{ label: "OK", value: null, kind: "primary" }],
+    });
+    return;
+  }
+  const count = (n, one, many) => el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(n) }), n === 1 ? one : many);
+  const commitRow = (c) => [
+    el("span", { className: "mono", style: "color:var(--ink-faint)", textContent: String(c.sha).slice(0, 7) }),
+    el("span", { textContent: c.subject || "" }),
+  ];
   const body = [];
-  if (plan.unsaved.length) {
-    body.push(el("div", { className: "grp" },
-      el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(plan.unsaved.length) }),
-        plan.unsaved.length === 1 ? "unsaved change" : "unsaved changes"),
-      wbList(plan.unsaved, (f) => el("span", { className: "mono", textContent: f }))));
-  }
-  if (plan.commits.length) {
-    body.push(el("div", { className: "grp" },
-      el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(plan.commits.length) }),
-        plan.commits.length === 1 ? "commit that exists only here" : "commits that exist only here"),
-      wbList(plan.commits, (c) => [
-        el("span", { className: "mono", style: "color:var(--ink-faint)", textContent: String(c.sha).slice(0, 7) }),
-        el("span", { textContent: c.subject }),
-      ])));
-  }
-  // Ignored files come summarised by folder, and commits made on a detached
-  // HEAD separately; both are drawn from whatever words the plan carries.
-  const ignored = Array.isArray(plan.ignored) ? plan.ignored : [];
-  if (ignored.length) {
-    body.push(el("div", { className: "grp" },
-      el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(ignored.length) }),
-        ignored.length === 1 ? "folder of ignored files" : "folders of ignored files"),
-      wbList(ignored, (g) => el("span", { className: "mono",
-        textContent: typeof g === "string" ? g : `${g.dir || g.path || ""}${g.count != null ? `  (${plural(g.count, "file", "files")})` : ""}` }))));
-  }
-  const detached = Array.isArray(plan.detached) ? plan.detached : Array.isArray(plan.detachedCommits) ? plan.detachedCommits : [];
-  if (detached.length) {
-    body.push(el("div", { className: "grp" },
-      el("div", { className: "grp-h" }, el("span", { className: "n", textContent: String(detached.length) }),
-        detached.length === 1 ? "commit on no branch" : "commits on no branch"),
-      wbList(detached, (c) => [
-        el("span", { className: "mono", style: "color:var(--ink-faint)", textContent: String(c.sha || c).slice(0, 7) }),
-        el("span", { textContent: c.subject || "" }),
-      ])));
-  }
-  if (!plan.unsaved.length && !plan.commits.length && !ignored.length && !detached.length) {
-    body.push(el("p", { className: "wb-lead", textContent: "Nothing in it exists only here, so no work is lost." }));
+  if (plan.folderGone) body.push(el("p", { className: "wb-lead", textContent: `The folder is already gone (${plan.path}). Discard closes the Workbench and keeps the branch's commits.` }));
+  if (plan.operation) body.push(el("p", { className: "wb-lead", textContent: `The folder is in the middle of ${plan.operation}. Its state as it is now is what gets kept.` }));
+  if (plan.unsaved.length) body.push(el("div", { className: "grp" }, count(plan.unsaved.length, "unsaved change", "unsaved changes"),
+    wbList(plan.unsaved, (f) => el("span", { className: "mono", textContent: f }))));
+  if (plan.commits.length) body.push(el("div", { className: "grp" }, count(plan.commits.length, "commit that exists only here", "commits that exist only here"),
+    wbList(plan.commits, commitRow)));
+  const detached = plan.detached || [];
+  if (detached.length) body.push(el("div", { className: "grp" }, count(detached.length, "commit on no branch", "commits on no branch"),
+    wbList(detached, commitRow)));
+  const ignored = plan.ignored || [];
+  if (ignored.length) body.push(el("div", { className: "grp" }, el("div", { className: "grp-h" }, "Files git does not keep"),
+    wbList(ignored, (g) => [el("span", { className: "mono", textContent: g.dir }),
+      el("span", { className: "hint", textContent: `${plural(g.count, "file", "files")}, ${sizeWords(g.bytes)}` })])));
+  if (!plan.unsaved.length && !plan.commits.length && !detached.length && !ignored.length && !plan.folderGone) {
+    body.push(el("p", { className: "wb-lead", textContent: "Nothing in it exists only here." }));
   }
   body.push(plan.branchPushed
     ? el("p", { className: "wb-lead" }, "The branch ", el("span", { className: "mono", textContent: plan.branch }),
         " is on the remote as ", el("span", { className: "mono", textContent: plan.remote }), ", so it is kept.")
     : el("p", { className: "wb-lead" }, "The branch ", el("span", { className: "mono", textContent: plan.branch }),
-        " was never pushed, so it goes too."));
-  const recover = plan.recover || plan.recovery || null;
-  if (recover) body.push(el("p", { className: "wb-lead wb-recover", textContent: typeof recover === "string" ? recover : recover.text || "" }));
+        " was never pushed, so it goes, with the rest kept in the copy."));
+  // What the copy cannot hold, by name, before the number is typed: the one
+  // part of a Discard that is not coming back.
+  body.push(notKeptGroup(plan.notKept));
+  if (plan.recover) {
+    body.push(el("p", { className: "wb-lead" }, "Kept until ", el("strong", { textContent: plan.until }), "; to get it back:"), recoverBlock(plan.recover));
+  }
   const want = String(taskId);
   const input = el("input", { className: "field", type: "text", autocomplete: "off", spellcheck: false });
   input.setAttribute("aria-label", `Type ${want} to confirm`);
@@ -7202,8 +7301,7 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
   };
   const choice = await wbDialog({
     title: `Discard the Workbench for task ${taskId}?`,
-    lead: recover ? "This deletes the folder. What was in it is kept aside first, so it can be got back."
-      : "This deletes the folder and any work that exists nowhere else. It cannot be undone.",
+    lead: "This deletes the folder. Everything in it is copied aside first, so it can be got back for a while.",
     body,
     actions: [
       { label: "Cancel", value: null },
@@ -7213,11 +7311,8 @@ async function discardWorkbench(wbId, taskId, { after = null } = {}) {
   if (choice !== "discard") return;
   try {
     const r = await window.delphi.workbench.discard(wbId, input.value);
-    const back = r.recover || r.recovery;
-    if (back) { notify(`Discarded. ${typeof back === "string" ? back : back.text || ""}`); if (after) await after(); return; }
-    notify(r.branchDeleted ? `Discarded, with the branch ${r.branch}.`
-      : r.keptRemote ? `Discarded. The branch is kept on the remote as ${r.keptRemote}.`
-      : `Discarded. The branch ${r.branch} is kept.`);
+    // The Sheet has the same sentence, from the module's own note.
+    notify(`Discarded.${keptWords(r)}`);
   } catch (error) { notifyError(error); }
   if (after) await after();
 }
@@ -7378,8 +7473,17 @@ window.delphi.onSheetRunOutput(({ entryId, taskId, chunk, chunks, truncated }) =
   const b = runBuffer(entryId, taskId);
   // The main process may batch pieces, and may skip some when they come too
   // fast; skipped output is in the log, which is read in full once it ends.
-  if (truncated) b.truncated = true;
   chunk = Array.isArray(chunks) ? chunks.join("") : String(chunk || "");
+  if (truncated) {
+    // The batch was cut at its front, so it starts part way through a line,
+    // and the line held over from before it never got its end. Both go.
+    b.truncated = true;
+    runTake(b);
+    b.partial = "";
+    const nl = chunk.indexOf("\n");
+    chunk = nl >= 0 ? chunk.slice(nl + 1) : "";
+    if (!chunk) return;
+  }
   b.pending.push(chunk);
   b.size += chunk.length;
   // Folded in early when a single frame's worth is already more than will be
@@ -7632,7 +7736,9 @@ async function openTaskSheet(taskId) {
     wbSlot.append(wbChip(wb, () => wbDo(() => wbUpdate(wb))));
 
     if (look.unreadable) {
-      wbSlot.append(btn("Why?", "", () => notifyError((wb.status && (wb.status.message || wb.status.words)) || "The folder cannot be read.")));
+      // No Recreate, Finish or Discard: the folder is there and may be full
+      // of work. Opening it is the one useful thing, and the banner says why.
+      wbSlot.append(btn("Open folder", "", () => wbOpen(wb, "folder")));
       return;
     }
     if (look.cls === "missing") {
@@ -7720,6 +7826,15 @@ async function openTaskSheet(taskId) {
   function paintAdvanced() {
     advHost.textContent = "";
     const wb = detail.workbench;
+    // The module's explanation, where it can be read, when the folder is
+    // unreadable or stopped in the middle of something.
+    const st = (wb && wb.status) || {};
+    if (st.state === "unreadable" && st.message) {
+      advHost.append(el("div", { className: "wb-banner err", role: "status", textContent: st.message }));
+    } else if (st.state === "busy" && st.operation) {
+      advHost.append(el("div", { className: "wb-banner", role: "status",
+        textContent: `${st.words}. Finish and Update wait until it is finished or stopped in the folder.` }));
+    }
     if (!wbAdv || !wb || wb.id !== wbAdv.id) { wbAdv = null; return; }
     const a = wbAdv.data;
     const copyBtn = (text, label) => {
@@ -8240,7 +8355,11 @@ async function openTaskSheet(taskId) {
 
   function runBody(entry, body) {
     const meta = entry.meta || {};
-    body.append(el("div", { className: "ts-run-cmd", textContent: entry.body, title: entry.body }));
+    // An agent's multi-line command is stored as its first line, with the
+    // whole script in meta.script. The line stays short here; hovering, Copy
+    // and Show output all give the script.
+    const script = typeof (entry.meta || {}).script === "string" && entry.meta.script.trim() ? entry.meta.script : null;
+    body.append(el("div", { className: "ts-run-cmd", textContent: entry.body, title: script || entry.body }));
     const line = el("div", { className: "ts-run-meta" });
     const state = meta.state;
     if (state === "ok" || state === "fail" || state === "running") {
@@ -8273,9 +8392,11 @@ async function openTaskSheet(taskId) {
     // Short output arrives inline in meta.out and is shown as is. Anything
     // longer stays in its log file until asked for, because a build log is
     // not something to pull into every repaint of the rail.
-    const inline = typeof meta.out === "string" && meta.out ? stripAnsi(meta.out) : "";
+    // Not inline when there is a script: the log the main process returns
+    // leads with it, so the expanded view shows what ran, then what it said.
+    const inline = !script && typeof meta.out === "string" && meta.out ? stripAnsi(meta.out) : "";
     const open = outputOpen.has(entry.id);
-    if (!inline && (meta.lines > 0 || state === "running")) {
+    if (!inline && (meta.lines > 0 || state === "running" || script)) {
       const toggle = el("button", { className: "ts-linkbtn", textContent: open ? "Hide output" : "Show output" });
       toggle.dataset.act = "output";
       toggle.setAttribute("aria-expanded", String(open));
@@ -8660,7 +8781,7 @@ async function openTaskSheet(taskId) {
         const holding = (box) => box.contains(document.activeElement);
         paintTop();
         paintWorkbench();
-        if (!wbAdv || !detail.workbench || detail.workbench.id !== wbAdv.id) paintAdvanced();
+        paintAdvanced();
         paintRing();
         if (!holding(meta)) paintMeta();
         if (!editingDesc) paintDesc();
