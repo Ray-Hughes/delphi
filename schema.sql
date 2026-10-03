@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- someone made; a claim is a lease an agent took and can lose.
   claimed_by   TEXT,
   claim_expires TEXT,
+  -- A person's marker for the card. Declared here as well as in
+  -- agent/schema_later.js because a new database gets this definition after
+  -- schema_later has run, so without it a fresh install had no colour column
+  -- until its second launch.
+  colour       TEXT,
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT
@@ -314,6 +319,13 @@ CREATE TABLE IF NOT EXISTS sessions (
   -- The folder this session runs in, resolved once. A project can span four
   -- repositories and a harness needs one answer.
   cwd         TEXT,
+  -- Also added by agent/schema_later.js for databases made before them. They
+  -- are declared here too because a database with no sessions table at all gets
+  -- this definition, and schema_later has already looked at its columns by then,
+  -- so leaving them out meant the first launch after an upgrade had no
+  -- workspace_id and could not start an agent tab.
+  workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL,
+  auto_allow  INTEGER NOT NULL DEFAULT 0,
   -- Whether a turn is in flight. Separate from status, which is whether the
   -- session is worth keeping: a failed turn does not archive a session, and an
   -- archived session is not idle, it is over.
