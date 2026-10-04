@@ -408,7 +408,9 @@ function makeItemStore({
     if (!pad) return;
     if (op.options.pad !== "carry") {
       result.pad = { mode: "keep", from: { id: Number(pad.id), title: pad.title } };
-      result.notices.push(`Its line stays in the pad ${pad.title} and keeps syncing from there.`);
+      result.notices.push(op.options.detach && row.parent_id != null
+        ? `Its line in the pad ${pad.title} moves out from under its parent and keeps syncing from there.`
+        : `Its line stays in the pad ${pad.title} and keeps syncing from there.`);
       return;
     }
     if (!pads.cutBlock(pad.body, op.id)) {
@@ -513,8 +515,10 @@ function makeItemStore({
     };
 
     if (op.entity === "task") {
-      const rows = moveTaskTree(op.id, op.options.organizerId ?? null, Boolean(op.options.detach && row.parent_id != null), p.keepInSource);
+      const detaching = Boolean(op.options.detach && row.parent_id != null);
+      const rows = moveTaskTree(op.id, op.options.organizerId ?? null, detaching, p.keepInSource);
       if (p.pad && p.pad.mode === "carry") carryPad(p, rows, statements, record);
+      else if (detaching && row.pad_id != null) outdentPadLine(op.id, row.pad_id, statements, record);
     } else if (op.entity === "note" || op.entity === "link") {
       record.rows.push({ table: KINDS[op.entity].table, id: op.id, project_id: from });
       statements.push([`UPDATE ${KINDS[op.entity].table} SET project_id = :p1${op.entity === "note" ? ", updated_at = datetime('now')" : ""} WHERE id = :p2`, [to, op.id]]);
@@ -568,6 +572,21 @@ function makeItemStore({
     statements.push(...(ctx.extra || []));
     runAll(statements);
     return { auditId: lastAudit(auditEntity, auditId, "update"), moved, notices: p.notices };
+  }
+
+  /**
+   * A detached subtask's pad line, taken out from under its parent and put at
+   * the top level of the same pad. Left indented, the next derivation reads
+   * the indentation as the truth and files it back under its old parent, in a
+   * project it no longer lives in.
+   */
+  function outdentPadLine(taskId, padId, statements, record) {
+    const pad = sql("SELECT id, body FROM scratchpads WHERE id = :p1", [padId])[0];
+    const cut = pad ? pads.cutBlock(pad.body, taskId) : null;
+    if (!cut) return;
+    const body = pads.appendBlock(cut.body, cut.block);
+    statements.push([`UPDATE scratchpads SET body = :p1, updated_at = datetime('now') WHERE id = :p2`, [body, Number(pad.id)]]);
+    record.pads.push({ id: Number(pad.id), body_before: pad.body, body_after: body });
   }
 
   /** The statements that carry a task's pad lines to a pad in the target. */
@@ -834,6 +853,17 @@ function makeItemStore({
         const values = cols.map((c) => r[c]);
         statements.push([`UPDATE ${r.table} SET ${cols.map((c, i) => `${c} = :p${i + 1}`).join(", ")} WHERE id = :p${cols.length + 1}`, [...values, r.id]]);
       }
+      // A subtask added under a moved task after the move goes back with it.
+      // The tree is the unit a move takes, so the undo takes the tree as it is
+      // now rather than splitting it: a new subtask left in the target with
+      // its parent gone home would be a subtask filed somewhere else.
+      const listed = op.rows.filter((r) => r.table === "tasks").map((r) => Number(r.id));
+      for (const r of op.rows.filter((x) => x.table === "tasks" && "parent_id" in x)) {
+        statements.push([`WITH RECURSIVE sub(id) AS (SELECT :p1 UNION ALL SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id)
+                          UPDATE tasks SET project_id = :p2, updated_at = datetime('now')
+                           WHERE id IN (SELECT id FROM sub) AND id NOT IN (${listed.join(", ")}) AND project_id IS :p3`,
+                         [r.id, op.from, op.to]]);
+      }
       for (const pad of op.pads || []) statements.push(["UPDATE scratchpads SET body = :p1 WHERE id = :p2", [pad.body_before, pad.id]]);
       for (const [e, id, pid] of op.assoc_added || []) {
         statements.push(["DELETE FROM item_projects WHERE entity = :p1 AND entity_id = :p2 AND project_id = :p3", [e, id, pid]]);
@@ -856,10 +886,15 @@ function makeItemStore({
     // An applied flag goes back to proposed, so it can be approved again or
     // rejected rather than sitting as "applied" over a change that was undone.
     if (op.flag_id) {
+      // Unless the item has been flagged again since: one live flag per item,
+      // so the old one stays applied in its thread and the new one carries on.
       statements.push([`UPDATE item_flags SET status = 'proposed', decided_by = NULL, decided_at = NULL, applied_audit_id = NULL,
-                               updated_at = datetime('now') WHERE id = :p1 AND status = 'applied'`, [op.flag_id]]);
+                               updated_at = datetime('now') WHERE id = :p1 AND status = 'applied'
+                           AND NOT EXISTS (SELECT 1 FROM item_flags g WHERE g.entity = item_flags.entity
+                                             AND g.entity_id = item_flags.entity_id AND g.id != item_flags.id
+                                             AND g.status IN ('open', 'evaluating', 'proposed'))`, [op.flag_id]]);
       statements.push([`INSERT INTO flag_entries (flag_id, kind, author, author_type, body) VALUES (:p1, 'note', :p2, :p3, :p4)`,
-        [op.flag_id, writer, writerType, "The change was undone, so the proposal is open again."]]);
+        [op.flag_id, writer, writerType, "The change was undone. The proposal is open again unless the item has a newer flag."]]);
     }
     runAll(statements);
     return { undone: true, kind: op.kind };
@@ -897,9 +932,10 @@ function makeItemStore({
     const auditEntity = KINDS[row.entity].audit;
     const id = auditEntity === "project" ? row.project_id : row.entity_id;
     if (id == null) return;
-    // No before_json, like a comment: a flag changes nothing about the item,
-    // so there is nothing for undo to put back.
-    sql(...auditStatement("update", auditEntity, id, summary, row.label, null, null));
+    // Marked as flag bookkeeping in before_json, which db.undoLast skips: a
+    // flag changes nothing about the item, and an agent's flag sitting on top
+    // of History used to stop a person's undo of their own edit underneath it.
+    sql(...auditStatement("update", auditEntity, id, summary, row.label, { __flag: Number(row.id) }, null));
   };
 
   /**
@@ -1030,6 +1066,21 @@ function makeItemStore({
     const who = by || writer;
     if (type === "agent") {
       throw new Error("Approving or rejecting a proposal is a person's decision, and this is an agent. Say what you think in a reply on the flag instead.");
+    }
+    // Only a writer that says it is a person decides. Unset is not human: a
+    // name that merely looks like a person's is how an agent with no type set
+    // approved its own proposal through the command line.
+    if (type !== "human") {
+      throw new Error("Approving or rejecting a proposal is a person's decision, and this writer has not said it is a person (DELPHI_AUTHOR_TYPE=human). Nothing was changed.");
+    }
+    // Nobody decides their own proposal, and nobody but a person decides on a
+    // flag an agent raised under the same name. A person approving the
+    // Oracle's proposal on a flag they raised themselves is the ordinary case.
+    if (row.proposed_by && who === row.proposed_by) {
+      throw new Error(`${who} proposed this, so ${who} cannot also decide it. Another person has to.`);
+    }
+    if (row.created_by && who === row.created_by && row.created_by_type !== "human") {
+      throw new Error(`${who} raised this flag as an agent, so ${who} cannot decide it. A person has to.`);
     }
     if (!LIVE.includes(row.status) && !(approve && row.status === "failed")) throw new Error(`Flag ${row.id} is ${row.status}, so there is nothing to decide.`);
     const proposal = parseJson(row.proposal);

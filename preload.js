@@ -99,6 +99,7 @@ contextBridge.exposeInMainWorld("delphi", {
     create: (payload) => call("harness:create", payload),
     update: (id, fields) => call("harness:update", id, fields),
     remove: (id) => call("harness:delete", id),
+    trustCommand: (id, trust) => call("harness:trustCommand", id, trust),
     start: (payload) => call("harness:start", payload),
     stop: (sessionId) => call("harness:stop", sessionId),
   },
@@ -118,6 +119,8 @@ contextBridge.exposeInMainWorld("delphi", {
     reject: (id, why) => call("runs:reject", id, why),
     stop: (id) => call("runs:stop", id),
     reply: (id, message) => call("runs:reply", id, message),
+    review: (id, verdict) => call("runs:review", id, verdict),
+    reorder: (ids) => call("runs:reorder", ids),
   },
   locks: {
     list: (projectId) => call("locks:list", projectId),

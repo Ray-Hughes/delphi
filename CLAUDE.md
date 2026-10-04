@@ -224,6 +224,32 @@ refuses to start on a mismatch. `whoami` and `delphi doctor` report which databa
 is in use. A second copy of the app on the same data folder only brings the first
 forward. `make dev` runs the checkout on a separate database in `~/.delphi-dev`.
 
+**The job dispatcher refuses more than it runs.** `agent/dispatch.js` runs every
+job (a handoff, a queued task, a person's request) from rows in `handoffs`, which
+`agent/jobs.js` writes for the app and the server alike. Three rules hold. A job's
+real argv is checked against an allowlist per harness (`POLICY`) immediately
+before every spawn, follow-ups included, so a flag nobody listed fails closed;
+adding a flag to a built-in template means adding it there too. An agent's job
+waits in `needs_approval` until a person approves it, unless the project has
+`auto_approve`; no MCP tool approves one. A `do` job runs only in its task's
+Workbench and an `ask` job only reads, in the project's folder. Limits come from
+`jobConcurrency` and `jobHarnessLimits`, bounded by `dispatch.BOUNDS` and read on
+every pass, and the order of queued jobs from `queue_rank`.
+
+**`items/` is one shared store, and agents never apply.** Moving, copying,
+associating and flagging items across projects all go through `items/store.js`,
+handed `sql` and a `batch`, so the app and the server write the same History
+rows and a move lands as one batch on either route. An agent may flag an item or
+propose a move; only a person's decision applies one, and the store refuses an
+agent's decision whatever reached it. The one move an agent makes itself is a task
+it filed in the last 24 hours (`update_task`, owner decision D2).
+
+**Memory is compact by default.** `search`, `oracle_ask` and `oracle_context`
+answer through `agent/recall.js`: one line per hit inside a token budget, with
+`get_note` and `get_task` to read more. `detail: "full"` returns the old
+whole-body answer unchanged, for clients written against it. A new recall tool
+follows the same rule: the brief answer by default, the full one on request.
+
 **Tests never touch a real database.** Not the one in
 `~/Library/Application Support/Delphi`, not a stray one in the checkout. Each test
 makes a temp directory and sets `DELPHI_DATA_DIR` and `DELPHI_DB` inside it. `test_all.js` sets both to

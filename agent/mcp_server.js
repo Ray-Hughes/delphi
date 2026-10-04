@@ -971,8 +971,11 @@ const TOOLS = {
       // setting the column here used to leave the task filed under an epic in
       // the project it had left.
       if (a.project_id !== undefined && a.project_id !== null && Number(a.project_id) !== Number(before.project_id)) {
+        // Only for a named writer: with no DELPHI_ACTOR every agent is
+        // "agent", and "you filed it" would let one move another's work.
+        const named = Boolean(process.env.DELPHI_ACTOR) && ACTOR !== "agent";
         const suffix = `(by ${ACTOR})`;
-        const mine = sql(`SELECT id FROM audit WHERE action = 'create' AND entity = 'task' AND entity_id = :p1
+        const mine = named && sql(`SELECT id FROM audit WHERE action = 'create' AND entity = 'task' AND entity_id = :p1
                             AND substr(summary, -length(:p2)) = :p2 AND at >= datetime('now', '-24 hours') LIMIT 1`,
                          [before.id, suffix])[0];
         if (!mine) {
@@ -1426,7 +1429,17 @@ const TOOLS = {
         why: { type: "string" },
       },
     },
-    run: (a) => sheets.decide(a.ask_id, a.choice, a.why ?? null),
+    // A person answering here (the delphi command, the Sheet in a terminal)
+    // puts the job waiting on the question back in the queue in the same
+    // call, so the app's dispatcher starts it as soon as it sees the write
+    // rather than at its next pass. jobs.resumeAnswered counts only a
+    // decision whose author_type is human, so an agent cannot answer its own.
+    run: (a) => {
+      const entry = sheets.decide(a.ask_id, a.choice, a.why ?? null);
+      let resumed = [];
+      try { resumed = jobs.resumeAnswered(sql, { taskId: entry.task_id }); } catch (error) { console.error(`resuming jobs after decide: ${error.message}`); }
+      return resumed.length ? { ...entry, resumed_jobs: resumed.map((r) => r.id) } : entry;
+    },
   },
 
   sheet_resolve: {
@@ -2343,7 +2356,10 @@ const TOOLS = {
       },
     },
     run: (a) => {
-      const done = itemStore.decide(a.flag_id, { approve: a.decision === "approve", ops: a.ops ?? null, note: a.note ?? null });
+      // The type as the environment said it, not as the name suggests: the
+      // store decides only for a writer that said it is a person.
+      const done = itemStore.decide(a.flag_id, { approve: a.decision === "approve", ops: a.ops ?? null, note: a.note ?? null,
+        byType: AUTHOR_TYPE || "unset" });
       return { flag: done.flag, audit_ids: done.auditIds };
     },
   },

@@ -12,9 +12,9 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | --- | --- |
 | `list_projects` | Every project with open task counts. Call first to find a `project_id` |
 | `add_project` | Create a project when work fits none of the existing ones |
-| `list_tasks` | Tasks, optionally filtered by project or status |
+| `list_tasks` | Tasks, optionally filtered by project or status. A `project_id` that does not exist is refused, not answered with an empty list |
 | `add_task` | Create a task |
-| `update_task` | Change status, priority, detail, or move between projects |
+| `update_task` | Change status, priority or detail. Moving it to another project only for a task you filed in the last day; see Moving work between projects |
 | `add_note` | Store a decision, gotcha or reference against a project |
 | `list_scratchpads` | The working documents in a project. Call before writing one |
 | `read_scratchpad` | One pad in full: what the last session was in the middle of |
@@ -24,15 +24,23 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `list_agents` | The other agents on this machine that work can be handed to |
 | `handoff_send` | Hand a piece of work to another agent. You are woken with the reply |
 | `handoff_status` | What has been handed to and from you, and the replies |
+| `run_status` | One job: its state, who asked and approved it, its Workbench, tokens, and the reply |
+| `run_list` | Jobs, newest first, by project, state, or only yours (`mine`). No tool approves one |
 | `lock_acquire` | Take a lease on a file, a branch, a migration, so two agents do not collide |
 | `lock_release` | Give one back |
 | `lock_status` | What is held in a project, and by whom |
+| `lock` | The three above in one tool: `action` is `take` (the default), `release` or `status` |
 | `timer_set` | Ask to be given a turn later, instead of waiting in a loop |
-| `search` | Text matching across tasks and notes |
+| `whoami` | Which database you are on, who your writes are attributed to, and whether an app is dispatching |
+| `search` | Tasks and notes by words, best first, one line each |
+| `get_note` | Notes in full by id, after `search`, `oracle_ask` or `oracle_context` |
 | `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
 | `oracle_entities` | What the graph knows about, most referenced first |
 | `oracle_ask` | Meaning and connections together. The main way to ask what we know |
 | `recent_activity` | What changed lately and which agent changed it |
+| `flag_item` | Say an item may be in the wrong project, where it belongs and why. Changes nothing |
+| `propose_move` | Propose one to three moves, copies or associations for an item. Never applies them |
+| `list_flags` | Flags on possibly misfiled items, each with its proposal in a line |
 | `get_task` | One task in full: detail, subtasks, discussion, every status it has been through |
 | `add_comment` | Leave your reasoning on a task, for whoever picks it up next |
 | `queue_status` | What is waiting for an agent and what other agents are holding |
@@ -55,6 +63,15 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `workbench_list` | The live Workbenches, with their status in words |
 
 There is no tool to discard a Workbench, on purpose. See Safety.
+
+### Memory is brief unless you ask
+
+`search`, `oracle_ask` and `oracle_context` answer compactly by default: an id, a
+title and a line each, inside a token budget (`budget`, 1500 by default), so consulting
+memory costs a fraction of what reading it in full does. `get_task` gives the Sheet as
+text rather than every entry as JSON. Read what you need with `get_note` or
+`get_task`, or pass `detail: "full"` for whole bodies, which is what these tools
+returned before.
 
 Every write is attributed. Set `DELPHI_ACTOR` in the server's environment to name the
 agent, and its changes appear in the History tab labelled with that name. Give each
@@ -366,6 +383,17 @@ Do not claim more than one task at a time. Finish or release before taking anoth
 `--workbenches` it gives each task its own Workbench and runs the agent there, leaving
 the Workbench for a person to review and finish. That is what makes `--concurrency`
 above 1 safe in one repository. It is off by default in this release.
+
+## Moving work between projects
+
+An item filed in the wrong project is fixed by a person, with one exception. You may
+move a task you filed yourself in the last 24 hours, with `update_task` and a new
+`project_id`: that is correcting your own misfiling, and its subtasks move with it.
+Any other move is refused with the sentence that says so. For those, `flag_item`
+with a note saying where it belongs and why, or `propose_move` with the exact
+operations. Both are records for a person to approve in the app; nothing an agent
+calls applies one, and there is no tool that approves a flag. `list_flags` shows
+what is already flagged, so check it before flagging the same thing twice.
 
 ## Delegation
 

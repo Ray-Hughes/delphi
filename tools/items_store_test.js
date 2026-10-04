@@ -369,8 +369,79 @@ function appSide() {
   check("undo of an association removes it", one("SELECT COUNT(*) AS n FROM item_projects WHERE entity = 'link' AND entity_id = ?", sharedLink.id).n, 0);
 }
 
+// Regressions from the review of b315415, each on the app's route.
+function reviewed() {
+  section("review: nobody approves their own proposal, and unset is not a person");
+  const P = db.createProject({ key: "rv-p", name: "RV P" });
+  const Q = db.createProject({ key: "rv-q", name: "RV Q" });
+  const agent = makeItemStore({ sql: db.sqlP, batch: db.batchP, actor: "claude:1", authorType: "agent" });
+  const n = db.createNote({ projectId: P.id, title: "rv note", body: "x" });
+  const proposed = agent.propose({ entity: "note", id: n.id, ops: [{ op: "move", entity: "note", id: n.id, to: Q.id }], reasoning: "mine", by: "claude:1" });
+  const sameName = makeItemStore({ sql: db.sqlP, batch: db.batchP, actor: "claude:1", authorType: "human" });
+  throws("the proposer claiming to be a person cannot approve it", () => sameName.decide(proposed.flag.id, { approve: true }), /claude:1 proposed this, so claude:1 cannot also decide it/);
+  const untyped = makeItemStore({ sql: db.sqlP, batch: db.batchP, actor: "someone" });
+  throws("a writer with no type is not a person", () => untyped.decide(proposed.flag.id, { approve: true }), /has not said it is a person/);
+  check("nothing moved", one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id, P.id);
+  const flaggedByAgent = agent.flag({ entity: "note", id: db.createNote({ projectId: P.id, title: "rv2", body: "y" }).id, note: "x", evaluate: "none" }).flag;
+  db.items().propose({ flagId: flaggedByAgent.id, ops: [{ op: "move", entity: "note", id: flaggedByAgent.entity_id, to: Q.id }], reasoning: "x", by: "oracle" });
+  throws("nor the agent that raised the flag, under its own name", () => sameName.decide(flaggedByAgent.id, { approve: true }), /raised this flag as an agent/);
+  check("a person approves it", db.items().decide(flaggedByAgent.id, { approve: true }).flag.status, "applied");
+
+  section("review: a flag does not block undo");
+  const renamed = db.createNote({ projectId: P.id, title: "before", body: "z" });
+  db.updateNote(renamed.id, { title: "after" });
+  agent.flag({ entity: "note", id: renamed.id, note: "misfiled?", evaluate: "none" });
+  const undone = db.undoLast(1);
+  check("rename, flag it, undo: the name comes back", [undone.undone, one("SELECT title FROM notes WHERE id = ?", renamed.id).title], [1, "before"]);
+  const flagRow = one("SELECT id FROM audit WHERE entity = 'note' AND entity_id = ? AND summary LIKE 'flagged%'", renamed.id);
+  throws("undoing the flag row itself says what to do instead", () => db.undo(flagRow.id), /Withdraw or reject the flag/);
+  check("and History does not offer it as restorable", db.listAudit(200).find((a) => a.id === flagRow.id).restorable, 0);
+
+  section("review: a detached subtask stays detached through the pad");
+  const pad = db.createScratchpad({ projectId: P.id, title: "rv pad", key: "rv-pad", body: "- [ ] parent\n  - [ ] child\n- [ ] other\n" });
+  const [parentId, childId] = q("SELECT id FROM tasks WHERE pad_id = ? ORDER BY id", pad.id).map((r) => r.id);
+  check("the pad filed the child under its parent", one("SELECT parent_id FROM tasks WHERE id = ?", childId).parent_id, parentId);
+  const detached = db.items().move("task", childId, Q.id, { detach: true });
+  db.derive(pad.id);
+  check("derive after the detach leaves it with no parent, in its new project", one("SELECT parent_id, project_id FROM tasks WHERE id = ?", childId), { parent_id: null, project_id: Q.id });
+  check("its line is at the top level of the pad", /^- \[ \] child/m.test(one("SELECT body FROM scratchpads WHERE id = ?", pad.id).body), true);
+  db.undo(detached.auditId);
+  check("undo puts it and its line back under the parent", [one("SELECT parent_id, project_id FROM tasks WHERE id = ?", childId), /^  - \[ \] child/m.test(one("SELECT body FROM scratchpads WHERE id = ?", pad.id).body)],
+    [{ parent_id: parentId, project_id: P.id }, true]);
+
+  section("review: undo of an approved flag after the item was flagged again");
+  const n3 = db.createNote({ projectId: P.id, title: "rv3", body: "w" });
+  const f3 = db.items().flag({ entity: "note", id: n3.id, note: "x", evaluate: "none" }).flag;
+  agent.propose({ flagId: f3.id, ops: [{ op: "move", entity: "note", id: n3.id, to: Q.id }], reasoning: "x", by: "claude:1" });
+  const applied = db.items().decide(f3.id, { approve: true });
+  const f4 = agent.flag({ entity: "note", id: n3.id, note: "again", evaluate: "none" }).flag;
+  db.undo(applied.auditIds[0]);
+  check("the undo works, the old flag stays applied, the new one stays live", [one("SELECT project_id FROM notes WHERE id = ?", n3.id).project_id,
+    db.items().getFlag(f3.id).flag.status, db.items().getFlag(f4.id).flag.status], [P.id, "applied", "open"]);
+
+  section("review: undo of a move takes a subtask added since");
+  const root = db.createTask({ projectId: P.id, title: "rv root" });
+  const mv = db.items().move("task", root.id, Q.id);
+  const late = db.createTask({ parentId: root.id, title: "added after the move" });
+  db.undo(mv.auditId);
+  check("the tree goes home whole", [one("SELECT project_id FROM tasks WHERE id = ?", root.id).project_id, one("SELECT project_id FROM tasks WHERE id = ?", late.id).project_id], [P.id, P.id]);
+
+  section("review: undoing a project delete brings its associations back");
+  const D = db.createProject({ key: "rv-d", name: "RV D" });
+  const dn = db.createNote({ projectId: D.id, title: "shown elsewhere", body: "v" });
+  db.items().associate("note", dn.id, Q.id);
+  const elsewhere = db.createNote({ projectId: Q.id, title: "shown in D", body: "u" });
+  db.items().associate("note", elsewhere.id, D.id);
+  db.deleteProject(D.id, { tasks: "delete" });
+  check("the delete took both", one("SELECT COUNT(*) AS n FROM item_projects WHERE (entity = 'note' AND entity_id = ?) OR project_id = ?", dn.id, D.id).n, 0);
+  db.undoLast(1);
+  check("undo restores both", q("SELECT entity_id, project_id FROM item_projects WHERE (entity = 'note' AND entity_id = ?) OR project_id = ? ORDER BY entity_id", dn.id, D.id)
+    .map((r) => [r.entity_id, r.project_id]).sort(), [[dn.id, Q.id], [elsewhere.id, D.id]].sort());
+}
+
 for (const [name, route] of ROUTES) scenario(name, route);
 appSide();
+reviewed();
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 fs.rmSync(dir, { recursive: true, force: true });

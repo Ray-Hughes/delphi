@@ -167,6 +167,39 @@ async function main() {
   const finished = await call("workbench:finish", wb.id);
   check("finish", [finished.finished, fs.existsSync(wb.path)], [true, false]);
 
+  // Before composer runs, whose quit hooks shut the dispatcher down.
+  section("runs: review, reorder, and a decision that wakes a job");
+  for (const c of ["runs:list", "runs:review", "runs:reorder", "runs:reply", "sheet:decide"]) {
+    check(`${c} is in preload and handled`, [called.includes(c), handlers.has(c)], [true, true]);
+  }
+  const runProject = db.createProject({ key: "ipc-runs", name: "IPC runs", path: dir });
+  const runTask2 = db.createTask({ projectId: runProject.id, title: "job to review" });
+  // A harness with no row: if anything starts these, it fails at once and
+  // spawns nothing, so no real agent CLI can be reached from this test.
+  const doneJob = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, task_id, request, kind, state, status, finished_at)
+                           VALUES (:p1, 'nobody', :p2, 'done already', 'ask', 'done', 'ready', datetime('now')) RETURNING id`, [runProject.id, runTask2.id])[0].id;
+  check("runs:list({needsReview: true}) lists it", (await call("runs:list", { needsReview: true })).map((r) => r.id), [doneJob]);
+  const reviewed = await call("runs:review", doneJob, { accepted: false, note: "Not this way." });
+  check("runs:review sends it back: { run, entry, continue }",
+    [reviewed.run.review, reviewed.entry.body, reviewed.entry.author_type, reviewed.continue.available], ["sent_back", "Not this way.", "human", false]);
+  check("and it leaves the list", (await call("runs:list", { needsReview: true })).length, 0);
+  const badReview = await handlers.get("runs:review")({}, doneJob, { accepted: true });
+  check("a second review is refused", [badReview.ok, /already reviewed/.test(badReview.error)], [false, true]);
+  const q1 = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, request, state, status) VALUES (:p1, 'nobody', 'q1', 'queued', 'queued') RETURNING id`, [runProject.id])[0].id;
+  const q2 = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, request, state, status) VALUES (:p1, 'nobody', 'q2', 'queued', 'queued') RETURNING id`, [runProject.id])[0].id;
+  check("runs:reorder returns the queue in its new order", (await call("runs:reorder", [q2, q1])).map((r) => [r.id, r.queue_rank]), [[q2, 1], [q1, 2]]);
+  const badOrder = await handlers.get("runs:reorder")({}, [doneJob]);
+  check("only queued jobs", [badOrder.ok, /not queued/.test(badOrder.error)], [false, true]);
+  db.sqlP("UPDATE handoffs SET state = 'stopped', status = 'cancelled' WHERE id IN (:p1, :p2)", [q1, q2]);
+  const waitTask = db.createTask({ projectId: runProject.id, title: "waiting on a person" });
+  const waiting = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, task_id, request, kind, state, status, actor, updated_at)
+                           VALUES (:p1, 'nobody', :p2, 'wait', 'ask', 'waiting_on_human', 'running', 'nobody:job', datetime('now', '-1 minute')) RETURNING id`, [runProject.id, waitTask.id])[0].id;
+  const asked = require("../sheet/store").makeSheetStore({ sql: db.sqlP, actor: "nobody:job", authorType: "agent" }).ask(waitTask.id, "Which?", ["this", "that"]);
+  await call("sheet:decide", asked.id, "a", null);
+  const woken = db.sqlP("SELECT state, reply FROM handoffs WHERE id = :p1", [waiting])[0];
+  check("sheet:decide starts the waiting job in the same call, not at the next pass",
+    [woken.state, /no agent called "nobody"/.test(woken.reply || "")], ["failed", true]);
+
   section("composer runs");
   const runTask = db.createTask({ projectId: project.id, title: "run here" });
   sent.length = 0;
@@ -226,6 +259,25 @@ async function main() {
   const got = await call("settings:get");
   check("the default branch prefix is there to show, and is naming.js's",
     got.workbenchBranchPrefixDefault, require("../workbench/naming").defaultPrefix());
+
+  check("the dispatcher's settings and pinned projects have defaults", [got.jobConcurrency, got.jobHarnessLimits, got.pinnedProjects], [3, {}, []]);
+  const refusedSet = async (fields) => { const r = await handlers.get("settings:set")({}, fields); return r.ok ? null : r.error; };
+  check("jobConcurrency is a whole number from 1 to 8",
+    [await refusedSet({ jobConcurrency: 0 }), await refusedSet({ jobConcurrency: 9 }), await refusedSet({ jobConcurrency: 2.5 }), (await call("settings:set", { jobConcurrency: 8 })).jobConcurrency],
+    ["jobConcurrency must be a whole number from 1 to 8", "jobConcurrency must be a whole number from 1 to 8", "jobConcurrency must be a whole number from 1 to 8", 8]);
+  check("a harness's limit is a whole number from 0 to 4, and the map is replaced whole",
+    [await refusedSet({ jobHarnessLimits: { codex: 5 } }), await refusedSet({ jobHarnessLimits: [1] }), await refusedSet({ jobHarnessLimits: { "no spaces": 1 } }),
+     (await call("settings:set", { jobHarnessLimits: { codex: 0, "claude-code": "2" } })).jobHarnessLimits],
+    ["jobHarnessLimits.codex must be a whole number from 0 to 4", "jobHarnessLimits must be an object of harness key to a number", "\"no spaces\" is not a harness key", { codex: 0, "claude-code": 2 }]);
+  const pinA = db.createProject({ key: "pin-a", name: "Pin A" });
+  const pinB = db.createProject({ key: "pin-b", name: "Pin B" });
+  check("pinned projects are existing ids, in order, once each",
+    [await refusedSet({ pinnedProjects: [pinA.id, 999999] }), await refusedSet({ pinnedProjects: "1" }),
+     (await call("settings:set", { pinnedProjects: [pinB.id, String(pinA.id), pinB.id] })).pinnedProjects],
+    ["No project 999999", "pinnedProjects must be a list of project ids", [pinB.id, pinA.id]]);
+  check("a refused field changes nothing", (await call("settings:get")).jobConcurrency, 8);
+  check("and the dispatcher reads them on its next pass", JSON.parse(fs.readFileSync(path.join(process.env.DELPHI_DATA_DIR, "settings.json"), "utf8")).jobHarnessLimits, { codex: 0, "claude-code": 2 });
+  await call("settings:set", { jobConcurrency: 3, jobHarnessLimits: {}, pinnedProjects: [] });
 
   section("where the data lives");
   const info = await call("app:dataInfo");

@@ -139,8 +139,9 @@ function cli() {
   section("delphi flags");
   const { spawnSync } = require("child_process");
   const run = (args, env = {}) => {
-    const r = spawnSync(process.execPath, [path.join(__dirname, "..", "bin", "delphi"), ...args],
-      { env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", DELPHI_ACTOR: "ray", DELPHI_AUTHOR_TYPE: "human", ...env }, encoding: "utf8", timeout: 60000 });
+    const childEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1", DELPHI_ACTOR: "ray", DELPHI_AUTHOR_TYPE: "human", ...env };
+    for (const k of Object.keys(childEnv)) if (childEnv[k] === undefined) delete childEnv[k];
+    const r = spawnSync(process.execPath, [path.join(__dirname, "..", "bin", "delphi"), ...args], { env: childEnv, encoding: "utf8", timeout: 60000 });
     return { code: r.status, out: r.stdout, err: r.stderr };
   };
   const P = db.createProject({ key: "cli-p", name: "CLI P" });
@@ -156,6 +157,38 @@ function cli() {
   check("reject needs a reason", [noWhy.code, /Why it is rejected is missing/.test(noWhy.err)], [1, true]);
   const ok = run(["flags", "approve", String(f.id), "--note", "yes"]);
   check("a person approves and it applies", [ok.code, /^Applied: /.test(ok.out), one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id], [0, true, Q.id]);
+  // The review's forge: an agent proposes, then approves through the command
+  // line with options before the verb and a person's type claimed or left out.
+  const n2 = db.createNote({ projectId: P.id, title: "forged", body: "x" });
+  const agentEnv = { DELPHI_ACTOR: "claude:1", DELPHI_AUTHOR_TYPE: "agent" };
+  const server = (calls, env) => {
+    const lines = calls.map(([name, args], i) => JSON.stringify({ jsonrpc: "2.0", id: i + 1, method: "tools/call", params: { name, arguments: args } }));
+    const childEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1", ...env };
+    for (const k of Object.keys(childEnv)) if (childEnv[k] === undefined) delete childEnv[k];
+    const r = spawnSync(process.execPath, [path.join(__dirname, "..", "agent", "mcp_server.js")], { env: childEnv, input: lines.join("\n") + "\n", encoding: "utf8" });
+    return r.stdout.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  };
+  const [made] = server([["propose_move", { entity: "note", id: n2.id, ops: [{ op: "move", entity: "note", id: n2.id, to: Q.id }], reasoning: "mine" }]], agentEnv);
+  const forgedFlag = JSON.parse(made.result.content[0].text).flag_id;
+  for (const [what, args, env] of [
+    ["an agent's session, options first", ["flags", "--all", "approve", String(forgedFlag)], agentEnv],
+    ["the proposer claiming to be a person", ["flags", "--all", "approve", String(forgedFlag)], { DELPHI_ACTOR: "claude:1", DELPHI_AUTHOR_TYPE: "human" }],
+    ["the proposer with no type at all", ["flags", "--project", "cli-p", "approve", String(forgedFlag)], { DELPHI_ACTOR: "claude:1", DELPHI_AUTHOR_TYPE: undefined }],
+  ]) {
+    const r = run(args, env);
+    check(`refused: ${what}`, [r.code, one("SELECT project_id FROM notes WHERE id = ?", n2.id).project_id], [1, P.id]);
+  }
+  check("and the flag is still proposed", one("SELECT status FROM item_flags WHERE id = ?", forgedFlag).status, "proposed");
+
+  section("D2 needs a named writer");
+  const mine = db.createProject({ key: "d2-p", name: "D2 P" });
+  const unnamed = { DELPHI_ACTOR: undefined, DELPHI_AUTHOR_TYPE: "agent" };
+  const [added] = server([["add_task", { title: "an unnamed agent's", project_id: mine.id }]], unnamed);
+  const taskId = JSON.parse(added.result.content[0].text).id;
+  const [tried] = server([["update_task", { id: taskId, project_id: Q.id }]], unnamed);
+  check("with no DELPHI_ACTOR, every agent is 'agent', so the exception does not apply", [Boolean(tried.error && /flag_item/.test(tried.error.message)),
+    one("SELECT project_id FROM tasks WHERE id = ?", taskId).project_id], [true, mine.id]);
+
   const shown = run(["flags", "show", String(f.id)]);
   check("show prints the thread", [shown.code, /decide +ray: Approved: yes/.test(shown.out)], [0, true]);
 }

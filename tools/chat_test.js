@@ -136,6 +136,15 @@ async function main() {
       ["session", "cop-2222", undefined],
     ]);
     check("the exit marker is taken off the output", actions.find((a) => a.key === "call_1" && a.type === "ran").output, "built ok");
+    // The fixture's result line is the shape Copilot CLI 1.0.x writes:
+    // usage.premiumRequests, and no dollars or input tokens.
+    check("its premium requests are the result's usage, and nothing is invented beside them",
+      actions.filter((a) => a.type === "usage" && a.premiumRequests !== undefined), [{ type: "usage", input: 0, output: 0, cost: null, premiumRequests: 1 }]);
+    const noUsage = [];
+    const m3 = chat.copilotSheetMapper((a) => noUsage.push(a));
+    m3('{"type":"result","sessionId":"s","exitCode":0}');
+    m3('{"type":"result","sessionId":"s","exitCode":0,"usage":{"premiumRequests":null}}');
+    check("a result without them reports none", noUsage.filter((a) => a.type === "usage"), []);
     const deltasOnly = [];
     const m2 = chat.copilotSheetMapper((a) => deltasOnly.push(a));
     m2('{"type":"assistant.message_delta","data":{"messageId":"x","deltaContent":"only "}}');

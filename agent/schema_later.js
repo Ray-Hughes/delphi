@@ -115,8 +115,19 @@ const LATER_COLUMNS = [
   ["handoffs", "cost_usd", "REAL"],
   ["handoffs", "last_activity", "TEXT"],
   ["handoffs", "followup", "TEXT"],
+  ["handoffs", "harness_hash", "TEXT"],
+  // A command a person trusted, as it was when they did. See schema.sql.
+  ["harnesses", "trusted_command", "TEXT"],
   ["handoffs", "turns", "INTEGER NOT NULL DEFAULT 0"],
   ["handoffs", "updated_at", "TEXT"],
+  // Reviewing a finished job, ordering queued ones, and Copilot's premium
+  // requests. See schema.sql.
+  ["handoffs", "reviewed_at", "TEXT"],
+  ["handoffs", "reviewed_by", "TEXT"],
+  ["handoffs", "review", "TEXT"],
+  ["handoffs", "review_note", "TEXT"],
+  ["handoffs", "queue_rank", "INTEGER"],
+  ["handoffs", "premium_requests", "REAL"],
   // A person's per project say over what agents may do there unasked.
   ["projects", "auto_approve", "INTEGER NOT NULL DEFAULT 0"],
   ["projects", "allow_unguarded", "INTEGER NOT NULL DEFAULT 0"],

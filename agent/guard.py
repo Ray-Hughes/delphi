@@ -116,7 +116,11 @@ DELPHI = re.compile(DELPHI_HEAD + r"\s+[\"']?discard\b")
 # decision, and an agent that reached it would be deciding about its own
 # proposal. The store refuses an agent's decision too; this is the courtesy in
 # front of it for a harness whose author type is not set.
-DELPHI_FLAGS = re.compile(DELPHI_HEAD + r"\s+[\"']?flags[\"']?\s+[\"']?(?:approve|reject)\b")
+#
+# Any words may come between flags and the verb: the command line takes its
+# options anywhere, so "delphi flags --all approve 1" approves, and a pattern
+# that wanted approve straight after flags let exactly that through.
+DELPHI_FLAGS = re.compile(DELPHI_HEAD + r"\s+[\"']?flags[\"']?(?:\s+\S+)*?\s+[\"']?(?:approve|reject)\b")
 
 
 def runs_delphi(rest: str, verb, depth: int = 0) -> bool:
@@ -160,7 +164,7 @@ ARGV_DISCARD = re.compile(
     r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']discard["']"""
 )
 ARGV_FLAGS = re.compile(
-    r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']flags["']\s*,\s*["'](?:approve|reject)["']"""
+    r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']flags["'](?:\s*,\s*["'][^"']*["'])*?\s*,\s*["'](?:approve|reject)["']"""
 )
 
 
@@ -179,6 +183,34 @@ def in_command_position(cmd: str, verb, argv) -> bool:
     starts += [m.end() for m in re.finditer(r"\$\(|<\(|`|\(|\{\s", cmd)]
     starts += [m.end() for m in re.finditer(r"\s-[a-zA-Z]*c\s+[\"']", cmd)]
     return any(runs_delphi(cmd[i:], verb) for i in starts)
+
+
+# A program that can write SQLite, run on Delphi's own database. An agent with
+# a shell could otherwise rewrite the harness table (the command a job runs),
+# approve its own jobs, or rewrite History. A tripwire, not a boundary: the
+# database is a file the agent's user can write. Read only is allowed
+# (sqlite3 -readonly, or a ?mode=ro URI), which is all an agent needs.
+DB_NAMED = r"""(?:delphi\.db\b|\$\{?DELPHI_DB\b|Application[ \\]+Support/Delphi/)"""
+DB_WRITER = re.compile(
+    r"""[\"']?(?:\S*/)?(?:sqlite3|sqlite-utils|litecli|python[\d.]*|node|ruby|perl|deno|bun)[\"']?(?:\s|$)[^;&|]*?""" + DB_NAMED
+)
+ARGV_DB_WRITER = re.compile(
+    r"""["'](?:\S*/)?(?:sqlite3|python[\d.]*|node)["']\s*,\s*\[?[^\]]*?""" + DB_NAMED
+)
+# An interpreter given a script with -c or -e: judged on the whole line,
+# because the script's own semicolons split it into segments that each look
+# innocent.
+INTERP_DB = re.compile(
+    r"""[\"']?(?:\S*/)?(?:python[\d.]*|node|ruby|perl|deno|bun)[\"']?(?:\s+-\S+)*?\s+-[a-zA-Z]*[ce]\s.*""" + DB_NAMED, re.S
+)
+DB_READ_ONLY = re.compile(r"(?:^|\s)-readonly\b|[?&]mode=ro\b")
+
+
+def writes_delphi_db(cmd: str) -> bool:
+    """Whether this segment runs something that can write SQLite on Delphi's database."""
+    if DB_READ_ONLY.search(cmd):
+        return False
+    return in_command_position(cmd, DB_WRITER, ARGV_DB_WRITER)
 
 
 def is_delphi_discard(cmd: str) -> bool:
@@ -278,6 +310,12 @@ def check_segment(cmd: str):
             "that is for a person. Say what you think on the flag instead: flag_item "
             "adds to it, and propose_move records a proposal."
         )
+    if writes_delphi_db(c):
+        return (
+            "This opens Delphi's own database with something that can write to it. "
+            "Change Delphi through its tools (or delphi on the command line), which "
+            "check and record what changed; open it with sqlite3 -readonly to look."
+        )
     # DELPHI_CLIENT tells the MCP server the command line is calling, which
     # unlocks its command line only tools. An agent has no reason to say so.
     if re.search(r"(?:^|[\s;&|(`])(?:export\s+|env\s+(?:-\S+\s+)*)?DELPHI_CLIENT=", c):
@@ -310,6 +348,14 @@ def check_bash(command: str):
         return (
             "Piping a downloaded script straight into a shell runs code nobody has read. "
             "Download it, look at it, then run it."
+        )
+
+    whole = unmask(norm(command))
+    if not DB_READ_ONLY.search(whole) and in_command_position(whole, INTERP_DB, ARGV_DB_WRITER):
+        return (
+            "This opens Delphi's own database with something that can write to it. "
+            "Change Delphi through its tools (or delphi on the command line), which "
+            "check and record what changed; open it read only to look."
         )
 
     # Unmasked on the whole line first, because a variable assigned in one

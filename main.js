@@ -120,10 +120,14 @@ let settings = {
   checkoutNoticeSeen: null,
   // The dispatcher (agent/dispatch.js): how many jobs run at once in all, how
   // many per harness (a key missing here means 1, because subscriptions
-  // throttle), and how long one may run before it is stopped.
+  // throttle), and how long one may run before it is stopped. Bounded by
+  // dispatch.BOUNDS, here and again where the dispatcher reads them.
   jobConcurrency: 3,
   jobHarnessLimits: {},
   jobTimeoutMinutes: 60,
+  // Projects kept at the top of the sidebar, in the person's order. Ids, so a
+  // renamed project stays pinned; settings:set drops any that do not exist.
+  pinnedProjects: [],
 };
 let schedulerTimer = null;
 let vaultTimer = null;
@@ -1189,7 +1193,16 @@ handle("sheet:append", (taskId, payload = {}) => {
 handle("sheet:promote", (id, on) => { const r = sheets.promote(id, on !== false); scheduleVaultExport(); return r; });
 handle("sheet:file", (id, kind, title) => { const r = sheets.file(id, kind, title || null); scheduleVaultExport(); return r; });
 handle("sheet:ask", (taskId, question, options) => { const r = sheets.ask(taskId, question, options); scheduleVaultExport(); return r; });
-handle("sheet:decide", (askId, choice, why) => { const r = sheets.decide(askId, choice, why || null); scheduleVaultExport(); return r; });
+// A person's answer, so a job waiting on that question goes back to its agent
+// now rather than at the next scheduler pass. The window's writes are this
+// process's own, which PRAGMA data_version never reports, so nothing else
+// would notice it sooner.
+handle("sheet:decide", (askId, choice, why) => {
+  const r = sheets.decide(askId, choice, why || null);
+  scheduleVaultExport();
+  try { dispatcher.answered(r && r.task_id != null ? r.task_id : null); } catch (error) { console.error("waking jobs after a decision", error); }
+  return r;
+});
 handle("sheet:log", (id) => readSheetLog(sheets.get(id)));
 
 // Runs started from the composer, by entry id, for interrupting and for
@@ -1722,6 +1735,9 @@ handle("harness:list", (force) =>
 handle("harness:create", (payload) => db.createHarness(payload));
 handle("harness:update", (id, fields) => db.updateHarness(id, fields));
 handle("harness:delete", (id) => db.deleteHarness(id));
+// trust: true lets jobs run this harness's command as it is now, though it is
+// not the agent's own binary; false takes that back. A person's decision.
+handle("harness:trustCommand", (id, trust) => db.trustHarnessCommand(id, trust === true));
 
 // One turn per session, not one turn overall. Two harnesses working two
 // sessions at once is the case this whole feature exists for; two turns in one
@@ -1861,11 +1877,13 @@ const dispatcher = createDispatcher({
   },
 });
 
-// opts: { projectId, states, taskId, limit }. Newest first.
+// opts: { projectId, states, taskId, needsReview, limit }. Newest first.
+// needsReview: done or failed, and nobody has reviewed it yet.
 handle("runs:list", (opts = {}) => dispatcher.list({
   projectId: opts && opts.projectId != null ? opts.projectId : null,
   states: opts && Array.isArray(opts.states) ? opts.states : null,
   taskId: opts && opts.taskId != null ? opts.taskId : null,
+  needsReview: Boolean(opts && opts.needsReview === true),
   limit: (opts && opts.limit) || 100,
 }));
 handle("runs:get", (id) => dispatcher.get(id));
@@ -1879,6 +1897,14 @@ handle("runs:approve", (id) => dispatcher.approve(id, { by: "you" }));
 handle("runs:reject", (id, why) => dispatcher.reject(id, { by: "you", why: why ?? null }));
 handle("runs:stop", (id) => dispatcher.stop(id, { by: "you" }));
 handle("runs:reply", (id, message) => dispatcher.reply(id, message, { by: "you" }));
+// { accepted: true|false, note? } -> { run, entry, continue }. continue is null
+// when accepted, else { available, why?, create?, workbench, task_id }; create
+// is the runs:create payload that carries on in the same Workbench.
+handle("runs:review", (id, verdict = {}) => dispatcher.review(id, {
+  accepted: verdict ? verdict.accepted : undefined, note: verdict && verdict.note != null ? verdict.note : null,
+}, { by: "you" }));
+// ids of queued jobs, first to run first -> every queued job, in the new order.
+handle("runs:reorder", (ids) => dispatcher.reorder(ids, { by: "you" }));
 
 // The older channels, kept for the window that still calls them.
 handle("handoffs:list", (opts) => db.listHandoffs(opts || {}));
@@ -2121,6 +2147,44 @@ handle("settings:set", (fields) => {
     }
   }
 
+  // The dispatcher's limits. Whole numbers inside dispatch.BOUNDS, refused
+  // rather than clamped, so Settings shows the sentence instead of a number
+  // that quietly became another one. Read on every pass, and a pass is run
+  // below, so a raised limit starts what was waiting at once.
+  const { BOUNDS } = require("./agent/dispatch");
+  const whole = (key, value, [min, max]) => {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${key} must be a whole number from ${min} to ${max}`);
+    return n;
+  };
+  if (fields.jobConcurrency !== undefined) settings.jobConcurrency = whole("jobConcurrency", fields.jobConcurrency, BOUNDS.jobConcurrency);
+  if (fields.jobTimeoutMinutes !== undefined) settings.jobTimeoutMinutes = whole("jobTimeoutMinutes", fields.jobTimeoutMinutes, BOUNDS.jobTimeoutMinutes);
+  // The whole map, as the window shows it: a harness left out goes back to 1.
+  // Keys are harness keys, which is what a job's to_harness holds.
+  if (fields.jobHarnessLimits !== undefined) {
+    const value = fields.jobHarnessLimits;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("jobHarnessLimits must be an object of harness key to a number");
+    const next = {};
+    for (const [key, limit] of Object.entries(value)) {
+      if (!/^[A-Za-z0-9._:-]{1,64}$/.test(key)) throw new Error(`"${key}" is not a harness key`);
+      next[key] = whole(`jobHarnessLimits.${key}`, limit, BOUNDS.jobHarnessLimit);
+    }
+    settings.jobHarnessLimits = next;
+  }
+  // Checked against the projects that exist, like scratchpadProjectId, and
+  // kept in the order given with repeats dropped.
+  if (fields.pinnedProjects !== undefined) {
+    const value = fields.pinnedProjects == null ? [] : fields.pinnedProjects;
+    if (!Array.isArray(value)) throw new Error("pinnedProjects must be a list of project ids");
+    const ids = [];
+    for (const raw of value) {
+      const id = Number(raw);
+      if (!Number.isInteger(id) || !db.getProject(id)) throw new Error(`No project ${raw}`);
+      if (!ids.includes(id)) ids.push(id);
+    }
+    settings.pinnedProjects = ids;
+  }
+
   const numeric = ["snoozeMinutes", "checkIntervalSeconds", "autoRemindBeforeDueHours"];
   for (const key of numeric) {
     if (fields[key] !== undefined) {
@@ -2131,6 +2195,7 @@ handle("settings:set", (fields) => {
   }
   saveSettings();
   if (fields.checkIntervalSeconds !== undefined) startScheduler();
+  if (fields.jobConcurrency !== undefined || fields.jobHarnessLimits !== undefined) dispatcher.tick();
   // The Appearance menu carries a radio mark, and the Windows control overlay is
   // painted by the system rather than by the stylesheet. Both are stale the moment
   // the theme is changed from inside the window instead of from the menu.

@@ -60,7 +60,8 @@ const COPILOT_EDITS = new Set(["edit", "create", "write"]);
 //   { type: "ran", key, output, code }    that command finished
 //   { type: "edited", path }              it changed a file
 //   { type: "session", id }               the harness's own session id, for resume
-//   { type: "usage", input, output, cost } tokens (and dollars, when it says) so far
+//   { type: "usage", input, output, cost } tokens (and dollars, when it says) so far;
+//     Copilot's adds premiumRequests, the one cost it reports
 //   { type: "error", message }            the turn failed
 //
 // and has flush(), for what is still buffered when the stream ends.
@@ -207,10 +208,16 @@ function copilotSheetMapper(emit) {
         emit({ type: "ran", key: String(data.toolCallId), output, code });
         return;
       }
-      case "result":
+      case "result": {
         flush();
         if (m.sessionId) emit({ type: "session", id: String(m.sessionId) });
+        // The only cost Copilot reports: its premium requests for this run of
+        // the CLI (usage.premiumRequests, a fraction for a cheaper model). No
+        // dollars and no input tokens, so none are invented here.
+        const premium = m.usage && m.usage.premiumRequests != null ? Number(m.usage.premiumRequests) : NaN;
+        if (Number.isFinite(premium)) emit({ type: "usage", input: 0, output: 0, cost: null, premiumRequests: premium });
         return;
+      }
       case "error":
         emit({ type: "error", message: String(data.message || m.message || "Copilot reported an error.") });
         return;

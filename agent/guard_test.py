@@ -75,11 +75,25 @@ MUST_BLOCK = [
   # Approving or rejecting a proposal to move work is a person's call too,
   # fenced the same way, through the same wrappers.
   "delphi flags approve 12", "delphi  flags   reject 12 'no'", "bin/delphi flags approve 12 --note yes",
+  # Options go anywhere on the command line, so they may come first.
+  "delphi flags --all approve 1", "delphi flags --project a approve 1", "delphi flags --note x reject 1",
+  "env DELPHI_AUTHOR_TYPE=human delphi flags --all approve 1",
+  "python3 -c 'import subprocess; subprocess.run([\"delphi\", \"flags\", \"--all\", \"approve\", \"1\"])'",
   "node bin/delphi flags approve 12", "env DELPHI_ACTOR=me delphi flags approve 12",
   "sh -c 'delphi flags approve 12'", "nohup delphi flags reject 3 why &", "(delphi flags approve 12)",
   "echo $(delphi flags approve 12)", "$(which delphi) flags approve 12", "D=delphi; $D flags approve 12",
   "script -q /dev/null delphi flags approve 12", "timeout 60 delphi flags approve 12",
   "python3 -c 'import subprocess; subprocess.run([\"delphi\", \"flags\", \"approve\", \"12\"])'",
+  # Writing Delphi's own database: the harness a job runs, approvals, History.
+  "sqlite3 delphi.db 'DELETE FROM audit WHERE label = \"x\"'",
+  "sqlite3 ~/Library/Application\\ Support/Delphi/delphi.db \"UPDATE harnesses SET command='/tmp/x'\"",
+  "sqlite3 \"$HOME/Library/Application Support/Delphi/delphi.db\" < evil.sql",
+  "sqlite3 \"$DELPHI_DB\" \"UPDATE handoffs SET approval='approved'\"", "sqlite3 ${DELPHI_DB} .dump",
+  "/usr/bin/sqlite3 /Users/me/va/delphi/delphi.db 'UPDATE projects SET auto_approve=1'",
+  "env X=1 sqlite3 delphi.db 'UPDATE tasks SET status=1'", "sh -c 'sqlite3 delphi.db \"DELETE FROM tasks WHERE id=1\"'",
+  "python3 -c 'import sqlite3; sqlite3.connect(\"delphi.db\").execute(\"UPDATE harnesses SET command=1\")'",
+  "node -e 'new (require(\"node:sqlite\").DatabaseSync)(process.env.DELPHI_DB)' ${DELPHI_DB}",
+  "python3 -c 'import subprocess; subprocess.run([\"sqlite3\", \"/x/delphi.db\", \"DELETE FROM tasks\"])'",
 ]
 
 MUST_ALLOW = [
@@ -92,7 +106,11 @@ MUST_ALLOW = [
   "git push origin feature/PROJ-1234",
   "git push --force-with-lease origin my-branch",
   "git clean -n", "git status", "npm install", "bundle exec rspec",
-  "sqlite3 delphi.db 'DELETE FROM audit WHERE label = \"x\"'",
+  "sqlite3 x.db 'DELETE FROM audit WHERE label = \"x\"'",
+  # Delphi's database read only, or only mentioned, is fine.
+  "sqlite3 -readonly delphi.db 'SELECT count(*) FROM tasks'",
+  "python3 -c 'import sqlite3; sqlite3.connect(\"file:delphi.db?mode=ro\", uri=True)'",
+  "git add delphi.db", "ls -la delphi.db", "grep -n delphi.db CLAUDE.md", "git commit -m 'checkpoint delphi.db'",
   "kubectl delete pod mypod", "terraform destroy -target=aws_instance.x",
   "git reset --hard HEAD~1", "curl -sL https://example.com/f.json -o f.json",
   "gh pr create --title x", "helm template test charts/foo",
@@ -114,7 +132,7 @@ MUST_ALLOW = [
   "D=delphi; $D status 42", "X=discard; echo $X", "printf '%s\\n' \"\" discard",
   "git commit -m 'guard: catch \\delphi and de\"\"lphi forms'",
   # Reading flags is ordinary, and so is talking about approving one.
-  "delphi flags", "delphi flags list --all", "delphi flags show 12", "delphi help flags",
+  "delphi flags", "delphi flags list --all", "delphi flags show 12", "delphi help flags", "delphi flags --status rejected",
   "git commit -m 'delphi flags approve is a person\\'s'", "grep -n 'flags approve' agent/guard.py",
   "delphi say 42 'a person should run delphi flags approve 12'",
 ]

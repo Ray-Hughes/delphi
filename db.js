@@ -278,7 +278,7 @@ function describeUpdate(entity, before, after) {
 function projectActivity(projectId, limit = 200) {
   return all(
     `SELECT id, at, action, entity, entity_id, summary, label, undone, undone_at,
-            CASE WHEN before_json IS NULL THEN 0 ELSE 1 END AS restorable
+            CASE WHEN before_json IS NULL OR before_json LIKE '{"__flag":%' THEN 0 ELSE 1 END AS restorable
      FROM audit
      WHERE (entity = 'project' AND entity_id = :projectId)
         OR (entity = 'task'  AND entity_id IN (SELECT id FROM tasks  WHERE project_id = :projectId))
@@ -302,7 +302,7 @@ function listAudit(limit = 100) {
     // reason: a delete with no stored copy cannot be put back, and the global
     // list used to offer an undo button on those rows anyway.
     `SELECT id, at, action, entity, entity_id, summary, label, undone, undone_at,
-            CASE WHEN before_json IS NULL THEN 0 ELSE 1 END AS restorable
+            CASE WHEN before_json IS NULL OR before_json LIKE '{"__flag":%' THEN 0 ELSE 1 END AS restorable
      FROM audit ORDER BY id DESC LIMIT :limit`,
     { limit }
   );
@@ -338,6 +338,10 @@ const RESTORE_ORDER = {
     // parent is not back yet.
     ["__sessions", "sessions"],
     ["__messages", "messages"],
+    // Last, once every item they name is back: the other projects this
+    // project's notes, links and tasks were shown in, and the items from
+    // elsewhere shown in it. The delete took both, by trigger and cascade.
+    ["__assoc", "item_projects"],
   ],
 };
 
@@ -434,6 +438,11 @@ function applyUndo(entry) {
   // A move, an association or its removal carries exactly what it changed in
   // __op, and is reversed from that alone. Replaying the stored row instead
   // reverted every edit made to the item since it moved.
+  // Flag bookkeeping (items/store.js flagAudit): a record that someone said
+  // an item may be misfiled, which changed nothing about it to put back.
+  if (before && before.__flag !== undefined) {
+    throw new Error("That is a flag, which changed nothing. Withdraw or reject the flag instead.");
+  }
   if (entry.action === "update" && before && before.__op) {
     items().undo(entry);
     return;
@@ -510,7 +519,10 @@ function applyUndo(entry) {
  */
 function undoLast(count = 1) {
   const pending = all(
-    "SELECT id FROM audit WHERE undone = 0 ORDER BY id DESC LIMIT :count",
+    // Flag bookkeeping is stepped over rather than stopped at: an agent's
+    // flag_item landing after a person's edit must not block undoing the edit.
+    `SELECT id FROM audit WHERE undone = 0 AND (before_json IS NULL OR before_json NOT LIKE '{"__flag":%')
+      ORDER BY id DESC LIMIT :count`,
     { count }
   );
   let undone = 0;
@@ -842,6 +854,18 @@ function deleteProjectRows(id, { tasks = "keep" } = {}) {
      WHERE s.project_id = :id`,
     { id }
   );
+  // Only the association rows this delete takes, so a strict restore puts
+  // back exactly what went: rows naming this project (they cascade), and the
+  // other projects its deleted notes, links and tasks were shown in (the
+  // delete triggers take those). Kept tasks keep theirs; pads are not in this
+  // copy at all, so neither are theirs.
+  before.__assoc = all(
+    `SELECT * FROM item_projects WHERE project_id = :id
+        OR (entity = 'note' AND entity_id IN (SELECT id FROM notes WHERE project_id = :id))
+        OR (entity = 'link' AND entity_id IN (SELECT id FROM links WHERE project_id = :id))
+        ${tasks === "delete" && taskIds.length ? `OR (entity = 'task' AND entity_id IN (${taskIds.map(Number).join(", ")}))` : ""}`,
+    { id }
+  ).filter((r) => r.entity !== "scratchpad" || Number(r.project_id) === Number(id));
 
   // By id rather than by project_id, so the rows deleted are exactly the rows
   // copied above. Deleting by project_id would let the cascade reach subtasks
@@ -2404,6 +2428,21 @@ function createHarness({ key, label, command, args, parser = "text", mcpStyle = 
   return getHarness(slug);
 }
 
+/**
+ * A person saying a job may run this harness's command although it is not
+ * the agent's own binary (agent/dispatch.js jobCommand). The command is stored
+ * as it is now, so trust ends the moment the command changes. Only the window
+ * calls this; nothing in the MCP server writes the column.
+ */
+function trustHarnessCommand(id, trust) {
+  const row = one("SELECT * FROM harnesses WHERE id = :id", { id });
+  if (!row) throw new Error("No such agent");
+  if (trust && !row.command) throw new Error(`${row.label} has no command to trust`);
+  run("UPDATE harnesses SET trusted_command = :t, updated_at = datetime('now') WHERE id = :id",
+      { id, t: trust ? row.command : null });
+  return one("SELECT * FROM harnesses WHERE id = :id", { id });
+}
+
 /** Built-ins are disabled rather than removed, so the definition can come back. */
 function deleteHarness(id) {
   const row = one("SELECT * FROM harnesses WHERE id = :id", { id });
@@ -2777,7 +2816,7 @@ module.exports = {
   projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
   adoptProjectPaths,
   listSessions, getSession, createSession, updateSession, deleteSession,
-  listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness,
+  listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness, trustHarnessCommand,
   listHandoffs, getHandoff, createHandoff, updateHandoff, pendingHandoffs, handoffsSince,
   acquireLock, releaseLock, listLocks,
   listMessages, appendMessage, updateMessage, addSessionUsage,

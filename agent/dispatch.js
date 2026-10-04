@@ -35,6 +35,9 @@
  */
 
 const os = require("os");
+const fs = require("fs");
+const path = require("path");
+const harness = require("../harness");
 const chat = require("../sheet/chat");
 const fmt = require("../sheet/format");
 const { makeSheetStore, pidAlive } = require("../sheet/store");
@@ -118,12 +121,14 @@ function checkArgv(argv, { parser, kind = "ask", unguarded = false, mcpFlags = [
   const policy = POLICY[parser];
   if (!policy) return `Delphi has no list of the flags a job may pass to a ${parser} agent`;
   const ctx = { kind, unguarded, prompt, resume };
+  // The exact argv the CLI will get, Delphi's MCP flags in place. They were
+  // once taken out before parsing, which let "--model --mcp-config X
+  // --dangerously-skip-permissions" through: the checker read the bypass as
+  // --model's value, and the CLI read it as a flag.
   const rest = argv.map(String);
-  if (mcpFlags && mcpFlags.length) {
-    for (let at = 0; at + mcpFlags.length <= rest.length; at++) {
-      if (mcpFlags.every((f, j) => rest[at + j] === String(f))) { rest.splice(at, mcpFlags.length); break; }
-    }
-  }
+  const mcp = (mcpFlags || []).map(String);
+  const mcpAt = (at) => mcp.length > 0 && at + mcp.length <= rest.length && mcp.every((f, j) => rest[at + j] === f);
+  let mcpSeen = false;
   let i = 0;
   if (policy.leading) {
     const lead = policy.leading(rest, ctx);
@@ -132,7 +137,13 @@ function checkArgv(argv, { parser, kind = "ask", unguarded = false, mcpFlags = [
   }
   for (; i < rest.length; i++) {
     const tok = rest[i];
-    if (policy.trailingPrompt && i === rest.length - 1 && prompt != null && tok === String(prompt)) continue;
+    // Delphi's own MCP wiring, accepted only where a flag is expected, once.
+    if (!mcpSeen && mcpAt(i)) { mcpSeen = true; i += mcp.length - 1; continue; }
+    // The prompt, last. One that starts with a dash would be read as a flag.
+    if (policy.trailingPrompt && i === rest.length - 1 && prompt != null && tok === String(prompt)) {
+      if (tok.startsWith("-")) return "a prompt that starts with '-', which the agent would read as a flag";
+      continue;
+    }
     if (!tok.startsWith("-") || tok === "-" || tok === "--") return `an argument it does not expect (${clipArg(tok)})`;
     let name = tok;
     let value;
@@ -150,6 +161,10 @@ function checkArgv(argv, { parser, kind = "ask", unguarded = false, mcpFlags = [
       if (!inline) {
         if (i + 1 >= rest.length) return `${name} with no value`;
         value = rest[++i];
+        // A value in its own argument never starts with a dash: some of these
+        // flags take an optional value (Claude's --resume), and the CLI reads
+        // a dash-word there as the next flag, not as the value.
+        if (value.startsWith("-")) return `${name} followed by ${clipArg(value)}, which the agent would read as a flag`;
       }
       if (!rule.ok(value, ctx)) return `${name} ${clipArg(value)}`;
     } else {
@@ -160,7 +175,51 @@ function checkArgv(argv, { parser, kind = "ask", unguarded = false, mcpFlags = [
   return null;
 }
 
+// The binary each kind of harness is, and where its real installs resolve to.
+// An npm install's `claude` is a link to .../@anthropic-ai/claude-code/bin/
+// claude.exe, Codex's to codex.js, Copilot's to npm-loader.js, and Claude's own
+// installer keeps versions under .../claude/versions/<n>; so the file a link
+// resolves to is accepted when it has the binary's name or sits in that
+// harness's own package, and the command as configured must be named for it.
+const BINARY = Object.fromEntries(harness.BUILTINS.filter((b) => b.command).map((b) => [b.parser, b.command]));
+const INSTALLED_IN = {
+  claude: [/[\\/]@anthropic-ai[\\/]claude-code[\\/]/, /[\\/]claude[\\/]versions[\\/]/],
+  codex: [/[\\/]@openai[\\/]codex[\\/]/],
+  copilot: [/[\\/]@github[\\/]copilot[\\/]/],
+};
+const stem = (file) => path.basename(file).replace(/\.(exe|js|cjs|mjs|cmd)$/i, "").toLowerCase();
+
+/**
+ * The absolute path a job may spawn for this harness row, or { error }. The
+ * row's command is whatever Settings (or anything that wrote the database)
+ * says, and a wrapper script there could add any flag it liked after every
+ * check here. So it must be the harness's own binary, unless a person marked
+ * this exact command as trusted.
+ */
+function jobCommand(row, { resolveBinary = launch.resolveBinary, which = harness.which } = {}) {
+  const configured = String(row.command || "");
+  const binary = BINARY[row.parser];
+  if (!configured) return { error: `${row.label} has no command set in Settings` };
+  const found = path.isAbsolute(configured) ? (fs.existsSync(configured) ? configured : null) : (resolveBinary(configured) || which(configured));
+  if (!found) return { error: `${row.label} is not installed, or is not on the PATH a login shell sees (looked for ${configured})` };
+  if (row.trusted_command && row.trusted_command === configured) return { path: found };
+  let real = found;
+  try { real = fs.realpathSync(found); } catch {}
+  const named = binary && stem(found) === binary;
+  const lands = binary && (stem(real) === binary || (INSTALLED_IN[binary] || []).some((r) => r.test(real)));
+  if (named && lands) return { path: found };
+  return {
+    error: `${row.label}'s command (${configured}) is not the ${binary || "agent's own"} program, so Delphi cannot know what flags it adds. ` +
+      `If you trust it, mark its command as trusted in Settings, under Agents; otherwise point it at ${binary || "the agent"} itself`,
+  };
+}
+
 const DEFAULTS = { jobConcurrency: 3, jobHarnessLimit: 1, jobTimeoutMinutes: 60 };
+// The bounds settings:set enforces, held here too so a hand-edited
+// settings.json cannot ask for forty agents at once. Eight in all is more than
+// one person can review; four of one harness is past what a subscription lets
+// run before it throttles. 0 for a harness holds its jobs without refusing them.
+const BOUNDS = { jobConcurrency: [1, 8], jobHarnessLimit: [0, 4], jobTimeoutMinutes: [1, 24 * 60] };
 const HOURLY_LIMIT = 12;
 const SHEET_TAIL = 20;
 const MAX_BRIEF_SHEET = 16000;
@@ -222,9 +281,9 @@ function createDispatcher({
     const s = (typeof settings === "function" ? settings() : settings) || {};
     const perHarness = s.jobHarnessLimits && typeof s.jobHarnessLimits === "object" ? s.jobHarnessLimits : {};
     return {
-      global: int(s.jobConcurrency, DEFAULTS.jobConcurrency, 1, 16),
-      harness: (key) => int(perHarness[key], DEFAULTS.jobHarnessLimit, 0, 16),
-      timeoutMs: int(s.jobTimeoutMinutes, DEFAULTS.jobTimeoutMinutes, 1, 24 * 60) * 60 * 1000,
+      global: int(s.jobConcurrency, DEFAULTS.jobConcurrency, ...BOUNDS.jobConcurrency),
+      harness: (key) => int(perHarness[key], DEFAULTS.jobHarnessLimit, ...BOUNDS.jobHarnessLimit),
+      timeoutMs: int(s.jobTimeoutMinutes, DEFAULTS.jobTimeoutMinutes, ...BOUNDS.jobTimeoutMinutes) * 60 * 1000,
     };
   };
 
@@ -276,7 +335,10 @@ function createDispatcher({
   }
 
   function approve(id, { by = "you" } = {}) {
-    const run = jobs.update(sql, id, { state: "queued", approval: "approved", approved_by: by, approved_at: stamp() }, { from: "needs_approval" });
+    // What the harness row is now is what the person approved it to run as.
+    const current = jobs.get(sql, id);
+    const hash = current ? jobs.harnessHash(sql, current.harness) : null;
+    const run = jobs.update(sql, id, { state: "queued", approval: "approved", approved_by: by, approved_at: stamp(), harness_hash: hash }, { from: "needs_approval" });
     if (!run) throw notIn(id, "waiting for approval");
     audit(run.id, "approved", run.request, by);
     note(run.task_id, `Job ${run.id} approved by ${by}: ${run.harness_label} may start.`);
@@ -356,6 +418,88 @@ function createDispatcher({
     changed(after);
     soon();
     return after;
+  }
+
+  /**
+   * A person's review of a finished job. Accepting records it. Sending it back
+   * records it too, and puts the person's note on the task's Sheet in their
+   * own name, where the next agent on the task reads it first; then says
+   * whether there is a Workbench to carry on in, with the runs:create payload
+   * that would, rather than starting one itself: what to run next, and with
+   * which agent, is the person's next decision, not this one.
+   */
+  function review(id, { accepted, note: said = null } = {}, { by = "you" } = {}) {
+    if (typeof accepted !== "boolean") throw new Error("A review says accepted: true or accepted: false.");
+    const text = said == null ? "" : String(said).trim();
+    const run = jobs.get(sql, id);
+    if (!run) throw new Error(`There is no job ${id}.`);
+    if (!jobs.REVIEWABLE.includes(run.state)) {
+      throw new Error(`Job ${id} is ${run.state.replace(/_/g, " ")}; only a done or failed job is reviewed.`);
+    }
+    const after = jobs.review(sql, id, { accepted, by, note: text || null });
+    if (!after) {
+      const now = jobs.get(sql, id);
+      throw new Error(now && now.reviewed_at
+        ? `Job ${id} was already reviewed by ${now.reviewed_by || "someone"} at ${now.reviewed_at}.`
+        : notIn(id, "done or failed").message);
+    }
+    let entry = null;
+    if (after.task_id) {
+      if (!accepted && text) {
+        entry = makeSheetStore({ sql, actor: by, authorType: "human" }).append({ taskId: after.task_id, kind: "say", body: text, promote: true });
+      }
+      note(after.task_id, accepted ? `Job ${id} reviewed and accepted by ${by}.` : `Job ${id} sent back by ${by}${text ? "." : ", with no note."}`);
+    }
+    audit(id, accepted ? "accepted" : "sent back", text || after.request, by);
+    changed(after);
+    if (accepted) return { run: after, entry: null, continue: null };
+    return { run: after, entry, continue: continuation(after, text) };
+  }
+
+  /**
+   * Whether a sent-back job can carry on where it left off, and how: the
+   * runs:create payload for a new do job on the same task, whose Workbench
+   * the dispatcher reuses because a task has one. A Workbench that is gone,
+   * parked or being put away is a person's to sort out first, and is said so.
+   */
+  function continuation(run, text) {
+    const wb = run.workbench;
+    const base = { workbench: wb, task_id: run.task_id };
+    if (!run.task_id) return { ...base, available: false, why: `Job ${run.id} has no task, so there is no Workbench to carry on in.` };
+    if (!wb) return { ...base, available: false, why: `Job ${run.id} had no Workbench: it only read. Ask again to have an agent change code.` };
+    const live = sql("SELECT state, path FROM workbenches WHERE id = :p1", [wb.id])[0];
+    const state = live ? live.state : null;
+    if (state !== "active") {
+      const said = { parked: "is parked; resume it first", missing: "folder is gone; recreate it first", closing: "is being put away" };
+      return { ...base, available: false, why: `Task ${run.task_id}'s Workbench ${said[state] || (state ? `is ${state}` : "is no longer recorded")}.` };
+    }
+    const request = `A person sent job ${run.id} back. Carry on in this task's Workbench, from what is already there.${text ? `\n\nTheir note:\n${text}` : ""}`;
+    return {
+      ...base,
+      available: true,
+      create: { projectId: run.project_id, harness: run.harness, taskId: run.task_id, kind: "do", request },
+    };
+  }
+
+  /** Queued jobs in a person's order, first to run first. Starts what that frees. */
+  function reorder(ids, { by = "you" } = {}) {
+    const order = jobs.reorder(sql, ids);
+    for (const id of ids) changed(jobs.get(sql, id));
+    audit(Number(ids[0]), `queue reordered: ${order.join(", ")}`, null, by);
+    soon();
+    return order.map((n) => jobs.get(sql, n));
+  }
+
+  /**
+   * A person answered on a task's Sheet: the job waiting on it goes back to
+   * its agent now, not at the next scheduler pass, which is a minute away by
+   * default and longer if someone stretched it.
+   */
+  function answered(taskId = null) {
+    const resumed = jobs.resumeAnswered(sql, { taskId });
+    for (const r of resumed) changed(r);
+    tick();
+    return resumed.map((r) => r.id);
   }
 
   const get = (id) => jobs.get(sql, id);
@@ -467,26 +611,9 @@ function createDispatcher({
     }
   }
 
-  /** A question the agent asked is answered: the job goes back to its agent. */
+  /** A question the agent asked is answered: the job goes back to its agent. See jobs.resumeAnswered. */
   function resumeAnswered() {
-    for (const row of sql("SELECT id, task_id, actor, updated_at FROM handoffs WHERE state = 'waiting_on_human' AND task_id IS NOT NULL AND actor IS NOT NULL")) {
-      const open = sql(`SELECT COUNT(*) AS n FROM comments c WHERE c.task_id = :p1 AND c.kind = 'ask' AND c.author = :p2
-                         AND NOT EXISTS (SELECT 1 FROM comments d WHERE d.kind = 'decide' AND d.ref_id = c.id)`, [row.task_id, row.actor])[0].n;
-      if (Number(open)) continue;
-      const answers = sql(`SELECT a.body AS question, d.meta AS meta, d.body AS body FROM comments d JOIN comments a ON a.id = d.ref_id
-                            WHERE d.kind = 'decide' AND d.author_type = 'human'
-                              AND a.task_id = :p1 AND a.author = :p2 AND d.created_at >= :p3 ORDER BY d.id`,
-                          [row.task_id, row.actor, row.updated_at || "0"]);
-      if (!answers.length) continue;
-      const lines = answers.map((a) => {
-        let m = {};
-        try { m = JSON.parse(a.meta) || {}; } catch {}
-        const why = String(a.body || "").split("\n").slice(1).join(" ").trim();
-        return `- "${a.question}": ${m.choice || "?"}) ${m.label || ""}${why ? `. ${why}` : ""}`;
-      });
-      const after = jobs.update(sql, row.id, { state: "queued", followup: `A person answered on the Sheet:\n${lines.join("\n")}\n\nCarry on from there.` }, { from: "waiting_on_human" });
-      if (after) changed(after);
-    }
+    for (const after of jobs.resumeAnswered(sql)) changed(after);
   }
 
   const harnessCount = (key) => [...live.values()].filter((e) => e.harness === key).length;
@@ -506,7 +633,7 @@ function createDispatcher({
       fileQueued();
       resumeAnswered();
       const lim = limits();
-      for (const row of sql("SELECT id, project_id, to_harness, task_id, requester_type FROM handoffs WHERE state = 'queued' ORDER BY id")) {
+      for (const row of sql(`SELECT id, project_id, to_harness, task_id, requester_type FROM handoffs WHERE state = 'queued' ORDER BY ${jobs.PICK_ORDER}`)) {
         if (live.size >= lim.global) break;
         if (harnessCount(row.to_harness) >= lim.harness(row.to_harness)) continue;
         if (taskBusy(row.task_id)) continue;
@@ -538,20 +665,29 @@ function createDispatcher({
   function begin(id) {
     const claimed = jobs.update(sql, id, { state: "running", runner_pid: pid, runner_host: host, agent_pid: null }, { from: "queued" });
     if (!claimed) return;
-    const entry = { id: claimed.id, harness: claimed.harness, taskId: claimed.task_id, stop: null, stopReason: null, stoppedBy: null, timer: null, lastPing: 0 };
+    // A job approved before approvals recorded the harness row is held to
+    // the row as it is when it first starts.
+    if (!sql("SELECT harness_hash FROM handoffs WHERE id = :p1", [claimed.id])[0].harness_hash) {
+      jobs.update(sql, claimed.id, { harness_hash: jobs.harnessHash(sql, claimed.harness) });
+    }
+    // The entry is this turn's identity. A turn abandoned at the hard deadline
+    // may still finish later, after the job was replied to and is running
+    // again under a new entry; nothing it does then may touch that one.
+    const entry = { id: claimed.id, harness: claimed.harness, taskId: claimed.task_id, stop: null, stopReason: null, stoppedBy: null, timer: null, lastPing: 0, abandoned: false };
     live.set(claimed.id, entry);
     changed(claimed);
     entry.promise = run(claimed, entry)
       .catch((error) => end(entry, { state: "failed", reply: `Delphi could not run this job: ${error.message}` }))
       .finally(() => {
         clearTimeout(entry.timer);
-        live.delete(entry.id);
+        if (live.get(entry.id) === entry) live.delete(entry.id);
         soon();
       });
   }
 
   /** Ends a turn. Conditional on the job still running, so a quit that already wrote it is not written twice. */
   function end(entry, { state, reply: text, fields = {}, noteText = null }) {
+    if (entry.abandoned || live.get(entry.id) !== entry) return null;
     const after = jobs.update(sql, entry.id, { ...fields, state, reply: text }, { from: "running" });
     if (!after) return null;
     audit(after.id, state.replace(/_/g, " "), after.request);
@@ -562,11 +698,16 @@ function createDispatcher({
   }
 
   function activity(entry, action) {
+    if (entry.abandoned) return;
     try {
       if (action.type === "usage") {
+        // premiumRequests is Copilot's, from its result line, once per turn
+        // (one process); summed, like the tokens, over a job's turns.
+        const premium = typeof action.premiumRequests === "number" && Number.isFinite(action.premiumRequests) ? action.premiumRequests : null;
         sql(`UPDATE handoffs SET tokens_in = COALESCE(tokens_in, 0) + :p1, tokens_out = COALESCE(tokens_out, 0) + :p2,
-               cost_usd = CASE WHEN :p3 IS NULL THEN cost_usd ELSE COALESCE(cost_usd, 0) + :p3 END WHERE id = :p4`,
-            [Number(action.input) || 0, Number(action.output) || 0, typeof action.cost === "number" ? action.cost : null, entry.id]);
+               cost_usd = CASE WHEN :p3 IS NULL THEN cost_usd ELSE COALESCE(cost_usd, 0) + :p3 END,
+               premium_requests = CASE WHEN :p4 IS NULL THEN premium_requests ELSE COALESCE(premium_requests, 0) + :p4 END WHERE id = :p5`,
+            [Number(action.input) || 0, Number(action.output) || 0, typeof action.cost === "number" ? action.cost : null, premium, entry.id]);
       } else if (action.type === "say" || action.type === "run" || action.type === "edited") {
         const text = action.type === "say" ? firstLine(action.text) : action.type === "run" ? `$ ${firstLine(action.command)}` : `edited ${action.path}`;
         sql("UPDATE handoffs SET last_activity = :p1, updated_at = datetime('now') WHERE id = :p2", [text, entry.id]);
@@ -697,7 +838,8 @@ function createDispatcher({
     const values = { jobWrite: job.kind === "do", jobRead: job.kind === "ask", jobUnguarded: false };
     let unguarded = false;
     const allowUnguarded = Number(project.allow_unguarded) === 1;
-    const setting = `turn on "Allow unguarded agents" in project ${project.name}'s settings`;
+    // Named exactly as the toggle in the project's settings reads.
+    const setting = `turn on "Allow agents without Delphi's safety guard" in project ${project.name}'s settings`;
     if (job.kind === "do") {
       if (row.parser === "copilot-json") {
         if (!allowUnguarded) {
@@ -734,7 +876,11 @@ function createDispatcher({
 
     const client = storeClient(makeSheetStore({ sql, actor, authorType: "agent" }));
     const firstEntry = Number(sql("SELECT COALESCE(MAX(id), 0) AS n FROM comments", [])[0].n);
-    const harnessRow = { label, command: row.command, args: template, parser: row.parser, mcp_style: row.mcp_style };
+    // The binary itself, resolved once here and spawned by that path, so what
+    // was checked is what runs.
+    const command = jobCommand(row);
+    if (command.error) return fail(`Refusing to start ${label}: ${command.error}.`);
+    const harnessRow = { label, command: command.path, args: template, parser: row.parser, mcp_style: row.mcp_style };
     const id = typeof dbId === "function" ? dbId() : dbId;
     let errorSeen = null;
     const turn = (resume, prompt) => runTurn({
@@ -743,7 +889,7 @@ function createDispatcher({
       env: { DELPHI_JOB: String(job.id), DELPHI_PROJECT: String(project.id), ...(dbPath ? { DELPHI_DB: dbPath } : {}), ...(id ? { DELPHI_DB_ID: id } : {}) },
       onStart: (control) => {
         entry.stop = control.stop;
-        try { jobs.update(sql, job.id, { agent_pid: control.pid || null }); } catch {}
+        if (!entry.abandoned) { try { jobs.update(sql, job.id, { agent_pid: control.pid || null }); } catch {} }
         if (entry.stopReason) control.stop(entry.stopReason === "shutdown" ? "quit" : "stopped");
       },
       onAction: (action) => {
@@ -755,12 +901,18 @@ function createDispatcher({
       // the MCP wiring are only known here, and a group that needs one of them
       // is exactly where a bypass flag could hide from a check made earlier.
       checkArgv: (argv, c) => {
+        // The harness row, read again now: if its command or argv template
+        // changed since the job was approved, that approval does not cover it.
+        const approved = sql("SELECT harness_hash FROM handoffs WHERE id = :p1", [job.id])[0];
+        if (!approved || !approved.harness_hash || approved.harness_hash !== jobs.harnessHash(sql, row.key)) {
+          return `Refusing to start ${label}: its definition in Settings changed after this job was approved, so the approval does not cover what would run now. Ask again to run it as it is.`;
+        }
         const why = checkArgv(argv, { parser: row.parser, kind: job.kind, unguarded, ...c });
         return why ? `Refusing to start ${label} with ${why}: a job passes only flags Delphi knows keep it ${job.kind === "do" ? "inside its Workbench" : "read only"}. Check its command line in Settings, under Agents.` : null;
       },
     });
 
-    const timeoutMs = jobTimeoutMs || limits().timeoutMs;
+    const timeoutMs = (typeof jobTimeoutMs === "function" ? jobTimeoutMs() : jobTimeoutMs) || limits().timeoutMs;
     entry.timer = setTimeout(() => {
       entry.stopReason = entry.stopReason || "timeout";
       if (entry.stop) entry.stop("timeout");
@@ -770,7 +922,8 @@ function createDispatcher({
       const hard = setTimeout(() => {
         if (!live.has(entry.id)) return;
         end(entry, { state: "failed", fields: { agent_pid: null }, reply: `timeout: stopped after ${Math.round(timeoutMs / 60000)} minutes, the longest a job may run, and its agent did not finish when told to.` });
-        live.delete(entry.id);
+        entry.abandoned = true;
+        if (live.get(entry.id) === entry) live.delete(entry.id);
         soon();
       }, hardGraceMs);
       if (hard.unref) hard.unref();
@@ -779,9 +932,12 @@ function createDispatcher({
 
     const resume = followup && job.native_session ? job.native_session : null;
     const opening = () => brief({ job, task, project, label, actor, workbench, cwd, followup });
+    // A reply that starts with a dash would be read as a flag by a CLI that
+    // takes its prompt as an argument; said in words, it cannot be.
+    const message = followup && /^\s*-/.test(followup) ? `The person says:\n${followup}` : followup;
     let result;
     try {
-      result = await turn(resume, resume ? followup : opening());
+      result = await turn(resume, resume ? message : opening());
       // A session the harness no longer has fails before saying anything:
       // start fresh rather than leave the job stuck behind it.
       if (resume && result.code !== 0 && !result.written.length && !result.interrupted && !entry.stopReason) {
@@ -823,11 +979,11 @@ function createDispatcher({
   }
 
   return {
-    tick, create, approve, reject, stop, reply, get, list, recover, shutdown,
+    tick, create, approve, reject, stop, reply, review, reorder, answered, get, list, recover, shutdown,
     running: () => [...live.keys()],
     /** Resolves once every job running now has ended. For tests and quitting. */
     idle: () => Promise.all([...live.values()].map((e) => e.promise)),
   };
 }
 
-module.exports = { createDispatcher, checkArgv, POLICY, storeClient, ADAPTER_BY_PARSER, DEFAULTS };
+module.exports = { createDispatcher, checkArgv, jobCommand, POLICY, storeClient, ADAPTER_BY_PARSER, DEFAULTS, BOUNDS };

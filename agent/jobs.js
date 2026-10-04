@@ -23,6 +23,7 @@
  */
 
 const fs = require("fs");
+const crypto = require("crypto");
 
 const STATES = ["queued", "needs_approval", "running", "waiting_on_human", "done", "failed", "stopped"];
 // Not finished: a job in one of these still holds its task.
@@ -53,6 +54,14 @@ const FROM_LEGACY = {
 
 const literalList = (list) => list.map((s) => `'${s}'`).join(", ");
 const OPEN_SQL = literalList(OPEN);
+
+// The state toRun reads a row as, in SQL, so a filter on it can sit before the
+// LIMIT. Filtering after it lost every open job older than the newest hundred.
+const STATE_SQL = `COALESCE(h.state, CASE h.status ${Object.entries(FROM_LEGACY).map(([from, to]) => `WHEN '${from}' THEN '${to}'`).join(" ")} ELSE h.status END)`;
+// Finished in a way a person has something to look at. A stopped job was
+// stopped by a person, who has looked already.
+const REVIEWABLE = ["done", "failed"];
+const REVIEWS = ["accepted", "sent_back"];
 
 /**
  * Whether a new job may run at once or waits for a person.
@@ -152,6 +161,13 @@ function toRun(row) {
     cost_usd: row.cost_usd == null ? null : Number(row.cost_usd),
     last_activity: row.last_activity || null,
     turns: Number(row.turns || 0),
+    premium_requests: row.premium_requests == null ? null : Number(row.premium_requests),
+    queue_rank: row.queue_rank == null ? null : Number(row.queue_rank),
+    review: row.review || null,
+    review_note: row.review_note || null,
+    reviewed_by: row.reviewed_by || null,
+    reviewed_at: row.reviewed_at || null,
+    needs_review: REVIEWABLE.includes(state) && Boolean(row.state) && !row.reviewed_at,
     native_session: row.native_session || null,
     followup: row.followup || null,
     runner_pid: row.runner_pid == null ? null : Number(row.runner_pid),
@@ -173,24 +189,42 @@ function get(sql, id) {
 
 /**
  * Jobs, newest first. states narrows to those states; a row with no state (an
- * older server's) is matched by what toRun reads it as.
+ * older server's) is matched by what toRun reads it as. needsReview narrows to
+ * finished jobs (done or failed) nobody has reviewed. Only rows the dispatcher
+ * wrote count: an older server's finished handoff was harvested by the agent
+ * that asked, and a backlog of those is not something a person owes a look.
  */
-function list(sql, { projectId = null, states = null, taskId = null, actor = null, limit = 100 } = {}) {
+function list(sql, { projectId = null, states = null, taskId = null, actor = null, needsReview = false, limit = 100 } = {}) {
   const where = [];
   const params = [];
   if (projectId != null) { params.push(Number(projectId)); where.push(`h.project_id = :p${params.length}`); }
   if (taskId != null) { params.push(Number(taskId)); where.push(`h.task_id = :p${params.length}`); }
   if (actor) { params.push(String(actor)); where.push(`(h.requested_by = :p${params.length} OR h.actor = :p${params.length})`); }
+  if (Array.isArray(states) && states.length) {
+    for (const s of states) if (!STATES.includes(s)) throw new Error(`states must be some of ${STATES.join(", ")}, not '${s}'.`);
+    where.push(`${STATE_SQL} IN (${literalList([...new Set(states)])})`);
+  }
+  if (needsReview) where.push(`h.state IN (${literalList(REVIEWABLE)}) AND h.reviewed_at IS NULL`);
   params.push(Math.max(1, Math.min(Number(limit) || 100, 500)));
   const rows = sql(`${RUN_SELECT} ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY h.id DESC LIMIT :p${params.length}`, params);
-  const wanted = Array.isArray(states) && states.length ? new Set(states) : null;
-  if (wanted) {
-    for (const s of wanted) if (!STATES.includes(s)) throw new Error(`states must be some of ${STATES.join(", ")}, not '${s}'.`);
-  }
-  return rows.map(toRun).filter((r) => !wanted || wanted.has(r.state));
+  return rows.map(toRun);
 }
 
 /** Writes a new job and returns it as a run. */
+/**
+ * What a harness row was when a job was approved: its command, its argv
+ * template and the rest of what decides what runs. The dispatcher compares it
+ * at every spawn, so a row changed after approval (by Settings, or by
+ * anything with the database file open) cannot run under that approval.
+ */
+function harnessHash(sql, key) {
+  const row = sql("SELECT command, args_json, parser, mcp_style, trusted_command FROM harnesses WHERE key = :p1", [String(key)])[0];
+  if (!row) return null;
+  return crypto.createHash("sha256")
+    .update(JSON.stringify([row.command, row.args_json, row.parser, row.mcp_style, row.trusted_command]))
+    .digest("hex");
+}
+
 function insert(sql, {
   projectId, toHarness, request, taskId = null, context = null, wake = true, kind = "ask", source = "handoff",
   requestedBy = null, requesterType = null, fromSessionId = null, state = "queued", approval = null,
@@ -200,19 +234,22 @@ function insert(sql, {
   if (!request || !String(request).trim()) throw new Error("A job needs a request: what to do, written for the agent.");
   const row = sql(
     `INSERT INTO handoffs (project_id, from_session_id, to_harness, task_id, request, context_json, wake,
-                           kind, state, status, source, requested_by, requester_type, approval, updated_at)
-     VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9, :p10, :p11, :p12, :p13, :p14, datetime('now'))
+                           kind, state, status, source, requested_by, requester_type, approval, harness_hash, updated_at)
+     VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9, :p10, :p11, :p12, :p13, :p14, :p15, datetime('now'))
      RETURNING id`,
     [Number(projectId), fromSessionId == null ? null : Number(fromSessionId), String(toHarness), taskId == null ? null : Number(taskId),
      String(request), context == null ? null : (typeof context === "string" ? context : JSON.stringify(context)), wake ? 1 : 0,
-     kind, state, LEGACY[state], source, requestedBy, requesterType, approval]
+     kind, state, LEGACY[state], source, requestedBy, requesterType, approval,
+     // Queued now means approved now (a person asked, or the project allows
+     // it), so the row it was approved against is recorded now too.
+     state === "queued" ? harnessHash(sql, toHarness) : null]
   )[0];
   return get(sql, row.id);
 }
 
 const COLUMNS = ["task_id", "reply", "approval", "approved_by", "approved_at", "actor", "workbench_id", "cwd", "runner_pid",
   "runner_host", "agent_pid", "native_session", "unguarded", "tokens_in", "tokens_out", "cost_usd", "last_activity",
-  "followup", "turns", "to_session_id", "wake"];
+  "followup", "turns", "to_session_id", "wake", "queue_rank", "harness_hash"];
 
 /**
  * Changes a job. A new state writes the legacy status beside it, and the
@@ -230,7 +267,12 @@ function update(sql, id, fields = {}, { from = null } = {}) {
     if (!STATES.includes(fields.state)) throw new Error(`Not a job state: ${fields.state}`);
     add("state", fields.state);
     add("status", LEGACY[fields.state]);
-    if (fields.state === "running") sets.push("started_at = COALESCE(started_at, datetime('now'))", "finished_at = NULL");
+    // A new turn is new work: whatever was reviewed before is not what it
+    // will finish with, and its place in the queue is used up.
+    if (fields.state === "running") {
+      sets.push("started_at = COALESCE(started_at, datetime('now'))", "finished_at = NULL", "queue_rank = NULL",
+        "reviewed_at = NULL", "reviewed_by = NULL", "review = NULL", "review_note = NULL");
+    }
     if (FINAL.includes(fields.state)) sets.push("finished_at = datetime('now')");
     if (fields.state === "queued" || fields.state === "waiting_on_human") sets.push("finished_at = NULL");
   }
@@ -270,6 +312,77 @@ function projectFor(sql, { projectId = null, taskId = null } = {}) {
   return Number(task.project_id);
 }
 
+/**
+ * Records a person's review of a finished job, once. Null when the job is not
+ * done or failed, or was reviewed already, so two windows cannot both send the
+ * same job back.
+ */
+function review(sql, id, { accepted, by, note = null }) {
+  const verdict = accepted ? "accepted" : "sent_back";
+  if (!REVIEWS.includes(verdict)) throw new Error(`Not a review: ${verdict}`);
+  const row = sql(`UPDATE handoffs SET reviewed_at = datetime('now'), reviewed_by = :p1, review = :p2, review_note = :p3, updated_at = datetime('now')
+                    WHERE id = :p4 AND state IN (${literalList(REVIEWABLE)}) AND reviewed_at IS NULL RETURNING id`,
+                  [String(by), verdict, note, Number(id)])[0];
+  return row ? get(sql, row.id) : null;
+}
+
+/**
+ * Puts queued jobs in a person's order: ids first, as given, then every other
+ * queued job in the order it would have run, so ranking three does not shuffle
+ * the rest. Throws, changing nothing, when an id is not a queued job.
+ */
+function reorder(sql, ids) {
+  if (!Array.isArray(ids) || !ids.length) throw new Error("Reordering needs the queued jobs' ids, first to run first.");
+  const wanted = ids.map(Number);
+  if (wanted.some((n) => !Number.isInteger(n))) throw new Error("Job ids are whole numbers.");
+  if (new Set(wanted).size !== wanted.length) throw new Error("A job can only be in the order once.");
+  const queued = sql(`SELECT id FROM handoffs WHERE state = 'queued' ORDER BY ${PICK_ORDER}`, []).map((r) => Number(r.id));
+  const notQueued = wanted.filter((n) => !queued.includes(n));
+  if (notQueued.length) {
+    throw new Error(`Only queued jobs can be reordered, and ${notQueued.length === 1 ? `job ${notQueued[0]} is` : `jobs ${notQueued.join(", ")} are`} not queued now.`);
+  }
+  const order = [...wanted, ...queued.filter((n) => !wanted.includes(n))];
+  order.forEach((n, i) => sql("UPDATE handoffs SET queue_rank = :p1, updated_at = datetime('now') WHERE id = :p2 AND state = 'queued'", [i + 1, n]));
+  return order;
+}
+
+// The order the dispatcher takes queued jobs in: a person's ranking first,
+// then oldest first.
+const PICK_ORDER = "queue_rank IS NULL, queue_rank, id";
+
+/**
+ * Jobs waiting on a person whose questions a person has now answered, put
+ * back in the queue with the answers as their next turn. Shared, so an answer
+ * given through the MCP server moves the job at once rather than whenever the
+ * app next looks; only a person's answer counts, so an agent cannot answer
+ * its own question and carry on. taskId narrows it to one task.
+ */
+function resumeAnswered(sql, { taskId = null } = {}) {
+  const out = [];
+  const params = [];
+  let narrow = "";
+  if (taskId != null) { params.push(Number(taskId)); narrow = ` AND task_id = :p1`; }
+  for (const row of sql(`SELECT id, task_id, actor, updated_at FROM handoffs WHERE state = 'waiting_on_human' AND task_id IS NOT NULL AND actor IS NOT NULL${narrow}`, params)) {
+    const open = sql(`SELECT COUNT(*) AS n FROM comments c WHERE c.task_id = :p1 AND c.kind = 'ask' AND c.author = :p2
+                       AND NOT EXISTS (SELECT 1 FROM comments d WHERE d.kind = 'decide' AND d.ref_id = c.id)`, [row.task_id, row.actor])[0].n;
+    if (Number(open)) continue;
+    const answers = sql(`SELECT a.body AS question, d.meta AS meta, d.body AS body FROM comments d JOIN comments a ON a.id = d.ref_id
+                          WHERE d.kind = 'decide' AND d.author_type = 'human'
+                            AND a.task_id = :p1 AND a.author = :p2 AND d.created_at >= :p3 ORDER BY d.id`,
+                        [row.task_id, row.actor, row.updated_at || "0"]);
+    if (!answers.length) continue;
+    const lines = answers.map((a) => {
+      let m = {};
+      try { m = JSON.parse(a.meta) || {}; } catch {}
+      const why = String(a.body || "").split("\n").slice(1).join(" ").trim();
+      return `- "${a.question}": ${m.choice || "?"}) ${m.label || ""}${why ? `. ${why}` : ""}`;
+    });
+    const after = update(sql, row.id, { state: "queued", followup: `A person answered on the Sheet:\n${lines.join("\n")}\n\nCarry on from there.` }, { from: "waiting_on_human" });
+    if (after) out.push(after);
+  }
+  return out;
+}
+
 /** How many jobs this project finished in the last hour. The loop breaker. */
 function finishedSince(sql, projectId, hours = 1) {
   return Number(sql(
@@ -280,6 +393,7 @@ function finishedSince(sql, projectId, hours = 1) {
 }
 
 module.exports = {
-  STATES, OPEN, FINAL, KINDS, LEGACY, OPEN_SQL,
-  approvalFor, projectFor, folders, folderProblem, readFolder, toRun, get, list, insert, update, finishedSince,
+  STATES, OPEN, FINAL, KINDS, LEGACY, OPEN_SQL, STATE_SQL, REVIEWABLE, PICK_ORDER,
+  approvalFor, projectFor, harnessHash, folders, folderProblem, readFolder, toRun, get, list, insert, update, finishedSince,
+  review, reorder, resumeAnswered,
 };

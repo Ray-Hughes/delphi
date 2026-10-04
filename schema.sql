@@ -521,6 +521,11 @@ CREATE TABLE IF NOT EXISTS harnesses (
   -- a flag that turns out to be wrong stays wrong on every install that already
   -- exists.
   seeded_json TEXT,
+  -- The command a person has said a job may run although it is not the
+  -- harness's own binary (a wrapper, a build of their own). Holds the command
+  -- as it was when trusted, so changing the command undoes the trust. Set
+  -- only from the window (harness:trustCommand); never through MCP.
+  trusted_command TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -599,8 +604,27 @@ CREATE TABLE IF NOT EXISTS handoffs (
   cost_usd        REAL,
   last_activity   TEXT,
   followup        TEXT,                              -- a person's reply, not yet sent
+  -- The harness row it was approved against (agent/jobs.js harnessHash). A
+  -- row that changed since refuses the job at spawn.
+  harness_hash    TEXT,
   turns           INTEGER NOT NULL DEFAULT 0,
-  updated_at      TEXT
+  updated_at      TEXT,
+  -- A person looking at what a finished job did, apart from the job finishing:
+  -- done means the agent stopped, not that anyone has read the Workbench.
+  -- review is accepted or sent_back. Cleared when the job runs again, because
+  -- a new turn is new work nobody has looked at.
+  reviewed_at     TEXT,
+  reviewed_by     TEXT,
+  review          TEXT,
+  review_note     TEXT,
+  -- A person's order for queued jobs, lowest first; NULL runs after every
+  -- ranked one, oldest first. Cleared when the job starts, so a reply that
+  -- queues it again goes to the back rather than jumping the queue.
+  queue_rank      INTEGER,
+  -- Copilot's premium requests, from usage.premiumRequests on its result
+  -- line. A count in Copilot's units (a cheap model is a fraction of one),
+  -- summed over turns. NULL for a harness that does not report it.
+  premium_requests REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status, id);

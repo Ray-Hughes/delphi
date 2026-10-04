@@ -499,15 +499,22 @@ tasks and findings as it goes rather than waiting to be asked.
 | --- | --- |
 | `list_projects` | Projects with open task counts |
 | `add_project` | Create a project when work fits none of the existing ones |
-| `list_tasks` | Tasks, filtered by project or status |
+| `list_tasks` | Tasks, filtered by project or status. An unknown `project_id` is refused |
 | `add_task` | Create a task |
-| `update_task` | Change status, priority, detail or project |
+| `update_task` | Change status, priority or detail. Moves only a task you filed in the last day |
 | `add_note` | Store a decision, gotcha or reference |
-| `search` | Search tasks and notes |
+| `whoami` | Which database this is, who you write as, and whether an app is dispatching |
+| `search` | Search tasks and notes, one line each unless `detail: "full"` |
+| `get_note` | Notes in full by id |
 | `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
 | `oracle_entities` | What the graph knows about, most referenced first |
 | `oracle_ask` | Meaning and connections together. The main way to ask what we know |
 | `recent_activity` | What changed, and which agent changed it |
+| `flag_item` | Flag an item that may be in the wrong project. Changes nothing |
+| `propose_move` | Propose where an item belongs. A person approves it |
+| `list_flags` | Flags on possibly misfiled items, with their proposals |
+| `run_status` / `run_list` | One job, or a list of them, as the Runs panel shows them |
+| `lock` | Take, release or list leases on files, branches and the like |
 | `sheet_read` | A task's Sheet: the tail, the ledger, or all of it, with a cursor for polling |
 | `sheet_get` | One entry by its id |
 | `sheet_append` | Write on a Sheet: something said, a note, or a command and its result |
