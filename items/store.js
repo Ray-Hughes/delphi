@@ -570,7 +570,22 @@ function makeItemStore({
     const what = auditEntity === "project" ? `${op.entity === "organizer" ? "epic" : "repository"} ${label} ${summary}` : summary;
     statements.push(auditStatement("update", auditEntity, auditId, what, label, before, { id: auditId, project_id: to }));
     statements.push(...(ctx.extra || []));
-    runAll(statements);
+    // The pads were read before the batch, and on the sqlite3 route nothing
+    // can hold them still in between. So the batch opens by checking each is
+    // still the body it was cut from; json() of something that is not JSON is
+    // the one error plain SQL can raise, and it ends the batch before
+    // anything is written. A pad edited in that gap is read again once.
+    const guards = record.pads.map((pad) => [
+      "SELECT CASE WHEN (SELECT body FROM scratchpads WHERE id = :p1) IS NOT :p2 THEN json('delphi: the pad changed') END",
+      [pad.id, pad.body_before]]);
+    try {
+      runAll([...guards, ...statements]);
+    } catch (error) {
+      const changed = record.pads.some((pad) => (sql("SELECT body FROM scratchpads WHERE id = :p1", [pad.id])[0] || {}).body !== pad.body_before);
+      if (!changed) throw error;
+      if (ctx.padRetry) throw new Error("A pad this move edits kept changing while it was being moved, so nothing was moved. Try again.");
+      return executeMove(p, { ...ctx, padRetry: true });
+    }
     return { auditId: lastAudit(auditEntity, auditId, "update"), moved, notices: p.notices };
   }
 
@@ -593,7 +608,9 @@ function makeItemStore({
   function carryPad(p, rows, statements, record) {
     const source = sql("SELECT id, body FROM scratchpads WHERE id = :p1", [p.pad.from.id])[0];
     const cut = pads.cutBlock(source.body, p.op.id);
-    let target = p.pad.to ? sql("SELECT id, body FROM scratchpads WHERE id = :p1", [p.pad.to.id])[0] : null;
+    let target = p.pad.to ? sql("SELECT id, body FROM scratchpads WHERE id = :p1", [p.pad.to.id])[0]
+      // A retry after a pad changed finds the plan pad the first try made.
+      : sql("SELECT id, body FROM scratchpads WHERE project_id = :p1 AND key = 'plan'", [p.op.to])[0] || null;
     if (!target) {
       // Made before the batch, because the batch needs its id and the sqlite3
       // route returns nothing from a batch. A plan pad left behind by a batch
@@ -912,20 +929,31 @@ function makeItemStore({
   function cleanEvidence(evidence) {
     if (evidence == null) return [];
     if (!Array.isArray(evidence)) throw new Error("evidence is a list of chips, such as {type: \"task\", id: 151}.");
-    return evidence.slice(0, 20).map((chip) => {
-      if (!chip || !EVIDENCE_TYPES.includes(chip.type)) throw new Error(`An evidence chip's type is one of ${EVIDENCE_TYPES.join(", ")}.`);
-      if (chip.type === "text" || chip.type === "url") return { type: chip.type, value: String(chip.value ?? "").slice(0, 4000) };
-      return { type: chip.type, id: idOf(chip.id, `A ${chip.type} chip's id`) };
-    });
+    // A chip that names no real id (#0, a number past what an id can be) is
+    // dropped and said, not allowed to refuse the whole flag: the flag is
+    // the point, and a typo in its evidence should not lose it.
+    const kept = [];
+    const dropped = [];
+    for (const chip of evidence.slice(0, 20)) {
+      if (!chip || !EVIDENCE_TYPES.includes(chip.type)) { dropped.push(`a chip of type ${chip && chip.type}`); continue; }
+      if (chip.type === "text" || chip.type === "url") { kept.push({ type: chip.type, value: String(chip.value ?? "").slice(0, 4000) }); continue; }
+      try { kept.push({ type: chip.type, id: idOf(chip.id, `A ${chip.type} chip's id`) }); } catch { dropped.push(`${chip.type} #${chip.id}`); }
+    }
+    kept.dropped = dropped;
+    return kept;
   }
 
-  const entryStatement = (flagId, kind, body, meta = null, refId = null) => [
+  // The Oracle's own entries (its questions, proposals and reasoning) are
+  // its, not the person's whose click or reply set it going: a thread that
+  // shows "you" asking yourself a question is a thread nobody can follow.
+  const ORACLE = { name: "oracle", type: "tool" };
+  const entryStatement = (flagId, kind, body, meta = null, refId = null, author = null) => [
     `INSERT INTO flag_entries (flag_id, kind, author, author_type, body, meta, ref_id) VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7)`,
-    [flagId, kind, writer, writerType, String(body), meta ? JSON.stringify(meta) : null, refId],
+    [flagId, kind, author ? author.name : writer, author ? author.type : writerType, String(body), meta ? JSON.stringify(meta) : null, refId],
   ];
-  const addEntry = (flagId, kind, body, meta = null, refId = null) => {
+  const addEntry = (flagId, kind, body, meta = null, refId = null, author = null) => {
     if (!ENTRY_KINDS.includes(kind)) throw new Error(`An entry's kind is one of ${ENTRY_KINDS.join(", ")}.`);
-    const [q, p] = entryStatement(flagId, kind, body, meta, refId);
+    const [q, p] = entryStatement(flagId, kind, body, meta, refId, author);
     return toEntry(sql(`${q} RETURNING *`, p)[0]);
   };
   const flagAudit = (row, summary) => {
@@ -950,6 +978,8 @@ function makeItemStore({
     if (!row) throw new Error(`There is no ${entity} ${itemId}.`);
     const text = String(note || "").trim().slice(0, NOTE_CHARS);
     const chips = cleanEvidence(evidence);
+    const dropped = chips.dropped || [];
+    const droppedNote = dropped.length ? ` (Evidence left out, not a real id: ${dropped.join(", ")}.)` : "";
     const from = SOURCES.includes(source) ? source : writerType === "agent" ? "agent" : "person";
     const meta = { ...(chips.length ? { evidence: chips } : {}), ...(suggest ? { suggest } : {}) };
     const live = () => sql(`SELECT * FROM item_flags WHERE entity = :p1 AND entity_id = :p2 AND status IN ('open', 'evaluating', 'proposed')`, [entity, itemId])[0];
@@ -960,7 +990,7 @@ function makeItemStore({
           `INSERT INTO item_flags (entity, entity_id, project_id, label, note, evidence, source, created_by, created_by_type)
            VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9) RETURNING *`,
           [entity, itemId, row.project_id ?? null, labelOf(entity, row), text, chips.length ? JSON.stringify(chips) : null,
-           from, writer, writerType || (from === "sweep" ? "tool" : null)])[0];
+           from, from === "sweep" ? ORACLE.name : writer, from === "sweep" ? ORACLE.type : writerType])[0];
       } catch (error) {
         // Two writers at once: the unique index let one in, and this one adds
         // to it instead. Anything else is a real failure.
@@ -969,13 +999,14 @@ function makeItemStore({
         existing.appendTo = true;
       }
       if (!existing.appendTo) {
-        addEntry(Number(existing.id), "say", text || "Flagged for review.", Object.keys(meta).length ? meta : null);
+        addEntry(Number(existing.id), "say", `${text || "Flagged for review."}${droppedNote}`, Object.keys(meta).length ? meta : null, null,
+          from === "sweep" ? ORACLE : null);
         flagAudit(existing, `flagged for review${text ? `: ${clip(text, 80)}` : ""}`);
         if (evaluate === "oracle") return { flag: evaluateFlag(Number(existing.id), { mode: "oracle" }).flag, appended: false };
         return { flag: summarise(flagRow(existing.id)), appended: false };
       }
     }
-    if (text || chips.length) addEntry(Number(existing.id), "say", text || "Flagged again.", Object.keys(meta).length ? meta : null);
+    if (text || chips.length || droppedNote) addEntry(Number(existing.id), "say", `${text || "Flagged again."}${droppedNote}`, Object.keys(meta).length ? meta : null);
     sql("UPDATE item_flags SET updated_at = datetime('now') WHERE id = :p1", [existing.id]);
     return { flag: summarise(flagRow(existing.id)), appended: true };
   }
@@ -1038,7 +1069,8 @@ function makeItemStore({
       [`UPDATE item_flags SET status = 'proposed', proposal = :p1, proposed_by = :p2, proposed_at = datetime('now'),
                               updated_at = datetime('now') WHERE id = :p3`, [JSON.stringify(proposal), proposer, row.id]],
       entryStatement(Number(row.id), "note", proposal.reasoning || summaryOf(proposal, row),
-        { proposal, plan: plans.map((p) => ({ ok: p.ok, summary: p.summary, refusals: p.refusals })) }),
+        { proposal, plan: plans.map((p) => ({ ok: p.ok, summary: p.summary, refusals: p.refusals })) }, null,
+        proposer === "oracle" ? ORACLE : null),
     ]);
     return { flag: summarise(flagRow(row.id)), plan: plans };
   }
@@ -1060,7 +1092,13 @@ function makeItemStore({
    * reached this: the tools/list has no approve, the guard blocks the command
    * line's, and this is the floor under both.
    */
-  function decide(flagId, { approve, ops = null, note = null, by = null, byType = null } = {}) {
+  function decide(flagId, { approve, ops = null, note = null, by = null, byType = null, via = null, entryId = null } = {}) {
+    // The window is the only place a person can be told apart from an agent
+    // claiming to be one: the command line takes whatever DELPHI_ACTOR and
+    // DELPHI_AUTHOR_TYPE it is given, and the guard can be spelled around. So
+    // only main.js passes via "window", and nothing the server or the command
+    // line loads ever does.
+    if (via !== "window") throw new Error("Approve or reject this in the Delphi window.");
     const row = requireFlag(flagId);
     const type = byType || writerType;
     const who = by || writer;
@@ -1088,6 +1126,22 @@ function makeItemStore({
                                AND (CASE WHEN json_valid(meta) THEN json_extract(meta, '$.proposal') END) IS NOT NULL
                                ORDER BY id DESC LIMIT 1`, [row.id])[0];
     const refId = lastProposal ? Number(lastProposal.id) : null;
+    // What is decided is the proposal the person looked at, named by its
+    // entry. A newer one (an agent's, a re-evaluation) arriving while the card
+    // was open must not be what an Approve applies.
+    // With no entryId and ops of their own, the person is deciding it
+    // themselves, proposal or none, and exactly those ops are applied.
+    // Without either there is nothing to say what was meant.
+    const ownDecision = approve && entryId == null && Array.isArray(ops) && ops.length > 0;
+    if (approve && entryId == null && !ownDecision) {
+      throw new Error("Approve needs the proposal you looked at (entryId), or your own ops, so a newer proposal is never applied in its place.");
+    }
+    if (entryId != null && Number(entryId) !== refId) {
+      const stale = new Error("The proposal changed since you looked. Look at it again before deciding.");
+      stale.code = "STALE";
+      stale.details = { seen: Number(entryId), latest: refId };
+      throw stale;
+    }
     const why = note ? String(note).trim().slice(0, NOTE_CHARS) : null;
     if (!approve) {
       if (!why) throw new Error("Say why when rejecting, so the next look at it does not propose the same thing.");
@@ -1102,17 +1156,19 @@ function makeItemStore({
     const chosen = ops ? cleanOps(ops) : proposal && proposal.ops;
     if (!chosen || !chosen.length) throw new Error(`Flag ${row.id} has no proposal yet; pass the ops to apply.`);
     const edited = Boolean(ops) && JSON.stringify(chosen) !== JSON.stringify(proposal && proposal.ops);
-    const body = edited
+    const body = ownDecision
+      ? `Decided by ${who}: ${summaryOf({ ops: chosen }, row).replace(/^Someone suggests: /, "")}.${why ? ` ${why}` : ""}`
+      : edited
       ? `Approved with changes: ${summaryOf({ ops: chosen }, row).replace(/^Someone suggests: /, "")} instead of ${proposal ? summaryOf(proposal, row).replace(/^.*? suggests: /, "") : "nothing proposed"}.${why ? ` ${why}` : ""}`
       : `Approved${why ? `: ${why}` : "."}`;
     const extra = [
       [`UPDATE item_flags SET status = 'applied', decided_by = :p1, decided_at = datetime('now'), decision_note = :p2,
                               updated_at = datetime('now') WHERE id = :p3`, [who, why, row.id]],
-      entryStatement(Number(row.id), "decide", body, { decision: "approve", by: who, ops: chosen, edited }, refId),
+      entryStatement(Number(row.id), "decide", body, { decision: ownDecision ? "own" : "approve", by: who, ops: chosen, edited }, ownDecision ? null : refId),
     ];
     let applied;
     try {
-      applied = apply(chosen, { flagId: Number(row.id), proposedBy: row.proposed_by || null, extra });
+      applied = apply(chosen, { flagId: Number(row.id), proposedBy: ownDecision ? null : row.proposed_by || null, extra });
     } catch (error) {
       runAll([
         [`UPDATE item_flags SET status = 'failed', decided_by = :p1, decided_at = datetime('now'), updated_at = datetime('now') WHERE id = :p2`, [who, row.id]],
@@ -1141,6 +1197,13 @@ function makeItemStore({
     };
   }
 
+  const proposalEntryId = (flagId) => {
+    const r = sql(`SELECT id FROM flag_entries WHERE flag_id = :p1 AND kind = 'note'
+                    AND (CASE WHEN json_valid(meta) THEN json_extract(meta, '$.proposal') END) IS NOT NULL
+                    ORDER BY id DESC LIMIT 1`, [flagId])[0];
+    return r ? Number(r.id) : null;
+  };
+
   /** A flag as every list shows it. */
   function summarise(row) {
     if (!row) return null;
@@ -1157,6 +1220,8 @@ function makeItemStore({
       created_by: row.created_by, created_by_type: row.created_by_type || null,
       note: clip(row.note, 300), evidence: parseJson(row.evidence, []),
       proposal, proposal_summary: summaryOf(proposal, row), proposed_by: row.proposed_by || null,
+      // The entry an Approve must name: flags:approve(id, {entryId}).
+      proposal_entry_id: proposalEntryId(row.id),
       needs, decided_by: row.decided_by || null, decision_note: row.decision_note || null,
       applied_audit_id: row.applied_audit_id == null ? null : Number(row.applied_audit_id),
       entries: count, created_at: row.created_at, updated_at: row.updated_at,
@@ -1217,6 +1282,8 @@ function makeItemStore({
       const noun = { task: ["task", "tasks"], note: ["note", "notes"], scratchpad: ["pad", "pads"], link: ["link", "links"] }[g.entity] || ["item", "items"];
       out.push({
         source: "flag", kind: "decision", group: true, ids: g.flags.map((f) => f.id),
+        // Approve all sends each of these: flags:approve(id, {entryId}).
+        entries: g.flags.map((f) => ({ id: f.id, entryId: f.proposal_entry_id })),
         project_id: g.home ? g.home.id : null,
         title: `${plural(g.flags.length, noun[0], noun[1])} in ${g.home ? g.home.name : "no project"} look like ${projectName(g.first.to)}`,
         summary: `The sweep suggests: ${g.first.op} to ${projectName(g.first.to)}.`,
@@ -1228,7 +1295,7 @@ function makeItemStore({
   }
 
   const needsRow = (f) => ({
-    source: "flag", kind: f.needs, id: f.id, project_id: f.project ? f.project.id : null,
+    source: "flag", kind: f.needs, id: f.id, entryId: f.proposal_entry_id, project_id: f.project ? f.project.id : null,
     title: f.label || `${f.entity} ${f.entity_id}`,
     summary: f.proposal_summary || (f.needs === "question" ? "The evaluator has a question." : f.note || "Flagged for review."),
     created_at: f.created_at,
@@ -1252,7 +1319,7 @@ function makeItemStore({
       return agentEvaluator(row, { prompt: evaluator.prompt(row) });
     }
     if (mode !== "oracle") throw new Error(`mode is oracle or agent, not '${mode}'.`);
-    const entries = sql("SELECT kind, body, meta FROM flag_entries WHERE flag_id = :p1 ORDER BY id", [row.id]);
+    const entries = sql("SELECT id, kind, author, author_type, body, meta FROM flag_entries WHERE flag_id = :p1 ORDER BY id", [row.id]);
     const result = evaluator.evaluate(row, { entries });
     if (result.proposal) {
       // Not the same thing again: a person already said no to it.
@@ -1262,10 +1329,14 @@ function makeItemStore({
           by: "oracle", evaluator: "oracle@1", signals: result.signals });
       }
     }
+    // A name that could be several projects is asked about, not guessed: the
+    // flag shows in Needs you as a question, and a reply looks again.
     runAll([
       ["UPDATE item_flags SET status = 'open', updated_at = datetime('now') WHERE id = :p1", [row.id]],
-      entryStatement(Number(row.id), "note", result.reasoning || "The Oracle found no clear home for it.",
-        { evaluator: "oracle@1", signals: result.signals, proposal: null }),
+      result.ask
+        ? entryStatement(Number(row.id), "ask", result.ask, { evaluator: "oracle@1", signals: result.signals, proposal: null }, null, ORACLE)
+        : entryStatement(Number(row.id), "note", result.reasoning || "The Oracle found no clear home for it.",
+          { evaluator: "oracle@1", signals: result.signals, proposal: null }, null, ORACLE),
     ]);
     return { flag: summarise(flagRow(row.id)), plan: null };
   }
@@ -1294,7 +1365,7 @@ function makeItemStore({
         propose({ flagId: fid, ops: [{ op: "move", entity: c.entity, id: c.id, to: c.to }], reasoning: c.reasoning,
           confidence: c.confidence, by: "oracle", evaluator: "oracle@1", signals: c.signals });
       } else {
-        addEntry(fid, "note", c.reasoning, { evaluator: "oracle@1", signals: c.signals, proposal: null });
+        addEntry(fid, "note", c.reasoning, { evaluator: "oracle@1", signals: c.signals, proposal: null }, null, ORACLE);
       }
       created.push(summarise(flagRow(fid)));
     }

@@ -4475,7 +4475,8 @@ function taskMenu(t, x, y, { after = null } = {}) {
   const item = itemOf("task", t);
   const moves = itemVerbs(item, { after, withIcons: false });
 
-  rowMenu(x, y, [
+  const opener = document.activeElement;
+  menuKeys(rowMenu(x, y, [
     { label: "Open", run: () => openTaskSheet(t.id) },
     { label: "Quick look", run: () => quickLook(t.id) },
     "-",
@@ -4499,7 +4500,7 @@ function taskMenu(t, x, y, { after = null } = {}) {
     // Said where it happened, because that is when someone needs to know it
     // is not final. deleteItem warns first when the task is only shown here.
     { label: "Delete", danger: true, run: () => deleteItem(item, { after }) },
-  ]);
+  ]), opener);
 }
 
 // ---------------------------------------------------------------------------
@@ -5135,6 +5136,35 @@ function renderNotes(root) {
       textContent: `${plural(state.notes.length - borrowed, "note", "notes")} here, and ${borrowed} from ${borrowed === 1 ? "another project" : "other projects"}.` }));
   }
   state.notes.forEach((n) => root.append(noteCard(n)));
+  paintAlsoIn(root, state.notes.filter((n) => !Number(n.associated)));
+}
+
+// Where else a home note is shown, by note id, from items:where. The list
+// query gives the "from" side only, so this is asked per note after the
+// cards are drawn and patched into them in place; a move, an association or
+// a flag fires flags-changed, which empties it.
+const alsoInCache = new Map();
+const ALSO_IN_MAX = 80;
+async function paintAlsoIn(root, notes) {
+  if (!window.delphi.items) return;
+  for (const n of notes.slice(0, ALSO_IN_MAX)) {
+    let also = alsoInCache.get(n.id);
+    if (!also) {
+      try { also = ((await window.delphi.items.where("note", n.id)).also) || []; } catch { also = []; }
+      alsoInCache.set(n.id, also);
+    }
+    if (!also.length || !root.isConnected) continue;
+    const card = root.querySelector(`[data-row="note-${n.id}"]`);
+    const head = card && card.querySelector(".note-head");
+    if (!head || head.querySelector(".also-tag")) continue;
+    const tag = el("button", { className: "from-tag also-tag", type: "button" }, "also in ",
+      ...also.slice(0, 2).flatMap((p, i) => [i ? ", " : null, dotFor(p.id, p.colour), el("b", { textContent: p.name })]),
+      also.length > 2 ? ` and ${also.length - 2} more` : null);
+    tag.title = `Also shown in ${also.map((p) => p.name).join(", ")}. Click for where else it is.`;
+    const item = itemOf("note", n);
+    tag.onclick = (e) => { e.stopPropagation(); const b = tag.getBoundingClientRect(); wherePopover(item, b.left, b.bottom + 4); };
+    head.insertBefore(tag, head.querySelector("select"));
+  }
 }
 
 /**
@@ -5344,6 +5374,64 @@ function formatArgv(list) {
   const lines = list.map((item) =>
     `  ${Array.isArray(item) ? `[${item.map((t) => JSON.stringify(t)).join(", ")}]` : JSON.stringify(item)}`);
   return `[\n${lines.join(",\n")}\n]`;
+}
+
+/**
+ * Whether jobs may run a harness's command when it is not the agent's own
+ * program: a wrapper script, a shim, something on a path Delphi does not
+ * recognise. A wrapper can add any flag it likes after every check Delphi
+ * makes, so the dispatcher refuses it until a person trusts that exact
+ * command, and refuses again the moment the command changes. Shown under the
+ * harness it belongs to, with the path it resolves to, because that file is
+ * what is actually being trusted.
+ */
+function harnessTrustRow(h, repaint) {
+  if (!h.command || !window.delphi.harnesses.trustCommand) return null;
+  const real = h.real_path || h.realPath || h.path || null;
+  const trusted = h.trusted_command && h.trusted_command === h.command;
+  const stale = h.trusted_command && h.trusted_command !== h.command;
+  const box = el("div", { className: "trust-row" + (trusted ? " on" : "") });
+  const say = el("div", { className: "grow" });
+  if (trusted) {
+    say.append(el("span", {}, el("b", { textContent: "Trusted command. " }), "Jobs run ", el("code", { textContent: h.command }),
+      real && real !== h.command ? el("span", {}, " (", el("code", { textContent: real }), ")") : null,
+      " as it is, with nothing checking what it adds."));
+  } else if (stale) {
+    say.append(el("b", { textContent: "Not trusted. " }), "The trust was for ", el("code", { textContent: h.trusted_command }),
+      ", and the command has changed since, so jobs will not run it until it is trusted again.");
+  } else {
+    say.append("Jobs run this agent only when its command is the agent's own program. If it is a wrapper you wrote or trust, mark it here.");
+  }
+  const b = el("button", { className: "btn sm", type: "button", textContent: trusted ? "Untrust" : "Trust this command…" });
+  b.onclick = async () => {
+    if (!trusted) {
+      const ok = await wbDialog({
+        title: `Trust ${h.label}'s command?`,
+        lead: "Delphi cannot see what a wrapper does. Whatever this file runs, with whatever flags it adds, runs for every job given to this agent, in that job's Workbench, without the checks Delphi makes on the agent's own program.",
+        body: [
+          el("div", { className: "grp" }, el("div", { className: "grp-h", textContent: "The command" }), el("span", { className: "mono", textContent: h.command })),
+          el("div", { className: "grp lost" }, el("div", { className: "grp-h", textContent: "The file it resolves to, which is what you are trusting" }),
+            el("span", { className: "mono", textContent: real || "not found on this machine" })),
+          el("p", { className: "wb-lead", textContent: "Editing the command later takes the trust away. Untrust here takes it away at once." }),
+        ],
+        actions: [{ label: "Cancel", value: false }, { label: "Trust it", kind: "danger", value: true }],
+        cancelValue: false,
+      });
+      if (!ok) return;
+    }
+    let saved;
+    try { saved = await window.delphi.harnesses.trustCommand(h.id, !trusted); }
+    catch (error) { notifyError(error); return; }
+    notify(trusted ? `${h.label}'s command is no longer trusted.` : `${h.label}'s command is trusted.`);
+    // Redrawn from the row the store returned, in place: the list behind it
+    // is re-probed through login shells, which is slow and can land after the
+    // pane has moved on.
+    const next = harnessTrustRow({ ...h, ...(saved || {}), path: h.path, trusted_command: saved ? saved.trusted_command : (trusted ? null : h.command) }, repaint);
+    if (next && box.isConnected) box.replaceWith(next);
+    else repaint();
+  };
+  box.append(say, b);
+  return box;
 }
 
 function openHarnessSheet(harness, done) {
@@ -6506,7 +6594,7 @@ async function renderSettings(root) {
   // The other agents, as rows you can edit. This is the difference between an
   // app that integrates with three tools and one that is a layer above any of
   // them: when a CLI renames a flag, the fix is here rather than in a release.
-  const harnessBox = el("div", { className: "setting" });
+  const harnessBox = el("div", { className: "setting", id: "settings-agents" });
   harnessBox.append(el("h3", { textContent: "Agents" }));
   harnessBox.append(el("p", {
     textContent: "The coding agents that can run as a tab inside a project. Each one runs in the project's folder with Delphi's own MCP server attached, so it can read the pads, file tasks, and be seen doing it in History. Delphi never holds their credentials: each signs in its own way and Delphi only runs the binary.",
@@ -6549,6 +6637,8 @@ async function renderSettings(root) {
       };
       row.append(toggle);
       harnessList.append(row);
+      const trust = harnessTrustRow(h, () => paintHarnesses(true));
+      if (trust) harnessList.append(trust);
     }
 
     const add = el("button", { className: "btn sm", textContent: "Add an agent" });
@@ -10046,7 +10136,14 @@ function settingFix(text, projectId) {
     return { label: "Open project settings", go: () => openProjectSettingsAt(projectId, anchor) };
   }
   if (/Settings, under Agents/i.test(t)) {
-    return { label: "Open Settings", go: () => goTo({ projectId: null, view: "settings", query: "" }) };
+    return { label: "Open Settings", go: async () => {
+      if (openSheet) await openSheet.close();
+      await goTo({ projectId: null, view: "settings", query: "" });
+      // The refusal names Agents, so that is where it lands.
+      for (let i = 0; i < 40 && !document.getElementById("settings-agents"); i += 1) await new Promise((r) => setTimeout(r, 50));
+      const box = document.getElementById("settings-agents");
+      if (box) box.scrollIntoView({ block: "start", behavior: motionOff() ? "auto" : "smooth" });
+    } };
   }
   return null;
 }
@@ -10232,7 +10329,11 @@ function approvalRow(run) {
 
   const approveKey = `approve-${run.id}`;
   const approve = withData(el("button", { className: "btn ok", type: "button", textContent: "Approve", disabled: runSending.has(approveKey) }), { act: "approve" });
-  approve.onclick = () => { approve.disabled = true; sendDraft(approveKey, () => window.delphi.runs.approve(run.id)); };
+  // The agent as this row showed it: a harness edited between the look and
+  // the click is refused rather than approved unseen. Sent once the run
+  // carries it; until then the dispatcher compares at spawn as before.
+  const seen = run.harness_hash_now || null;
+  approve.onclick = () => { approve.disabled = true; sendDraft(approveKey, () => window.delphi.runs.approve(run.id, seen ? { harnessHash: seen } : {})); };
   if (runRefused.has(approveKey)) main.append(refusedLine(approveKey));
   const reject = withData(el("button", { className: "btn no", type: "button", textContent: rejecting ? "Cancel" : "Reject" }), { act: "reject" });
   reject.onclick = () => {
@@ -10816,12 +10917,39 @@ function itemVerbs(item, { after = null, withIcons = true } = {}) {
   ];
 }
 
+/**
+ * A menu a keyboard can drive: role menu with menuitems, focus moved into it,
+ * arrows, Home and End to move, Escape to close and Tab to leave. Focus goes
+ * back to whatever opened it, unless a verb has opened a dialog that took it.
+ */
+function menuKeys(menu, opener) {
+  if (!menu) return;
+  menu.setAttribute("role", "menu");
+  const choices = [...menu.querySelectorAll(".ctx-item")];
+  for (const c of choices) { c.setAttribute("role", "menuitem"); c.tabIndex = -1; }
+  for (const h of menu.querySelectorAll(".ctx-head")) h.setAttribute("role", "presentation");
+  for (const sep of menu.querySelectorAll(".ctx-sep")) sep.setAttribute("role", "separator");
+  const back = () => { if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus({ preventScroll: true }); };
+  menu.addEventListener("keydown", (e) => {
+    const at = choices.indexOf(document.activeElement);
+    const go = (i) => { e.preventDefault(); choices[(i + choices.length) % choices.length].focus(); };
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeRowMenu(); back(); }
+    else if (e.key === "ArrowDown") go(at + 1);
+    else if (e.key === "ArrowUp") go(at < 0 ? -1 : at - 1);
+    else if (e.key === "Home") go(0);
+    else if (e.key === "End") go(-1);
+    else if (e.key === "Tab") { closeRowMenu(); back(); }
+  });
+  if (choices.length) choices[0].focus({ preventScroll: true });
+}
+
 function itemMenu(item, x, y, { after = null, onClose = null, onDelete = null } = {}) {
+  const opener = document.activeElement;
   const head = el("div", { className: "ctx-head", textContent: `${ITEM_NOUN[item.entity]} #${item.id}` });
   const del = el("button", { className: "ctx-item danger", type: "button" },
     itemIcon("trash"), el("span", { textContent: "Delete" }), el("span", { className: "d", textContent: "undo in History" }));
   del.onclick = async () => { closeRowMenu(); await deleteItem(item, { after, onDelete }); };
-  rowMenu(x, y, [head, ...itemVerbs(item, { after }), "-", { node: del }], { className: "item-menu", onClose });
+  menuKeys(rowMenu(x, y, [head, ...itemVerbs(item, { after }), "-", { node: del }], { className: "item-menu", onClose }), opener);
 }
 
 async function dissociateHere(item, projectId, after = null) {
@@ -11301,22 +11429,44 @@ function refusalWords(error) {
  * is not already on screen, and what is found goes to the store as evidence
  * chips beside the text, which is sent whole either way.
  */
+// Linear in the text: each pattern runs once over the original, and a match
+// inside one an earlier pattern took is skipped by looking at a byte per
+// character, where rebuilding the string per match made a long paste
+// quadratic. The titles are indexed once rather than searched per match.
+const EVIDENCE_CAP = 60;
 function readEvidence(text) {
-  let rest = String(text || "");
+  const rest = String(text || "");
+  const taken = new Uint8Array(rest.length);
   const chips = [];
   const seen = new Set();
-  const mask = (m) => { rest = rest.slice(0, m.index) + " ".repeat(m[0].length) + rest.slice(m.index + m[0].length); };
-  const add = (key, chip) => { if (seen.has(key)) return; seen.add(key); chips.push(chip); };
-  const taskTitle = (id) => { const t = state.everyTask.find((x) => x.id === id) || state.tasks.find((x) => x.id === id); return t ? t.title : null; };
-  const noteTitle = (id) => { const n = state.notes.find((x) => x.id === id); return n ? n.title : null; };
-  const padTitle = (id) => { const p = state.pads.find((x) => x.id === id); return p ? p.title : null; };
-  const all = (re) => [...rest.matchAll(re)];
+  const free = (m) => { for (let i = m.index, end = m.index + m[0].length; i < end; i += 1) if (taken[i]) return false; return true; };
+  const mask = (m) => { taken.fill(1, m.index, m.index + m[0].length); };
+  const add = (key, chip) => { if (seen.has(key) || chips.length >= EVIDENCE_CAP) return; seen.add(key); chips.push(chip); };
+  const titles = (list, label = "title") => new Map((list || []).map((x) => [x.id, x[label]]));
+  const tasks = titles(state.everyTask);
+  for (const t of state.tasks || []) if (!tasks.has(t.id)) tasks.set(t.id, t.title);
+  const notes = titles(state.notes);
+  const padsById = titles(state.pads);
+  const taskTitle = (id) => tasks.get(id) || null;
+  const noteTitle = (id) => notes.get(id) || null;
+  const padTitle = (id) => padsById.get(id) || null;
+  const all = (re) => [...rest.matchAll(re)].filter(free);
 
   for (const m of all(/\bhttps?:\/\/[^\s<>()"'`]+[^\s<>()"'`.,;:!?]/g)) {
     add(`url:${m[0]}`, { cls: "url", ty: "link", label: m[0].replace(/^https?:\/\//, ""), evidence: [{ type: "url", value: m[0] }] });
     mask(m);
   }
-  for (const m of all(/\b(?:[a-z0-9-]+\.)+(?:com|org|io|net|dev|app|co)\/[^\s<>()"'`]*[^\s<>()"'`.,;:!?]/gi)) {
+  // A bare domain with a path, such as github.com/owner/repo. Tried once per
+  // word, anchored at its start: unanchored, "a.a.a.a..." pasted whole made
+  // the engine retry the dotted run from every position, which is quadratic.
+  const domainAt = /^((?:[a-z0-9-]+\.)+(?:com|org|io|net|dev|app|co)\/[^\s<>()"'`]*[^\s<>()"'`.,;:!?])/i;
+  const bare = [];
+  for (const w of rest.matchAll(/[^\s(`'"<>]+/g)) {
+    if (w[0].length > 2000 || w[0].indexOf("/") < 0) continue;
+    const hit = domainAt.exec(w[0]);
+    if (hit) bare.push(Object.assign([hit[1]], { index: w.index }));
+  }
+  for (const m of bare.filter(free)) {
     add(`url:https://${m[0]}`, { cls: "url", ty: "link", label: m[0], evidence: [{ type: "url", value: `https://${m[0]}` }] });
     mask(m);
   }
@@ -11386,7 +11536,10 @@ async function openFlagDialog(item, { after = null } = {}) {
     refs.textContent = "";
     for (const c of chips) refs.append(el("span", { className: `ref ${c.cls}` }, el("span", { className: "ty", textContent: c.ty }), el("span", { textContent: c.label })));
   };
-  text.oninput = paintRefs;
+  // Read a moment after typing stops rather than on every key, and at once
+  // when sent, so what goes as evidence is always what the text says.
+  let refsTimer = null;
+  text.oninput = () => { clearTimeout(refsTimer); refsTimer = setTimeout(paintRefs, 120); };
   const err = el("div", { className: "err-msg", hidden: true });
   const left = el("div", { className: "fl-l" }, subj,
     el("div", { className: "fx-label", textContent: "What should happen, why, and your evidence" }), text,
@@ -11433,6 +11586,8 @@ async function openFlagDialog(item, { after = null } = {}) {
   let sending = false;
   async function send() {
     if (sending) return;
+    clearTimeout(refsTimer);
+    paintRefs();
     sending = true;
     sendBtn.disabled = true;
     err.hidden = true;
@@ -11486,6 +11641,7 @@ let flagsAgain = false;
 let flagsSig = "";
 
 function flagsChanged() {
+  alsoInCache.clear();
   if (flagsTimer) return;
   flagsTimer = setTimeout(() => { flagsTimer = null; reloadFlags(); }, 250);
 }
@@ -11517,6 +11673,8 @@ async function reloadFlags() {
       if (sig === flagsSig) continue;
       flagsSig = sig;
       state.flagRows = rows;
+      const live = new Set(rows.flatMap((r) => (r.group ? [`group:${r.title}`, ...r.ids] : [r.id])));
+      for (const k of [...flagUi.keys()]) if (!live.has(k)) flagUi.delete(k);
       flagDetails.clear();
       for (const [k, v] of details) flagDetails.set(k, v);
       paintRunsLive();
@@ -11527,6 +11685,38 @@ async function reloadFlags() {
 }
 
 const flagRowsNow = () => state.flagRows || [];
+
+// What a card is doing, by flag id: { pending, error, stale }. Kept outside
+// the card because runs-changed repaints Needs you about once a second, and a
+// disabled Approve or the sentence a refusal came back with must not vanish
+// with the node that drew it. Sweep groups are keyed "group:<title>".
+const flagUi = new Map();
+
+/**
+ * Approves the proposal a card showed, by its entry. STALE means a newer
+ * proposal arrived since: the card is drawn again with the new one and says
+ * so, rather than applying either without a second look.
+ */
+async function approveFlag(flagId, entryId, chosen, ops, homeName) {
+  const now = flagUi.get(flagId) || {};
+  if (now.pending) return;
+  flagUi.set(flagId, { pending: true });
+  repaintKeepingFocus();
+  let r;
+  try {
+    r = await window.delphi.flags.approve(flagId, chosen ? { entryId, ops: chosen } : { entryId });
+  } catch (error) {
+    flagUi.set(flagId, error && error.code === "STALE" ? { stale: true } : { error: refusalWords(error) });
+    flagsSig = "";
+    await reloadFlags();
+    repaintKeepingFocus();
+    return;
+  }
+  flagUi.delete(flagId);
+  await refresh();
+  reloadFlags();
+  notifyUndo(`Approved: ${proposalTitle(ops, homeName).replace(/^./, (c) => c.toLowerCase())}.`, (r && r.auditIds) || []);
+}
 
 /** Does something to a flag, says what went wrong in the store's words, and asks again. */
 async function flagAct(fn) {
@@ -11693,7 +11883,7 @@ function flagCard(row, d) {
     p.append(el("div", { className: "prop-why", textContent: ask ? ask.body : row.summary || "The evaluator has a question." }));
   } else {
     if (f.note) p.append(el("div", { className: "prop-why", textContent: f.note }));
-    if (oracleNote && oracleNote.body && oracleNote.author !== "you") {
+    if (oracleNote && oracleNote.body && (oracleNote.author === "oracle" || oracleNote.author_type === "tool")) {
       p.append(el("div", { className: "prop-alt", textContent: oracleNote.body }));
     }
     const cites = flagCites({ ...f, note: null }, signals);
@@ -11717,7 +11907,7 @@ function flagCard(row, d) {
       if (!note) { field.focus(); err.hidden = false; err.textContent = "Say why, so the next look does not propose the same thing."; return; }
       send.disabled = true;
       const looked = again.checked;
-      const ok = await sendDraft(rejectKey, () => window.delphi.flags.reject(f.id, { note, reevaluate: looked }));
+      const ok = await sendDraft(rejectKey, () => window.delphi.flags.reject(f.id, { note, reevaluate: looked, entryId: f.proposal_entry_id ?? row.entryId ?? null }));
       if (!ok) return;
       runDrafts.delete(againKey);
       notify(looked ? "Rejected. The Oracle has looked again with your reason." : "Rejected. Nothing was changed.");
@@ -11753,41 +11943,49 @@ function flagCard(row, d) {
 
   const acts = el("div", { className: "prop-acts" });
   const button = (text, cls, run) => { const b = el("button", { className: `btn ${cls}`.trim(), type: "button", textContent: text }); b.onclick = run; return b; };
+  // The proposal this card shows, by its entry. Approve and reject name it, so
+  // a newer proposal arriving while the card was open is refused (STALE)
+  // rather than applied in its place.
+  const entryId = f.proposal_entry_id != null ? f.proposal_entry_id : row.entryId != null ? row.entryId : null;
+  const ui = flagUi.get(f.id) || {};
+  if (ui.stale) p.insertBefore(el("div", { className: "prop-stale", role: "alert", textContent: "This proposal changed since you looked. This is the new one." }), err);
+  if (ui.error) { err.hidden = false; err.setAttribute("role", "alert"); err.textContent = ui.error; }
   if (kind === "decision") {
-    const approve = button("Approve", "ok", async () => {
-      approve.disabled = true;
-      let r;
-      try { r = await window.delphi.flags.approve(f.id); } catch (error) { approve.disabled = false; fail(error); return; }
-      await refresh();
-      reloadFlags();
-      notifyUndo(`Approved: ${proposalTitle(ops, item.homeName).replace(/^./, (c) => c.toLowerCase())}.`, (r && r.auditIds) || []);
-    });
+    const approve = withData(button(ui.pending ? "Approving…" : "Approve", "ok", () => approveFlag(f.id, entryId, null, ops, item.homeName)), { act: "approve" });
+    approve.disabled = Boolean(ui.pending) || entryId == null;
+    if (entryId == null) approve.title = "This proposal has no entry to approve against yet; ask the Oracle again.";
     acts.append(approve,
-      button(runDrafts.has(rejectKey) ? "Cancel" : "Reject", "no", () => {
+      withData(button(runDrafts.has(rejectKey) ? "Cancel" : "Reject", "no", () => {
         if (runDrafts.has(rejectKey)) runDrafts.delete(rejectKey); else runDrafts.set(rejectKey, "");
         repaintKeepingFocus();
-      }),
-      button("Change it…", "", () => openItemPicker(item, ops[0] ? (ops[0].op === "associate" || ops[0].op === "dissociate" ? "associate" : ops[0].op) : "move", {
+      }), { act: "reject" }),
+      withData(button("Change it…", "", () => openItemPicker(item, ops[0] ? (ops[0].op === "associate" || ops[0].op === "dissociate" ? "associate" : ops[0].op) : "move", {
         preset: ops,
         decide: async (chosen) => {
-          const r = await window.delphi.flags.approve(f.id, { ops: chosen });
+          const r = await window.delphi.flags.approve(f.id, { entryId, ops: chosen });
+          flagUi.delete(f.id);
           await refresh();
           reloadFlags();
           notifyUndo("Approved with your change.", (r && r.auditIds) || []);
         },
-      })));
+      })), { act: "change" }));
   } else if (kind === "review") {
     acts.append(
       button("Ask the Oracle again", "", () => flagAct(async () => {
         const r = await window.delphi.flags.evaluate(f.id, { mode: "oracle" });
         notify(r && r.flag && r.flag.status === "proposed" ? r.flag.proposal_summary || "The Oracle has a proposal." : "Still no clear home. Say where in a reply, or decide it yourself.");
       })),
+      // With no proposal there is no entry to approve against, so the ops
+      // chosen in the picker are the decision: one call applies exactly them
+      // and closes the flag as decided by you, so the change and the flag's
+      // record land together, with Undo.
       button("Decide it myself…", "", () => openItemPicker(item, "move", {
         decide: async (chosen) => {
           const r = await window.delphi.flags.approve(f.id, { ops: chosen });
+          flagUi.delete(f.id);
           await refresh();
           reloadFlags();
-          notifyUndo("Done, and the flag is closed.", (r && r.auditIds) || []);
+          notifyUndo("Done, and the flag is closed as decided by you.", (r && r.auditIds) || []);
         },
       })));
   }
@@ -11824,19 +12022,37 @@ function sweepGroupRow(row) {
   if (row.summary) p.append(el("div", { className: "prop-why", textContent: row.summary }));
   const err = el("div", { className: "err-msg", hidden: true });
   const acts = el("div", { className: "prop-acts" });
-  const all = el("button", { className: "btn ok", type: "button", textContent: "Approve all" });
+  // Each suggestion is approved against the proposal entry this row was
+  // drawn with, so one that changed since is refused (STALE) and left for a
+  // second look rather than applied unseen.
+  const key = `group:${row.title}`;
+  const ui = flagUi.get(key) || {};
+  if (ui.error) { err.hidden = false; err.setAttribute("role", "alert"); err.textContent = ui.error; }
+  const entries = Array.isArray(row.entries) && row.entries.length ? row.entries : row.ids.map((id) => ({ id, entryId: null }));
+  const all = withData(el("button", { className: "btn ok", type: "button", textContent: ui.pending ? "Approving…" : "Approve all" }), { act: "approve-all" });
+  all.disabled = Boolean(ui.pending);
   all.onclick = async () => {
-    all.disabled = true;
+    if ((flagUi.get(key) || {}).pending) return;
+    flagUi.set(key, { pending: true });
+    repaintKeepingFocus();
     const auditIds = [];
     const failed = [];
-    for (const id of row.ids) {
-      try { const r = await window.delphi.flags.approve(id); auditIds.push(...((r && r.auditIds) || [])); }
-      catch (error) { failed.push(`Flag ${id}: ${refusalWords(error)}`); }
+    let stale = 0;
+    for (const { id, entryId } of entries) {
+      try { const r = await window.delphi.flags.approve(id, { entryId }); auditIds.push(...((r && r.auditIds) || [])); }
+      catch (error) {
+        if (error && error.code === "STALE") { stale += 1; flagUi.set(id, { stale: true }); }
+        else failed.push(`Flag ${id}: ${refusalWords(error)}`);
+      }
     }
+    const said = [stale ? `${plural(stale, "suggestion", "suggestions")} changed since you looked and ${stale === 1 ? "was" : "were"} left for another look.` : "", ...failed].filter(Boolean).join(" ");
+    if (said) flagUi.set(key, { error: said }); else flagUi.delete(key);
+    if (stale) openSweeps.add(row.title);
+    flagsSig = "";
     await refresh();
-    reloadFlags();
-    if (failed.length) { err.hidden = false; err.textContent = failed.join(" "); }
-    notifyUndo(`Approved ${plural(row.ids.length - failed.length, "suggestion", "suggestions")}${failed.length ? `; ${failed.length} could not be applied` : ""}.`, auditIds);
+    await reloadFlags();
+    const done = entries.length - failed.length - stale;
+    notifyUndo(`Approved ${plural(done, "suggestion", "suggestions")}${failed.length + stale ? `; ${failed.length + stale} not` : ""}.`, auditIds);
   };
   const opened = openSweeps.has(row.title);
   const review = el("button", { className: "btn", type: "button", textContent: opened ? "Hide them" : "Review each" });

@@ -68,7 +68,7 @@ async function route(name, routeEnv) {
     const listed = (await agent.request("tools/list", {})).tools.map((t) => t.name);
     check("flag_item, propose_move and list_flags are offered", ["flag_item", "propose_move", "list_flags"].every((n) => listed.includes(n)), true);
     check("no approve of any kind is offered", listed.filter((n) => /decide|approve|apply/.test(n) && n !== "sheet_decide"), []);
-    await rejects("flag_decide is refused without the command line", agent.call("flag_decide", { flag_id: 1, decision: "approve" }), /Unknown tool flag_decide/);
+    await rejects("there is no flag_decide tool at all", agent.call("flag_decide", { flag_id: 1, decision: "approve" }), /Unknown tool flag_decide/);
 
     section(`${name}: an agent moving its own new task (D2)`);
     const epic = db.createOrganizer({ projectId: A.id, name: "epic" });
@@ -99,22 +99,15 @@ async function route(name, routeEnv) {
     const bad = await agent.call("propose_move", { entity: "note", id: n.id, ops: [{ op: "move", entity: "note", id: n.id, to: A.id }], reasoning: "x" });
     check("a second proposal on the same item joins its flag, refusal shown", [bad.flag_id, bad.plan[0].ok, /already lives in Alpha/.test(bad.plan[0].refusals[0])], [flagged.flag_id, false, true]);
 
-    section(`${name}: the command line, for a person and for an agent`);
-    const sneaky = await client(`claude-code:${tag}`, { DELPHI_AUTHOR_TYPE: "agent", ...routeEnv }, "delphi-cli");
-    try {
-      await rejects("an agent behind the command line still cannot approve", sneaky.call("flag_decide", { flag_id: flagged.flag_id, decision: "approve" }), /person's decision, and this is an agent/);
-    } finally { sneaky.close(); }
-    const unnamed = await client("claude-code:99", { ...routeEnv }, "delphi-cli");
-    try {
-      await rejects("nor one that left its type out, by its name", unnamed.call("flag_decide", { flag_id: flagged.flag_id, decision: "approve" }), /person's decision/);
-    } finally { unnamed.close(); }
-    const person = await client("ray", { DELPHI_AUTHOR_TYPE: "human", ...routeEnv }, "delphi-cli");
-    try {
-      const approved = await person.call("flag_decide", { flag_id: flagged.flag_id, decision: "approve", ops: [{ op: "move", entity: "note", id: n.id, to: B.id, keepInSource: true }] });
-      check("a person approves, and it applies", [approved.flag.status, one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id], ["applied", B.id]);
-      check("kept in the old project", one("SELECT project_id FROM item_projects WHERE entity = 'note' AND entity_id = ?", n.id).project_id, A.id);
-      check("the History row is the person's", /\(by ray\)$/.test(one("SELECT summary FROM audit WHERE id = ?", approved.audit_ids[0]).summary), true);
-    } finally { person.close(); }
+    section(`${name}: no decision through the server, whoever asks`);
+    for (const [who, env] of [["an agent", { DELPHI_AUTHOR_TYPE: "agent" }], ["a person, by its type", { DELPHI_AUTHOR_TYPE: "human" }]]) {
+      const c = await client(who === "an agent" ? `claude-code:${tag}` : "ray", { ...env, ...routeEnv }, "delphi-cli");
+      try {
+        await rejects(`${who} behind the command line's client name finds no decide tool`, c.call("flag_decide", { flag_id: flagged.flag_id, decision: "approve" }), /Unknown tool flag_decide/);
+      } finally { c.close(); }
+    }
+    check("the flag is still proposed and nothing moved", [one("SELECT status FROM item_flags WHERE id = ?", flagged.flag_id).status,
+      one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id], ["proposed", A.id]);
 
     section(`${name}: what an agent reads includes what is shown from elsewhere`);
     db.items().associate("task", theirs.id, B.id);
@@ -127,8 +120,9 @@ async function route(name, routeEnv) {
     check("list_scratchpads includes it with its home", (pads.find((p) => p.id === pad.id) || {}).home, `a-${tag}`);
     const read = await agent.call("read_scratchpad", { project_id: B.id, key: `shared-${tag}` });
     check("read_scratchpad by key finds the associated pad", read.id, pad.id);
+    db.items().associate("note", n.id, B.id);
     const found = await agent.call("search", { query: "misfiled", detail: "full" });
-    check("search says where else a note is shown", (found.notes.find((x) => x.id === n.id) || {}).also_in, `Alpha ${tag}`);
+    check("search says where else a note is shown", (found.notes.find((x) => x.id === n.id) || {}).also_in, `Beta ${tag}`);
   } finally {
     agent.close();
   }
@@ -151,12 +145,18 @@ function cli() {
   db.items().propose({ flagId: f.id, ops: [{ op: "move", entity: "note", id: n.id, to: Q.id }], reasoning: "it is Q's" });
   const listed = run(["flags", "--project", "cli-p"]);
   check("list shows the flag and its proposal", [listed.code, new RegExp(`#${f.id} proposed .*cli note.*move to CLI Q`).test(listed.out)], [0, true]);
-  const agentTry = run(["flags", "approve", String(f.id)], { DELPHI_AUTHOR_TYPE: "agent" });
-  check("an agent's session is refused before anything starts", [agentTry.code, /a person to decide/.test(agentTry.err), one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id], [1, true, P.id]);
-  const noWhy = run(["flags", "reject", String(f.id)]);
-  check("reject needs a reason", [noWhy.code, /Why it is rejected is missing/.test(noWhy.err)], [1, true]);
-  const ok = run(["flags", "approve", String(f.id), "--note", "yes"]);
-  check("a person approves and it applies", [ok.code, /^Applied: /.test(ok.out), one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id], [0, true, Q.id]);
+  // The command line never decides, for anyone: it cannot tell a person
+  // from an agent that sets DELPHI_ACTOR and DELPHI_AUTHOR_TYPE to look like one.
+  for (const [what, args, env] of [
+    ["approve, as a person", ["flags", "approve", String(f.id), "--note", "yes"], {}],
+    ["reject, as a person", ["flags", "reject", String(f.id), "no"], {}],
+    ["approve, as an agent", ["flags", "approve", String(f.id)], { DELPHI_AUTHOR_TYPE: "agent" }],
+    ["approve with options first", ["flags", "--all", "approve", String(f.id)], {}],
+  ]) {
+    const r = run(args, env);
+    check(`delphi flags ${what}: says where, exits 1`, [r.code, r.err.trim()], [1, "delphi: Approve or reject this in the Delphi window."]);
+  }
+  check("and nothing changed", [one("SELECT status FROM item_flags WHERE id = ?", f.id).status, one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id], ["proposed", P.id]);
   // The review's forge: an agent proposes, then approves through the command
   // line with options before the verb and a person's type claimed or left out.
   const n2 = db.createNote({ projectId: P.id, title: "forged", body: "x" });
@@ -190,7 +190,9 @@ function cli() {
     one("SELECT project_id FROM tasks WHERE id = ?", taskId).project_id], [true, mine.id]);
 
   const shown = run(["flags", "show", String(f.id)]);
-  check("show prints the thread", [shown.code, /decide +ray: Approved: yes/.test(shown.out)], [0, true]);
+  check("show prints the thread and the plan", [shown.code, /note +you: it is Q's/.test(shown.out), /plan: Moves it to CLI Q/.test(shown.out)], [0, true, true]);
+  const help = run(["help", "flags"]);
+  check("the help says decisions are made in the window", /done in the Delphi window only/.test(help.out), true);
 }
 
 async function main() {

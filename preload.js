@@ -115,7 +115,8 @@ contextBridge.exposeInMainWorld("delphi", {
     list: (opts) => call("runs:list", opts),
     get: (id) => call("runs:get", id),
     create: (payload) => call("runs:create", payload),
-    approve: (id) => call("runs:approve", id),
+    // opts: { harnessHash } from the run as shown (run.harness_hash_now).
+    approve: (id, opts) => call("runs:approve", id, opts),
     reject: (id, why) => call("runs:reject", id, why),
     stop: (id) => call("runs:stop", id),
     reply: (id, message) => call("runs:reply", id, message),

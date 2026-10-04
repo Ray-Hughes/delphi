@@ -194,16 +194,38 @@ function statusFor(done, current) {
  * carries the anchor: nothing to cut, and nothing changed.
  */
 function cutBlock(body, taskId) {
-  const lines = String(body == null ? "" : body).split("\n");
-  const entry = parse(body).find((e) => e.taskId === Number(taskId));
+  // A pad saved with Windows line endings is cut the same way and keeps them.
+  const text = String(body == null ? "" : body);
+  const crlf = text.includes("\r\n");
+  const plain = crlf ? text.replace(/\r\n/g, "\n") : text;
+  const lines = plain.split("\n");
+  // A line inside a fenced code block is an example, not the task, even when
+  // it quotes the task's anchor: the real line is the one outside the fences.
+  const fenced = new Set();
+  let open = null;
+  lines.forEach((line, i) => {
+    const m = /^\s*(```|~~~)/.exec(line);
+    if (m && (!open || m[1] === open)) { fenced.add(i); open = open ? null : m[1]; return; }
+    if (open) fenced.add(i);
+  });
+  const entry = parse(plain).find((e) => e.taskId === Number(taskId) && !fenced.has(e.index));
   if (!entry) return null;
-  const width = (line) => (/^(\s*)/.exec(line)[1]).replace(/\t/g, "  ").length;
+  const lead = (line) => /^[ \t]*/.exec(line)[0];
+  const width = (line) => lead(line).replace(/\t/g, "  ").length;
   const rootWidth = width(lines[entry.index]);
+  // By indentation, not by blank lines: a blank line inside the block is
+  // part of it when deeper lines follow, so a grandchild below a gap is not
+  // left behind to be filed under the old parent by the next derivation.
   let end = entry.index + 1;
-  while (end < lines.length && lines[end].trim() && width(lines[end]) > rootWidth) end++;
+  for (let i = end; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    if (width(lines[i]) <= rootWidth) break;
+    end = i + 1;
+  }
   const taken = lines.slice(entry.index, end);
-  const block = taken.map((line) => line.replace(/\t/g, "  ").slice(rootWidth)).join("\n");
-  return { body: [...lines.slice(0, entry.index), ...lines.slice(end)].join("\n"), block };
+  const block = taken.map((line) => (line.trim() ? lead(line).replace(/\t/g, "  ").slice(rootWidth) + line.slice(lead(line).length) : "")).join("\n");
+  const rest = [...lines.slice(0, entry.index), ...lines.slice(end)].join("\n");
+  return { body: crlf ? rest.replace(/\n/g, "\r\n") : rest, block };
 }
 
 /**

@@ -187,12 +187,48 @@ def in_command_position(cmd: str, verb, argv) -> bool:
 
 # A program that can write SQLite, run on Delphi's own database. An agent with
 # a shell could otherwise rewrite the harness table (the command a job runs),
-# approve its own jobs, or rewrite History. A tripwire, not a boundary: the
-# database is a file the agent's user can write. Read only is allowed
-# (sqlite3 -readonly, or a ?mode=ro URI), which is all an agent needs.
-DB_NAMED = r"""(?:delphi\.db\b|\$\{?DELPHI_DB\b|Application[ \\]+Support/Delphi/)"""
+# approve its own jobs, or rewrite History.
+#
+# A tripwire against an agent doing it in passing, not a boundary: the
+# database is a file the agent's user can write, and copying it, editing the
+# copy and copying it back, or a script file that opens it, are out of scope.
+# Only the real database is fenced (the per-user data folder, the folders
+# DELPHI_DB and DELPHI_DATA_DIR name, and $DELPHI_DB written as a variable),
+# so a test's own delphi.db in a temp folder is not. Read only is allowed:
+# sqlite3 with -readonly among its own options, or a file: URI with mode=ro.
+def _data_paths():
+    """Spellings of the real database's folder or file a command could use."""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        folders = [os.path.join(home, "Library", "Application Support", "Delphi")]
+    elif sys.platform.startswith("win"):
+        folders = [os.path.join(os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming"), "Delphi")]
+    else:
+        folders = [os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "Delphi")]
+    if os.environ.get("DELPHI_DATA_DIR"):
+        folders.append(os.environ["DELPHI_DATA_DIR"])
+    files = [os.path.join(f, "delphi.db") for f in folders]
+    if os.environ.get("DELPHI_DB"):
+        files.append(os.environ["DELPHI_DB"])
+    out = set()
+    for f in files:
+        for p in (f, os.path.realpath(f)):
+            out.add(p)
+            if p.startswith(home + os.sep):
+                rest = p[len(home):]
+                out.update(("~" + rest, "$HOME" + rest, "${HOME}" + rest))
+    pieces = []
+    for p in sorted(out, key=len, reverse=True):
+        # A space may be written escaped, and a quote may sit anywhere in it.
+        pieces.append(r"\\? ".join(re.escape(part) for part in p.split(" ")))
+    return pieces
+
+
+DB_NAMED = r"(?:\$\{?DELPHI_DB\b|" + "|".join(_data_paths()) + r")"
+# sqlite3 with -readonly among its own options, before the file argument.
+SQLITE_RO = r"""sqlite3[\"']?(?:\s+-(?!readonly\b)(?:cmd|separator|newline|nullvalue|init|vfs|lookaside|pagecache|heap|maxsize|mmap)\s+\S+|\s+-(?!readonly\b)[\w-]+)*\s+-readonly\b"""
 DB_WRITER = re.compile(
-    r"""[\"']?(?:\S*/)?(?:sqlite3|sqlite-utils|litecli|python[\d.]*|node|ruby|perl|deno|bun)[\"']?(?:\s|$)[^;&|]*?""" + DB_NAMED
+    r"""[\"']?(?:\S*/)?(?:sqlite3(?!""" + SQLITE_RO[len("sqlite3"):] + r""")|sqlite-utils|litecli|python[\d.]*|node|ruby|perl|deno|bun)[\"']?(?:\s|$)[^;&|]*?""" + DB_NAMED
 )
 ARGV_DB_WRITER = re.compile(
     r"""["'](?:\S*/)?(?:sqlite3|python[\d.]*|node)["']\s*,\s*\[?[^\]]*?""" + DB_NAMED
@@ -203,14 +239,14 @@ ARGV_DB_WRITER = re.compile(
 INTERP_DB = re.compile(
     r"""[\"']?(?:\S*/)?(?:python[\d.]*|node|ruby|perl|deno|bun)[\"']?(?:\s+-\S+)*?\s+-[a-zA-Z]*[ce]\s.*""" + DB_NAMED, re.S
 )
-DB_READ_ONLY = re.compile(r"(?:^|\s)-readonly\b|[?&]mode=ro\b")
+# A file: URI that opens the database read only, taken out before matching, so
+# the same script naming it read write elsewhere is still caught.
+RO_URI = re.compile(r"""file:[^\s'"]*[?&]mode=ro\b[^\s'"]*""")
 
 
 def writes_delphi_db(cmd: str) -> bool:
     """Whether this segment runs something that can write SQLite on Delphi's database."""
-    if DB_READ_ONLY.search(cmd):
-        return False
-    return in_command_position(cmd, DB_WRITER, ARGV_DB_WRITER)
+    return in_command_position(RO_URI.sub(" ", cmd), DB_WRITER, ARGV_DB_WRITER)
 
 
 def is_delphi_discard(cmd: str) -> bool:
@@ -306,9 +342,10 @@ def check_segment(cmd: str):
         )
     if is_delphi_flags_decision(c):
         return (
-            "delphi flags approve and reject decide where someone's work lives, and "
-            "that is for a person. Say what you think on the flag instead: flag_item "
-            "adds to it, and propose_move records a proposal."
+            "Approve or reject this in the Delphi window: deciding where someone's "
+            "work lives is for a person, and the command line refuses it anyway. Say "
+            "what you think on the flag instead: flag_item adds to it, and "
+            "propose_move records a proposal."
         )
     if writes_delphi_db(c):
         return (
@@ -351,7 +388,7 @@ def check_bash(command: str):
         )
 
     whole = unmask(norm(command))
-    if not DB_READ_ONLY.search(whole) and in_command_position(whole, INTERP_DB, ARGV_DB_WRITER):
+    if in_command_position(RO_URI.sub(" ", whole), INTERP_DB, ARGV_DB_WRITER):
         return (
             "This opens Delphi's own database with something that can write to it. "
             "Change Delphi through its tools (or delphi on the command line), which "

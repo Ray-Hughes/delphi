@@ -24,10 +24,16 @@ GUARD = os.path.join(HERE, "guard.py")
 REPO = os.path.dirname(HERE)
 
 
+# Where the guard is told the real database is, as an agent Delphi launched
+# would be. A test's own delphi.db anywhere else is not fenced.
+REAL = "/srv/delphi-data"
+ENV = {**os.environ, "DELPHI_DB": REAL + "/delphi.db", "DELPHI_DATA_DIR": REAL}
+
+
 def run(tool, inp):
     p = subprocess.run([sys.executable, GUARD],
                        input=json.dumps({"tool_name": tool, "tool_input": inp}),
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=ENV)
     return p.returncode, (p.stderr.strip().splitlines() or [""])[0]
 
 
@@ -72,6 +78,8 @@ MUST_BLOCK = [
   "echo 42 | unbuffer -p delphi discard 42",
   "D=delphi; $D discard 42", "D=/usr/local/bin/delphi && ${D} discard 42",
   "\\delphi discard 42", "de\"\"lphi discard 42", "delphi dis''card 42",
+  # The command line refuses these for everyone now (they are decided only in
+  # the Delphi window), so this is a courtesy: the agent is told why at once.
   # Approving or rejecting a proposal to move work is a person's call too,
   # fenced the same way, through the same wrappers.
   "delphi flags approve 12", "delphi  flags   reject 12 'no'", "bin/delphi flags approve 12 --note yes",
@@ -85,16 +93,25 @@ MUST_BLOCK = [
   "script -q /dev/null delphi flags approve 12", "timeout 60 delphi flags approve 12",
   "python3 -c 'import subprocess; subprocess.run([\"delphi\", \"flags\", \"approve\", \"12\"])'",
   # Writing Delphi's own database: the harness a job runs, approvals, History.
-  "sqlite3 delphi.db 'DELETE FROM audit WHERE label = \"x\"'",
+  "sqlite3 /srv/delphi-data/delphi.db \"UPDATE harnesses SET command='/tmp/x'\"",
+  "sqlite3 \"$DELPHI_DB\" \"UPDATE handoffs SET approval='approved'\"", "sqlite3 ${DELPHI_DB} .dump",
+  "/usr/bin/sqlite3 /srv/delphi-data/delphi.db 'UPDATE projects SET auto_approve=1'",
+  "env X=1 sqlite3 /srv/delphi-data/delphi.db 'UPDATE tasks SET status=1'",
+  "sh -c 'sqlite3 /srv/delphi-data/delphi.db \"DELETE FROM tasks WHERE id=1\"'",
+  "python3 -c 'import sqlite3; sqlite3.connect(\"/srv/delphi-data/delphi.db\").execute(\"UPDATE harnesses SET command=1\")'",
+  "node -e 'new (require(\"node:sqlite\").DatabaseSync)(process.env.DELPHI_DB)' ${DELPHI_DB}",
+  "python3 -c 'import subprocess; subprocess.run([\"sqlite3\", \"/srv/delphi-data/delphi.db\", \"DELETE FROM tasks\"])'",
+  # -readonly counts only among sqlite3's own options, before the file.
+  "sqlite3 /srv/delphi-data/delphi.db 'DELETE FROM tasks' -readonly",
+  "sqlite3 /srv/delphi-data/delphi.db \"UPDATE tasks SET title='-readonly'\"",
+  "sqlite3 x.db \"ATTACH '/srv/delphi-data/delphi.db' AS d; DELETE FROM d.tasks\"",
+  # A read only URI does not excuse the same script opening it read write.
+  "python3 -c 'import sqlite3; sqlite3.connect(\"file:/srv/delphi-data/delphi.db?mode=ro\", uri=True); sqlite3.connect(\"/srv/delphi-data/delphi.db\").execute(\"DELETE FROM tasks\")'",
+] + ([
+  # The per-user data folder, however it is spelled.
   "sqlite3 ~/Library/Application\\ Support/Delphi/delphi.db \"UPDATE harnesses SET command='/tmp/x'\"",
   "sqlite3 \"$HOME/Library/Application Support/Delphi/delphi.db\" < evil.sql",
-  "sqlite3 \"$DELPHI_DB\" \"UPDATE handoffs SET approval='approved'\"", "sqlite3 ${DELPHI_DB} .dump",
-  "/usr/bin/sqlite3 /Users/me/va/delphi/delphi.db 'UPDATE projects SET auto_approve=1'",
-  "env X=1 sqlite3 delphi.db 'UPDATE tasks SET status=1'", "sh -c 'sqlite3 delphi.db \"DELETE FROM tasks WHERE id=1\"'",
-  "python3 -c 'import sqlite3; sqlite3.connect(\"delphi.db\").execute(\"UPDATE harnesses SET command=1\")'",
-  "node -e 'new (require(\"node:sqlite\").DatabaseSync)(process.env.DELPHI_DB)' ${DELPHI_DB}",
-  "python3 -c 'import subprocess; subprocess.run([\"sqlite3\", \"/x/delphi.db\", \"DELETE FROM tasks\"])'",
-]
+] if sys.platform == "darwin" else [])
 
 MUST_ALLOW = [
   # Compound commands. A flag belonging to one command must not be read as
@@ -107,9 +124,13 @@ MUST_ALLOW = [
   "git push --force-with-lease origin my-branch",
   "git clean -n", "git status", "npm install", "bundle exec rspec",
   "sqlite3 x.db 'DELETE FROM audit WHERE label = \"x\"'",
-  # Delphi's database read only, or only mentioned, is fine.
-  "sqlite3 -readonly delphi.db 'SELECT count(*) FROM tasks'",
-  "python3 -c 'import sqlite3; sqlite3.connect(\"file:delphi.db?mode=ro\", uri=True)'",
+  # Delphi's database read only, or only mentioned, is fine, and so is a
+  # delphi.db that is not the real one (a test's, a copy in a temp folder).
+  "sqlite3 -readonly /srv/delphi-data/delphi.db 'SELECT count(*) FROM tasks'",
+  "sqlite3 -bail -readonly \"$DELPHI_DB\" 'SELECT 1'",
+  "python3 -c 'import sqlite3; sqlite3.connect(\"file:/srv/delphi-data/delphi.db?mode=ro\", uri=True)'",
+  "sqlite3 /tmp/t/delphi.db 'select 1'", "sqlite3 delphi.db 'DELETE FROM audit WHERE label = \"x\"'",
+  "cat /srv/delphi-data/delphi.db-wal | wc -c",
   "git add delphi.db", "ls -la delphi.db", "grep -n delphi.db CLAUDE.md", "git commit -m 'checkpoint delphi.db'",
   "kubectl delete pod mypod", "terraform destroy -target=aws_instance.x",
   "git reset --hard HEAD~1", "curl -sL https://example.com/f.json -o f.json",

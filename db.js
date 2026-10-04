@@ -2434,12 +2434,15 @@ function createHarness({ key, label, command, args, parser = "text", mcpStyle = 
  * as it is now, so trust ends the moment the command changes. Only the window
  * calls this; nothing in the MCP server writes the column.
  */
-function trustHarnessCommand(id, trust) {
+// realPath: the file the command resolved to when the person trusted it,
+// never the bare name, which could resolve somewhere else tomorrow.
+function trustHarnessCommand(id, trust, realPath = null) {
   const row = one("SELECT * FROM harnesses WHERE id = :id", { id });
   if (!row) throw new Error("No such agent");
   if (trust && !row.command) throw new Error(`${row.label} has no command to trust`);
+  if (trust && !(realPath && path.isAbsolute(realPath))) throw new Error(`${row.label}'s command (${row.command}) could not be found, so there is nothing to trust`);
   run("UPDATE harnesses SET trusted_command = :t, updated_at = datetime('now') WHERE id = :id",
-      { id, t: trust ? row.command : null });
+      { id, t: trust ? realPath : null });
   return one("SELECT * FROM harnesses WHERE id = :id", { id });
 }
 

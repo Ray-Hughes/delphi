@@ -175,42 +175,115 @@ function checkArgv(argv, { parser, kind = "ask", unguarded = false, mcpFlags = [
   return null;
 }
 
-// The binary each kind of harness is, and where its real installs resolve to.
-// An npm install's `claude` is a link to .../@anthropic-ai/claude-code/bin/
-// claude.exe, Codex's to codex.js, Copilot's to npm-loader.js, and Claude's own
-// installer keeps versions under .../claude/versions/<n>; so the file a link
-// resolves to is accepted when it has the binary's name or sits in that
-// harness's own package, and the command as configured must be named for it.
+// The binary each kind of harness is, and where a real one is installed.
+//
+// A tripwire against accidents and casual edits (a wrapper typed into
+// Settings, a `claude` script earlier on PATH, a row an agent rewrote), not a
+// boundary against a determined local process, which can write these same
+// folders. The command, followed to the file it really is, must sit under a
+// folder installers put these programs in, inside that harness's own package
+// or named for it, in folders nobody else can write; or be exactly the file a
+// person trusted.
 const BINARY = Object.fromEntries(harness.BUILTINS.filter((b) => b.command).map((b) => [b.parser, b.command]));
-const INSTALLED_IN = {
-  claude: [/[\\/]@anthropic-ai[\\/]claude-code[\\/]/, /[\\/]claude[\\/]versions[\\/]/],
-  codex: [/[\\/]@openai[\\/]codex[\\/]/],
-  copilot: [/[\\/]@github[\\/]copilot[\\/]/],
+const PACKAGE = {
+  claude: `${path.sep}@anthropic-ai${path.sep}claude-code${path.sep}`,
+  codex: `${path.sep}@openai${path.sep}codex${path.sep}`,
+  copilot: `${path.sep}@github${path.sep}copilot${path.sep}`,
 };
 const stem = (file) => path.basename(file).replace(/\.(exe|js|cjs|mjs|cmd)$/i, "").toLowerCase();
+const realOf = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+
+let npmRootCache;
+/** `npm root -g`, once: where npm's global installs land for the node in use (asdf, nvm, volta or system). */
+function npmRoot({ which = harness.which } = {}) {
+  if (npmRootCache !== undefined) return npmRootCache;
+  npmRootCache = null;
+  try {
+    const npm = launch.resolveBinary("npm") || which("npm");
+    if (npm) {
+      const out = require("child_process").execFileSync(npm, ["root", "-g"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] });
+      const line = String(out).split("\n").map((l) => l.trim()).filter((l) => path.isAbsolute(l)).pop();
+      if (line) npmRootCache = realOf(line) || line;
+    }
+  } catch {}
+  return npmRootCache;
+}
 
 /**
- * The absolute path a job may spawn for this harness row, or { error }. The
- * row's command is whatever Settings (or anything that wrote the database)
- * says, and a wrapper script there could add any flag it liked after every
- * check here. So it must be the harness's own binary, unless a person marked
- * this exact command as trusted.
+ * The folders a real install lives under, each with whether anything under it
+ * counts (a folder only that harness uses) or only that harness's package or
+ * a file named for it.
  */
-function jobCommand(row, { resolveBinary = launch.resolveBinary, which = harness.which } = {}) {
+function installRoots({ home = require("os").homedir(), npm = npmRoot() } = {}) {
+  const roots = [
+    { dir: path.join(home, ".local", "share", "claude", "versions"), only: "claude" },
+    { dir: path.join(home, ".claude", "local"), only: "claude" },
+    { dir: "/opt/homebrew" }, { dir: "/usr/local/Cellar" }, { dir: "/usr/local/lib/node_modules" },
+  ];
+  if (npm) roots.push({ dir: npm });
+  return roots.map((r) => ({ ...r, dir: realOf(r.dir) || r.dir }));
+}
+
+const inside = (root, file) => {
+  const rel = path.relative(root, file);
+  return rel && !rel.startsWith("..") && !path.isAbsolute(rel);
+};
+
+/**
+ * Why a file, or a folder above it, could be swapped by somebody else, or
+ * null. A folder anyone can write is refused unless it is sticky (as /tmp is),
+ * where others cannot replace what is in it; a file or folder owned by anyone
+ * but this user or root is refused. Not on Windows, which has no such bits.
+ */
+function swappable(file) {
+  if (typeof process.getuid !== "function") return null;
+  const uid = process.getuid();
+  let at = file;
+  for (;;) {
+    let st;
+    try { st = fs.statSync(at); } catch { return `${at} cannot be read`; }
+    if (st.uid !== uid && st.uid !== 0) return `${at} belongs to another user`;
+    if (st.isDirectory() && (st.mode & 0o002) && !(st.mode & 0o1000)) return `${at} can be written by anyone`;
+    if (at !== file && st.isFile()) return `${at} is not a folder`;
+    if (!st.isDirectory() && (st.mode & 0o002)) return `${at} can be written by anyone`;
+    const up = path.dirname(at);
+    if (up === at) return null;
+    at = up;
+  }
+}
+
+/** The command as the job would find it, followed to the real file, or null. */
+function resolveCommand(command, { resolveBinary = launch.resolveBinary, which = harness.which } = {}) {
+  const configured = String(command || "");
+  if (!configured) return null;
+  const found = path.isAbsolute(configured) ? (fs.existsSync(configured) ? configured : null) : (resolveBinary(configured) || which(configured));
+  if (!found) return null;
+  return { found, real: realOf(found) || found };
+}
+
+/**
+ * The absolute path a job may spawn for this harness row, or { error }.
+ * row.trusted_command, when set, is the real path a person trusted; a row
+ * whose command now resolves anywhere else is not trusted.
+ */
+function jobCommand(row, { resolveBinary = launch.resolveBinary, which = harness.which, roots = null } = {}) {
   const configured = String(row.command || "");
   const binary = BINARY[row.parser];
-  if (!configured) return { error: `${row.label} has no command set in Settings` };
-  const found = path.isAbsolute(configured) ? (fs.existsSync(configured) ? configured : null) : (resolveBinary(configured) || which(configured));
-  if (!found) return { error: `${row.label} is not installed, or is not on the PATH a login shell sees (looked for ${configured})` };
-  if (row.trusted_command && row.trusted_command === configured) return { path: found };
-  let real = found;
-  try { real = fs.realpathSync(found); } catch {}
-  const named = binary && stem(found) === binary;
-  const lands = binary && (stem(real) === binary || (INSTALLED_IN[binary] || []).some((r) => r.test(real)));
-  if (named && lands) return { path: found };
+  const label = row.label || "This agent";
+  if (!configured) return { error: `${label} has no command set in Settings` };
+  const resolved = resolveCommand(configured, { resolveBinary, which });
+  if (!resolved) return { error: `${label} is not installed, or is not on the PATH a login shell sees (looked for ${configured})` };
+  const { found, real } = resolved;
+  const unsafe = swappable(real) || (found !== real ? swappable(path.dirname(found)) : null);
+  if (unsafe) return { error: `${label}'s command (${found}) could be changed by someone else: ${unsafe}` };
+  if (row.trusted_command && row.trusted_command === real) return { path: found };
+  const list = roots || installRoots();
+  const ok = binary && list.some((r) => inside(r.dir, real) && (
+    r.only ? r.only === binary : (real.includes(PACKAGE[binary] || "\0") || stem(real) === binary)));
+  if (ok) return { path: found };
   return {
-    error: `${row.label}'s command (${configured}) is not the ${binary || "agent's own"} program, so Delphi cannot know what flags it adds. ` +
-      `If you trust it, mark its command as trusted in Settings, under Agents; otherwise point it at ${binary || "the agent"} itself`,
+    error: `${label}'s command (${configured}, which is ${real}) is not ${binary || "the agent"} as an installer put it, so Delphi cannot know what flags it adds. ` +
+      `If you trust it, click "Trust this command" under Settings, Agents, ${label}; otherwise point it at ${binary || "the agent"} itself`,
   };
 }
 
@@ -334,10 +407,21 @@ function createDispatcher({
     return run;
   }
 
-  function approve(id, { by = "you" } = {}) {
-    // What the harness row is now is what the person approved it to run as.
+  /**
+   * harnessHash: the harness row as the person saw it (a run's
+   * harness_hash_now). Approval is of what they saw, so a row changed since is
+   * refused rather than approved at the click. requireHash is the window's
+   * route, where showing it is the point.
+   */
+  function approve(id, { by = "you", harnessHash = null, requireHash = false } = {}) {
     const current = jobs.get(sql, id);
     const hash = current ? jobs.harnessHash(sql, current.harness) : null;
+    if (current && requireHash && !harnessHash) {
+      throw new Error(`Approving job ${id} needs the agent's settings as you saw them (harnessHash). Look at it again, then approve.`);
+    }
+    if (current && harnessHash && harnessHash !== hash) {
+      throw new Error(`${current.harness_label}'s settings changed after you looked at job ${id}, so it was not approved. Look at it again, then approve.`);
+    }
     const run = jobs.update(sql, id, { state: "queued", approval: "approved", approved_by: by, approved_at: stamp(), harness_hash: hash }, { from: "needs_approval" });
     if (!run) throw notIn(id, "waiting for approval");
     audit(run.id, "approved", run.request, by);
@@ -502,8 +586,15 @@ function createDispatcher({
     return resumed.map((r) => r.id);
   }
 
-  const get = (id) => jobs.get(sql, id);
-  const list = (opts = {}) => jobs.list(sql, opts);
+  // Each run carries its harness row's hash as it is now, for the window to
+  // hand back when a person approves what it showed them.
+  const withHash = (runs) => {
+    const seen = new Map();
+    const now = (key) => { if (!seen.has(key)) seen.set(key, jobs.harnessHash(sql, key)); return seen.get(key); };
+    return runs.map((r) => (r ? { ...r, harness_hash_now: now(r.harness) } : r));
+  };
+  const get = (id) => withHash([jobs.get(sql, id)])[0];
+  const list = (opts = {}) => withHash(jobs.list(sql, opts));
 
   // ---------------------------------------------------------------------------
   // Recovery and shutdown
@@ -986,4 +1077,4 @@ function createDispatcher({
   };
 }
 
-module.exports = { createDispatcher, checkArgv, jobCommand, POLICY, storeClient, ADAPTER_BY_PARSER, DEFAULTS, BOUNDS };
+module.exports = { createDispatcher, checkArgv, jobCommand, resolveCommand, installRoots, POLICY, storeClient, ADAPTER_BY_PARSER, DEFAULTS, BOUNDS };

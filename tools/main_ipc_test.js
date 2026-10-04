@@ -338,8 +338,15 @@ async function main() {
   check("flags-changed went to the window", sent.slice(sentBefore).some(([c, p]) => c === "flags-changed" && p.flagId === flagged.flag.id), true);
   const needs = await call("flags:list", { needsYou: true });
   check("Needs you rows", needs.some((r) => r.source === "flag" && r.id === flagged.flag.id && r.kind === "decision"), true);
-  const approved = await call("flags:approve", flagged.flag.id, { note: "yes" });
+  const noEntry = await handlers.get("flags:approve")({}, flagged.flag.id, { note: "yes" });
+  check("approve without the entry the person saw is refused", [noEntry.ok, /needs the proposal you looked at/.test(noEntry.error)], [false, true]);
+  const approved = await call("flags:approve", flagged.flag.id, { note: "yes", entryId: flagged.flag.proposal_entry_id });
   check("approve applies", [approved.flag.status, db.handle().prepare("SELECT project_id FROM tasks WHERE id = ?").get(parent.id).project_id], ["applied", there.id]);
+  const selfDecided = db.createNote({ projectId: here.id, title: "decide it myself", body: "x" });
+  const openFlag = await call("items:flag", { entity: "note", id: selfDecided.id, note: "?", evaluate: "none" });
+  const mine = await call("flags:approve", openFlag.flag.id, { ops: [{ op: "move", entity: "note", id: selfDecided.id, to: there.id }], note: "mine" });
+  check("flags:approve with the person's own ops and no entryId applies them", [mine.flag.status,
+    db.handle().prepare("SELECT project_id FROM notes WHERE id = ?").get(selfDecided.id).project_id], ["applied", there.id]);
   const swept = await call("flags:sweep", {});
   check("sweep answers in its shape", [Array.isArray(swept.created), typeof swept.skipped], [true, "number"]);
 

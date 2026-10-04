@@ -35,6 +35,9 @@ function check(what, got, want) {
   }
 }
 function section(name) { console.log(`\n${name}`); }
+// A decision as the window makes it: via the window, naming the proposal the
+// person was shown. Only main.js passes via "window" in the app itself.
+const W = (store, id, opts) => store.decide(id, { via: "window", entryId: store.getFlag(id).flag.proposal_entry_id, ...opts });
 
 const brain = db.createProject({ key: "brain", name: "Second Brain app", summary: "The tracker itself" });
 const offer = db.createProject({ key: "offerworks", name: "Offerworks", summary: "Offer letters" });
@@ -72,11 +75,33 @@ const op = flagged.flag.proposal && flagged.flag.proposal.ops[0];
 check("move to the tracker's project, kept in Offerworks", op && { op: op.op, to: op.to, keep: Boolean(op.options && op.options.keepInSource) }, { op: "move", to: brain.id, keep: true });
 console.log("   ", flagged.flag.proposal_summary, "\n   ", flagged.flag.proposal.reasoning);
 check("by the Oracle", [flagged.flag.proposal.evaluator, flagged.flag.proposed_by], ["oracle@1", "oracle"]);
-check("the reasoning names its neighbours and the scores", /Its nearest are note \d+ .* Second Brain app scores [\d.]+ against [\d.]+ for Offerworks\. The flag says it spans Offerworks/.test(flagged.flag.proposal.reasoning), true);
+check("the reasoning quotes the words it kept it for, then its neighbours and the scores", /^You wrote "spans to Offerworks", so it stays shown in Offerworks\. Its nearest are note \d+ .* Second Brain app scores [\d.]+ against [\d.]+ for Offerworks\./.test(flagged.flag.proposal.reasoning), true);
 check("the fallback project never voted", (flagged.flag.proposal.signals.knn || []).some(([pid]) => pid === claude.id), false);
 check("nothing moved", db.handle().prepare("SELECT project_id FROM notes WHERE id = ?").get(misfiled.id).project_id, offer.id);
 const thread = items.getFlag(flagged.flag.id);
 check("the evaluation is a note entry carrying the proposal", thread.entries.some((e) => e.kind === "note" && e.meta && e.meta.proposal), true);
+
+section("the person's words come first: the mockup's flag text");
+const secondCopy = db.createNote({ projectId: offer.id, title: "Delphi split-brain, the second copy",
+  body: "The app and the MCP server read different sqlite database files, so the tracker showed nothing an agent wrote." });
+const mock = items.flag({ entity: "note", id: secondCopy.id, note: "This is about Delphi's own database. Keep it visible in Offerworks too." }).flag;
+const mockOp = mock.proposal && mock.proposal.ops[0];
+check("move to the tracker's project, kept visible in Offerworks", mockOp && [mockOp.op, mockOp.to, Boolean(mockOp.options && mockOp.options.keepInSource)], ["move", brain.id, true]);
+check("citing the phrase it acted on", /You wrote "Keep it visible in Offerworks too", so it stays shown in Offerworks\./.test(mock.proposal.reasoning), true);
+const told = (words) => {
+  const n = db.createNote({ projectId: offer.id, title: `told ${words}`, body: "q" });
+  const f = items.flag({ entity: "note", id: n.id, note: words }).flag;
+  return { f, ops: f.proposal && f.proposal.ops.map((o) => [o.op, o.to, Boolean(o.options && o.options.keepInSource)]) };
+};
+const both = told("Move it to Beta and keep it visible in Offerworks too");
+check("an explicit move plus keep", both.ops, [["move", beta.id, true]]);
+check("quoting both instructions", /You wrote "Move it to Beta", so it moves to Beta\. You wrote "keep it visible in Offerworks too"/.test(both.f.proposal.reasoning), true);
+check("move here and also show it elsewhere is a move plus an association",
+  told("Move it to Beta, and also show it in SSNR / MPI").ops, [["move", beta.id, false], ["associate", ssnr.id, false]]);
+check("copy, not move, when it says copy", told("Copy it to Beta").ops, [["copy", beta.id, false]]);
+check("in both, with a target, keeps the home", told("It belongs in Beta, in both places really").ops, [["move", beta.id, true]]);
+const tracker = db.createProject({ key: "delphi-tracker", name: "Delphi tracker" });
+check("a name that resolves to exactly one project is used", told("This belongs with Delphi").ops, [["move", tracker.id, false]]);
 
 section("named intent");
 const t1 = db.createNote({ projectId: offer.id, title: "n1", body: "x" });
@@ -94,7 +119,31 @@ db.createProject({ key: "delphi-queue", name: "Delphi: the agent queue" });
 const t4 = db.createNote({ projectId: offer.id, title: "unrelated thing", body: "quarterly gardening rota" });
 const amb = items.flag({ entity: "note", id: t4.id, note: "This belongs in Delphi" }).flag;
 check("an ambiguous name is not guessed", [amb.status, (items.getFlag(amb.id).entries.find((e) => e.meta && e.meta.signals) || { meta: { signals: {} } }).meta.signals.ambiguous.map((a) => a.word)], ["open", ["delphi"]]);
-check("and the reasoning says so", /"delphi" names more than one project/.test(items.getFlag(amb.id).entries.slice(-1)[0].body), true);
+const lastEntry = items.getFlag(amb.id).entries.slice(-1)[0];
+check("it asks which one, naming all three, instead of guessing", [lastEntry.kind, /"delphi" could be Delphi tracker \(\d+\), Delphi: the task system \(\d+\) or Delphi: the agent queue \(\d+\)\. Which one\?/.test(lastEntry.body)], ["ask", true]);
+check("so it shows in Needs you as a question", items.needsYou().some((r) => r.id === amb.id && r.kind === "question"), true);
+check("the Oracle's question is the Oracle's, not the person's", [lastEntry.author, lastEntry.author_type], ["oracle", "tool"]);
+const systemId = db.handle().prepare("SELECT id FROM projects WHERE key = 'delphi-tasks'").get().id;
+const answered = items.reply(amb.id, `Delphi: the task system (${systemId})`);
+const afterAnswer = items.getFlag(amb.id);
+check("a reply naming one, as the window's choice does, settles it and proposes it",
+  [answered.kind, afterAnswer.flag.status, afterAnswer.flag.proposal && afterAnswer.flag.proposal.ops[0].to], ["say", "proposed", systemId]);
+check("the question is not asked again", afterAnswer.entries.filter((e) => e.kind === "ask").length, 1);
+check("and the proposal is the Oracle's too", [afterAnswer.entries.slice(-1)[0].author, afterAnswer.entries.slice(-1)[0].author_type], ["oracle", "tool"]);
+for (const [what, reply] of [["by key", "delphi-queue"], ["by #id", `#${db.handle().prepare("SELECT id FROM projects WHERE key = 'delphi-queue'").get().id}`]]) {
+  const n = db.createNote({ projectId: offer.id, title: `answer ${what}`, body: "q" });
+  const f = items.flag({ entity: "note", id: n.id, note: "This belongs with Delphi" }).flag;
+  items.reply(f.id, reply);
+  const got = items.getFlag(f.id);
+  check(`an answer ${what} settles it`, [got.flag.proposal && got.flag.proposal.ops[0].to, got.entries.filter((e) => e.kind === "ask").length],
+    [db.handle().prepare("SELECT id FROM projects WHERE key = 'delphi-queue'").get().id, 1]);
+}
+const vague = db.createNote({ projectId: offer.id, title: "vague answer", body: "q" });
+const vf = items.flag({ entity: "note", id: vague.id, note: "This belongs with Delphi" }).flag;
+items.reply(vf.id, "not sure, you pick");
+const vgot = items.getFlag(vf.id);
+check("a reply that names none is told so once, not asked again", [vgot.entries.filter((e) => e.kind === "ask").length,
+  /did not name one of/.test(vgot.entries.slice(-1)[0].body), vgot.entries.slice(-1)[0].author], [1, true, "oracle"]);
 
 section("an agent evaluator is off, and its prompt fits");
 let refused = "";
@@ -114,7 +163,7 @@ check("it applied nothing", db.handle().prepare("SELECT id, project_id FROM note
 const again = items.sweep({ projectId: claude.id });
 check("a second sweep skips what is already flagged", again.created.length, 0);
 const rejectedFlag = swept.created.find((f) => f.entity_id === vaInClaude.id);
-if (rejectedFlag.status === "proposed") items.decide(rejectedFlag.id, { approve: false, note: "it is fine there" });
+if (rejectedFlag.status === "proposed") W(items, rejectedFlag.id, { approve: false, note: "it is fine there" });
 else items.withdraw(rejectedFlag.id);
 check("a rejected suggestion stays dismissed", items.sweep({ projectId: claude.id }).created.some((f) => f.entity_id === vaInClaude.id), rejectedFlag.status !== "proposed");
 

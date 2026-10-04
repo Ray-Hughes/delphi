@@ -392,7 +392,9 @@ move a task you filed yourself in the last 24 hours, with `update_task` and a ne
 Any other move is refused with the sentence that says so. For those, `flag_item`
 with a note saying where it belongs and why, or `propose_move` with the exact
 operations. Both are records for a person to approve in the app; nothing an agent
-calls applies one, and there is no tool that approves a flag. `list_flags` shows
+calls applies one, and there is no tool that approves a flag. Approving or
+rejecting one happens only in the Delphi window: `delphi flags approve` and `reject`
+refuse, whatever DELPHI_ACTOR or DELPHI_AUTHOR_TYPE say. `list_flags` shows
 what is already flagged, so check it before flagging the same thing twice.
 
 ## Delegation

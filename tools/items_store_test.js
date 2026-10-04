@@ -53,6 +53,9 @@ function throws(what, fn, pattern) {
   return null;
 }
 function section(name) { console.log(`\n${name}`); }
+// A decision as the window makes it: via the window, naming the proposal the
+// person was shown. Only main.js passes via "window" in the app itself.
+const W = (store, id, opts) => store.decide(id, { via: "window", entryId: store.getFlag(id).flag.proposal_entry_id, ...opts });
 
 // --- the sqlite3 route, as agent/mcp_server.js does it -------------------------------
 
@@ -285,15 +288,15 @@ function scenario(name, { sql, batch }) {
   check("a second flag joins the first", [f2.flag.id, f2.appended, f2.flag.entries], [f1.flag.id, true, 2]);
   const proposed = items.propose({ flagId: f1.flag.id, ops: [{ op: "move", entity: "note", id: note.id, to: C.id, keepInSource: true }], reasoning: "it is Gamma's", confidence: 0.7, by: "claude-code:1", evaluator: "claude-code:1" });
   check("a proposal is recorded with its plan, not applied", [proposed.flag.status, proposed.plan[0].ok, one("SELECT project_id FROM notes WHERE id = ?", note.id).project_id], ["proposed", true, B.id]);
-  throws("an agent cannot approve", () => items.decide(f1.flag.id, { approve: true, by: "claude-code:1", byType: "agent" }), /a person's decision, and this is an agent/);
-  throws("a rejection says why", () => items.decide(f1.flag.id, { approve: false }), /Say why when rejecting/);
-  const applied = items.decide(f1.flag.id, { approve: true, note: "yes" });
+  throws("an agent cannot approve", () => W(items, f1.flag.id, { approve: true, by: "claude-code:1", byType: "agent" }), /a person's decision, and this is an agent/);
+  throws("a rejection says why", () => W(items, f1.flag.id, { approve: false }), /Say why when rejecting/);
+  const applied = W(items, f1.flag.id, { approve: true, note: "yes" });
   check("approval applies it and the flag says so", [applied.flag.status, applied.flag.decided_by, one("SELECT project_id FROM notes WHERE id = ?", note.id).project_id, applied.flag.applied_audit_id === applied.auditIds[0]],
     ["applied", "ray", C.id, true]);
   check("its History row credits the proposer", /proposed by claude-code:1 \(by ray\)$/.test(one("SELECT summary FROM audit WHERE id = ?", applied.auditIds[0]).summary), true);
   items.undo(one("SELECT * FROM audit WHERE id = ?", applied.auditIds[0]));
   check("undoing an applied flag returns it to proposed", [items.getFlag(f1.flag.id).flag.status, one("SELECT project_id FROM notes WHERE id = ?", note.id).project_id], ["proposed", B.id]);
-  const rejected = items.decide(f1.flag.id, { approve: false, note: "no, it is fine" });
+  const rejected = W(items, f1.flag.id, { approve: false, note: "no, it is fine" });
   check("rejected", rejected.flag.status, "rejected");
   const doomed = db.createNote({ projectId: A.id, title: "doomed", body: "x" });
   const fd = items.flag({ entity: "note", id: doomed.id, note: "?", evaluate: "none" });
@@ -303,7 +306,7 @@ function scenario(name, { sql, batch }) {
   db.handle().prepare("UPDATE tasks SET claimed_by = 'codex', claim_expires = datetime('now', '+30 minutes') WHERE id = ?").run(held.id);
   const bad = items.propose({ flagId: impossible.flag.id, ops: [{ op: "move", entity: "task", id: held.id, to: B.id }], reasoning: "x" });
   check("an impossible proposal is recorded and shown as impossible", [bad.flag.status, bad.plan[0].ok], ["proposed", false]);
-  throws("approving it refuses", () => items.decide(impossible.flag.id, { approve: true }), /held by codex/);
+  throws("approving it refuses", () => W(items, impossible.flag.id, { approve: true }), /held by codex/);
   check("and the flag is failed, not applied", items.getFlag(impossible.flag.id).flag.status, "failed");
   db.handle().prepare("UPDATE tasks SET claimed_by = NULL, claim_expires = NULL WHERE id = ?").run(held.id);
   const needs = items.needsYou({ projectId: A.id });
@@ -378,14 +381,14 @@ function reviewed() {
   const n = db.createNote({ projectId: P.id, title: "rv note", body: "x" });
   const proposed = agent.propose({ entity: "note", id: n.id, ops: [{ op: "move", entity: "note", id: n.id, to: Q.id }], reasoning: "mine", by: "claude:1" });
   const sameName = makeItemStore({ sql: db.sqlP, batch: db.batchP, actor: "claude:1", authorType: "human" });
-  throws("the proposer claiming to be a person cannot approve it", () => sameName.decide(proposed.flag.id, { approve: true }), /claude:1 proposed this, so claude:1 cannot also decide it/);
+  throws("the proposer claiming to be a person cannot approve it", () => W(sameName, proposed.flag.id, { approve: true }), /claude:1 proposed this, so claude:1 cannot also decide it/);
   const untyped = makeItemStore({ sql: db.sqlP, batch: db.batchP, actor: "someone" });
-  throws("a writer with no type is not a person", () => untyped.decide(proposed.flag.id, { approve: true }), /has not said it is a person/);
+  throws("a writer with no type is not a person", () => W(untyped, proposed.flag.id, { approve: true }), /has not said it is a person/);
   check("nothing moved", one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id, P.id);
   const flaggedByAgent = agent.flag({ entity: "note", id: db.createNote({ projectId: P.id, title: "rv2", body: "y" }).id, note: "x", evaluate: "none" }).flag;
   db.items().propose({ flagId: flaggedByAgent.id, ops: [{ op: "move", entity: "note", id: flaggedByAgent.entity_id, to: Q.id }], reasoning: "x", by: "oracle" });
-  throws("nor the agent that raised the flag, under its own name", () => sameName.decide(flaggedByAgent.id, { approve: true }), /raised this flag as an agent/);
-  check("a person approves it", db.items().decide(flaggedByAgent.id, { approve: true }).flag.status, "applied");
+  throws("nor the agent that raised the flag, under its own name", () => W(sameName, flaggedByAgent.id, { approve: true }), /raised this flag as an agent/);
+  check("a person approves it", W(db.items(), flaggedByAgent.id, { approve: true }).flag.status, "applied");
 
   section("review: a flag does not block undo");
   const renamed = db.createNote({ projectId: P.id, title: "before", body: "z" });
@@ -413,7 +416,7 @@ function reviewed() {
   const n3 = db.createNote({ projectId: P.id, title: "rv3", body: "w" });
   const f3 = db.items().flag({ entity: "note", id: n3.id, note: "x", evaluate: "none" }).flag;
   agent.propose({ flagId: f3.id, ops: [{ op: "move", entity: "note", id: n3.id, to: Q.id }], reasoning: "x", by: "claude:1" });
-  const applied = db.items().decide(f3.id, { approve: true });
+  const applied = W(db.items(), f3.id, { approve: true });
   const f4 = agent.flag({ entity: "note", id: n3.id, note: "again", evaluate: "none" }).flag;
   db.undo(applied.auditIds[0]);
   check("the undo works, the old flag stays applied, the new one stays live", [one("SELECT project_id FROM notes WHERE id = ?", n3.id).project_id,
@@ -439,9 +442,92 @@ function reviewed() {
     .map((r) => [r.entity_id, r.project_id]).sort(), [[dn.id, Q.id], [elsewhere.id, D.id]].sort());
 }
 
+// Regressions from the r4 review.
+function reviewedAgain() {
+  const P = db.createProject({ key: "r4-p", name: "R4 P" });
+  const Q = db.createProject({ key: "r4-q", name: "R4 Q" });
+  const agent = makeItemStore({ sql: db.sqlP, batch: db.batchP, actor: "claude:4", authorType: "agent" });
+
+  section("r4: a decision is the window's, about the proposal it showed");
+  const n = db.createNote({ projectId: P.id, title: "r4 note", body: "x" });
+  const first = agent.propose({ entity: "note", id: n.id, ops: [{ op: "move", entity: "note", id: n.id, to: Q.id }], reasoning: "first", by: "claude:4" });
+  throws("without via window, even a person is told where to go", () => db.items().decide(first.flag.id, { approve: true, entryId: first.flag.proposal_entry_id }), /^Approve or reject this in the Delphi window\.$/);
+  throws("an Approve that names no proposal is refused", () => db.items().decide(first.flag.id, { approve: true, via: "window" }), /needs the proposal you looked at/);
+  const seen = first.flag.proposal_entry_id;
+  agent.propose({ flagId: first.flag.id, ops: [{ op: "associate", entity: "note", id: n.id, to: Q.id }], reasoning: "second", by: "claude:4" });
+  const stale = throws("the proposal changed since the person looked", () => db.items().decide(first.flag.id, { approve: true, via: "window", entryId: seen }), /changed since you looked/);
+  check("with code STALE", stale && stale.code, "STALE");
+  check("nothing moved", one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id, P.id);
+  const latest = db.items().getFlag(first.flag.id).flag.proposal_entry_id;
+  check("approving the latest, by its entry, applies the latest", [W(db.items(), first.flag.id, { approve: true }).flag.status, latest !== seen,
+    one("SELECT COUNT(*) AS n FROM item_projects WHERE entity = 'note' AND entity_id = ?", n.id).n], ["applied", true, 1]);
+
+  section("a person decides a flag with no proposal, in the window, with their own ops");
+  const bare = db.createNote({ projectId: P.id, title: "no proposal", body: "q" });
+  const open = agent.flag({ entity: "note", id: bare.id, note: "somewhere else?", evaluate: "none" }).flag;
+  throws("with neither an entry nor ops there is nothing to apply", () => db.items().decide(open.id, { approve: true, via: "window" }), /or your own ops/);
+  throws("and never outside the window", () => db.items().decide(open.id, { approve: true, ops: [{ op: "move", entity: "note", id: bare.id, to: Q.id }] }), /in the Delphi window/);
+  const own = db.items().decide(open.id, { approve: true, via: "window", ops: [{ op: "move", entity: "note", id: bare.id, to: Q.id, keepInSource: true }], note: "mine" });
+  check("exactly those ops are applied", [own.flag.status, one("SELECT project_id FROM notes WHERE id = ?", bare.id).project_id,
+    one("SELECT project_id FROM item_projects WHERE entity = 'note' AND entity_id = ?", bare.id).project_id], ["applied", Q.id, P.id]);
+  check("recorded as the person's own decision", /^Decided by you: move to R4 Q, keep in R4 P\. mine$/.test(db.items().getFlag(open.id).entries.slice(-1)[0].body), true);
+  check("and History does not credit a proposer", /proposed by/.test(one("SELECT summary FROM audit WHERE id = ?", own.auditIds[0]).summary), false);
+
+  section("r4: evidence that names no real id is dropped and said");
+  const m = db.createNote({ projectId: P.id, title: "r4 evidence", body: "y" });
+  const f = agent.flag({ entity: "note", id: m.id, note: "see these", evidence: [{ type: "task", id: 0 }, { type: "task", id: "99999999999999999999" }, { type: "url", value: "https://example.invalid" }], evaluate: "none" }).flag;
+  check("the flag is made, with the good chip", [f.status, f.evidence.map((c) => c.type)], ["open", ["url"]]);
+  check("and its first entry says what was left out", /Evidence left out, not a real id: task #0, task #99999999999999999999/.test(db.items().getFlag(f.id).entries[0].body), true);
+
+  section("r4: a detach takes the whole block, gaps, tabs and fences included");
+  const gap = db.createScratchpad({ projectId: P.id, title: "gap", key: "r4-gap", body: "- [ ] pb\n  - [ ] cb\n\n    - [ ] gb\n- [ ] tailb\n" });
+  const [pb, cb, gb] = q("SELECT id FROM tasks WHERE pad_id = ? ORDER BY id", gap.id).map((r) => r.id);
+  check("the grandchild below the gap is the child's", one("SELECT parent_id FROM tasks WHERE id = ?", gb).parent_id, cb);
+  db.items().move("task", cb, Q.id, { detach: true });
+  db.derive(gap.id);
+  db.derive(gap.id);
+  check("after derives the child is detached and the grandchild still under it, in the new project",
+    [one("SELECT parent_id, project_id FROM tasks WHERE id = ?", cb), one("SELECT parent_id, project_id FROM tasks WHERE id = ?", gb)],
+    [{ parent_id: null, project_id: Q.id }, { parent_id: cb, project_id: Q.id }]);
+  check("and the old parent kept nothing", one("SELECT COUNT(*) AS n FROM tasks WHERE parent_id = ?", pb).n, 0);
+  const fz = db.createScratchpad({ projectId: P.id, title: "fz", key: "r4-fz", body: "- [ ] pz\n  - [ ] cz\n" });
+  const cz = q("SELECT id FROM tasks WHERE pad_id = ? ORDER BY id", fz.id)[1].id;
+  const withFence = "Example:\n```\n    - [ ] cz <!--d:" + cz + "-->\n```\n" + one("SELECT body FROM scratchpads WHERE id = ?", fz.id).body;
+  db.handle().prepare("UPDATE scratchpads SET body = ? WHERE id = ?").run(withFence, fz.id);
+  db.items().move("task", cz, Q.id, { detach: true });
+  const fzBody = one("SELECT body FROM scratchpads WHERE id = ?", fz.id).body;
+  check("the fenced copy is left alone and the real line is outdented", [fzBody.includes("```\n    - [ ] cz <!--d:" + cz + "-->\n```"), new RegExp("^- \\[ \\] cz <!--d:" + cz + "-->", "m").test(fzBody)], [true, true]);
+
+  section("r4: a pad edited while a move cuts from it");
+  const race = db.createScratchpad({ projectId: P.id, title: "race", key: "r4-race", body: "- [ ] pr\n  - [ ] cr\n" });
+  const cr = q("SELECT id FROM tasks WHERE pad_id = ? ORDER BY id", race.id)[1].id;
+  let edits = 0;
+  const racing = makeItemStore({
+    sql: db.sqlP, actor: "ray", authorType: "human",
+    // Someone writes the pad between the read and the first batch.
+    batch: (statements) => {
+      if (edits++ === 0) db.handle().prepare("UPDATE scratchpads SET body = body || ? WHERE id = ?").run("\nwritten meanwhile\n", race.id);
+      return db.batchP(statements);
+    },
+  });
+  racing.move("task", cr, Q.id, { detach: true });
+  const raced = one("SELECT body FROM scratchpads WHERE id = ?", race.id).body;
+  check("the move read the pad again and kept the other edit", [raced.includes("written meanwhile"), new RegExp("^- \\[ \\] cr <!--d:" + cr + "-->", "m").test(raced), edits], [true, true, 2]);
+  let always = 0;
+  const race2 = db.createScratchpad({ projectId: P.id, title: "race2", key: "r4-race2", body: "- [ ] pq\n  - [ ] cq\n" });
+  const cq = q("SELECT id FROM tasks WHERE pad_id = ? ORDER BY id", race2.id)[1].id;
+  const hopelessStore = makeItemStore({
+    sql: db.sqlP, actor: "ray", authorType: "human",
+    batch: (statements) => { db.handle().prepare("UPDATE scratchpads SET body = body || ? WHERE id = ?").run(`y${always++}`, race2.id); return db.batchP(statements); },
+  });
+  throws("a pad that keeps changing refuses rather than overwriting", () => hopelessStore.move("task", cq, Q.id, { detach: true }), /kept changing while it was being moved, so nothing was moved/);
+  check("and nothing moved", one("SELECT parent_id, project_id FROM tasks WHERE id = ?", cq).project_id, P.id);
+}
+
 for (const [name, route] of ROUTES) scenario(name, route);
 appSide();
 reviewed();
+reviewedAgain();
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 fs.rmSync(dir, { recursive: true, force: true });

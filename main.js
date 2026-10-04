@@ -1541,9 +1541,14 @@ handle("flags:get", (id) => itemStore.getFlag(id));
 handle("flags:reply", itemWrite((r) => ({ change: "reply", flagId: r.flag_id }), (id, body) => itemStore.reply(id, body)));
 handle("flags:evaluate", itemWrite((r) => ({ change: "evaluated", flagId: r.flag.id }), (id, opts = {}) => itemStore.evaluate(id, { mode: (opts && opts.mode) || "oracle" })));
 handle("flags:approve", itemWrite((r) => ({ change: "approved", flagId: r.flag.id }),
-  (id, opts = {}) => itemStore.decide(id, { approve: true, ops: (opts && opts.ops) || null, note: (opts && opts.note) || null, by: "you", byType: "human" })));
+  // opts: { entryId (required: the proposal entry the card showed, its
+  // proposal_entry_id), ops?, note? }. A newer proposal refuses with STALE.
+  (id, opts = {}) => itemStore.decide(id, { approve: true, entryId: (opts && opts.entryId) ?? null, ops: (opts && opts.ops) || null,
+    note: (opts && opts.note) || null, by: "you", byType: "human", via: "window" })));
 handle("flags:reject", itemWrite((r) => ({ change: "rejected", flagId: r.flag.id }), (id, opts = {}) => {
-  const done = itemStore.decide(id, { approve: false, note: (opts && opts.note) || null, by: "you", byType: "human" });
+  // The window is the one place a decision is taken (see items/store.js decide).
+  const done = itemStore.decide(id, { approve: false, entryId: (opts && opts.entryId) ?? null, note: (opts && opts.note) || null,
+    by: "you", byType: "human", via: "window" });
   if (opts && opts.reevaluate) done.flag = itemStore.evaluate(id, { mode: "oracle" }).flag;
   return done;
 }));
@@ -1737,7 +1742,12 @@ handle("harness:update", (id, fields) => db.updateHarness(id, fields));
 handle("harness:delete", (id) => db.deleteHarness(id));
 // trust: true lets jobs run this harness's command as it is now, though it is
 // not the agent's own binary; false takes that back. A person's decision.
-handle("harness:trustCommand", (id, trust) => db.trustHarnessCommand(id, trust === true));
+// Stored as the real file the command resolves to now (agent/dispatch.js).
+handle("harness:trustCommand", (id, trust) => {
+  const row = db.listHarnesses().find((h) => h.id === Number(id));
+  const resolved = trust === true && row ? require("./agent/dispatch").resolveCommand(row.command) : null;
+  return db.trustHarnessCommand(id, trust === true, resolved ? resolved.real : null);
+});
 
 // One turn per session, not one turn overall. Two harnesses working two
 // sessions at once is the case this whole feature exists for; two turns in one
@@ -1893,7 +1903,11 @@ handle("runs:create", (payload = {}) => dispatcher.create({
   projectId: payload.projectId, harness: payload.harness, request: payload.request,
   taskId: payload.taskId ?? null, kind: payload.kind || "ask", context: payload.context ?? null,
 }, { by: "you", type: "human" }));
-handle("runs:approve", (id) => dispatcher.approve(id, { by: "you" }));
+// opts.harnessHash: the run's harness_hash_now as the window showed it, so a
+// person approves the agent as they saw it, not as it is at the click.
+// The window always sends the harness hash it showed, so a click can only ever
+// approve the agent setup the person was looking at.
+handle("runs:approve", (id, opts = {}) => dispatcher.approve(id, { by: "you", harnessHash: opts && opts.harnessHash ? String(opts.harnessHash) : null, requireHash: true }));
 handle("runs:reject", (id, why) => dispatcher.reject(id, { by: "you", why: why ?? null }));
 handle("runs:stop", (id) => dispatcher.stop(id, { by: "you" }));
 handle("runs:reply", (id, message) => dispatcher.reply(id, message, { by: "you" }));

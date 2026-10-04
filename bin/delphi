@@ -97,10 +97,10 @@ const HELP = {
   ],
   done: ["delphi done <task>", "Mark a task done. If it still has a Workbench, offers to finish that too."],
   flags: [
-    "delphi flags [list] [--project KEY] [--status S|--all] | show <id> | approve <id> [--note \"<text>\"] | reject <id> \"<why>\"",
+    "delphi flags [list] [--project KEY] [--status S|--all] | show <id>",
     "Items flagged as possibly filed in the wrong project, and where the Oracle or an agent proposes they go.",
-    "approve applies the proposal (a move, copy or association, undoable from History); reject needs a reason,",
-    "so the next look does not propose the same thing. Both are a person's decision and are refused in an agent's session.",
+    "Approving or rejecting a proposal is done in the Delphi window only: the command line cannot tell a person",
+    "from an agent claiming to be one. delphi flags approve and reject say so and change nothing.",
   ],
   chat: [
     "delphi chat <task> [--agent claude|copilot] [--auto] [--allow-unguarded] [\"<message>\" | -- <message...>]",
@@ -578,19 +578,7 @@ const COMMANDS = {
       for (const p of got.plan || []) say(`  plan: ${p.summary}`);
       return 0;
     }
-    if (verb === "approve") {
-      const done = await client.call("flag_decide", { flag_id: id, decision: "approve", ...(flags.note ? { note: String(flags.note) } : {}) });
-      say(`Applied: ${flagLine(done.flag)}`);
-      if (done.audit_ids && done.audit_ids.length) say(`Undo it from History (entry ${done.audit_ids.join(", ")}).`);
-      return 0;
-    }
-    if (verb === "reject") {
-      const why = need(flags.note || positional.slice(2).join(" "), "Why it is rejected", "flags");
-      const done = await client.call("flag_decide", { flag_id: id, decision: "reject", note: String(why) });
-      say(`Rejected: ${flagLine(done.flag)}`);
-      return 0;
-    }
-    throw new UsageError(`flags knows list, show, approve and reject, not '${verb}'.`, "flags");
+    throw new UsageError(`flags knows list and show, not '${verb}'.`, "flags");
   },
 
   async cat(client, { positional, flags }) {
@@ -1358,14 +1346,15 @@ async function main(argv) {
   // so before a server is even started, and the guard blocks the command in
   // an agent's shell before it gets here.
   // The verb is the first positional, as the command itself reads it, not
-  // the first word: options go anywhere, and "flags --all approve 1" was an
-  // approve that this check never saw.
+  // the first word: options go anywhere.
   let flagsVerb = null;
   if (command === "flags") {
     try { flagsVerb = parseArgs(args).positional[0] || null; } catch { flagsVerb = null; }
   }
-  if (["approve", "reject"].includes(flagsVerb) && process.env.DELPHI_AUTHOR_TYPE === "agent") {
-    process.stderr.write(`delphi: ${flagsVerb} is for a person to decide, and this is an agent's session. Say what you think on the flag instead (flag_item adds to it). Nothing was changed.\n`);
+  // Never here, for anyone: the command line cannot tell a person from an
+  // agent that sets DELPHI_ACTOR and DELPHI_AUTHOR_TYPE to look like one.
+  if (["approve", "reject"].includes(flagsVerb)) {
+    process.stderr.write("delphi: Approve or reject this in the Delphi window.\n");
     return 1;
   }
   // Before anything touches the terminal: the full screen view in a pipe or a

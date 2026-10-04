@@ -2341,28 +2341,9 @@ const TOOLS = {
         status: f.status, proposal: f.proposal_summary, by: f.created_by })),
   },
 
-  // The command line's alone (INTERNAL_TOOLS): a person approving or
-  // rejecting, from delphi flags. The store refuses an agent's decision
-  // whatever reached it, so this being unlisted is a courtesy, as the
-  // Workbench tools' is.
-  flag_decide: {
-    description: "Approve or reject a flag's proposal.",
-    schema: {
-      type: "object",
-      required: ["flag_id", "decision"],
-      properties: {
-        flag_id: { type: "number" }, decision: { type: "string", enum: ["approve", "reject"] },
-        note: { type: "string" }, ops: { type: "array", items: { type: "object" } },
-      },
-    },
-    run: (a) => {
-      // The type as the environment said it, not as the name suggests: the
-      // store decides only for a writer that said it is a person.
-      const done = itemStore.decide(a.flag_id, { approve: a.decision === "approve", ops: a.ops ?? null, note: a.note ?? null,
-        byType: AUTHOR_TYPE || "unset" });
-      return { flag: done.flag, audit_ids: done.auditIds };
-    },
-  },
+  // There is no decide tool. Approving or rejecting a proposal happens only in
+  // the Delphi window: nothing that reaches this server, the command line
+  // included, can show it is a person rather than an agent saying it is one.
   flag_get: {
     description: "One flag with its thread and the plan of its proposal.",
     schema: { type: "object", required: ["flag_id"], properties: { flag_id: { type: "number" } } },
@@ -2405,7 +2386,7 @@ const INTERNAL_TOOLS = new Set([
   "workbench_park", "workbench_resume", "workbench_update", "workbench_commit", "workbench_push",
   "workbench_pr", "workbench_finish_plan", "workbench_finished", "workbench_busy", "workbench_closing", "workbench_discarded", "workbench_recreate",
   "workbench_forget", "workbench_housekeep", "workbench_advanced",
-  "flag_decide", "flag_get",
+  "flag_get",
 ]);
 const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";
 

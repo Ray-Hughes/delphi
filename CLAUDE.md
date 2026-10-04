@@ -196,6 +196,29 @@ commands Copilot or Codex run; that is why `delphi chat --auto` with Copilot nee
 `--allow-unguarded`. `sheet/run.js` asks it before every `$ ` run, a person's or
 an agent's, and fails closed when python3 or `guard.py` cannot be found.
 
+**What a job may run is a tripwire, not a boundary.** `agent/dispatch.js`
+refuses a job whose argv carries a flag off its per-harness allowlist, whose
+harness row changed after approval, or whose command is not the agent as an
+installer put it (under the npm global root, Homebrew, or Claude's own install
+folders, in folders nobody else can write) unless a person clicked "Trust this
+command", which stores the real file it resolved to. The guard's database rule
+blocks writing the real `delphi.db` from a shell (sqlite3 without `-readonly`
+among its options, or an interpreter naming it), and leaves any other
+`delphi.db` alone. These catch accidents, casual edits and an agent doing it in
+passing. They do not stop a determined process running as the same user, which
+can write those folders and that file; copying the database, editing the copy
+and copying it back, or a script file that opens it, are out of scope.
+
+**Approving or rejecting a flag happens only in the window.** `flags:approve`
+and `flags:reject` in `main.js` are the one caller of `items/store.js` decide,
+and the only one that passes `via: "window"`, which decide requires. The command
+line cannot tell a person from an agent that sets `DELPHI_ACTOR` and
+`DELPHI_AUTHOR_TYPE` to look like one, and the guard can be spelled around, so
+there is no decide tool in the MCP server and `delphi flags approve` and `reject`
+only say "Approve or reject this in the Delphi window." The guard still blocks
+those commands, as a courtesy. An Approve names the proposal entry the person
+saw (`entryId`), and decide refuses with code `STALE` when a newer one exists.
+
 **A module the app and the server both need goes in `files` and in
 `OUTSIDE_TOO`, never in `extraResources`.** The server and the CLI run under a
 plain Node outside `app.asar`, from `Resources/`, and find their modules by

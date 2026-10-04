@@ -247,6 +247,18 @@ check("the carried lines parse as the same tasks", [...pads.anchoredIds(pads.app
 check("stripAnchors leaves the document and no task ids", pads.stripAnchors(carryBody), "# Plan\n\n- [ ] one\n  - [ ] sub\n    - [x] subsub\n- [ ] two\n\nprose");
 check("which parses as lines with no anchors", pads.parse(pads.stripAnchors(carryBody)).every((e) => e.taskId === null), true);
 
+// The block is found by indentation, not ended by a blank line, so nothing
+// nested under the line is left behind to be filed under the old parent.
+check("a blank line inside the block does not end it",
+  pads.cutBlock("- [ ] p <!--d:1-->\n  - [ ] c <!--d:2-->\n\n    - [ ] g <!--d:3-->\n- [ ] t <!--d:4-->\n", 2),
+  { body: "- [ ] p <!--d:1-->\n- [ ] t <!--d:4-->\n", block: "- [ ] c <!--d:2-->\n\n  - [ ] g <!--d:3-->" });
+check("tabs nest the same as two spaces",
+  pads.cutBlock("- [ ] p <!--d:1-->\n\t- [ ] c <!--d:2-->\n\t\t- [ ] g <!--d:3-->\n\t- [ ] s <!--d:4-->\n", 2).block, "- [ ] c <!--d:2-->\n  - [ ] g <!--d:3-->");
+check("an anchor quoted in a code fence is not the line cut",
+  pads.cutBlock("```\n  - [ ] c <!--d:2-->\n```\n- [ ] p <!--d:1-->\n  - [ ] c <!--d:2-->\n", 2).body, "```\n  - [ ] c <!--d:2-->\n```\n- [ ] p <!--d:1-->\n");
+check("Windows line endings are cut and kept",
+  pads.cutBlock("- [ ] p <!--d:1-->\r\n  - [ ] c <!--d:2-->\r\n  - [ ] s <!--d:3-->\r\n", 2), { body: "- [ ] p <!--d:1-->\r\n  - [ ] s <!--d:3-->\r\n", block: "- [ ] c <!--d:2-->" });
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 fs.rmSync(dir, { recursive: true, force: true });
 process.exit(failures ? 1 : 0);

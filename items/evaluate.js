@@ -171,6 +171,87 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
   }
 
   /**
+   * The project a phrase names, after "in", "with", "to" and the like: one
+   * project, several (ambiguous, so a person is asked), or none. A phrase is
+   * the object of an instruction, so here the first word of a longer name
+   * counts too ("Delphi" for "Delphi tracker"), which would be too loose
+   * against a whole note.
+   */
+  function resolvePhrase(phrase, all) {
+    const { named, ambiguous } = namedProjects(phrase, all);
+    if (named.length) return { projects: named.slice(0, 1), ambiguous: [] };
+    const words = String(phrase).toLowerCase().match(/[a-z0-9][a-z0-9_-]*/g) || [];
+    const first = words.find((w) => w.length >= 3 && !/^(the|this|that|its|our|project|projects|here|there|both|too|also)$/.test(w));
+    const byHead = first ? all.filter((p) => String(p.name).toLowerCase().split(/[^a-z0-9_-]+/)[0] === first && p.status !== "archived") : [];
+    const merged = new Map([...byHead, ...ambiguous.flatMap((a) => a.projects.map((id) => all.find((p) => p.id === id)))].filter(Boolean).map((p) => [p.id, p]));
+    if (merged.size === 1) return { projects: [...merged.values()], ambiguous: [] };
+    if (merged.size > 1) return { projects: [], ambiguous: [{ word: first || ambiguous[0].word, projects: [...merged.keys()] }] };
+    return { projects: [], ambiguous: [] };
+  }
+
+  /**
+   * What the person told it to do, read before anything is counted, because
+   * an instruction beats a guess. Each finding keeps the words it came from,
+   * so the reasoning can quote them back. The item's own text is read for
+   * keep phrases only ("it spans Offerworks" is the item saying where else it
+   * belongs); where it should move is the person's to say.
+   */
+  function readInstructions(said, itemText, all, home) {
+    const OBJ = "([^.,;:!?\\n]+)";
+    const out = { move: null, copy: null, keep: [], keepHome: null, ask: [] };
+    const clause = (text, re) => {
+      const found = [];
+      const g = new RegExp(re.source, "gi");
+      for (let m = g.exec(text); m; m = g.exec(text)) {
+        // The object ends where the next instruction starts: in "move it to
+        // Beta and keep it in Offerworks", the move's target is Beta alone.
+        const object = String(m[1] || "").split(/\s+(?:and|but|so|then|while|or|though|keep|also|plus|where|which|because|since)\b/i)[0];
+        const quote = m[0].trim().slice(0, m[0].trim().length - String(m[1] || "").trim().length) + object.trim();
+        found.push({ quote: quote.trim(), object });
+      }
+      return found;
+    };
+    const take = (hit, apply, kind) => {
+      const r = resolvePhrase(hit.object, all);
+      if (r.ambiguous.length) out.ask.push({ quote: hit.quote, kind, ...r.ambiguous[0] });
+      else if (r.projects.length) apply(r.projects[0], hit.quote);
+      return r;
+    };
+    const keepRes = [
+      new RegExp(`\\bkeep(?:ing)?\\s+(?:it|this|them)?\\s*(?:visible|shown|showing|listed|around|too|as well)?\\s*(?:in|under|on)\\s+${OBJ}`),
+      new RegExp(`\\b(?:also|still)\\s+(?:show|keep|list|appear|visible|be visible|be shown)\\w*\\s*(?:it|this)?\\s*(?:in|under|on)\\s+${OBJ}`),
+      new RegExp(`\\b(?:visible|shown)\\s+(?:in|under|on)\\s+${OBJ}\\s+(?:too|as well)\\b`),
+      new RegExp(`\\bspan(?:s|ning)?\\s+(?:to|into|across)?\\s*${OBJ}`),
+    ];
+    const keepPhrase = (text, fromItem) => {
+      for (const re of keepRes) {
+        for (const hit of clause(text, re)) {
+          const r = take(hit, (p, quote) => {
+            if (p.id === home) { if (!out.keepHome) out.keepHome = { quote, fromItem }; }
+            else if (!fromItem && !out.keep.some((k) => k.project.id === p.id)) out.keep.push({ project: p, quote });
+          }, "keep");
+          if (fromItem && r.ambiguous.length) out.ask.pop();
+        }
+      }
+    };
+    keepPhrase(said, false);
+    // "In both", "here too": keep, with no project named, means here.
+    const bare = /\b(?:in both|both places|keep it here|here too|here as well|keep (?:it|this) (?:visible|shown) too)\b/i.exec(said);
+    if (bare && !out.keepHome) out.keepHome = { quote: bare[0], fromItem: false };
+    if (!out.keepHome) keepPhrase(itemText, true);
+    const copyRe = new RegExp(`\\b(?:cop(?:y|ied)|duplicate|also need (?:it|this))\\b[^.,;!?\\n]*?\\b(?:in|to|into|under)\\s+${OBJ}`);
+    const moveRe = new RegExp(`\\b(?:move|moved|moving|belongs?|should (?:be|live)|refile|goes|go|lives?|file it|wrong project)\\b[^.,;!?\\n]*?\\b(?:in|to|into|with|under)\\s+${OBJ}`);
+    for (const hit of clause(said, copyRe)) if (!out.copy) take(hit, (p, quote) => { if (p.id !== home) out.copy = { project: p, quote }; }, "copy");
+    for (const hit of clause(said, moveRe)) {
+      if (out.move) break;
+      take(hit, (p, quote) => { if (p.id !== home && !(out.copy && out.copy.project.id === p.id)) out.move = { project: p, quote }; }, "move");
+    }
+    // A target a keep phrase already named is where it is kept, not where it goes.
+    out.keep = out.keep.filter((k) => !(out.move && k.project.id === out.move.project.id) && !(out.copy && k.project.id === out.copy.project.id));
+    return out;
+  }
+
+  /**
    * One flag's answer: a proposal or none, the reasoning in plain sentences,
    * and the signals behind it, which are stored so a person can see why.
    */
@@ -193,6 +274,85 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
     };
     const op = (kind, to, extra = {}) => ({ op: kind, entity: flag.entity, id: Number(flag.entity_id), to, ...extra });
     const associable = ["task", "note", "scratchpad", "link"].includes(flag.entity);
+
+    // 0. The person's own instructions, first, quoted back.
+    const told = readInstructions(words, item.text, all, home);
+    // A question already asked is answered by the person's replies after it:
+    // a project named by name, key or id settles it, and the instruction it
+    // was asked about goes ahead with that project. A question is never asked
+    // twice; a reply that settles nothing is said so, as a note.
+    const lastAsk = entries.map((e) => e.kind).lastIndexOf("ask");
+    const answers = lastAsk >= 0 ? entries.slice(lastAsk + 1).filter((e) => e.kind === "say" && e.author_type !== "tool").map((e) => String(e.body || "")) : [];
+    const answerFor = (a) => {
+      for (const text of answers.slice().reverse()) {
+        const byId = [...text.matchAll(/(?:#|\(|\bproject\s+)(\d+)\b/gi)].map((m) => Number(m[1])).filter((id) => all.some((p) => p.id === id));
+        const byName = namedProjects(text, all).named.map((p) => p.id);
+        const phrase = resolvePhrase(text, all).projects.map((p) => p.id);
+        const among = [...new Set([...byId, ...byName, ...phrase])];
+        const inChoices = among.filter((id) => a.projects.includes(id));
+        const pick = inChoices.length === 1 ? inChoices[0] : !inChoices.length && among.length === 1 ? among[0] : null;
+        if (pick != null && pick !== home) return { project: all.find((p) => p.id === pick), quote: clip(text, 80) };
+      }
+      return null;
+    };
+    const unanswered = [];
+    for (const a of told.ask) {
+      const settled = answerFor(a);
+      if (!settled) { unanswered.push(a); continue; }
+      if (a.kind === "copy" && !told.copy) told.copy = settled;
+      else if (a.kind === "keep") { if (!told.keep.some((k) => k.project.id === settled.project.id)) told.keep.push(settled); }
+      else if (!told.move) told.move = settled;
+    }
+    told.ask = unanswered;
+    signals.instructions = {
+      move: told.move && [told.move.project.id, told.move.quote], copy: told.copy && [told.copy.project.id, told.copy.quote],
+      keep: told.keep.map((k) => [k.project.id, k.quote]), keep_home: told.keepHome && told.keepHome.quote,
+    };
+    const keepOps = associable ? told.keep.slice(0, 2).map((k) => op("associate", k.project.id)) : [];
+    const keepWords = (keepHome) => [
+      keepHome && associable ? ` ${told.keepHome.fromItem ? "The item itself says" : "You wrote"} "${clip(told.keepHome.quote, 80)}", so it stays shown in ${homeName}.` : "",
+      ...told.keep.slice(0, keepOps.length).map((k) => ` You wrote "${clip(k.quote, 80)}", so it is also shown in ${k.project.name}.`),
+    ].join("");
+    if (told.ask.length && !told.move && !told.copy && lastAsk >= 0) {
+      const a = told.ask[0];
+      const choices = a.projects.map((pid) => `${name(pid)} (${pid})`).join(", ");
+      return {
+        proposal: null, confidence: 0, signals,
+        reasoning: clip(answers.length
+          ? `Your reply did not name one of ${choices}, so nothing is proposed yet. Reply with one of them by name or number.`
+          : `Waiting for your answer: "${a.word}" could be ${choices}.`, 600),
+      };
+    }
+    if (told.ask.length && !told.move && !told.copy) {
+      const a = told.ask[0];
+      const choices = a.projects.map((pid) => `${name(pid)} (${pid})`);
+      return {
+        proposal: null, confidence: 0,
+        signals: { ...signals, ambiguous: [...ambiguous.filter((x) => x.word !== a.word), { word: a.word, projects: a.projects }] },
+        ask: clip(`You wrote "${a.quote}", and "${a.word}" could be ${choices.slice(0, -1).join(", ")} or ${choices.slice(-1)}. Which one?`, 600),
+        reasoning: clip(`"${a.word}" names more than one project, so it was not guessed.`, 600),
+      };
+    }
+    if (told.copy && ["task", "note", "scratchpad", "link"].includes(flag.entity)) {
+      return {
+        proposal: { ops: [op("copy", told.copy.project.id), ...keepOps].slice(0, 3) }, confidence: NAMED_CONFIDENCE, signals,
+        reasoning: clip(`You wrote "${clip(told.copy.quote, 80)}", so a copy goes to ${told.copy.project.name} and the original stays.${keepWords(false)}`, 600),
+      };
+    }
+    if (told.move) {
+      const keepHome = Boolean(told.keepHome) && associable;
+      return {
+        proposal: { ops: [op("move", told.move.project.id, keepHome ? { keepInSource: true } : {}), ...keepOps].slice(0, 3) },
+        confidence: NAMED_CONFIDENCE, signals,
+        reasoning: clip(`You wrote "${clip(told.move.quote, 80)}", so it moves to ${told.move.project.name}.${keepWords(keepHome)}`, 600),
+      };
+    }
+    if (keepOps.length && !told.keepHome && !wantsMove) {
+      return {
+        proposal: { ops: keepOps }, confidence: NAMED_CONFIDENCE, signals,
+        reasoning: clip(keepWords(false).trim(), 600),
+      };
+    }
 
     // 1. Named intent: one target and one verb is a clear instruction.
     if (targets.length === 1 && (wantsMove || wantsCopy || wantsKeep)) {
@@ -246,12 +406,14 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
           : `No clear home: ${name(best)} scores ${round(bestScore)} against ${round(homeScore)} for ${homeName}${lead ? `; its nearest are ${lead}` : ""}.${ambiguity}`, 600),
       };
     }
-    const keep = associable && wantsKeep && homeNamed;
+    // Keeping it where it is comes from the person's words (or the item's
+    // own), quoted, never from the vote.
+    const keep = associable && (Boolean(told.keepHome) || (wantsKeep && homeNamed));
     const confidence = Math.min(0.95, round(bestScore / (total || 1)));
+    const quoted = told.keepHome ? keepWords(true) : keep ? ` The flag says it spans ${homeName}, so it stays shown there.` : "";
     return {
-      proposal: { ops: [op("move", best, keep ? { keepInSource: true } : {})] }, confidence, signals,
-      reasoning: clip(`Its nearest are ${lead}. ${name(best)} scores ${round(bestScore)} against ${round(homeScore)} for ${homeName}.` +
-        (keep ? ` The flag says it spans ${homeName}, so it stays shown there.` : "") + ambiguity, 600),
+      proposal: { ops: [op("move", best, keep ? { keepInSource: true } : {}), ...keepOps.filter((o) => o.to !== best)].slice(0, 3) }, confidence, signals,
+      reasoning: clip(`${quoted.trim() ? `${quoted.trim()} ` : ""}Its nearest are ${lead}. ${name(best)} scores ${round(bestScore)} against ${round(homeScore)} for ${homeName}.` + ambiguity, 600),
     };
   }
 
@@ -310,7 +472,7 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
     return text.length > PROMPT_CHARS ? text.slice(0, PROMPT_CHARS) : text;
   }
 
-  return { evaluate, sweep, prompt, namedProjects };
+  return { evaluate, sweep, prompt, namedProjects, readInstructions, resolvePhrase };
 }
 
 module.exports = { makeEvaluator, FALLBACK_KEYS, BEAT_HOME, SHARE };

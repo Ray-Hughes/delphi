@@ -3483,6 +3483,41 @@
   .review-box textarea.field { min-height: 80px; resize: vertical; font-family: inherit; line-height: 1.45; }
   .rehome-list li { align-items: baseline; }
   .rehome-list .refusal { color: var(--crit); }
+  /* A harness's trusted command, under its row in Settings, Agents. */
+  .trust-row {
+    display: flex; align-items: center; gap: 10px; margin: -2px 0 6px 18px; padding: 8px 10px;
+    border: 1px dashed var(--line); border-radius: var(--r-sm); font-size: 12px; color: var(--ink-dim); line-height: 1.5;
+  }
+  .trust-row.on { border-style: solid; border-color: color-mix(in srgb, var(--warn) 50%, var(--line)); background: color-mix(in srgb, var(--warn) 6%, var(--surface)); }
+  .trust-row b { color: var(--ink); font-weight: 600; }
+  .trust-row code { font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+  .trust-row .grow { flex: 1; min-width: 0; }
+
+  /* Checkboxes and radios in the cross-project dialogs and cards, drawn from
+     tokens: the native ones stay white on the dark ground. */
+  .pk-row input, .pk-opts input, .evo input, .prop .reject-why input[type="checkbox"] {
+    appearance: none; -webkit-appearance: none; width: 16px; height: 16px; flex: 0 0 16px; margin: 0;
+    border: 1.5px solid var(--ink-faint); background: var(--surface); display: inline-grid; place-items: center;
+  }
+  .pk-row input[type="checkbox"], .pk-opts input[type="checkbox"], .prop .reject-why input[type="checkbox"] { border-radius: 4px; }
+  .pk-row input[type="radio"], .pk-opts input[type="radio"], .evo input[type="radio"] { border-radius: 99px; }
+  .pk-row input:checked, .pk-opts input:checked, .evo input:checked, .prop .reject-why input:checked { border-color: var(--accent); }
+  .pk-row input[type="checkbox"]:checked, .pk-opts input[type="checkbox"]:checked, .prop .reject-why input[type="checkbox"]:checked { background: var(--accent); }
+  .pk-row input[type="checkbox"]:checked::after, .pk-opts input[type="checkbox"]:checked::after, .prop .reject-why input[type="checkbox"]:checked::after {
+    content: ""; width: 4px; height: 8px; border: solid var(--btn-fg); border-width: 0 2px 2px 0; transform: translateY(-1px) rotate(45deg);
+  }
+  .pk-row input[type="radio"]:checked::after, .pk-opts input[type="radio"]:checked::after, .evo input[type="radio"]:checked::after {
+    content: ""; width: 8px; height: 8px; border-radius: 99px; background: var(--accent);
+  }
+  .pk-row input:disabled, .pk-opts input:disabled, .evo input:disabled { opacity: .35; }
+  .pk-row input:focus-visible, .pk-opts input:focus-visible, .evo input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .pk-opts label input { margin-top: 2px; }
+  .evo input { margin-top: 2px; }
+
+  /* "also in", on an item in its home that other projects show too. */
+  .also-tag { border-style: solid; }
+  .item-menu .ctx-item:focus-visible { background: var(--accent); color: var(--btn-fg); outline: none; }
+  .item-menu .ctx-item:focus-visible .d { color: inherit; opacity: .8; }
 </style>
 </head>
 <body>
