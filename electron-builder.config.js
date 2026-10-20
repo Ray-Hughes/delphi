@@ -104,6 +104,8 @@ module.exports = {
     { from: "agent/directives.js", to: "agent/directives.js" },
     // Ranking, snippets and budgets for the memory tools. Only the server needs it.
     { from: "agent/recall.js", to: "agent/recall.js" },
+    // Second opinions: another agent's CLI, run read only. Only the server needs it.
+    { from: "agent/second_opinion.js", to: "agent/second_opinion.js" },
     // The command line tool. Resources/bin/delphi spawns ../agent/mcp_server.js,
     // the same server an editor uses. tools/after-pack.js makes sure it is still
     // executable once it lands here.

@@ -6940,6 +6940,23 @@ async function renderSettings(root) {
     textContent: "Agents already connected pick this up within a few seconds; there is nothing to restart. It does not apply to files that have to be files to work, such as scripts an agent runs or documents it generates." }));
   root.append(scratch);
 
+  // --- second opinion ------------------------------------------------------
+  const second = el("div", { className: "setting" });
+  second.append(el("h3", { textContent: "Second opinion" }));
+  second.append(el("p", {
+    textContent: "Turn this on and every agent connected to this tracker is told to ask Copilot for a second opinion through the second_opinion tool: a review of the diff before a commit or pull request, and an independent diagnosis when it reaches a root cause. Copilot runs read only and can read this tracker's notes. Agents are told to verify what it says, to skip trivial work, and never to send it secrets or personal data.",
+  }));
+  const secondRow = el("div", { className: "row" });
+  const secondBox = el("input", { type: "checkbox", checked: settings.secondOpinionMode === true, id: "second-opinion-mode" });
+  const secondLbl = el("label", { htmlFor: "second-opinion-mode", textContent: "Ask Copilot for a second opinion on reviews and diagnoses" });
+  const secondMsg = el("span", { className: "hint" });
+  secondRow.append(secondBox, secondLbl, secondMsg);
+  second.append(secondRow);
+  secondBox.onchange = () => saveScratch({ secondOpinionMode: secondBox.checked }, secondMsg, secondBox);
+  second.append(el("p", { className: "hint", style: "margin:12px 0 0",
+    textContent: "The tool works whether or not this is on; this is whether agents are told to use it. Agents already connected are reminded through their next tool results. Copilot has to be installed and signed in on this machine." }));
+  root.append(second);
+
   // --- mouse buttons -------------------------------------------------------
   const mouse = el("div", { className: "setting" });
   mouse.append(el("h3", { textContent: "Using a mouse button" }));

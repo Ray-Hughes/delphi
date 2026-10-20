@@ -102,6 +102,12 @@ let settings = {
   // for someone without asking. See agent/directives.js for how it reaches them.
   scratchpadMode: false,
   scratchpadProjectId: null,   // null means "no default, pick a project"
+  // Whether connected agents are told to ask another agent for a second opinion
+  // (the second_opinion tool) before a commit and when they reach a root cause.
+  // Off by default for the same reason as the scratchpad: it changes how every
+  // agent sharing this database works, and spends the other agent's quota.
+  secondOpinionMode: false,
+  secondOpinionAgent: "copilot",
   // On by default because the celebration is the confirmation that a task was
   // completed, and the row leaves straight afterwards. The system reduced motion
   // preference already suppresses all of it for the people who need that, so
@@ -2119,6 +2125,15 @@ handle("settings:set", (fields) => {
   }
 
   if (fields.scratchpadMode !== undefined) settings.scratchpadMode = fields.scratchpadMode === true;
+
+  if (fields.secondOpinionMode !== undefined) settings.secondOpinionMode = fields.secondOpinionMode === true;
+  if (fields.secondOpinionAgent !== undefined) {
+    // A harness key, not a command: the server looks the row up by it, so
+    // anything that could not be one is refused here rather than there.
+    const key = String(fields.secondOpinionAgent || "");
+    if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(key)) throw new Error("secondOpinionAgent must be an agent's key, such as copilot");
+    settings.secondOpinionAgent = key;
+  }
 
   if (fields.animations !== undefined) settings.animations = fields.animations !== false;
 

@@ -298,7 +298,7 @@ function serverPath() {
  * Electron's own binary in that mode is a Node that is certainly present and
  * can read inside app.asar besides.
  */
-function serverLaunch({ dbPath, dbId, projectId, sessionId, actor }) {
+function serverLaunch({ dbPath, dbId, projectId, sessionId, actor, readOnly = false }) {
   return {
     command: process.execPath,
     args: [serverPath()],
@@ -312,6 +312,9 @@ function serverLaunch({ dbPath, dbId, projectId, sessionId, actor }) {
       DELPHI_ACTOR: actor,
       ...(projectId ? { DELPHI_PROJECT: String(projectId) } : {}),
       ...(sessionId ? { DELPHI_SESSION: String(sessionId) } : {}),
+      // A server that offers only the tools that read. See READ_ONLY_TOOLS in
+      // agent/mcp_server.js.
+      ...(readOnly ? { DELPHI_READ_ONLY: "1" } : {}),
     },
   };
 }

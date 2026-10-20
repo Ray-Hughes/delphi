@@ -325,6 +325,44 @@ Delphi stops running handoffs by itself after twelve finish in one project in an
 hour. Two agents that each wake the other are a loop that spends money at machine
 speed with nobody watching, and the limit is the thing that notices.
 
+## Second opinions
+
+`second_opinion` asks another agent, Copilot by default, and waits for the answer.
+It is not a job: there is no approval, no app needs to be running, and the answer
+comes back in the same call, usually within a minute. That is what it is for: the
+question you are blocked on right now.
+
+```
+second_opinion(request, files?, cwd?, task_id?, project?, timeout_seconds?)
+```
+
+Copilot runs read only. Its command line may carry only a short list of flags, write
+and shell are denied by name, and a Copilot command line in Settings that passes
+anything else is refused rather than trimmed. It does get Delphi's own tools, from a
+server started with `DELPHI_READ_ONLY=1` that offers only the tools that read, under
+its own name in History (`copilot:second-opinion`). So it can read the same notes
+and pads you can, and cannot file work, change a pad, hand off a job or ask for a
+second opinion of its own. It runs in `cwd`, or the project's folder, or the
+server's own. Relative paths in `files` are taken from that folder, and a file
+outside it lets its folder in, one at a time; the filesystem root and a home folder
+are refused as too wide. Write a diff to a file and pass the path, because the
+request is a prompt and Copilot reads nothing from stdin. With `task_id` the answer
+is also kept on the task's Sheet, so the next session has it.
+
+**Second opinion mode** (Settings, Second opinion) tells every connected agent when to
+use it: on a diff before a commit or pull request, on a root cause, reached
+independently, and on large unfamiliar code. Verify what it says before acting on
+it, say what it found and which findings held up, skip trivial work, and never send
+it secrets or personal data. The rule reaches an agent three ways, as the
+scratchpad's does: the server's instructions, a note on `second_opinion`,
+`queue_complete`, `add_comment`, `sheet_append` and `list_projects`, and a reminder
+on a tool result. The reminder comes on `list_projects` and on the first result an
+hour, which is how a session that was already running when the mode was turned on
+hears about it.
+
+Only Copilot can be the second opinion for now. Each CLI says "read only" in its own
+flags, and a second one should arrive with its own.
+
 ## Taking work from the queue
 
 Tasks placed in the queue are work someone has decided is ready for an agent. Nobody
