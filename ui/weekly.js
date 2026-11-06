@@ -119,7 +119,8 @@ globalThis.DelphiWeekly = (() => {
   /** Last week's unfinished objectives are offered again, not picked for you. */
   function seedPicks() {
     P.carry = ((P.data.next_week.last && P.data.next_week.last.objectives) || [])
-      .filter((o) => o.status !== "done")
+      // Done needs no carrying, and a task that no longer exists cannot be.
+      .filter((o) => o.status !== "done" && o.status !== "missing")
       .map((o) => ({ key: o.task_id != null ? `t${o.task_id}` : `x${o.text}`, text: o.text, task_id: o.task_id, project_id: P.data.next_week.last.project_id }));
   }
 
@@ -141,6 +142,7 @@ globalThis.DelphiWeekly = (() => {
     scrim.addEventListener("keydown", onKey);
     P = { scrim, box, head, body, foot, returnTo, step, focusNext: null, links: 0, data: null, error: null, picks: [], carry: [], acted: new Map(), rowMsg: new Map(), dropping: null, busy: false, saved: null, saveMsg: null, projectId: null, own: "" };
     if (draft) Object.assign(P, draft);
+    P.busy = inflight;
     document.body.append(scrim);
     paint();
     box.querySelector(".wk-x").focus();
@@ -151,7 +153,9 @@ globalThis.DelphiWeekly = (() => {
     if (!P) return;
     const back = P.returnTo;
     const changed = P.acted.size || P.saved;
-    draft = P.saved ? null : { picks: P.picks, own: P.own, projectId: P.projectId, acted: P.acted };
+    // After a save the picks are spent, but what was Parked or Dropped keeps
+    // its Undo for the next time the panel opens.
+    draft = P.saved ? { acted: P.acted } : { picks: P.picks, own: P.own, projectId: P.projectId, acted: P.acted };
     P.scrim.remove();
     P = null;
     if (changed) { status = null; if (app && app.refresh) app.refresh(); }
@@ -366,38 +370,59 @@ globalThis.DelphiWeekly = (() => {
   // ---------------------------------------------------------------------------
   // 2. Tidy
 
+  // A write in flight, whichever panel started it. Module level, not on the
+  // panel, because closing and reopening makes a new panel while the first
+  // write is still on its way, and a second click must not start a second one.
+  let inflight = false;
+  // The panel the answer belongs to: the one that asked, if it is still open,
+  // else the one open now (the same Map of what was done rides in the draft).
+  const target = () => P;
+  /** After a write that finished with no panel open: Today and the lists catch up. */
+  const settled = (mine) => { if (P !== mine) { status = null; if (app && app.refresh) app.refresh(); } };
+
   async function act(taskId, kind, why) {
-    if (P.busy) return;
-    P.busy = true;
-    P.rowMsg.delete(taskId);
+    if (inflight) return;
+    const mine = P;
+    inflight = true;
+    mine.busy = true;
+    mine.rowMsg.delete(taskId);
     paint();
     try {
       const r = kind === "park" ? await window.delphi.weekly.park(taskId) : await window.delphi.weekly.drop(taskId, why);
-      if (!P) return;
-      P.acted.set(taskId, { kind, receipt: r.receipt, was: r.was });
-      P.dropping = null;
-      P.focusNext = `undo-${taskId}`;
+      mine.acted.set(taskId, { kind, receipt: r.receipt, was: r.was, row: (mine.data && mine.data.tidy.stale.find((x) => x.id === taskId)) || null });
+      mine.why = null;
+      const now = target(mine);
+      if (now) { now.dropping = null; now.focusNext = `undo-${taskId}`; }
     } catch (error) {
-      if (P) P.rowMsg.set(taskId, errOf(error));
+      const now = target(mine);
+      if (now) now.rowMsg.set(taskId, errOf(error)); else if (app) app.notify(errOf(error));
     } finally {
+      inflight = false;
+      mine.busy = false;
+      settled(mine);
       if (P) { P.busy = false; paint(); }
     }
   }
 
   async function undoAct(taskId) {
-    const a = P.acted.get(taskId);
-    if (!a || P.busy) return;
-    P.busy = true;
+    const mine = P;
+    const a = mine.acted.get(taskId);
+    if (!a || inflight) return;
+    inflight = true;
+    mine.busy = true;
     paint();
     try {
       await window.delphi.weekly.undo({ receipt: a.receipt });
-      if (!P) return;
-      P.acted.delete(taskId);
-      P.focusNext = `park-${taskId}`;
-      P.rowMsg.set(taskId, { ok: true, text: `Put back to ${statusWord(a.was)}.` });
+      mine.acted.delete(taskId);
+      const now = target(mine);
+      if (now) { now.focusNext = `park-${taskId}`; now.rowMsg.set(taskId, { ok: true, text: `Put back to ${statusWord(a.was)}.` }); }
     } catch (error) {
-      if (P) P.rowMsg.set(taskId, errOf(error));
+      const now = target(mine);
+      if (now) now.rowMsg.set(taskId, errOf(error)); else if (app) app.notify(errOf(error));
     } finally {
+      inflight = false;
+      mine.busy = false;
+      settled(mine);
       if (P) { P.busy = false; paint(); }
     }
   }
@@ -425,6 +450,9 @@ globalThis.DelphiWeekly = (() => {
       // On a line of its own under the row, so the title keeps its width.
       const field = el("input", { className: "wk-in", type: "text", placeholder: "Why let it go? Optional, kept on its Sheet", maxLength: 500 });
       field.dataset.wk = `why-${s.id}`;
+      // Kept on the panel, so a Drop that fails and repaints keeps the words.
+      field.value = P.why && P.why.id === s.id ? P.why.text : "";
+      field.oninput = () => { P.why = { id: s.id, text: field.value }; };
       field.setAttribute("aria-label", `Why drop #${s.id}`);
       const go = button("Drop it", "btn sm danger");
       go.dataset.wk = `dropgo-${s.id}`;
@@ -458,7 +486,10 @@ globalThis.DelphiWeekly = (() => {
 
   function tidy(d) {
     const out = [];
-    const stale = d.tidy.stale;
+    // What was Parked or Dropped from here stays listed with its Undo, even
+    // after a reload no longer finds it stale.
+    const listed = new Set(d.tidy.stale.map((x) => x.id));
+    const stale = [...d.tidy.stale, ...[...P.acted.values()].map((a) => a.row).filter((x) => x && !listed.has(x.id))];
     if (stale.length) {
       const box = el("div", { className: "wk-box" });
       for (const s of stale) box.append(staleRow(s));
@@ -577,19 +608,29 @@ globalThis.DelphiWeekly = (() => {
   }
 
   async function save() {
-    if (P.busy) return;
+    if (inflight) return;
+    const mine = P;
     const projectId = chosenProject();
-    P.busy = true;
-    P.saveMsg = null;
+    inflight = true;
+    mine.busy = true;
+    mine.saveMsg = null;
+    paint();
     try {
-      const note = await window.delphi.weekly.save({ projectId, objectives: P.picks.map((p) => ({ text: p.text })) });
-      if (!P) return;
-      P.saved = note;
-      P.focusNext = "open-note";
+      const note = await window.delphi.weekly.save({ projectId, objectives: mine.picks.map((p) => ({ text: p.text })) });
+      // Saved, whichever panel is showing now: the draft is spent, so a panel
+      // opened again does not offer the same picks to save a second time.
+      draft = { acted: mine.acted };
       status = null;
+      mine.saved = note;
+      const now = target(mine);
+      if (now) { now.saved = note; now.picks = mine.picks; now.focusNext = "open-note"; }
     } catch (error) {
-      if (P) P.saveMsg = errOf(error);
+      const now = target(mine);
+      if (now) now.saveMsg = errOf(error); else if (app) app.notify(errOf(error));
     } finally {
+      inflight = false;
+      mine.busy = false;
+      settled(mine);
       if (P) { P.busy = false; paint(); }
     }
   }
@@ -603,8 +644,8 @@ globalThis.DelphiWeekly = (() => {
       openNote.dataset.wk = "open-note";
       openNote.onclick = () => { const pid = P.saved.project_id; close(); app.go({ projectId: pid, view: "notes" }); };
       out.push(el("div", { className: "wk-saved", role: "status" }, el("span", { className: "wk-saved-i" }, I("check")),
-        el("div", { className: "grow" }, el("b", { textContent: `Saved ${plural(P.picks.length, "objective", "objectives")} for the week of ${nw.week}` }),
-          el("div", { className: "wk-dim", textContent: `As a decision note in ${name || "the project"}. Next week's review starts by checking them.` })),
+        el("div", { className: "grow" }, el("b", { textContent: `${P.saved.updated ? "Updated" : "Saved"} ${plural(P.picks.length, "objective", "objectives")} for the week of ${nw.week}` }),
+          el("div", { className: "wk-dim", textContent: `${P.saved.updated ? "The week's decision note" : "As a decision note"} in ${name || "the project"}. Next week's review starts by checking them.` })),
         openNote));
     }
 
@@ -634,7 +675,7 @@ globalThis.DelphiWeekly = (() => {
       if (e.key !== "Enter" || e.isComposing) return;
       e.preventDefault();
       const text = field.value.replace(/\s+/g, " ").trim();
-      if (!text || P.picks.length >= MAX()) return;
+      if (!text || P.picks.length >= MAX() || picked(`x${text}`)) return;
       P.own = "";
       P.picks.push({ key: `x${text}`, text, task_id: null, project_id: null });
       if (P.picks.length >= MAX()) P.focusNext = "save";
