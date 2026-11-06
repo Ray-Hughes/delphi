@@ -2239,10 +2239,19 @@ function listSessions(projectId) {
             (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
             (SELECT m.content FROM messages m
               WHERE m.session_id = s.id AND m.role = 'user'
-              ORDER BY m.id LIMIT 1) AS opener
+              ORDER BY m.id LIMIT 1) AS opener,
+            -- What the sidebar calls "last active". updated_at alone moves only
+            -- when the row is edited, and a conversation is busiest when it is not.
+            (SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = s.id) AS last_message_at
      FROM sessions s
      WHERE s.project_id = :projectId AND s.status != 'archived'
-     ORDER BY s.updated_at DESC, s.id DESC`,
+     -- Most recently used first, by the same measure the sidebar prints, so
+     -- the order and the "2 days ago" beside each row cannot disagree.
+     -- datetime() because last_run_at is written as ISO with a T and a Z.
+     ORDER BY MAX(s.updated_at,
+                  COALESCE(datetime(s.last_run_at), ''),
+                  COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = s.id), '')) DESC,
+              s.id DESC`,
     { projectId }
   );
 }
@@ -2608,6 +2617,22 @@ function listLocks(projectId = null) {
   );
 }
 
+/**
+ * How many History rows name this session as their author.
+ *
+ * A harness writes as `<harness>:<sessionId>` and the server signs every audit
+ * summary "(by <actor>)", so that suffix is the attribution. Deleting such a
+ * session would leave History pointing at a conversation nobody can open, which
+ * is why the window offers only Archive for one. The pattern ends at the
+ * closing bracket so session 6 never counts session 16's rows.
+ */
+function sessionChanges(id) {
+  const n = Number(id);
+  if (!Number.isInteger(n)) return 0;
+  const r = one("SELECT COUNT(*) AS n FROM audit WHERE summary LIKE :pattern", { pattern: `%(by %:${n})` });
+  return r ? r.n : 0;
+}
+
 function deleteSession(id) {
   const before = getSession(id);
   if (!before) return null;
@@ -2818,7 +2843,7 @@ module.exports = {
   listWorkspaces, getWorkspace, workspaceByPath, createWorkspace, updateWorkspace, deleteWorkspace,
   projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
   adoptProjectPaths,
-  listSessions, getSession, createSession, updateSession, deleteSession,
+  listSessions, getSession, createSession, updateSession, deleteSession, sessionChanges,
   listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness, trustHarnessCommand,
   listHandoffs, getHandoff, createHandoff, updateHandoff, pendingHandoffs, handoffsSince,
   acquireLock, releaseLock, listLocks,

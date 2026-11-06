@@ -109,7 +109,12 @@ const state = {
   // settings.json as last read, for the agent limits Runs draws.
   settings: {},
   pinned: [],
-  restOpen: false,
+  // settings.hiddenFromActive as [{ id, at }]. See sidebarGroups.
+  hidden: [],
+  restOpen: (() => { try { return localStorage.getItem("delphi.sidebar.moreOpen") === "1"; } catch { return false; } })(),
+  // The project whose whole session list is unfolded, if any. A project id
+  // rather than a flag, so moving to another project folds its list again.
+  sessionsAllFor: null,
   // Today opens All work until it is built; this says which of the two was clicked.
   todayPick: false,
   runsEarlier: false,
@@ -672,43 +677,94 @@ function goBack() {
 
 
 
-/**
- * One project's row, and its sessions under it when it is the open one.
- *
- * The sidebar draws its own row now and borrows only the sessions from here,
- * so the rename, close and keyboard handling for a session live in one place.
- */
-function projectRows(p, open) {
-  const on = p.id === state.projectId;
-  const row = el("div", { className: "gs" + (on ? " on" : ""), tabIndex: 0, role: "button" });
-  if (on) row.setAttribute("aria-current", "page");
-  row.title = p.open_count ? `${p.name}\n${plural(p.open_count, "open task", "open tasks")}` : p.name;
-  row.append(el("span", { className: "dot", style: `background:${safeColour(p.colour)}` }));
-  row.append(el("span", { className: "nm", textContent: p.name }));
-  if (p.open_count) row.append(el("span", { className: "kbd", textContent: String(p.open_count) }));
-  row.onclick = open;
-  row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
-  row.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
-  if (!on) return [row];
+// The words for an agent, as the person picked it. Null is Delphi's own chat,
+// which drives no CLI and so has no harness row to borrow a label from.
+function sessionAgent(sn) {
+  if (!sn.harness) return "Delphi chat";
+  const h = state.harnesses.find((x) => x.key === sn.harness);
+  return h ? h.label : sn.harness;
+}
 
-  // The open project's sessions sit under it, indented, so the column reads as
-  // one tree rather than as two lists that happen to be stacked.
+/** "2 months ago": a sidebar is scanned, and a day count past a week is arithmetic. */
+function sessionAgo(stamp) {
+  const s = TIME.secondsSince(stamp);
+  if (!Number.isFinite(s)) return "";
+  const say = (n, unit) => `${n} ${unit}${n === 1 ? "" : "s"} ago`;
+  if (s < 60) return "just now";
+  if (s < 3600) return say(Math.round(s / 60), "minute");
+  if (s < 86400) return say(Math.round(s / 3600), "hour");
+  const days = Math.round(s / 86400);
+  if (days < 14) return say(days, "day");
+  if (days < 60) return say(Math.round(days / 7), "week");
+  if (days < 365) return say(Math.round(days / 30), "month");
+  return say(Math.round(days / 365), "year");
+}
+
+// The newest of the times a session can be said to have been used. Compared as
+// times, because last_run_at is ISO and the rest are SQLite's own format, and
+// the two do not sort together as text.
+function sessionLastActive(sn) {
+  let best = null;
+  for (const v of [sn.last_message_at, sn.last_run_at, sn.updated_at, sn.created_at]) {
+    const at = v ? TIME.parseStamp(v) : null;
+    if (at && (!best || at > best.at)) best = { at, v };
+  }
+  return best ? best.v : null;
+}
+
+// More than this and the list folds, because the sessions sit between the
+// open project and the rest of the sidebar and a long column pushes it away.
+const SESSIONS_SHOWN = 3;
+
+const SESSION_HELP = "A conversation with Delphi's chat or with Claude Code, Codex or Copilot, working in this project's folder. " +
+  "Everything it changes is recorded under its name.";
+
+/**
+ * The open project's sessions, indented under it so the column reads as one
+ * tree rather than as two lists that happen to be stacked.
+ *
+ * Labelled, because a bare "Session 1" under a project told nobody what it
+ * was, and each row says which agent and how long ago, because that is how a
+ * person tells two of them apart.
+ */
+function sessionKids() {
   const kids = el("div", { className: "gkids" });
+  const info = el("button", { className: "gs-info", type: "button", textContent: "i", title: SESSION_HELP });
+  info.setAttribute("aria-label", `About AI sessions. ${SESSION_HELP}`);
+  kids.append(el("div", { className: "gs-head" }, el("span", { textContent: "AI sessions" }), info));
+
   const addSession = el("div", { className: "gs sub", tabIndex: 0, role: "button" },
-    el("span", { className: "nm dim", textContent: "+ New session" }));
+    el("span", { className: "nm dim", textContent: "+ New AI session" }));
+  addSession.dataset.row = "sess-new";
   const start = async () => { await newSession(); navigate({ view: "chat" }); };
   addSession.onclick = start;
   addSession.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); start(); } };
   kids.append(addSession);
 
-  for (const sn of state.sessions) {
+  const all = state.sessions;
+  const showAll = state.sessionsAllFor === state.projectId || all.length <= SESSIONS_SHOWN;
+  // Folded, the open conversation still shows, for the reason the open project
+  // does under More projects: the sidebar never hides where you are.
+  const shown = showAll ? all
+    : all.filter((sn, i) => i < SESSIONS_SHOWN || sn.id === state.sessionId);
+
+  for (const sn of shown) {
     const srow = el("div", {
-      className: "gs sub" + (sn.id === state.sessionId && state.view === "chat" ? " on" : ""),
-      tabIndex: 0, role: "button", title: sn.title || "New session",
+      className: "gs sub sess" + (sn.id === state.sessionId && state.view === "chat" ? " on" : ""),
+      tabIndex: 0, role: "button",
     });
+    srow.dataset.row = "sess-" + sn.id;
+    const when = sessionAgo(sessionLastActive(sn));
+    // The agent is left out when the title already is its name, which is what
+    // a tab in the chat strip is called until someone renames it.
+    const agent = sessionAgent(sn);
+    const meta = [agent === sn.title ? null : agent, when].filter(Boolean).join(" · ");
+    srow.title = `${sn.title || "Session"}\n${meta}`;
     srow.append(
       el("span", { className: "sd" + (state.streaming && sn.id === state.sessionId ? " live" : "") }),
-      el("span", { className: "nm", textContent: sn.title || "Session" })
+      el("span", { className: "gs-txt" },
+        el("span", { className: "nm", textContent: sn.title || "Session" }),
+        el("span", { className: "gs-meta", textContent: meta })),
     );
 
     const openS = async () => {
@@ -716,22 +772,37 @@ function projectRows(p, open) {
       await openSession(sn.id);
     };
 
-    // Both actions were on the right click menu only, which is a place nobody
-    // looks. They are on the row now; the menu keeps them too.
-    const rename = el("button", { className: "srow-btn", title: "Rename", textContent: "✎" });
-    rename.onclick = (e) => { e.stopPropagation(); renameSession(sn); };
+    const more = el("button", { className: "srow-btn more", type: "button", textContent: "⋯", title: "Rename, archive or delete" });
+    more.setAttribute("aria-label", `Actions for ${sn.title || "this session"}`);
+    more.setAttribute("aria-haspopup", "menu");
+    more.onclick = (e) => { e.stopPropagation(); sessionMenu(sn, more, e.detail === 0); };
+    more.onkeydown = (e) => e.stopPropagation();
 
-    const close = el("button", { className: "srow-btn close", title: "Close this session", textContent: "×" });
-    close.onclick = (e) => { e.stopPropagation(); closeSession(sn); };
-
-    srow.append(el("span", { className: "srow-acts" }, rename, close));
+    srow.append(el("span", { className: "srow-acts" }, more));
     srow.onclick = openS;
     srow.ondblclick = (e) => { e.preventDefault(); renameSession(sn); };
-    srow.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openS(); } };
-    srow.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, e.clientX, e.clientY); };
+    srow.onkeydown = (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openS(); }
+      // The keyboard's own way to a context menu, so the row's actions are not
+      // only for people with a pointer.
+      if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) { e.preventDefault(); sessionMenu(sn, more, true); }
+    };
+    srow.oncontextmenu = (e) => { e.preventDefault(); sessionMenu(sn, more, false, e.clientX, e.clientY); };
     kids.append(srow);
   }
-  return [row, kids];
+
+  if (all.length > SESSIONS_SHOWN) {
+    const hidden = all.length - shown.length;
+    const toggle = el("div", { className: "gs sub gs-more", tabIndex: 0, role: "button" },
+      el("span", { className: "nm dim", textContent: showAll ? "Show fewer" : `Show all ${all.length} (${hidden} more)` }));
+    toggle.dataset.row = "sess-all";
+    toggle.setAttribute("aria-expanded", String(showAll));
+    const flip = () => { state.sessionsAllFor = showAll ? null : state.projectId; renderSidebar(); };
+    toggle.onclick = flip;
+    toggle.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); flip(); } };
+    kids.append(toggle);
+  }
+  return kids;
 }
 
 /**
@@ -763,29 +834,52 @@ async function renameSession(session) {
   await refresh();
 }
 
+/** Lets go of a session the window is showing, before it disappears from under it. */
+function dropOpenSession(session) {
+  if (state.sessionId !== session.id) return;
+  state.sessionId = null;
+  state.messages = [];
+}
+
+// After a session row is gone its menu button is too, and focus would fall to
+// the page; the list's first row is the nearest thing still there.
+function focusSessions() {
+  const next = document.querySelector('#projects [data-row="sess-new"]');
+  if (next) next.focus({ preventScroll: true });
+}
+
 /**
- * Closes a session, which deletes it and its messages.
+ * Archives a session: out of the sidebar and the chat strip, kept whole.
  *
- * Asked for first when there is anything to lose. A session nobody spoke in is
- * the one you made by mistake, and making someone confirm the removal of an
- * empty box is the sort of prompt people learn to click through.
+ * Not asked for first, because nothing is lost; the row is still in the
+ * database with its messages, and History keeps its name.
  */
-async function closeSession(session) {
-  const spoken = (session.message_count || 0) > 0;
-  if (spoken) {
-    const ok = confirm(
-      `Close "${session.title || "this session"}"?\n\n` +
-      `Its ${session.message_count} message${session.message_count === 1 ? "" : "s"} go with it. ` +
-      "Nothing on disk is touched."
-    );
-    if (!ok) return;
-  }
-  await window.delphi.sessions.remove(session.id);
-  if (state.sessionId === session.id) {
-    state.sessionId = null;
-    state.messages = [];
-  }
+async function archiveSession(session) {
+  try { await window.delphi.sessions.archive(session.id); } catch (error) { alert(error.message); return; }
+  dropOpenSession(session);
   await refresh();
+  focusSessions();
+}
+
+/**
+ * Deletes a session and its messages, after asking.
+ *
+ * Only ever offered for one that changed nothing in Delphi (see sessionMenu),
+ * and main.js refuses the rest anyway, so the question here is only about the
+ * conversation itself.
+ */
+async function deleteSession(session) {
+  const n = session.message_count || 0;
+  const ok = confirm(
+    `Delete "${session.title || "this session"}"?\n\n` +
+    (n ? `Its ${n} message${n === 1 ? "" : "s"} go with it. ` : "It has no messages. ") +
+    "This cannot be undone. Nothing on disk is touched."
+  );
+  if (!ok) return;
+  try { await window.delphi.sessions.remove(session.id); } catch (error) { alert(error.message); return; }
+  dropOpenSession(session);
+  await refresh();
+  focusSessions();
 }
 
 
@@ -856,11 +950,64 @@ async function paintGit(box, folder) {
   box.append(row);
 }
 
-function sessionMenu(session, x, y) {
-  rowMenu(x, y, [
+/**
+ * Rename, Archive and Delete for one session, hung from its ⋯ button or opened
+ * at the pointer.
+ *
+ * Delete is offered only for a session History does not name. One that changed
+ * things is the author of those rows, and deleting it would leave them
+ * pointing at nothing, so the menu says why and offers Archive instead. Asked
+ * when the menu opens rather than carried on every row, because it is a count
+ * over the audit table and the sidebar repaints often.
+ */
+async function sessionMenu(session, button, fromKeyboard = false, x = null, y = null) {
+  let changed = 0;
+  try { changed = await window.delphi.sessions.changes(session.id); } catch { changed = 1; }
+  const items = [
     { label: "Rename", run: async () => renameSession(session) },
-    { label: "Close", danger: true, run: async () => closeSession(session) },
-  ]);
+    { label: "Archive", run: async () => archiveSession(session) },
+  ];
+  if (changed) {
+    items.push("-", el("div", { className: "ctx-note",
+      textContent: `Delete is not offered: History records ${plural(changed, "change", "changes")} by this session, ` +
+        `and ${changed === 1 ? "it" : "they"} would lose ${changed === 1 ? "its" : "their"} author. Archive hides the session and keeps that record.` }));
+  } else {
+    items.push("-", { label: "Delete…", danger: true, run: async () => deleteSession(session) });
+  }
+  keyedMenu(button, items, { fromKeyboard, x, y });
+}
+
+/**
+ * A row menu hung from a button, with the keyboard handling the Workbench
+ * menus have: focus moves in, the arrows move through it, Escape closes it and
+ * hands focus back to the button, and Tab leaves. At a point instead when the
+ * menu came from a right click.
+ */
+function keyedMenu(button, items, { fromKeyboard = false, x = null, y = null } = {}) {
+  const box = button && button.isConnected ? button.getBoundingClientRect() : null;
+  const left = x != null ? x : box ? box.left : 0;
+  const top = y != null ? y : box ? box.bottom + 4 : 0;
+  if (button) button.setAttribute("aria-expanded", "true");
+  const menu = rowMenu(left, top, items, {
+    onClose: () => {
+      if (!button) return;
+      button.setAttribute("aria-expanded", "false");
+      if (button.isConnected && (!document.activeElement || document.activeElement === document.body)) button.focus({ preventScroll: true });
+    },
+  });
+  menu.setAttribute("role", "menu");
+  const choices = [...menu.querySelectorAll(".ctx-item")];
+  for (const c of choices) c.setAttribute("role", "menuitem");
+  menu.addEventListener("keydown", (e) => {
+    const at = choices.indexOf(document.activeElement);
+    if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); closeRowMenu(); if (button && button.isConnected) button.focus(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); choices[(at + 1) % choices.length].focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); choices[(at - 1 + choices.length) % choices.length].focus(); }
+    else if (e.key === "Tab") closeRowMenu();
+  });
+  if (fromKeyboard) choices[0]?.focus();
+  else { menu.tabIndex = -1; menu.focus(); }
+  return menu;
 }
 
 function projectRow(p) {
@@ -1609,7 +1756,7 @@ function renderWorkspaceSettings(root) {
   }
   for (const p of state.wsProjects) {
     const chip = el("span", { className: "chip", textContent: p.name, title: "Open this project" });
-    chip.onclick = () => navigate({ projectId: p.id, view: "chat" });
+    chip.onclick = () => navigate({ projectId: p.id, view: "overview" });
     list.append(chip);
   }
   root.append(settingSection("Projects",
@@ -2102,7 +2249,7 @@ function confirmDestroy({ project, counts }) {
  * a menu that quietly retargeted itself at whatever is on screen would be the
  * worst kind of wrong.
  */
-function projectMenu(p, x, y) {
+function projectMenu(p, x, y, button = null, fromKeyboard = false) {
   const set = async (fields) => {
     try {
       await window.delphi.projects.update(p.id, fields);
@@ -2147,8 +2294,19 @@ function projectMenu(p, x, y) {
     .map((s) => ({ label: PROJECT_STATUS_VERB[s], run: () => set({ status: s }) }));
 
   const pinned = state.pinned.includes(p.id);
-  rowMenu(x, y, [
+  // Hide and Show only where they mean something. A pinned project is above
+  // both groups, and a project that is merely quiet is not hidden, so there is
+  // nothing to show; pinning is how to keep one of those in sight.
+  const groups = sidebarGroups();
+  const where = groups.groupOf(p);
+  const shelf = where === "active"
+    ? [{ label: "Hide from Active", run: () => setHidden(p.id, true) }]
+    : where === "rest" && groups.stillHidden(p)
+    ? [{ label: "Show in Active", run: () => setHidden(p.id, false) }]
+    : [];
+  const items = [
     { label: pinned ? "Unpin" : "Pin to the top", run: () => setPinned(p.id, !pinned) },
+    ...shelf,
     "-",
     { label: "Rename", run: rename },
     { label: p.summary ? "Edit the summary" : "Add a summary", run: describe },
@@ -2163,7 +2321,9 @@ function projectMenu(p, x, y) {
     { label: "Settings", run: () => { $("search").value = ""; return navigate({ projectId: p.id, view: "project", query: "" }); } },
     { label: "Archive…", run: () => archiveProject(p) },
     { label: "Delete the project…", danger: true, run: () => destroyProject(p) },
-  ]);
+  ];
+  if (button && x == null) keyedMenu(button, items, { fromKeyboard });
+  else keyedMenu(button, items, { x, y });
 }
 
 /**
@@ -12374,10 +12534,60 @@ async function setPinned(projectId, on) {
   } catch {}
 }
 
+// Hidden from Active. Kept in settings.json as [{ id, at }], written whole.
+const cleanHidden = (list) => (Array.isArray(list) ? list : [])
+  .filter((h) => h && Number.isInteger(Number(h.id)) && typeof h.at === "string")
+  .map((h) => ({ id: Number(h.id), at: h.at }));
+
+async function setHidden(projectId, on) {
+  const next = state.hidden.filter((h) => h.id !== projectId);
+  if (on) next.push({ id: projectId, at: TIME.toStamp(new Date()) });
+  state.hidden = next;
+  renderSidebar();
+  try {
+    const saved = await window.delphi.settings.set({ hiddenFromActive: next });
+    if (saved) { state.settings = saved; state.hidden = cleanHidden(saved.hiddenFromActive); renderSidebar(); }
+  } catch (error) { alert(error.message); }
+}
+
 // ---------------------------------------------------------------------------
 // The sidebar
 
 const ACTIVE_DAYS = 14;
+
+/**
+ * Which group each project is drawn in: Pinned, Active, or More projects.
+ *
+ * Active is worked out, not chosen: anything with an open job, or touched in
+ * the last ACTIVE_DAYS. Hide from Active is the one way to overrule it, and it
+ * lasts only until the project is touched again after the hide, so a project
+ * someone put away comes back the moment there is something new in it rather
+ * than staying lost. A pin outranks both.
+ */
+function sidebarGroups() {
+  const { late, touched } = projectPulse();
+  const busy = new Set();
+  const running = new Set();
+  for (const r of state.runs) {
+    if (RUN_OPEN.includes(r.state)) busy.add(r.project_id);
+    if (r.state === "running") running.add(r.project_id);
+  }
+  const cutoff = TIME.toStamp(new Date(Date.now() - ACTIVE_DAYS * 86400000));
+  const hiddenAt = new Map(state.hidden.map((h) => [h.id, h.at]));
+  // An agent working there now counts as touching it, so a project is never
+  // tucked away while something is changing in it.
+  const stillHidden = (p) => hiddenAt.has(p.id) && !running.has(p.id) && String(touched.get(p.id) || "") <= hiddenAt.get(p.id);
+  const isActive = (p) => !stillHidden(p) && (busy.has(p.id) || String(touched.get(p.id) || "") >= cutoff);
+
+  const byId = new Map(state.projects.map((p) => [p.id, p]));
+  const pinned = state.pinned.map((id) => byId.get(id)).filter(Boolean);
+  const pinnedIds = new Set(pinned.map((p) => p.id));
+  const active = state.projects.filter((p) => !pinnedIds.has(p.id) && isActive(p));
+  const activeIds = new Set(active.map((p) => p.id));
+  const rest = state.projects.filter((p) => !pinnedIds.has(p.id) && !activeIds.has(p.id));
+  return { pinned, active, rest, late, touched, stillHidden, groupOf: (p) =>
+    pinnedIds.has(p.id) ? "pinned" : activeIds.has(p.id) ? "active" : "rest" };
+}
 
 /** Per project: open tasks overdue, and the newest time anything in it was touched. */
 function projectPulse() {
@@ -12415,9 +12625,9 @@ let sidebarSig = null;
 function renderSidebar() {
   const { late, touched } = projectPulse();
   const sig = JSON.stringify([
-    state.projects, state.pinned, !!state.restOpen, state.projectId, state.view, state.query, sidebarPlace(),
+    state.projects, state.pinned, state.hidden, state.sessionsAllFor, state.harnesses.map((h) => h.label), !!state.restOpen, state.projectId, state.view, state.query, sidebarPlace(),
     state.runs.map((r) => [r.project_id, r.state]), needsYouTotal(),
-    [...late], [...touched], (state.sessions || []).map((x) => [x.id, x.title, x.run_state]), state.sessionId, state.pane,
+    [...late], [...touched], (state.sessions || []).map((x) => [x.id, x.title, x.run_state, x.harness, sessionAgo(sessionLastActive(x))]), state.sessionId, state.pane,
     state.workspaces, state.workspaceId,
   ]);
   if (sig === sidebarSig && $("projects").childNodes.length) return;
@@ -12475,47 +12685,55 @@ function paintSidebar() {
     box.append(el("div", { className: "pp-empty", textContent: "No projects yet. Make one with New project below, or file a task from an agent." }));
   }
 
-  const { late, touched } = projectPulse();
+  const { pinned, active, rest, late } = sidebarGroups();
   const agentsOn = new Map();
-  const busy = new Set();
   for (const r of state.runs) {
     if (r.state === "running") agentsOn.set(r.project_id, (agentsOn.get(r.project_id) || 0) + 1);
-    if (RUN_OPEN.includes(r.state)) busy.add(r.project_id);
   }
-  const cutoff = TIME.toStamp(new Date(Date.now() - ACTIVE_DAYS * 86400000));
-  const isActive = (p) => busy.has(p.id) || String(touched.get(p.id) || "") >= cutoff;
 
-  const byId = new Map(state.projects.map((p) => [p.id, p]));
-  const pinned = state.pinned.map((id) => byId.get(id)).filter(Boolean);
-  const pinnedIds = new Set(pinned.map((p) => p.id));
-  const active = state.projects.filter((p) => !pinnedIds.has(p.id) && isActive(p));
-  const activeIds = new Set(active.map((p) => p.id));
-  const rest = state.projects.filter((p) => !pinnedIds.has(p.id) && !activeIds.has(p.id));
-
-  const row = (p) => {
+  const row = (p, { outside = false } = {}) => {
     const on = p.id === state.projectId;
-    const r = el("div", { className: "proj sb-proj" + (p.open_count ? "" : " quiet") + (on ? " active" : ""), tabIndex: 0, role: "button" });
+    const r = el("div", { className: "proj sb-proj" + (p.open_count ? "" : " quiet") + (on ? " active" : "") + (outside ? " outside" : ""), tabIndex: 0, role: "button" });
     if (on) r.setAttribute("aria-current", "page");
     r.dataset.row = "proj-" + p.id;
     r.title = p.open_count ? `${p.name}\n${plural(p.open_count, "open task", "open tasks")}` : p.name;
     r.append(el("span", { className: "dot", style: `background:${safeColour(p.colour)}` }),
       el("span", { className: "proj-name", textContent: p.name }));
-    if (p.path) { const f = homeIcon("folder", "fold"); f.append(Object.assign(document.createElementNS("http://www.w3.org/2000/svg", "title"), { textContent: p.path })); r.append(f); }
+    // The folder icon gives way to the open tag there, so the name keeps room.
+    if (p.path && !outside) { const f = homeIcon("folder", "fold"); f.append(Object.assign(document.createElementNS("http://www.w3.org/2000/svg", "title"), { textContent: p.path })); r.append(f); }
     const n = agentsOn.get(p.id);
     if (n) r.append(el("span", { className: "ag", title: `${plural(n, "agent", "agents")} working here now` }, el("span", { className: "live-dot" }), String(n)));
+    // Said in words, because the open project drawn under a folded More
+    // projects otherwise looks as if it belonged to the group above the fold.
+    if (outside) {
+      r.append(el("span", { className: "open-tag", textContent: "open" }));
+      r.title += "\nOpen now. It lives under More projects.";
+    }
     const od = late.get(p.id);
     if (od) r.append(el("span", { className: "od", textContent: `${od} late` }));
     r.append(el("span", { className: "count", textContent: p.open_count ? String(p.open_count) : "" }));
-    const open = () => { $("search").value = ""; navigate({ projectId: p.id, view: "chat", query: "" }); };
+    // Its Overview, never its chat. Landing on chat used to put a "+ New
+    // session" row right under the pointer that had just clicked, and a
+    // session made by a stray click is clutter nobody knew how to remove.
+    const open = () => { $("search").value = ""; navigate({ projectId: p.id, view: "overview", query: "" }); };
     r.onclick = open;
-    r.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
-    r.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY); };
+    r.onkeydown = (e) => {
+      if (e.target !== r) return;
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+      if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) { e.preventDefault(); projectMenu(p, null, null, more, true); }
+    };
+    r.oncontextmenu = (e) => { e.preventDefault(); projectMenu(p, e.clientX, e.clientY, more); };
+    const more = el("button", { className: "proj-more", type: "button", textContent: "\u22ef", title: "Pin, hide or more" });
+    more.setAttribute("aria-label", `Actions for ${p.name}`);
+    more.setAttribute("aria-haspopup", "menu");
+    more.onclick = (e) => { e.stopPropagation(); projectMenu(p, null, null, more, e.detail === 0); };
+    r.append(more);
     if (!on) return [r];
     // The open project keeps its sessions under it, so a conversation is one
     // click away from wherever the project was opened.
-    const kids = projectRows(p, open)[1];
-    if (kids) kids.className = "sb-kids";
-    return kids ? [r, kids] : [r];
+    const kids = sessionKids();
+    kids.className = "sb-kids";
+    return [r, kids];
   };
 
   if (pinned.length) {
@@ -12530,16 +12748,28 @@ function paintSidebar() {
     const fold = el("div", { className: "fold-row" + (state.restOpen ? " open" : ""), tabIndex: 0, role: "button" });
     fold.dataset.row = "fold";
     fold.setAttribute("aria-expanded", String(!!state.restOpen));
-    fold.append(el("span", { className: "car", textContent: "▸" }), el("span", { className: "grow", textContent: pinned.length || active.length ? "Everything else" : "Projects" }));
+    // "More projects (14)" rather than "Everything else" and a bare number,
+    // which read as a place of its own rather than as the rest of this list.
+    const word = pinned.length || active.length ? "More projects" : "Projects";
+    fold.append(el("span", { className: "car", textContent: "▸" }), el("span", { className: "grow", textContent: `${word} (${rest.length})` }));
+    fold.title = `Projects with nothing new in the last ${ACTIVE_DAYS} days, or hidden from Active. Right click a project to pin or hide it.`;
     const lateInside = rest.reduce((n, p) => n + (late.get(p.id) || 0), 0);
+    // Folded only: open, each row below says its own.
     if (!state.restOpen && lateInside) fold.append(el("span", { className: "od", textContent: `${lateInside} late` }));
-    fold.append(el("span", { className: "count", textContent: String(rest.length) }));
-    const toggle = () => { state.restOpen = !state.restOpen; renderSidebar(); };
+    // Remembered in this window's storage: it is a view preference, and losing
+    // it to private storage costs nothing worse than a closed fold.
+    const toggle = () => {
+      state.restOpen = !state.restOpen;
+      try { localStorage.setItem("delphi.sidebar.moreOpen", state.restOpen ? "1" : "0"); } catch {}
+      renderSidebar();
+    };
     fold.onclick = toggle;
     fold.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
     box.append(fold);
-    // Folded, the open project still shows, so the sidebar never hides where you are.
-    rest.filter((p) => state.restOpen || p.id === state.projectId).forEach((p) => box.append(...row(p)));
+    if (state.restOpen) rest.forEach((p) => box.append(...row(p)));
+    // Folded, the open project still shows, so the sidebar never hides where
+    // you are; marked, so it is plain why it is there.
+    else rest.filter((p) => p.id === state.projectId).forEach((p) => box.append(...row(p, { outside: true })));
   }
 
   const add = el("button", { className: "btn wide", type: "button" }, homeIcon("plus"), "New project");
@@ -14235,6 +14465,7 @@ async function boot() {
     const settings = await window.delphi.settings.get();
     state.settings = settings || {};
     state.pinned = readPins(settings);
+    state.hidden = cleanHidden(settings.hiddenFromActive);
     migratePins(settings).then(() => { state.pinned = readPins(state.settings); renderSidebar(); });
     applyTheme(settings.theme);
     applyMotion(settings.animations !== false);

@@ -138,6 +138,10 @@ let settings = {
   // Projects kept at the top of the sidebar, in the person's order. Ids, so a
   // renamed project stays pinned; settings:set drops any that do not exist.
   pinnedProjects: [],
+  // Projects taken out of the sidebar's Active group, each with when, as
+  // [{ id, at }]. Touching the project after `at` brings it back on its own,
+  // so hiding is "not now" rather than a second archive nobody remembers.
+  hiddenFromActive: [],
 };
 let schedulerTimer = null;
 let vaultTimer = null;
@@ -2063,7 +2067,15 @@ handle("sessions:list", (projectId) => db.listSessions(projectId));
 handle("sessions:get", (id) => db.getSession(id));
 handle("sessions:create", (payload) => db.createSession(payload));
 handle("sessions:update", (id, fields) => db.updateSession(id, fields));
-handle("sessions:delete", (id) => db.deleteSession(id));
+// Refused here as well as hidden in the window, because the menu is not the
+// only thing that can send this, and a deleted author leaves History unreadable.
+handle("sessions:delete", (id) => {
+  const changed = db.sessionChanges(id);
+  if (changed) throw new Error(`This session made ${changed} recorded change${changed === 1 ? "" : "s"}, so it can only be archived.`);
+  return db.deleteSession(id);
+});
+handle("sessions:changes", (id) => db.sessionChanges(id));
+handle("sessions:archive", (id) => db.updateSession(id, { status: "archived" }));
 handle("messages:list", (sessionId) => db.listMessages(sessionId));
 handle("messages:append", (payload) => db.appendMessage(payload));
 handle("messages:update", (id, fields) => db.updateMessage(id, fields));
@@ -2219,6 +2231,22 @@ handle("settings:set", (fields) => {
       if (!ids.includes(id)) ids.push(id);
     }
     settings.pinnedProjects = ids;
+  }
+  // Unlike pins, a project that no longer exists is dropped rather than
+  // refused: the list is rewritten whole on every hide, and one deleted
+  // project should not make every later hide fail.
+  if (fields.hiddenFromActive !== undefined) {
+    const value = fields.hiddenFromActive == null ? [] : fields.hiddenFromActive;
+    if (!Array.isArray(value)) throw new Error("hiddenFromActive must be a list of { id, at }");
+    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+    const kept = new Map();
+    for (const raw of value) {
+      const id = Number(raw && typeof raw === "object" ? raw.id : raw);
+      if (!Number.isInteger(id) || !db.getProject(id)) continue;
+      const at = raw && typeof raw === "object" && /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(String(raw.at)) ? String(raw.at) : now;
+      kept.set(id, { id, at });
+    }
+    settings.hiddenFromActive = [...kept.values()];
   }
 
   const numeric = ["snoozeMinutes", "checkIntervalSeconds", "autoRemindBeforeDueHours"];
