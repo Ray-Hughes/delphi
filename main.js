@@ -687,7 +687,7 @@ app.on("second-instance", () => {
   show();
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // The second launch does nothing but quit; app.quit() above is not
   // synchronous, so this would otherwise still open a window and a scheduler.
   if (!FIRST_INSTANCE) return;
@@ -696,6 +696,14 @@ app.whenReady().then(() => {
   // Before the database is opened for the first time, or the migration finds a
   // file already there and declines to do anything.
   if (app.isPackaged) paths.migrateLegacyDatabase();
+  // A restore asked for before the last quit goes in now, while nothing has
+  // the file open. See main/backups.js.
+  const restored = backups.applyPending();
+  if (restored && !restored.ok) console.error(`could not restore ${restored.from}: ${restored.error}`);
+  // A new version on an old file: a copy of it as the old version left it,
+  // before opening migrates it. Awaited, because the first open is next.
+  let updated = null;
+  try { updated = await backups.beforeOpen(app.getVersion()); } catch (error) { console.error("snapshot before the update", error); }
   // Before the window, so the harness strip has rows to draw on the first paint.
   // Guarded because a database that has no registry is still a working tracker,
   // and refusing to start over it would be a poor trade.
@@ -717,12 +725,21 @@ app.whenReady().then(() => {
   }
   // Jobs the last app was running when it died are failed as interrupted,
   // with a note on their Sheet, and never rerun on their own.
+  let interrupted = [];
   try {
-    const interrupted = dispatcher.recover();
+    interrupted = dispatcher.recover();
     if (interrupted.length) console.log(`marked ${interrupted.length} interrupted jobs`);
   } catch (error) {
     console.error("recovering jobs", error);
   }
+  // Read before startHeartbeat below writes this launch's beat over the old
+  // one, which is the only record of how the last run ended.
+  try {
+    recovery.start(identity.readAlive(paths.RESOLVED), interrupted, { host: require("os").hostname() });
+  } catch (error) {
+    console.error("reading how the last run ended", error);
+  }
+  markRestorePoints({ restored, updated });
   benches.housekeep().then((report) => {
     if ((report.missing.length || report.restored.length || report.adopted.length || (report.reconciled || []).length) && win && !win.isDestroyed()) {
       win.webContents.send("db-changed");
@@ -746,6 +763,7 @@ app.whenReady().then(() => {
   // Late enough not to compete with the first paint, and once only: a desktop
   // app that phones home on a timer is a desktop app people firewall.
   setTimeout(() => checkForUpdate({ quiet: true }), 12000);
+  scheduleSnapshots();
 
   // Following the system means following it while running, not only at startup.
   nativeTheme.on("updated", () => {
@@ -1868,6 +1886,8 @@ handle("harness:start", ({ sessionId, prompt, system, autoAllow }) =>
 // what agents asked for. It is here because this is where the harnesses live.
 
 const { createDispatcher } = require("./agent/dispatch");
+const { createRecovery, register: registerRecovery } = require("./main/recovery");
+const { createBackups } = require("./main/backups");
 const { makeWorkbenchStore: makeJobBenchStore } = require("./workbench/store");
 // Its own Workbench verbs, attributed to Delphi rather than to "you": a
 // Workbench a job started was started by the dispatcher, on a person's say-so.
@@ -1944,6 +1964,58 @@ handle("runs:review", (id, verdict = {}) => dispatcher.review(id, {
 }, { by: "you" }));
 // ids of queued jobs, first to run first -> every queued job, in the new order.
 handle("runs:reorder", (ids) => dispatcher.reorder(ids, { by: "you" }));
+
+// ---------------------------------------------------------------------------
+// Recovery: the banner after an unclean exit, and the database's snapshots.
+// The rules live in main/recovery.js and main/backups.js; this is the wiring.
+
+const recovery = createRecovery({ sql: db.sqlP, isAlive: require("./sheet/store").pidAlive });
+registerRecovery(handle, { recovery, dispatcher });
+
+const backups = createBackups({
+  dataDir: paths.RESOLVED.dataDir, dbPath: paths.DB_PATH, source: () => db.handle(), sqlite: require("node:sqlite"),
+});
+
+/**
+ * The rows that say a snapshot was taken before something big, once the
+ * database is open, and this version written into meta for the next launch to
+ * compare. A failure here costs the History line, never the launch.
+ */
+function markRestorePoints({ restored, updated }) {
+  const point = (kind, label, file) => {
+    try {
+      db.sqlP("INSERT INTO restore_points (kind, label, backup_path) VALUES (:p1, :p2, :p3)", [kind, label, file || null]);
+    } catch (error) { console.error("recording a restore point", error); }
+  };
+  if (updated) point("update", `Before updating from ${updated.from || "an earlier version"} to ${updated.to}`, updated.file);
+  if (restored && restored.ok) point("restore", `Before restoring ${path.basename(restored.from)}`, restored.pre);
+  try {
+    db.sqlP("INSERT INTO meta (key, value) VALUES ('app_version', :p1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [app.getVersion()]);
+  } catch (error) { console.error("recording the app version", error); }
+  lastRestore = restored;
+}
+let lastRestore = null;
+
+/**
+ * Today's snapshot a little after launch, so it never competes with the first
+ * paint, and again every 24 hours for an app that stays open for days.
+ */
+function scheduleSnapshots() {
+  const take = () => backups.daily().catch((error) => console.error("the daily snapshot", error));
+  setTimeout(take, 8000).unref?.();
+  setInterval(take, 24 * 3600 * 1000).unref?.();
+}
+
+handle("backups:list", () => ({ dir: backups.dir, backups: backups.list(), lastRestore }));
+handle("backups:preview", (name) => backups.preview(name));
+// The window has already shown the preview and asked. The current file is
+// snapshotted first (requestRestore), then the app restarts to put the chosen
+// one in place before anything opens it.
+handle("backups:restore", async (name) => {
+  const asked = await backups.requestRestore(name);
+  setTimeout(() => { app.relaunch(); app.quit(); }, 200);
+  return asked;
+});
 
 // The older channels, kept for the window that still calls them.
 handle("handoffs:list", (opts) => db.listHandoffs(opts || {}));

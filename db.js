@@ -30,6 +30,11 @@ function open() {
   // immediately rather than waiting its turn. The app and any number of agents
   // write to this file concurrently, so "immediately" is a lost write.
   db.exec("PRAGMA busy_timeout = 5000");
+  // Every commit synced to disk before it returns. FULL is what node:sqlite
+  // compiles in anyway; it is said here so the app and both of the server's
+  // routes agree on purpose rather than by default, because Apple's sqlite3
+  // runs at NORMAL, where a power cut can roll back the last few commits.
+  db.exec("PRAGMA synchronous = FULL");
   // Schema is idempotent, so applying it on every open keeps a hand-copied
   // database in step without a migration framework.
   const schema = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");

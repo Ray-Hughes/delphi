@@ -29,3 +29,6 @@ vault/
 # from the repository, output, secrets in environment dumps and all. Anchored to
 # the root because tools/fixtures/sheets/ holds test fixtures that are committed.
 /sheets/
+# Database snapshots (main/backups.js), for a data folder pointed at the checkout.
+/backups/
+/restore.pending.json

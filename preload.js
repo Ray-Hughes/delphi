@@ -111,6 +111,19 @@ contextBridge.exposeInMainWorld("delphi", {
   },
   // Jobs, for the Runs panel: handoffs, queued tasks and a person's own
   // requests, as one list. See agent/jobs.js for a run's shape.
+  // After an unclean exit: the banner and the runs it interrupted.
+  recovery: {
+    state: () => call("recovery:state"),
+    resume: (id) => call("recovery:resume", id),
+    dismissRun: (id) => call("recovery:dismissRun", id),
+    dismiss: () => call("recovery:dismiss"),
+  },
+  // The database's snapshots, and putting one back.
+  backups: {
+    list: () => call("backups:list"),
+    preview: (name) => call("backups:preview", name),
+    restore: (name) => call("backups:restore", name),
+  },
   runs: {
     list: (opts) => call("runs:list", opts),
     get: (id) => call("runs:get", id),

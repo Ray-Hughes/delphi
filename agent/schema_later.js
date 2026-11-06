@@ -238,6 +238,16 @@ const LATER_TABLES = [
   finished_at TEXT,
   outcome     TEXT
 )`],
+  // Snapshots taken before something big. See schema.sql and main/backups.js.
+  ["restore_points", `CREATE TABLE IF NOT EXISTS restore_points (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER,
+  audit_id    INTEGER,
+  kind        TEXT NOT NULL CHECK (kind IN ('migration', 'rebuild', 'update', 'large_undo', 'restore')),
+  label       TEXT NOT NULL,
+  backup_path TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+)`],
 ];
 
 // [name, table, columns the index needs, statement]. The columns are checked
@@ -283,6 +293,8 @@ const LATER_INDEXES = [
    "CREATE INDEX IF NOT EXISTS idx_item_copies_source ON item_copies(entity, source_id)"],
   ["idx_second_opinions_started", "second_opinions", ["started_at"],
    "CREATE INDEX IF NOT EXISTS idx_second_opinions_started ON second_opinions(started_at)"],
+  ["idx_restore_points_created", "restore_points", ["created_at"],
+   "CREATE INDEX IF NOT EXISTS idx_restore_points_created ON restore_points(created_at)"],
 ];
 
 /**

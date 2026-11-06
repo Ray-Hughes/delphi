@@ -1183,6 +1183,7 @@ function render() {
   // Where render() hands a part of the window to its module under ui/. One
   // line per module, added by the slice that builds it, so two slices working
   // at once collide on a line rather than on a function.
+  if (window.DelphiRecovery) DelphiRecovery.remember({ projectId: state.projectId, view: state.view });
   // --- end MOUNTS ---
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
@@ -4230,6 +4231,9 @@ function renderTaskCalendar(root, tasks) {
 /** The composer at the top of the flat list. */
 function taskComposer() {
   const input = el("input", { className: "field", placeholder: "Add a task and press Enter. Start with ! for high priority." });
+  // One quick-entry draft per place it can be typed in: a project, or all work.
+  const draftId = state.projectId || "all";
+  if (window.DelphiRecovery) DelphiRecovery.bindDraft(input, "quick", draftId);
   input.onkeydown = async (e) => {
     if (e.key !== "Enter" || !input.value.trim()) return;
     let title = input.value.trim();
@@ -4238,6 +4242,7 @@ function taskComposer() {
     const ref = (title.match(/\b([A-Z][A-Z0-9]+-\d+)\b/) || [])[1] || null;
     await window.delphi.tasks.create({ projectId: state.projectId, title, priority, ref });
     input.value = "";
+    if (window.DelphiRecovery) DelphiRecovery.clearDraft("quick", draftId);
     refresh();
   };
   return input;
@@ -7289,6 +7294,7 @@ async function renderSettings(root) {
   data.append(dl);
   root.append(data);
   paintDataInfo(data, dl);
+  if (window.DelphiBackups) DelphiBackups.paint(root);
 }
 
 /**
@@ -8946,6 +8952,12 @@ async function openTaskSheet(taskId) {
   // an input silently clips it to whatever fits.
   const title = el("textarea", { className: "ts-title", value: detail.task.title, rows: 1 });
   title.setAttribute("aria-label", "Task title");
+  // The title is never empty, so a kept edit comes back only when it differs.
+  if (window.DelphiRecovery) {
+    const kept = DelphiRecovery.draft("title", taskId);
+    if (kept && kept !== detail.task.title) title.value = kept;
+    title.addEventListener("input", () => DelphiRecovery.saveDraft("title", taskId, title.value === detail.task.title ? "" : title.value));
+  }
   const growTitle = () => {
     title.style.height = "auto";
     title.style.height = `${title.scrollHeight}px`;
@@ -9092,10 +9104,16 @@ async function openTaskSheet(taskId) {
     if (editingDesc) {
       const area = el("textarea", { className: "ts-desc-edit", value: text, spellcheck: false });
       area.placeholder = "What does finishing this actually involve";
+      if (window.DelphiRecovery) {
+        const kept = DelphiRecovery.draft("desc", taskId);
+        if (kept != null && kept !== text) area.value = kept;
+        area.addEventListener("input", () => DelphiRecovery.saveDraft("desc", taskId, area.value === text ? "" : area.value));
+      }
       const save = async () => {
         editingDesc = false;
         if (area.value !== text) await write({ detail: area.value }, "description saved");
         else paintDesc();
+        if (window.DelphiRecovery) DelphiRecovery.clearDraft("desc", taskId);
       };
       area.onblur = save;
       desc.append(area);
@@ -9740,6 +9758,7 @@ async function openTaskSheet(taskId) {
   composerKind.setAttribute("aria-live", "polite");
   const composer = el("textarea", { className: "ts-composer-box", placeholder: "Write to the Sheet" });
   composer.setAttribute("aria-label", "Write to the Sheet");
+  if (window.DelphiRecovery) DelphiRecovery.bindDraft(composer, "sheet", taskId);
   const send = el("button", { className: "btn primary sm", textContent: "Comment" });
 
   /**
@@ -9812,6 +9831,7 @@ async function openTaskSheet(taskId) {
     }
     sending = false;
     composer.value = "";
+    if (window.DelphiRecovery) DelphiRecovery.clearDraft("sheet", taskId);
     senseComposer();
     detail = await window.delphi.tasks.detail(taskId) || detail;
     paintAll({ stick: true });
@@ -9886,6 +9906,7 @@ async function openTaskSheet(taskId) {
   const closeSheet = async () => {
     if (!openSheet) return;
     openSheet = null;
+    if (window.DelphiRecovery) DelphiRecovery.taskClosed();
     const updates = {};
     if (title.value.trim() && title.value !== detail.task.title) updates.title = title.value.trim();
     overlay.remove();
@@ -9893,6 +9914,7 @@ async function openTaskSheet(taskId) {
       await window.delphi.tasks.update(taskId, updates);
       refresh();
     }
+    if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", taskId);
   };
 
   overlay.onclick = (e) => { if (e.target === overlay) closeSheet(); };
@@ -9928,6 +9950,7 @@ async function openTaskSheet(taskId) {
     },
   };
   openSheet = handle;
+  if (window.DelphiRecovery) DelphiRecovery.taskOpened(taskId);
 }
 
 // ---------------------------------------------------------------------------
@@ -12218,18 +12241,24 @@ function flagCard(row, d) {
   }
   if (runDrafts.has(replyKey) || kind === "question") {
     const field = withData(el("input", { className: "field", placeholder: kind === "question" ? "Answer it. The Oracle looks again with your answer." : "Add to the thread. It stays with the flag.", value: runDrafts.get(replyKey) || "" }), { keep: replyKey });
-    field.oninput = () => runDrafts.set(replyKey, field.value);
+    field.oninput = () => {
+      runDrafts.set(replyKey, field.value);
+      if (window.DelphiRecovery) DelphiRecovery.saveDraft("flag", f.id, field.value);
+    };
     const send = el("button", { className: "btn", type: "button", textContent: "Reply", disabled: runSending.has(replyKey) });
     const go = async () => {
       const body = field.value.trim();
       if (!body) { field.focus(); return; }
       send.disabled = true;
-      if (await sendDraft(replyKey, () => window.delphi.flags.reply(f.id, body))) reloadFlags();
+      if (await sendDraft(replyKey, () => window.delphi.flags.reply(f.id, body))) {
+        if (window.DelphiRecovery) DelphiRecovery.clearDraft("flag", f.id);
+        reloadFlags();
+      }
     };
     send.onclick = go;
     field.onkeydown = (e) => {
       if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); go(); }
-      if (e.key === "Escape" && kind !== "question") { e.stopPropagation(); runDrafts.delete(replyKey); runRefused.delete(replyKey); repaintKeepingFocus(); }
+      if (e.key === "Escape" && kind !== "question") { e.stopPropagation(); runDrafts.delete(replyKey); runRefused.delete(replyKey); if (window.DelphiRecovery) DelphiRecovery.clearDraft("flag", f.id); repaintKeepingFocus(); }
     };
     p.append(el("div", { className: "reply" }, field, send), refusedLine(replyKey));
   }
@@ -14567,7 +14596,39 @@ async function boot() {
     applyMotion(true);
     state.pinned = readPins(null);
   }
-  refresh();
+  await reopen();
+}
+
+/**
+ * The first paint, at the place the last run was left: the project, the view,
+ * the scroll and the open task, whatever ended that run. A place that no longer
+ * exists falls back to the start. Then, after an unclean exit, the banner.
+ */
+async function reopen() {
+  const R = window.DelphiRecovery;
+  if (!R) return refresh();
+  R.pruneDrafts();
+  // Replies to flags are drawn only while they hold something, so a kept one
+  // is put back where that check looks.
+  for (const d of R.draftsOf("flag")) runDrafts.set(`freply-${d.id}`, d.text);
+  const back = R.lastPlace();
+  if (back.view) {
+    state.projectId = back.projectId ?? null;
+    state.view = back.view;
+  }
+  await refresh();
+  if (state.projectId && !state.projects.some((p) => p.id === state.projectId)) {
+    state.projectId = null;
+    state.view = "new";
+    await refresh();
+  }
+  R.watchScroll(document, "content");
+  // After the view's own asynchronous paint, which the first frame is not.
+  if (back.scroll && back.projectId === state.projectId && back.view === state.view) {
+    setTimeout(() => { const c = $("content"); if (c) c.scrollTop = back.scroll; }, 400);
+  }
+  if (back.taskId) openTaskSheet(back.taskId).catch(() => R.taskClosed());
+  R.showBanner(document.querySelector("main.main"), { onChange: () => reloadRuns() });
 }
 
 boot();

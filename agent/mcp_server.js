@@ -158,6 +158,9 @@ function openDatabase() {
     // claiming from the same queue at the same moment is the normal case here,
     // not the edge one.
     handle.exec("PRAGMA busy_timeout = 5000");
+    // FULL, as the app sets it. Here it is the compile default; on the binary
+    // route below it is not, which is why each script says it again.
+    handle.exec("PRAGMA synchronous = FULL");
     return {
       kind: "node:sqlite",
       query(statement) {
@@ -196,7 +199,9 @@ function openDatabase() {
         // The dot command rather than the pragma. PRAGMA busy_timeout prints the
         // value it set, and that line lands in stdout ahead of the results,
         // where it makes the JSON unparseable and every query look empty.
-        const lines = [".timeout 5000", ".mode json", ".headers on", statement];
+        // synchronous is per connection, and every call here is a new one at
+        // Apple's NORMAL, so each script sets FULL first. It prints nothing.
+        const lines = ["PRAGMA synchronous = FULL;", ".timeout 5000", ".mode json", ".headers on", statement];
         const file = path.join(os.tmpdir(), `delphi-${process.pid}-${Date.now()}.sql`);
         fs.writeFileSync(file, lines.join("\n"));
         try {
@@ -222,7 +227,7 @@ function openDatabase() {
       // COMMIT and the whole script rolls back. execFileSync throws on that
       // exit, with sqlite3's own message on stderr.
       batch(statements) {
-        const lines = [".timeout 5000", ".bail on", "BEGIN IMMEDIATE;",
+        const lines = ["PRAGMA synchronous = FULL;", ".timeout 5000", ".bail on", "BEGIN IMMEDIATE;",
           ...statements.map((q) => (q.trim().endsWith(";") ? q : `${q};`)), "COMMIT;"];
         const file = path.join(os.tmpdir(), `delphi-${process.pid}-${Date.now()}-batch.sql`);
         fs.writeFileSync(file, lines.join("\n"));
@@ -333,6 +338,20 @@ if (process.env.DELPHI_DB_ID) {
 }
 
 const DATABASE = openDatabase();
+
+// Which file this server opened. Restoring a backup puts a different file at
+// the same path while the app is closed, and an agent session that outlived it
+// would carry on writing: on node:sqlite into the old file, now set aside, and
+// on either route with whatever it had read from the old one in mind. So every
+// call checks, and refuses in words once the file under the path has changed.
+const fileId = () => { try { const st = fs.statSync(DB); return `${st.dev}:${st.ino}`; } catch { return null; } };
+const OPENED_FILE = fileId();
+function refuseIfReplaced() {
+  const now = fileId();
+  if (OPENED_FILE && now && now !== OPENED_FILE) {
+    throw new Error("Delphi restored a backup. Restart this agent's session.");
+  }
+}
 
 // Every insert the Sheet makes uses RETURNING, which the sqlite3 command only
 // understands from 3.35. An older one (some long-term-support Linux releases
@@ -2729,6 +2748,7 @@ async function handle(req) {
   }
 
   if (method === "tools/call") {
+    refuseIfReplaced();
     const tool = TOOLS[params.name];
     if (!tool || (INTERNAL_TOOLS.has(params.name) && !CLI_CLIENT)) throw new Error(`Unknown tool ${params.name}`);
     if (READ_ONLY && !READ_ONLY_TOOLS.has(params.name)) {

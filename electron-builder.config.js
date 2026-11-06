@@ -87,6 +87,9 @@ module.exports = {
     // <link rel="stylesheet"> in index.html against it.
     "ui/",
     "styles/",
+    // The main process's areas, required from main.js, which the require walk
+    // in tools/package_test.js follows into the archive.
+    "main/",
   ],
 
   // The MCP server is launched by an editor using its own Node, and a plain Node
