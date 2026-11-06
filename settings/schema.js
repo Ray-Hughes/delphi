@@ -31,7 +31,7 @@
     { id: "jobs", label: "Jobs and approvals", icon: "shield", group: "Work", lede: "How many agent jobs run, for how long, and which ones wait for you." },
     { id: "workbenches", label: "Workbenches", icon: "branch", group: "Work", lede: "A Workbench is a task's own folder and branch, so two pieces of work never share a checkout." },
     { id: "memory", label: "Memory", icon: "memory", group: "Work", lede: "Where agents keep their working notes, how notes open, and the folder everything is mirrored to." },
-    { id: "focus", label: "Focus and Today", icon: "focus", group: "Habits", lede: "Reminders, snoozing, and what Today brings to the top." },
+    { id: "focus", label: "Focus and Today", icon: "focus", group: "Habits", lede: "Reminders, snoozing, and Focus mode: its breaks and what Interruption asks." },
     { id: "brief", label: "Brief and weekly review", icon: "clock", group: "Habits", lede: "When Today offers the weekly review: a look back at the week, a tidy of what went quiet, and next week's few objectives." },
     { id: "data", label: "Data and backups", icon: "db", group: "System", lede: "Where Delphi keeps everything, and how to get back to an earlier day." },
     { id: "privacy", label: "Privacy", icon: "lock", group: "System", lede: "What leaves this computer, who it goes to, and what never does." },
@@ -143,6 +143,18 @@
       notChanged: "The shortcuts inside the window, such as Cmd+K.",
       synonyms: ["global hotkey", "summon", "toggle", "keyboard shortcut", "accelerator"],
       effect: "hotkey",
+    },
+    {
+      // A single key, not a chord: Focus is something to reach without
+      // thinking. The choices are only letters nothing else in the window
+      // answers to (G, J, K and E are the list's, and I, B and D are Focus's
+      // own once it is open), so no choice here can shadow another key.
+      key: "focusLetter", section: "shortcuts", group: "In the window", type: "enum", default: "f",
+      choices: [["f", "F"], ["o", "O"], ["u", "U"], ["off", "No key"]],
+      label: "Open Focus mode with",
+      desc: "One key, pressed anywhere in the window outside a text box. Focus is in Cmd+K and on the bar at the top either way.",
+      notChanged: "The keys inside Focus: I for an interruption, B for a break, D for done, Esc to leave.",
+      synonyms: ["focus", "deep work", "zen", "distraction free", "single task", "keyboard"],
     },
 
     // --- Agents and harnesses ----------------------------------------------
@@ -283,6 +295,23 @@
       notChanged: "Reminders already snoozed.",
       synonyms: ["snooze", "later", "postpone", "remind me later"],
     },
+    {
+      // Text, not numbers, because the panel's select hands back text and an
+      // enum is compared exactly.
+      key: "focusBreakMinutes", section: "focus", group: "Focus mode", type: "enum", default: "30",
+      choices: [["15", "15 minutes"], ["30", "30 minutes"], ["60", "60 minutes"]],
+      label: "Break length offered first",
+      desc: "Which of the three lengths Focus's Break button has ready, so B then Enter starts it.",
+      notChanged: "The other two, which are always one click away, or a break already running.",
+      synonyms: ["break", "rest", "pomodoro", "pause", "timer"],
+    },
+    {
+      key: "focusTriage", section: "focus", group: "Focus mode", type: "bool", default: true,
+      label: "Ask the three questions on an interruption",
+      desc: "Can it wait three hours, does it keep the business running, can AI do it. Off, Interruption offers the three outcomes as plain buttons instead.",
+      notChanged: "What each outcome does: file it for later, switch to it now, or hand it to an agent.",
+      synonyms: ["interruption", "triage", "questions", "eisenhower", "urgent"],
+    },
 
     // --- Brief and weekly review -------------------------------------------
     {
@@ -329,6 +358,14 @@
       key: "checkoutNoticeSeen", section: null, internal: true, type: "checkoutNotice", default: null, nullable: true,
       label: "Checkout database notice seen",
       desc: "The ignored checkout database you have already been told about, so the notice shows once per file.",
+      synonyms: [],
+    },
+    {
+      // Kept here rather than in the window's storage so a break survives a
+      // restart: the window comes back blurred, counting down to the same end.
+      key: "focusBreakUntil", section: null, internal: true, type: "breakEnd", default: null, nullable: true, portable: false,
+      label: "Break ends at",
+      desc: "When the running Focus break ends, in milliseconds since 1970, or nothing when there is no break.",
       synonyms: [],
     },
   ];
@@ -466,6 +503,17 @@
         next[key] = whole(s, limit, s.min, s.max, `The limit for ${key}`);
       }
       return next;
+    },
+    // A moment no more than an hour and a minute away, the longest break plus
+    // the time a save can take. Further out would be a window locked by a
+    // typo; a past one is allowed, because a restart has to be able to read
+    // and then clear a break that ended while Delphi was closed.
+    breakEnd(s, v, ctx) {
+      const now = ctx.nowMs ? ctx.nowMs() : Date.now();
+      if (typeof v !== "number" || !Number.isInteger(v) || v <= 0 || v > now + 61 * 60000) {
+        fail(s, "A break ends within the next hour, as milliseconds since 1970.");
+      }
+      return v;
     },
     // A path, and only ever the one app:dataInfo reported: anything else would
     // acknowledge a notice nobody was shown.

@@ -292,14 +292,14 @@ function createDispatcher({
    * A job a person asked for, from the window. Refused at once, with the
    * reason, when it could never run: nothing to run it with, or nowhere.
    */
-  function create({ projectId, harness: key, request, taskId = null, kind = "ask", context = null, wake = false, fromSessionId = null } = {}, { by = "you", type = "human" } = {}) {
+  function create({ projectId, harness: key, request, taskId = null, kind = "ask", context = null, wake = false, fromSessionId = null } = {}, { by = "you", type = "human", hold = false } = {}) {
     const project = projectRow(jobs.projectFor(sql, { projectId: projectId || null, taskId }));
     if (!project) throw new Error(`There is no project ${projectId}.`);
     const row = sql("SELECT key, label, enabled FROM harnesses WHERE key = :p1", [String(key || "")])[0];
     if (!row || !Number(row.enabled)) throw new Error(`There is no agent called "${key}" turned on here. Turn it on in Settings, under Agents.`);
     const problem = jobs.folderProblem(sql, project.id);
     if (problem) throw new Error(problem);
-    const { state, approval } = jobs.approvalFor({ requesterType: type, autoApprove: Number(project.auto_approve) === 1 });
+    const { state, approval } = jobs.approvalFor({ requesterType: type, autoApprove: Number(project.auto_approve) === 1, hold });
     const run = jobs.insert(sql, {
       projectId: project.id, toHarness: row.key, request, taskId, context, wake, kind, source: "person",
       requestedBy: by, requesterType: type, fromSessionId, state, approval,

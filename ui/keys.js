@@ -3,9 +3,10 @@
 // G then a letter goes to a place (ui/commands.js says which letter is which):
 // the second key has to come within 1.5 seconds, or the G is forgotten. In a
 // list, J and K move a highlight down and up the tasks, Enter opens the one
-// highlighted, and E opens it to edit its title. There is no F: there is no
-// Focus view yet, and an F that only did what Enter does was a second name
-// for the same key. It comes back with Focus.
+// highlighted, and E opens it to edit its title. F (or whichever key the
+// focusLetter setting names) opens Focus mode, on the highlighted row's task when
+// there is one; ui/focus.js decides, through app.singleKey, so this file never
+// needs to know the setting.
 //
 // No single key fires while the focus is in somewhere to type, or while a
 // panel, a menu or the bar is open over the page: those own the keyboard. The
@@ -42,6 +43,7 @@ globalThis.DelphiKeys = (() => {
    * @param app.openBar()        the Cmd+K bar
    * @param app.openSwitcher()   the project switcher (Cmd+P)
    * @param app.openTask(id, how) how is "open" or "edit"
+   * @param app.singleKey(key, taskId) optional; true when it took the key
    */
   function install(app) {
     document.addEventListener("keydown", (e) => {
@@ -76,6 +78,10 @@ globalThis.DelphiKeys = (() => {
       }
       gAt = 0;
       if (key === "g" && !e.shiftKey) { gAt = Date.now(); return; }
+      if (app.singleKey && !e.shiftKey) {
+        const row = lit();
+        if (app.singleKey(key, row ? Number(row.dataset.taskId) : null)) { e.preventDefault(); return; }
+      }
       if (key === "j") { e.preventDefault(); move(1); return; }
       if (key === "k") { e.preventDefault(); move(-1); return; }
       const row = lit();
