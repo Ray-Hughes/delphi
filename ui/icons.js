@@ -39,6 +39,11 @@ globalThis.DelphiIcons = (() => {
     pencil: [["path",{"d":"M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z"}],["path",{"d":"m13.5 6.5 4 4"}]],
     sliders: [["path",{"d":"M4 7h10M18 7h2M4 17h4M12 17h8"}],["circle",{"cx":"16","cy":"7","r":"2"}],["circle",{"cx":"10","cy":"17","r":"2"}]],
     list: [["path",{"d":"M9 6h11M9 12h11M9 18h11"}],["circle",{"cx":"4.5","cy":"6","r":".6","fill":"currentColor"}],["circle",{"cx":"4.5","cy":"12","r":".6","fill":"currentColor"}],["circle",{"cx":"4.5","cy":"18","r":".6","fill":"currentColor"}]],
+    // Focus mode's: Interruption, Break, a parked task, and Send.
+    bolt: [["path",{"d":"M13 2 4 14h7l-1 8 9-12h-7z"}]],
+    cup: [["path",{"d":"M5 9h11v5a5 5 0 0 1-5 5H10a5 5 0 0 1-5-5z"}],["path",{"d":"M16 10h1.5a2.5 2.5 0 0 1 0 5H16"}],["path",{"d":"M8 3v2M12 3v2"}]],
+    pause: [["path",{"d":"M9 6v12M15 6v12"}]],
+    send: [["path",{"d":"M12 19V5M5 12l7-7 7 7"}]],
     kanban: [["rect",{"x":"3.5","y":"4","width":"5","height":"15","rx":"1.5"}],["rect",{"x":"10.5","y":"4","width":"5","height":"10","rx":"1.5"}],["rect",{"x":"17.5","y":"4","width":"3","height":"6","rx":"1"}]],
   };
 

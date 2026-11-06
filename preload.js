@@ -273,6 +273,8 @@ contextBridge.exposeInMainWorld("delphi", {
   },
   // Today: stuck tasks, the one banner and the brief, and "Mark as seen".
   today: { view: (opts) => call("today:view", opts || {}), seen: (upTo) => call("today:seen", upTo || null) },
+  // Focus mode (main/focus.js): a delegation held for approval, and the notice when a break ends.
+  focus: { delegate: (payload) => call("focus:delegate", payload), notify: (payload) => call("focus:notify", payload) },
   // Memory (main/memory.js): the tab, the reasons beside a task, Log a fact.
   memory: { list: (projectId) => call("memory:list", projectId ?? null), search: (q, projectId) => call("memory:search", q, projectId ?? null), relatedFor: (taskId, opts) => call("memory:relatedFor", taskId, opts || {}), logFact: (payload) => call("memory:logFact", payload) },
   // The path of a dropped file or folder. File.path is gone in this Electron,

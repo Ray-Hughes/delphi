@@ -70,8 +70,12 @@ const REVIEWS = ["accepted", "sent_back"];
  * A person's own request runs. An agent's waits for a person, unless the
  * project has said its agents may start work by themselves. A requester type
  * nobody recorded is treated as an agent, because the safe mistake is asking.
+ * hold asks for the person's yes even on their own request, and even where the
+ * project auto-approves: Focus delegates in one keystroke from a composer, and
+ * a job that started from a stray Enter is the mistake approval exists to stop.
  */
-function approvalFor({ requesterType = null, autoApprove = false } = {}) {
+function approvalFor({ requesterType = null, autoApprove = false, hold = false } = {}) {
+  if (hold) return { state: "needs_approval", approval: "pending" };
   if (requesterType === "human") return { state: "queued", approval: "not_needed" };
   if (autoApprove) return { state: "queued", approval: "auto" };
   return { state: "needs_approval", approval: "pending" };

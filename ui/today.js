@@ -244,6 +244,9 @@ globalThis.DelphiToday = (() => {
 
   function startFocus() {
     const q = focusQueue((app.state().everyTask) || []);
+    // Focus mode on the task this card names, so the card and Focus agree; with
+    // nothing due or in progress, Focus picks its own first task.
+    if (window.DelphiFocus) { DelphiFocus.enter(q.length ? q[0].t.id : null); return; }
     if (!q.length) { app.notify("Nothing is due or in progress for you, so there is nothing to focus on yet."); return; }
     app.openTask(q[0].t.id);
   }

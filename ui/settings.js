@@ -194,7 +194,9 @@ globalThis.DelphiSettingsPanel = (() => {
       { group: "In lists", label: "Next and previous row", plain: ["J", "K"] },
       { group: "In lists", label: "Open the row", plain: ["Enter"] },
       { group: "In lists", label: "Edit its title", plain: ["E"] },
-      { group: "In lists", label: "Focus on it", plain: ["F"] },
+      { group: "In lists", label: "Focus on it (anywhere else, Focus mode on the top task)", plain: ["F"] },
+      { group: "In Focus", label: "Interruption, Break, Done", plain: ["I", "B", "D"] },
+      { group: "In Focus", label: "Leave Focus (not during a break)", plain: ["Esc"] },
       { group: "In Settings", label: "Search settings", keys: "CmdOrCtrl+F" },
       { group: "In Settings", label: "Move between sections", plain: ["↑", "↓"] },
       { group: "In Settings", label: "Clear the search, then close", plain: ["Esc"] });
