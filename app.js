@@ -11434,6 +11434,9 @@ function refusalWords(error) {
 // character, where rebuilding the string per match made a long paste
 // quadratic. The titles are indexed once rather than searched per match.
 const EVIDENCE_CAP = 60;
+// An id the store will take: "#0" or a twenty-digit number stays plain text
+// rather than becoming a chip that gets the whole flag refused.
+const goodId = (n) => Number.isSafeInteger(n) && n > 0;
 function readEvidence(text) {
   const rest = String(text || "");
   const taken = new Uint8Array(rest.length);
@@ -11473,7 +11476,7 @@ function readEvidence(text) {
   for (const m of all(/(?:\btasks?\s+)?#(\d+)\s*(?:to|through|\.\.|-)\s*#?(\d+)\b/gi)) {
     const a = Number(m[1]);
     const b = Number(m[2]);
-    if (!(b > a) || b - a > 19) continue;
+    if (!goodId(a) || !goodId(b) || !(b > a) || b - a > 19) continue;
     const ids = [];
     for (let id = a; id <= b; id += 1) ids.push(id);
     add(`range:${a}:${b}`, { cls: "task", ty: "tasks", label: `#${a} to #${b}, ${ids.length} tasks`, evidence: ids.map((id) => ({ type: "task", id })) });
@@ -11482,12 +11485,14 @@ function readEvidence(text) {
   for (const m of all(/\b(task|note|pad|project)s?\s+#?(\d+)\b/gi)) {
     const type = m[1].toLowerCase();
     const id = Number(m[2]);
+    if (!goodId(id)) continue;
     const title = type === "task" ? taskTitle(id) : type === "note" ? noteTitle(id) : type === "pad" ? padTitle(id) : projectNameOf(id, null);
     add(`${type}:${id}`, { cls: type, ty: type, label: `#${id}${title ? ` ${title}` : ""}`, evidence: [{ type, id }] });
     mask(m);
   }
   for (const m of all(/(^|[^\w&/])#(\d+)\b/g)) {
     const id = Number(m[2]);
+    if (!goodId(id)) continue;
     const title = taskTitle(id);
     add(`task:${id}`, { cls: "task", ty: "task", label: `#${id}${title ? ` ${title}` : ""}`, evidence: [{ type: "task", id }] });
     mask(m);
@@ -11822,8 +11827,35 @@ function consideredLine(f, signals, ops) {
 /** The newest entry of a kind on a flag's thread, optionally only those carrying a proposal. */
 const lastEntry = (entries, kind, test = () => true) => [...(entries || [])].reverse().find((e) => e.kind === kind && test(e)) || null;
 
+/**
+ * Who a proposal came from when the Oracle only checked it: a proposal driven
+ * by an agent's own words is that agent's suggestion, at lower confidence, and
+ * the card says so in the agent's name rather than in the Oracle's voice.
+ * The store writes suggested_by and nothing else; null when the Oracle's own.
+ */
+function suggestedBy(f) {
+  const p = f && f.proposal;
+  return p && p.suggested_by ? { name: String(p.suggested_by), type: p.suggested_by_type || null } : null;
+}
+
+// An actor name is whatever the writer chose, so it is never shown alone:
+// "agent Ray" cannot be read as Ray the person.
+const suggesterKind = (type) => (type === "agent" ? "agent " : type === "human" ? "" : "unmarked writer ");
+
+function suggestedTag(f) {
+  const who = suggestedBy(f);
+  if (!who) return null;
+  const conf = f.proposal && f.proposal.confidence != null ? ` (${Number(f.proposal.confidence).toFixed(2)})` : "";
+  const kind = suggesterKind(who.type);
+  // The Oracle checked it only when the Oracle wrote it up; an agent's own
+  // propose_move went straight onto the flag.
+  const checked = f.proposal.oracle_checked === true;
+  return el("span", { className: "suggested-tag", title: `${kind}${who.name} suggested this${checked ? " from its own words; the Oracle checked it against what it can see" : " itself; the Oracle did not write it"}${conf ? `, at confidence ${Number(f.proposal.confidence).toFixed(2)}` : ""}.` },
+    kind, el("b", { textContent: who.name }), checked ? " suggested, the Oracle checked" : " suggested", conf);
+}
+
 function flagSourceWords(f) {
-  const by = f.proposed_by === "oracle" || (f.proposal && f.proposal.evaluator === "oracle@1") ? "the Oracle" : f.proposed_by || null;
+  const by = suggestedBy(f) ? null : f.proposed_by === "oracle" || (f.proposal && f.proposal.evaluator === "oracle@1") ? "the Oracle" : f.proposed_by || null;
   const whose = f.source === "sweep" ? "found by the sweep" : f.source === "person" ? "on your flag" : `on ${f.created_by || "an agent"}'s flag`;
   return `${by ? `from ${by}, ` : ""}${whose} at ${clockWords(f.created_at)}`;
 }
@@ -11859,6 +11891,7 @@ function flagCard(row, d) {
   const p = el("div", { className: "prop" });
   const label = kind === "decision" ? "Proposal" : kind === "question" ? "Question" : "Flagged";
   p.append(el("div", { className: "row" }, el("span", { className: "k", textContent: label }),
+    kind === "decision" ? suggestedTag(f) : null,
     el("span", { className: "hint", textContent: kind === "decision" ? flagSourceWords(f) : `${f.source === "sweep" ? "the sweep flagged it" : f.source === "person" ? "you flagged it" : `flagged by ${f.created_by || "an agent"}`} at ${clockWords(f.created_at)}` }),
     el("span", { className: "grow" }),
     withData(el("span", { className: "hint", textContent: spanWords(TIME.secondsSince(f.updated_at || f.created_at)) }), { since: f.updated_at || f.created_at })));

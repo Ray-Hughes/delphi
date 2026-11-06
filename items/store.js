@@ -23,7 +23,7 @@
  */
 
 const pads = require("../pads");
-const { makeEvaluator } = require("./evaluate");
+const { makeEvaluator, suggesterLabel, AGENT_CONFIDENCE } = require("./evaluate");
 
 // What each kind of item is, as the store needs to know it: its table, the
 // column a person reads as its name, and the audit entity History files it
@@ -104,6 +104,10 @@ function inProject(entity, alias, param) {
   return `(${alias}.project_id = ${param} OR ${alias}.id IN (SELECT entity_id FROM item_projects
              WHERE project_id = ${param} AND entity = '${entity}'))`;
 }
+
+// What marks a propose() call as the Oracle's own. A symbol, because nothing
+// that came through JSON (a tool's arguments, a command line) can hold one.
+const ORACLE_CALL = Symbol("oracle-call");
 
 function makeItemStore({
   sql, batch = null, actor = "agent", authorType = null, settings = () => ({}),
@@ -1027,6 +1031,20 @@ function makeItemStore({
     return entry;
   }
 
+  /**
+   * Ops on a flag change the flagged item and nothing else (a task's move
+   * still takes its subtree, which the plan counts). The same rule for an
+   * agent's proposal and a person's own decision in the window, so neither
+   * can be the way to move something nobody flagged.
+   */
+  function onlyItsItem(row, ops, what) {
+    for (const o of ops) {
+      if (o.entity !== row.entity || o.id !== Number(row.entity_id)) {
+        throw new Error(`Flag ${row.id} is about ${row.entity} ${row.entity_id}; ${what} changes that item only.`);
+      }
+    }
+  }
+
   function cleanOps(ops) {
     if (!Array.isArray(ops) || !ops.length || ops.length > MAX_OPS) throw new Error(`A proposal is 1 to ${MAX_OPS} ops.`);
     return ops.map((o) => {
@@ -1041,7 +1059,7 @@ function makeItemStore({
    * and all, so a proposal that could not be applied is visible as such.
    */
   function propose({ flagId = null, entity = null, id = null, ops, reasoning = "", confidence = null, by = null,
-                     evaluator: who = null, signals = null } = {}) {
+                     evaluator: who = null, signals = null, suggestedBy = null, suggestedByType = null, [ORACLE_CALL]: oracle = false } = {}) {
     let row = flagId != null ? requireFlag(flagId) : null;
     if (!row) {
       const made = flag({ entity, id, note: "", evaluate: "none" });
@@ -1051,18 +1069,26 @@ function makeItemStore({
       throw new Error(`Flag ${row.id} is ${row.status}; a proposal goes on an open one.`);
     }
     const clean = cleanOps(ops);
-    for (const o of clean) {
-      if (o.entity !== row.entity || o.id !== Number(row.entity_id)) {
-        throw new Error(`Flag ${row.id} is about ${row.entity} ${row.entity_id}; a proposal on it changes that item only.`);
-      }
-    }
+    onlyItsItem(row, clean, "a proposal on it");
     const plans = clean.map(plan);
+    // Only the Oracle's own evaluation and a person speak in their own voice.
+    // Anything else proposed here (an agent's propose_move, or a writer that
+    // never said it is a person) is that writer's suggestion: in its name,
+    // at no more than even odds, whatever confidence it claims. The Oracle
+    // is told apart by a symbol only this module holds: propose_move passes
+    // the agent's own name as its evaluator, and an agent may call itself
+    // "oracle@1".
+    const asked = oracle ? (suggestedBy ? { by: String(suggestedBy), type: suggestedByType || null } : null)
+      : writerType === "human" ? null : { by: writer, type: writerType };
+    const claimed = confidence == null || !Number.isFinite(Number(confidence)) ? null : Math.max(0, Math.min(1, Number(confidence)));
     const proposal = {
       ops: clean,
       reasoning: clip(reasoning, REASON_CHARS),
-      confidence: confidence == null || !Number.isFinite(Number(confidence)) ? null : Math.max(0, Math.min(1, Number(confidence))),
+      confidence: asked ? Math.min(AGENT_CONFIDENCE, claimed == null ? AGENT_CONFIDENCE : claimed) : claimed,
       ...(signals ? { signals } : {}),
       evaluator: who || (writerType === "agent" ? writer : "person"),
+      ...(asked ? { suggested_by: asked.by, suggested_by_type: asked.type } : {}),
+      ...(oracle ? { oracle_checked: true } : {}),
     };
     const proposer = by || proposal.evaluator;
     runAll([
@@ -1078,13 +1104,19 @@ function makeItemStore({
   /** How a proposal reads in a list: "Oracle suggests: move to X, keep in Y (0.82)". */
   function summaryOf(proposal, row) {
     if (!proposal || !Array.isArray(proposal.ops)) return null;
-    const words = proposal.ops.map((o) => {
+    const words = opsWords(proposal, row);
+    if (proposal.suggested_by) return `Suggested by ${suggesterLabel(proposal.suggested_by, proposal.suggested_by_type)}: ${words}${proposal.confidence != null ? ` (${proposal.confidence.toFixed(2)})` : ""}`;
+    const who = proposal.evaluator === "oracle@1" ? "Oracle" : proposal.evaluator || "Someone";
+    return `${who} suggests: ${words}${proposal.confidence != null ? ` (${proposal.confidence.toFixed(2)})` : ""}`;
+  }
+
+  /** What a proposal's ops do, in words, with no one's name on them. */
+  function opsWords(proposal, row) {
+    return proposal.ops.map((o) => {
       const there = projectName(o.to);
       const keep = o.options && o.options.keepInSource && row && row.project_id != null ? `, keep in ${projectName(row.project_id)}` : "";
       return o.op === "move" ? `move to ${there}${keep}` : o.op === "copy" ? `copy to ${there}` : o.op === "associate" ? `also show in ${there}` : `take out of ${there}`;
     }).join("; ");
-    const who = proposal.evaluator === "oracle@1" ? "Oracle" : proposal.evaluator || "Someone";
-    return `${who} suggests: ${words}${proposal.confidence != null ? ` (${proposal.confidence.toFixed(2)})` : ""}`;
   }
 
   /**
@@ -1154,12 +1186,20 @@ function makeItemStore({
       return { flag: summarise(flagRow(row.id)), auditIds: [] };
     }
     const chosen = ops ? cleanOps(ops) : proposal && proposal.ops;
+    // Before anything is written. propose() has refused such ops since flags
+    // began, so a stored one that reaches here was written some other way,
+    // and is refused as that rather than applied.
+    if (chosen && !ops && !Array.isArray(chosen)) throw new Error(`Flag ${row.id}'s stored proposal cannot be read, so it was not applied. Reject it, or approve with your own ops.`);
+    if (chosen && !ops && chosen.some((o) => o.entity !== row.entity || Number(o.id) !== Number(row.entity_id))) {
+      throw new Error(`Flag ${row.id}'s stored proposal changes something other than ${row.entity} ${row.entity_id}, so it was not applied. Reject it, or approve with your own ops.`);
+    }
+    if (chosen) onlyItsItem(row, chosen, "a decision on it");
     if (!chosen || !chosen.length) throw new Error(`Flag ${row.id} has no proposal yet; pass the ops to apply.`);
     const edited = Boolean(ops) && JSON.stringify(chosen) !== JSON.stringify(proposal && proposal.ops);
     const body = ownDecision
-      ? `Decided by ${who}: ${summaryOf({ ops: chosen }, row).replace(/^Someone suggests: /, "")}.${why ? ` ${why}` : ""}`
+      ? `Decided by ${who}: ${opsWords({ ops: chosen }, row)}.${why ? ` ${why}` : ""}`
       : edited
-      ? `Approved with changes: ${summaryOf({ ops: chosen }, row).replace(/^Someone suggests: /, "")} instead of ${proposal ? summaryOf(proposal, row).replace(/^.*? suggests: /, "") : "nothing proposed"}.${why ? ` ${why}` : ""}`
+      ? `Approved with changes: ${opsWords({ ops: chosen }, row)} instead of ${proposal && Array.isArray(proposal.ops) ? opsWords(proposal, row) : "nothing proposed"}.${why ? ` ${why}` : ""}`
       : `Approved${why ? `: ${why}` : "."}`;
     const extra = [
       [`UPDATE item_flags SET status = 'applied', decided_by = :p1, decided_at = datetime('now'), decision_note = :p2,
@@ -1326,7 +1366,8 @@ function makeItemStore({
       const rejected = row.status === "rejected" && JSON.stringify(parseJson(row.proposal, {}).ops) === JSON.stringify(result.proposal.ops);
       if (!rejected) {
         return propose({ flagId: row.id, ops: result.proposal.ops, reasoning: result.reasoning, confidence: result.confidence,
-          by: "oracle", evaluator: "oracle@1", signals: result.signals });
+          by: "oracle", evaluator: "oracle@1", signals: result.signals, suggestedBy: result.proposal.suggested_by || null, suggestedByType: result.proposal.suggested_by_type || null,
+          [ORACLE_CALL]: true });
       }
     }
     // A name that could be several projects is asked about, not guessed: the
@@ -1363,7 +1404,7 @@ function makeItemStore({
       const fid = made.flag.id;
       if (c.confidence >= 0.8) {
         propose({ flagId: fid, ops: [{ op: "move", entity: c.entity, id: c.id, to: c.to }], reasoning: c.reasoning,
-          confidence: c.confidence, by: "oracle", evaluator: "oracle@1", signals: c.signals });
+          confidence: c.confidence, by: "oracle", evaluator: "oracle@1", signals: c.signals, [ORACLE_CALL]: true });
       } else {
         addEntry(fid, "note", c.reasoning, { evaluator: "oracle@1", signals: c.signals, proposal: null }, null, ORACLE);
       }

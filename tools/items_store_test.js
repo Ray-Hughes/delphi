@@ -288,6 +288,7 @@ function scenario(name, { sql, batch }) {
   check("a second flag joins the first", [f2.flag.id, f2.appended, f2.flag.entries], [f1.flag.id, true, 2]);
   const proposed = items.propose({ flagId: f1.flag.id, ops: [{ op: "move", entity: "note", id: note.id, to: C.id, keepInSource: true }], reasoning: "it is Gamma's", confidence: 0.7, by: "claude-code:1", evaluator: "claude-code:1" });
   check("a proposal is recorded with its plan, not applied", [proposed.flag.status, proposed.plan[0].ok, one("SELECT project_id FROM notes WHERE id = ?", note.id).project_id], ["proposed", true, B.id]);
+  check("a person's own proposal keeps their voice and their confidence", [proposed.flag.proposal.confidence, proposed.flag.proposal.suggested_by || null], [0.7, null]);
   throws("an agent cannot approve", () => W(items, f1.flag.id, { approve: true, by: "claude-code:1", byType: "agent" }), /a person's decision, and this is an agent/);
   throws("a rejection says why", () => W(items, f1.flag.id, { approve: false }), /Say why when rejecting/);
   const applied = W(items, f1.flag.id, { approve: true, note: "yes" });
@@ -467,6 +468,8 @@ function reviewedAgain() {
   const open = agent.flag({ entity: "note", id: bare.id, note: "somewhere else?", evaluate: "none" }).flag;
   throws("with neither an entry nor ops there is nothing to apply", () => db.items().decide(open.id, { approve: true, via: "window" }), /or your own ops/);
   throws("and never outside the window", () => db.items().decide(open.id, { approve: true, ops: [{ op: "move", entity: "note", id: bare.id, to: Q.id }] }), /in the Delphi window/);
+  throws("the person's own ops touch only the flagged item", () => db.items().decide(open.id, { approve: true, via: "window",
+    ops: [{ op: "move", entity: "note", id: n.id, to: P.id }] }), /is about note \d+; a decision on it changes that item only/);
   const own = db.items().decide(open.id, { approve: true, via: "window", ops: [{ op: "move", entity: "note", id: bare.id, to: Q.id, keepInSource: true }], note: "mine" });
   check("exactly those ops are applied", [own.flag.status, one("SELECT project_id FROM notes WHERE id = ?", bare.id).project_id,
     one("SELECT project_id FROM item_projects WHERE entity = 'note' AND entity_id = ?", bare.id).project_id], ["applied", Q.id, P.id]);

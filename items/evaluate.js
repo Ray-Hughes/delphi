@@ -22,6 +22,8 @@ const NEIGHBOURS = 8;
 const BEAT_HOME = 1.6;
 const SHARE = 0.5;
 const NAMED_CONFIDENCE = 0.9;
+// The most a proposal resting on an agent's words alone may claim.
+const AGENT_CONFIDENCE = 0.5;
 // Projects that hold work nobody filed properly. Their rows are misfiled more
 // often than anything else, so letting them vote would vote for the misfiling.
 const FALLBACK_KEYS = ["claude", "general"];
@@ -34,6 +36,20 @@ const KEEP_WORDS = /\b(also|spans?|spanning|keep (?:it|this) in|still show|as we
 const clip = (text, limit) => {
   const value = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
   return value.length <= limit ? value : `${value.slice(0, limit - 3)}...`;
+};
+// Another writer's words set inside the Oracle's own double quotes: a quote
+// mark of theirs would end the quotation early and let the rest read as the
+// Oracle speaking.
+const quoted = (text, limit) => clip(String(text == null ? "" : text).replace(/["“”„‟]/g, "'"), limit);
+/**
+ * Who suggested something, as a card or a reason names them. An actor name is
+ * whatever the writer chose ("Ray" as easily as "claude:1"), so the name is
+ * never shown alone: the kind it said it is comes first, and a writer that
+ * never said it is a person is not drawn as one.
+ */
+const suggesterLabel = (by, type) => {
+  const who = quoted(by || "unnamed", 60);
+  return type === "agent" ? `agent ${who}` : type === "human" ? who : `unmarked writer ${who}`;
 };
 const round = (n) => Math.round(n * 100) / 100;
 const escape = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -261,7 +277,20 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
     const homeName = (all.find((p) => p.id === home) || { name: "no project" }).name;
     const item = itemText(flag.entity, flag.entity_id);
     if (!item) return { proposal: null, reasoning: "The item is gone.", confidence: 0, signals: {} };
-    const words = [flag.note, ...entries.filter((e) => e.kind === "say").map((e) => e.body)].filter(Boolean).join("\n");
+    // Only a person's words are instructions. An agent's flag note or reply
+    // ("Ray said: move it to Bravo") is evidence from that agent, attributed
+    // to it and weighed lower: quoted back as "You wrote", under the Oracle's
+    // name, it would launder an agent's wish into a person's.
+    // The flag's note is also its first say entry, written under its author's
+    // own name and type, so with entries it is read from there and never
+    // twice. The note on the row is read only when no entries were passed.
+    const says = entries.filter((e) => e.kind === "say");
+    const noteAlone = says.length ? null : { author: flag.created_by, author_type: flag.created_by_type || null, body: flag.note };
+    const spoken = noteAlone ? [noteAlone, ...says] : says;
+    const words = spoken.filter((e) => e.author_type === "human").map((e) => e.body).filter(Boolean).join("\n");
+    // Unset is not human: a writer that never said it is a person is weighed
+    // as an agent. The Oracle's own entries (type tool) are neither.
+    const agentSays = spoken.filter((e) => e.body && e.author_type !== "human" && e.author_type !== "tool");
     const name = (pid) => (all.find((p) => p.id === pid) || { name: `project ${pid}` }).name;
     const { named, ambiguous } = namedProjects(words, all);
     const targets = named.filter((p) => p.id !== home && p.status !== "archived");
@@ -282,7 +311,7 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
     // was asked about goes ahead with that project. A question is never asked
     // twice; a reply that settles nothing is said so, as a note.
     const lastAsk = entries.map((e) => e.kind).lastIndexOf("ask");
-    const answers = lastAsk >= 0 ? entries.slice(lastAsk + 1).filter((e) => e.kind === "say" && e.author_type !== "tool").map((e) => String(e.body || "")) : [];
+    const answers = lastAsk >= 0 ? entries.slice(lastAsk + 1).filter((e) => e.kind === "say" && e.author_type === "human").map((e) => String(e.body || "")) : [];
     const answerFor = (a) => {
       for (const text of answers.slice().reverse()) {
         const byId = [...text.matchAll(/(?:#|\(|\bproject\s+)(\d+)\b/gi)].map((m) => Number(m[1])).filter((id) => all.some((p) => p.id === id));
@@ -368,13 +397,33 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
       };
     }
 
-    // 2 and 3. The neighbour vote, with the evidence a person attached.
+    // What an agent said it wants, as evidence: the first agent's move or
+    // copy target, quoted under its own name. A target that is archived, or
+    // a copy of something that cannot be copied, is no suggestion at all.
+    const usable = (o) => o === "move" || associable;
+    let suggested = null;
+    for (const e of agentSays) {
+      const theirs = readInstructions(String(e.body || ""), "", all, home);
+      const t = [theirs.move && { ...theirs.move, op: "move" }, theirs.copy && { ...theirs.copy, op: "copy" }]
+        .find((x) => x && x.project.status !== "archived" && x.project.id !== home && usable(x.op));
+      if (t) { suggested = { by: e.author || "an agent", type: e.author_type || null, op: t.op, project: t.project, quote: t.quote }; break; }
+    }
+    if (suggested) signals.suggested = [suggested.by, suggested.type, suggested.op, suggested.project.id, suggested.quote];
+    const saidBy = (s) => quoted(s.quote, 80);
+    const theySaid = suggested
+      ? ` ${suggesterLabel(suggested.by, suggested.type)} wrote "${saidBy(suggested)}"; that is its suggestion, not a person's instruction.` : "";
+
+    // 2 and 3. The neighbour vote, with the evidence attached to the flag.
     const docs = corpus();
     const setup = votingSetup(all, docs);
     const vec = lexicalVector(item.text);
     const { near, scores } = vote(vec, docs, {
       ...setup, skip: (d) => d.entity === flag.entity && d.id === Number(flag.entity_id),
     });
+    // Evidence is the flag author's: a person's chip is a vote, an agent's
+    // is that agent's claim and counts for half, beside its words.
+    const byPerson = flag.created_by_type === "human";
+    const agentVotes = new Map();
     const evidence = parseJson(flag.evidence, []) || [];
     const evidenceProjects = [];
     for (const chip of evidence) {
@@ -385,35 +434,79 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
         const r = sql(`SELECT project_id FROM ${table} WHERE id = :p1`, [Number(chip.id)])[0];
         pid = r && r.project_id != null ? Number(r.project_id) : null;
       }
-      if (pid != null) { scores.set(pid, (scores.get(pid) || 0) + 1); evidenceProjects.push(pid); }
+      if (pid == null) continue;
+      evidenceProjects.push(pid);
+      if (byPerson) scores.set(pid, (scores.get(pid) || 0) + 1);
+      else agentVotes.set(pid, (agentVotes.get(pid) || 0) + 0.5);
     }
     // A target the person named but gave no verb for counts as one vote too.
     for (const t of targets) scores.set(t.id, (scores.get(t.id) || 0) + 1);
-    const ranked = [...scores].filter(([pid]) => all.some((p) => p.id === pid && p.status !== "archived")).sort((a, b) => b[1] - a[1]);
-    const total = ranked.reduce((s, [, v]) => s + v, 0);
-    signals.knn = ranked.slice(0, 5).map(([pid, v]) => [pid, round(v)]);
+    // An agent's named target counts, but for half what a person's would.
+    if (suggested) agentVotes.set(suggested.project.id, (agentVotes.get(suggested.project.id) || 0) + 0.5);
+    // The vote is settled twice, without the agent and with it. What the
+    // neighbours and the person settle on carries their confidence; anything
+    // the agent's half vote changes is the agent's, said so, at no more than
+    // even odds. Otherwise an agent naming Y could tip a vote for X and have
+    // it read as the Oracle's own finding.
+    const live = (pid) => all.some((p) => p.id === pid && p.status !== "archived");
+    const settle = (s) => {
+      const ranked = [...s].filter(([pid]) => live(pid)).sort((x, y) => y[1] - x[1]);
+      const total = ranked.reduce((sum, [, v]) => sum + v, 0);
+      const homeScore = s.get(home) || 0;
+      const [best, bestScore] = ranked[0] || [null, 0];
+      const passes = !(best == null || best === home || bestScore < BEAT_HOME * homeScore || bestScore < SHARE * total);
+      return { ranked, total, homeScore, best, bestScore, passes };
+    };
+    const base = settle(scores);
+    const merged = new Map(scores);
+    for (const [pid, v] of agentVotes) merged.set(pid, (merged.get(pid) || 0) + v);
+    const withAgent = settle(merged);
+    signals.knn = base.ranked.slice(0, 5).map(([pid, v]) => [pid, round(v)]);
+    if (agentVotes.size) signals.agent_votes = [...agentVotes].map(([pid, v]) => [pid, round(v)]);
     signals.neighbours = near.slice(0, 5).map(([d, s]) => [d.entity, d.id, d.title, d.project_id, round(s)]);
     signals.evidence_projects = evidenceProjects;
-    const homeScore = scores.get(home) || 0;
-    const [best, bestScore] = ranked[0] || [null, 0];
     const lead = near.slice(0, 2).map(([d, s]) => `${d.entity} ${d.id} "${clip(d.title, 60)}" in ${name(d.project_id)} (${round(s)})`).join(" and ");
     const ambiguity = ambiguous.length ? ` "${ambiguous.map((a) => a.word).join("\", \"")}" names more than one project, so it was not taken as a target.` : "";
-    if (best == null || best === home || bestScore < BEAT_HOME * homeScore || bestScore < SHARE * total) {
+    const neighboursSay = base.passes ? ` Without it, the neighbours point to ${name(base.best)}.` : " The neighbours do not settle it.";
+
+    // The neighbours' and the person's answer, at their own confidence.
+    const settled = () => {
+      // Keeping it where it is comes from the person's words (or the item's
+      // own), quoted, never from the vote.
+      const keep = associable && (Boolean(told.keepHome) || (wantsKeep && homeNamed));
+      const confidence = Math.min(0.95, round(base.bestScore / (base.total || 1)));
+      const quotedKeep = told.keepHome ? keepWords(true) : keep ? ` The flag says it spans ${homeName}, so it stays shown there.` : "";
       return {
-        proposal: null, confidence: total ? round(bestScore / total) : 0, signals,
-        reasoning: clip(best == null
-          ? `Nothing similar enough was found to say where it belongs.${ambiguity}`
-          : `No clear home: ${name(best)} scores ${round(bestScore)} against ${round(homeScore)} for ${homeName}${lead ? `; its nearest are ${lead}` : ""}.${ambiguity}`, 600),
+        proposal: { ops: [op("move", base.best, keep ? { keepInSource: true } : {}), ...keepOps.filter((o) => o.to !== base.best)].slice(0, 3) }, confidence, signals,
+        reasoning: clip(`${quotedKeep.trim() ? `${quotedKeep.trim()} ` : ""}Its nearest are ${lead}. ${name(base.best)} scores ${round(base.bestScore)} against ${round(base.homeScore)} for ${homeName}.` + theySaid + ambiguity, 600),
       };
+    };
+    // The agent's answer, as its suggestion: in its name, at even odds.
+    const agents = (to, opKind, by, type, why) => ({
+      proposal: { ops: [op(opKind, to)], suggested_by: String(by || "an agent"), suggested_by_type: type || null },
+      confidence: AGENT_CONFIDENCE, signals,
+      reasoning: clip(`Suggested by ${suggesterLabel(by, type)}, ${why}. No person has said so.${neighboursSay}`, 600),
+    });
+
+    if (base.passes && withAgent.passes && withAgent.best === base.best) return settled();
+    if (withAgent.passes) {
+      const s = suggested && suggested.project.id === withAgent.best ? suggested : null;
+      if (s) return agents(s.project.id, s.op, s.by, s.type, `who wrote "${saidBy(s)}"`);
+      return agents(withAgent.best, "move", flag.created_by, flag.created_by_type, `from the evidence it attached to its flag`);
     }
-    // Keeping it where it is comes from the person's words (or the item's
-    // own), quoted, never from the vote.
-    const keep = associable && (Boolean(told.keepHome) || (wantsKeep && homeNamed));
-    const confidence = Math.min(0.95, round(bestScore / (total || 1)));
-    const quoted = told.keepHome ? keepWords(true) : keep ? ` The flag says it spans ${homeName}, so it stays shown there.` : "";
+    // Nothing else points anywhere, so the agent's wish is put forward as
+    // what it is: its suggestion, at no more than even odds.
+    // An agent agreeing with the neighbours, whose chips only spread the
+    // vote, leaves the neighbours' answer theirs.
+    if (suggested && base.passes && suggested.project.id === base.best) return settled();
+    if (suggested) return agents(suggested.project.id, suggested.op, suggested.by, suggested.type, `who wrote "${saidBy(suggested)}"`);
+    // An agent's chips that only spread the vote do not overrule it.
+    if (base.passes) return settled();
     return {
-      proposal: { ops: [op("move", best, keep ? { keepInSource: true } : {}), ...keepOps.filter((o) => o.to !== best)].slice(0, 3) }, confidence, signals,
-      reasoning: clip(`${quoted.trim() ? `${quoted.trim()} ` : ""}Its nearest are ${lead}. ${name(best)} scores ${round(bestScore)} against ${round(homeScore)} for ${homeName}.` + ambiguity, 600),
+      proposal: null, confidence: base.total ? round(base.bestScore / base.total) : 0, signals,
+      reasoning: clip(base.best == null
+        ? `Nothing similar enough was found to say where it belongs.${ambiguity}`
+        : `No clear home: ${name(base.best)} scores ${round(base.bestScore)} against ${round(base.homeScore)} for ${homeName}${lead ? `; its nearest are ${lead}` : ""}.${ambiguity}`, 600),
     };
   }
 
@@ -459,7 +552,10 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
       'or {"ask":"<one question for the person>"} when you cannot tell. Never more than 3 ops.',
     ].join("\n");
     const itemPart = clip(`Item: ${flag.entity} ${flag.entity_id}, "${item.title}", home ${flag.project_id ?? "none"}.\n${item.text}`, 1500);
-    const askPart = clip(`The person said: ${flag.note || "(nothing)"}${evidence.length ? `\nEvidence: ${evidence.join("; ")}` : ""}`, 2000);
+    // An agent's note is its own claim, and an evaluator told otherwise would
+    // take it as the person's instruction.
+    const noteBy = flag.created_by_type === "human" ? "The person said" : `${suggesterLabel(flag.created_by, flag.created_by_type)} flagged it and said`;
+    const askPart = clip(`${noteBy}: ${flag.note || "(nothing)"}${evidence.length ? `\nEvidence: ${evidence.join("; ")}` : ""}`, 2000);
     let used = head.length + itemPart.length + askPart.length + 200;
     const rows = [];
     for (const p of all) {
@@ -475,4 +571,4 @@ function makeEvaluator({ sql, settings = () => ({}) } = {}) {
   return { evaluate, sweep, prompt, namedProjects, readInstructions, resolvePhrase };
 }
 
-module.exports = { makeEvaluator, FALLBACK_KEYS, BEAT_HOME, SHARE };
+module.exports = { makeEvaluator, suggesterLabel, FALLBACK_KEYS, BEAT_HOME, SHARE, AGENT_CONFIDENCE };

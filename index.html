@@ -3518,6 +3518,13 @@
   .also-tag { border-style: solid; }
   .item-menu .ctx-item:focus-visible { background: var(--accent); color: var(--btn-fg); outline: none; }
   .item-menu .ctx-item:focus-visible .d { color: inherit; opacity: .8; }
+  /* A proposal an agent suggested and the Oracle only checked: the agent's
+     name, set apart from the Oracle's own voice. */
+  .suggested-tag {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--kind-agent);
+    border: 1px solid color-mix(in srgb, var(--kind-agent) 40%, var(--line)); border-radius: 99px; padding: 1px 8px; white-space: nowrap;
+  }
+  .suggested-tag b { font-family: var(--mono); font-weight: 600; }
 </style>
 </head>
 <body>

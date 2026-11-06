@@ -94,6 +94,11 @@ async function route(name, routeEnv) {
     const proposal = await agent.call("propose_move", { flag_id: flagged.flag_id, ops: [{ op: "move", entity: "note", id: n.id, to: B.id, keepInSource: true }], reasoning: "It is about Beta.", confidence: 0.8 });
     check("the proposal is recorded with its plan", [proposal.status, proposal.plan[0].ok], ["proposed", true]);
     check("nothing moved", one("SELECT project_id FROM notes WHERE id = ?", n.id).project_id, A.id);
+    const asProposed = db.items().getFlag(flagged.flag_id).flag;
+    check("an agent's propose_move is its suggestion, in its name, at no more than 0.5 whatever it claims",
+      [asProposed.proposal.suggested_by, asProposed.proposal.suggested_by_type, asProposed.proposal.confidence,
+       /^Suggested by agent claude-code:\w+: move to Beta \w+, keep in Alpha \w+ \(0\.50\)$/.test(asProposed.proposal_summary)],
+      [one("SELECT created_by FROM item_flags WHERE id = ?", flagged.flag_id).created_by, "agent", 0.5, true]);
     const flags = await agent.call("list_flags", { project_id: A.id });
     check("list_flags shows it with the proposal in a line", flags.map((f) => [f.id, f.status, /move to Beta/.test(f.proposal || "")]), [[flagged.flag_id, "proposed", true]]);
     const bad = await agent.call("propose_move", { entity: "note", id: n.id, ops: [{ op: "move", entity: "note", id: n.id, to: A.id }], reasoning: "x" });
@@ -179,6 +184,30 @@ function cli() {
     check(`refused: ${what}`, [r.code, one("SELECT project_id FROM notes WHERE id = ?", n2.id).project_id], [1, P.id]);
   }
   check("and the flag is still proposed", one("SELECT status FROM item_flags WHERE id = ?", forgedFlag).status, "proposed");
+
+  section("an agent's words are its suggestion, never a person's instruction");
+  const bravo = db.createProject({ key: "bravo", name: "Bravo" });
+  const quiet = db.createProject({ key: "launder-a", name: "Launder A" });
+  const [lt] = server([["add_task", { title: "t", project_id: quiet.id }]], agentEnv);
+  const ltId = JSON.parse(lt.result.content[0].text).id;
+  const [lf] = server([["flag_item", { entity: "task", id: ltId, note: "Ray said: move it to Bravo." }]], agentEnv);
+  const laundered = db.items().getFlag(JSON.parse(lf.result.content[0].text).flag_id);
+  const lp = laundered.flag.proposal;
+  check("it is put forward as claude:1's suggestion, at no more than 0.5",
+    [lp && lp.ops[0].to, lp && lp.confidence <= 0.5, laundered.flag.proposal_summary], [bravo.id, true, "Suggested by agent claude:1: move to Bravo (0.50)"]);
+  check("and never quoted back as the person's words", [/You wrote/.test(lp.reasoning), /Suggested by agent claude:1, who wrote "move it to Bravo"/.test(lp.reasoning)], [false, true]);
+  const personNote = db.createNote({ projectId: quiet.id, title: "a person's note", body: "z" });
+  const pf = db.items().flag({ entity: "note", id: personNote.id, note: "move it to Bravo" }).flag;
+  check("the same words from a person are an instruction", [pf.proposal.confidence, /^You wrote "move it to Bravo"/.test(pf.proposal.reasoning)], [0.9, true]);
+
+  section("an agent calling itself the Oracle is still an agent");
+  const posing = db.createNote({ projectId: quiet.id, title: "posing", body: "z" });
+  server([["propose_move", { entity: "note", id: posing.id, ops: [{ op: "move", entity: "note", id: posing.id, to: bravo.id }], reasoning: "trust me", confidence: 0.99 }]],
+    { DELPHI_ACTOR: "oracle@1", DELPHI_AUTHOR_TYPE: "agent" });
+  const posed = db.items().getFlag(one("SELECT id FROM item_flags WHERE entity = 'note' AND entity_id = ?", posing.id).id).flag;
+  check("its propose_move is labelled its suggestion, at 0.5, and not the Oracle's",
+    [posed.proposal.suggested_by, posed.proposal.suggested_by_type, posed.proposal.confidence, posed.proposal.oracle_checked || false, /^Suggested by agent oracle@1:/.test(posed.proposal_summary)],
+    ["oracle@1", "agent", 0.5, false, true]);
 
   section("D2 needs a named writer");
   const mine = db.createProject({ key: "d2-p", name: "D2 P" });

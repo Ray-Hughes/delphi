@@ -167,6 +167,102 @@ if (rejectedFlag.status === "proposed") W(items, rejectedFlag.id, { approve: fal
 else items.withdraw(rejectedFlag.id);
 check("a rejected suggestion stays dismissed", items.sweep({ projectId: claude.id }).created.some((f) => f.entity_id === vaInClaude.id), rejectedFlag.status !== "proposed");
 
+section("an agent's words and chips are its suggestion, never the neighbours' finding");
+const agentItems = makeItemStore({ sql: db.sqlP, batch: db.batchP, actor: "claude:7", authorType: "agent" });
+const liveFlag = (id) => items.getFlag(id).flag;
+const done = (f) => { if (["open", "evaluating", "proposed"].includes(liveFlag(f.id).status)) items.withdraw(f.id); };
+done(flagged.flag);
+// The neighbours alone settle the owner's note on the tracker's project.
+const plain = items.flag({ entity: "note", id: misfiled.id, note: "" }).flag;
+check("with no words, the neighbours send it to the tracker's project", [plain.proposal && plain.proposal.ops[0].to, Boolean(plain.proposal && plain.proposal.suggested_by)], [brain.id, false]);
+const plainConfidence = plain.proposal.confidence;
+done(plain);
+const agrees = agentItems.flag({ entity: "note", id: misfiled.id, note: "move it to Second Brain app" }).flag;
+check("an agent agreeing changes neither the answer nor its confidence", [agrees.proposal.ops[0].to, agrees.proposal.confidence, Boolean(agrees.proposal.suggested_by)],
+  [brain.id, plainConfidence, false]);
+done(agrees);
+const spread = agentItems.flag({ entity: "note", id: misfiled.id, note: "move it to Second Brain app",
+  evidence: Array.from({ length: 12 }, () => ({ type: "project", id: beta.id })) }).flag;
+check("an agent agreeing while its chips spread the vote leaves the neighbours' answer theirs",
+  [spread.proposal && spread.proposal.ops[0].to, spread.proposal && spread.proposal.confidence, Boolean(spread.proposal && spread.proposal.suggested_by)],
+  [brain.id, plainConfidence, false]);
+done(spread);
+const chips = Array.from({ length: 12 }, () => ({ type: "project", id: beta.id }));
+const tipped = agentItems.flag({ entity: "note", id: misfiled.id, note: "move it to Beta", evidence: chips }).flag;
+console.log("   ", tipped.proposal_summary, "\n   ", tipped.proposal.reasoning);
+check("an agent that tips the vote to another project gets its own name on it, at 0.5",
+  [tipped.proposal.ops[0].to, tipped.proposal.confidence, tipped.proposal.suggested_by, tipped.proposal.suggested_by_type, tipped.proposal_summary],
+  [beta.id, 0.5, "claude:7", "agent", "Suggested by agent claude:7: move to Beta (0.50)"]);
+check("and the reasoning says where the neighbours pointed without it",
+  /^Suggested by agent claude:7, who wrote "move it to Beta"\. No person has said so\. Without it, the neighbours point to Second Brain app\./.test(tipped.proposal.reasoning), true);
+done(tipped);
+
+const lonely = (title) => db.createNote({ projectId: offer.id, title, body: "qzxv wplm frobnicate" });
+const chipNote = lonely("zzkq one");
+const byAgent = agentItems.flag({ entity: "note", id: chipNote.id, note: "", evidence: [{ type: "project", id: beta.id }, { type: "project", id: beta.id }] }).flag;
+check("an agent's evidence chips alone are its suggestion, at 0.5",
+  [byAgent.proposal && byAgent.proposal.ops[0].to, byAgent.proposal && byAgent.proposal.confidence, byAgent.proposal && byAgent.proposal.suggested_by,
+   byAgent.proposal && /from the evidence it attached/.test(byAgent.proposal.reasoning)], [beta.id, 0.5, "claude:7", true]);
+done(byAgent);
+const byPerson = items.flag({ entity: "note", id: chipNote.id, note: "", evidence: [{ type: "project", id: beta.id }, { type: "project", id: beta.id }] }).flag;
+check("the same chips from a person are the person's vote", [byPerson.proposal && byPerson.proposal.ops[0].to, byPerson.proposal && byPerson.proposal.confidence > 0.5,
+  Boolean(byPerson.proposal && byPerson.proposal.suggested_by)], [beta.id, true, false]);
+done(byPerson);
+
+section("whose words a flag's note is does not depend on who replied");
+const n2 = lonely("zzkq two");
+const humanFirst = items.flag({ entity: "note", id: n2.id, note: "move it to Beta", evaluate: "none" }).flag;
+check("the flag row carries its author's type", humanFirst.created_by_type, "human");
+agentItems.reply(humanFirst.id, "I would leave it where it is");
+items.evaluate(humanFirst.id);
+const hf = liveFlag(humanFirst.id);
+check("a person's note is still their instruction after an agent replies", [hf.proposal && hf.proposal.ops[0].to, hf.proposal && hf.proposal.confidence,
+  hf.proposal && /^You wrote "move it to Beta"/.test(hf.proposal.reasoning)], [beta.id, 0.9, true]);
+done(humanFirst);
+const n3 = lonely("zzkq three");
+const agentFirst = agentItems.flag({ entity: "note", id: n3.id, note: "move it to Beta", evaluate: "none" }).flag;
+check("an agent's flag row says agent", agentFirst.created_by_type, "agent");
+items.reply(agentFirst.id, "hmm, not sure about this one");
+items.evaluate(agentFirst.id);
+const af = liveFlag(agentFirst.id);
+check("an agent's note is still its suggestion after a person replies", [af.proposal && af.proposal.ops[0].to, af.proposal && af.proposal.confidence,
+  af.proposal && af.proposal.suggested_by, af.proposal && /You wrote/.test(af.proposal.reasoning)], [beta.id, 0.5, "claude:7", false]);
+done(agentFirst);
+
+section("an archived project is no suggestion");
+const shut = db.createProject({ key: "shut", name: "Shuttered" });
+db.handle().prepare("UPDATE projects SET status = 'archived' WHERE id = ?").run(shut.id);
+const n4 = lonely("zzkq four");
+const toArchived = agentItems.flag({ entity: "note", id: n4.id, note: "move it to Shuttered" }).flag;
+check("an agent naming an archived project proposes nothing", [toArchived.proposal, toArchived.status], [null, "open"]);
+done(toArchived);
+
+section("an agent's name and quote cannot pass for a person's");
+const ray = makeItemStore({ sql: db.sqlP, batch: db.batchP, actor: "Ray", authorType: "agent" });
+const n5 = lonely("zzkq five");
+const posed = ray.flag({ entity: "note", id: n5.id, note: 'move it to Beta "now", says the person' }).flag;
+console.log("   ", posed.proposal_summary, "\n   ", posed.proposal.reasoning);
+check("an agent named Ray is labelled an agent", [posed.proposal_summary, /^Suggested by agent Ray, who wrote "/.test(posed.proposal.reasoning)],
+  ["Suggested by agent Ray: move to Beta (0.50)", true]);
+check("its quote marks cannot close the Oracle's quotation", (posed.proposal.reasoning.match(/"/g) || []).length, 2);
+done(posed);
+
+section("a stored proposal that touches another item is refused before anything changes");
+const n6 = lonely("zzkq six");
+const other = lonely("zzkq other");
+const forged = items.flag({ entity: "note", id: n6.id, note: "", evaluate: "none" }).flag;
+const bad = { ops: [{ op: "move", entity: "note", id: other.id, to: beta.id }], reasoning: "", confidence: 0.9, evaluator: "mallory" };
+db.handle().prepare("UPDATE item_flags SET status = 'proposed', proposal = ?, proposed_by = 'mallory' WHERE id = ?").run(JSON.stringify(bad), forged.id);
+db.handle().prepare("INSERT INTO flag_entries (flag_id, kind, author, author_type, body, meta) VALUES (?, 'note', 'mallory', 'agent', 'x', ?)")
+  .run(forged.id, JSON.stringify({ proposal: bad }));
+const entriesBefore = items.getFlag(forged.id).entries.length;
+let forgedError = "";
+try { W(items, forged.id, { approve: true }); } catch (error) { forgedError = error.message; }
+check("it is refused, saying it is the stored proposal", /stored proposal changes something other than note \d+, so it was not applied/.test(forgedError), true);
+check("and nothing changed: the flag, its thread, the other note",
+  [liveFlag(forged.id).status, items.getFlag(forged.id).entries.length, db.handle().prepare("SELECT project_id FROM notes WHERE id = ?").get(other.id).project_id],
+  ["proposed", entriesBefore, offer.id]);
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 fs.rmSync(dir, { recursive: true, force: true });
 process.exit(failures ? 1 : 0);
