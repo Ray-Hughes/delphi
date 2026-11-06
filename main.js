@@ -108,6 +108,10 @@ let settings = {
   // agent sharing this database works, and spends the other agent's quota.
   secondOpinionMode: false,
   secondOpinionAgent: "copilot",
+  // How many second opinions may start in an hour, across every agent on this
+  // database. Each one spends the other agent's quota. See
+  // harness.SECOND_OPINION_HOURLY.
+  secondOpinionHourlyLimit: harness.SECOND_OPINION_HOURLY.default,
   // On by default because the celebration is the confirmation that a task was
   // completed, and the row leaves straight afterwards. The system reduced motion
   // preference already suppresses all of it for the people who need that, so
@@ -2188,6 +2192,9 @@ handle("settings:set", (fields) => {
   };
   if (fields.jobConcurrency !== undefined) settings.jobConcurrency = whole("jobConcurrency", fields.jobConcurrency, BOUNDS.jobConcurrency);
   if (fields.jobTimeoutMinutes !== undefined) settings.jobTimeoutMinutes = whole("jobTimeoutMinutes", fields.jobTimeoutMinutes, BOUNDS.jobTimeoutMinutes);
+  if (fields.secondOpinionHourlyLimit !== undefined) {
+    settings.secondOpinionHourlyLimit = whole("secondOpinionHourlyLimit", fields.secondOpinionHourlyLimit, harness.SECOND_OPINION_HOURLY.bounds);
+  }
   // The whole map, as the window shows it: a harness left out goes back to 1.
   // Keys are harness keys, which is what a job's to_harness holds.
   if (fields.jobHarnessLimits !== undefined) {

@@ -62,6 +62,9 @@ module.exports = {
     // server needs jobs.js outside the archive too (tools/after-pack.js).
     "agent/jobs.js",
     "agent/dispatch.js",
+    // Which binary an agent may be started from. The dispatcher and the
+    // server's second_opinion both ask it, so it is copied out as well.
+    "agent/binaries.js",
     "sheet/",
     "workbench/",
     // Items across projects and flags: the store and the Oracle's evaluator,
@@ -86,7 +89,7 @@ module.exports = {
   // it. That is how 1.6.0 shipped a main process that died on require("./pads")
   // before it could open a window. The modules both sides need (pads.js, git.js,
   // harness.js, embeddings.js, agent/schema_later.js, agent/launch.js, agent/locate.js,
-  // agent/identity.js, agent/jobs.js, sheet/, workbench/, items/) are
+  // agent/identity.js, agent/jobs.js, agent/binaries.js, sheet/, workbench/, items/) are
   // copied out by tools/after-pack.js instead, from its OUTSIDE_TOO list, after
   // the archive is written. tools/package_test.js reads both lists and the real
   // archive, so neither half can go missing again without a test failing.

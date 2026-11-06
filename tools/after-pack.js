@@ -51,6 +51,9 @@ const OUTSIDE_TOO = [
   "agent/locate.js",
   "agent/identity.js",
   "agent/jobs.js",
+  // Which binary an agent may be started from: the dispatcher's rule, which
+  // second_opinion in the server applies too.
+  "agent/binaries.js",
   "sheet",
   "workbench",
   // Move, copy, associate and flag: the server's tools and the app's IPC use
