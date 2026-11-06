@@ -149,9 +149,19 @@ const el = (tag, props = {}, ...kids) => {
  * looks for one on the way up from whatever the pointer is over and marks the
  * first it finds, once. Disabled controls keep the arrow.
  */
+const isBackdrop = (node) => {
+  if (getComputedStyle(node).position !== "fixed") return false;
+  const r = node.getBoundingClientRect();
+  return r.width >= innerWidth * 0.9 && r.height >= innerHeight * 0.9;
+};
 document.addEventListener("mouseover", (e) => {
   for (let node = e.target; node && node !== document.body && node.nodeType === 1; node = node.parentElement) {
     if (node.dataset.pointerChecked) return;
+    // A dialog's backdrop closes on a click that lands on the backdrop
+    // itself, so it carries an onclick, but nothing inside it is clickable
+    // for that reason. A fixed layer covering the window is a backdrop:
+    // stop there, and never pass the hand down to what it holds.
+    if (node.classList.contains("overlay") || isBackdrop(node)) return;
     if (typeof node.onclick === "function") {
       // A class rather than an inline style, so the stylesheet can still give
       // the arrow back while the control is disabled or busy.
