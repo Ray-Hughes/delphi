@@ -152,7 +152,7 @@
       if (r.by_harness.length) body.append(el("div", { className: "lg-sub", textContent: "By agent, last eight weeks (dollars API-equivalent)" }), groupRows(r.by_harness, (g) => g.label || g.key));
       const st = L.statusPhrases(r.status_seconds);
       if (st.length) body.append(el("div", { className: "lg-sub", textContent: `Time in status, all time, of its ${r.agent_tasks === 1 ? "agent task" : `${r.agent_tasks} agent tasks`}` }), note(st.join(", ")));
-      for (const t of r.tabs) body.append(note(`${t.harness_label} tabs and chat, all time: ${L.tokens(t.tokens_in + t.tokens_out)} tokens over ${t.sessions} ${t.sessions === 1 ? "session" : "sessions"}. Sessions keep a running total, so they are not split by week.`));
+      for (const t of r.tabs) body.append(note(`${L.tabLabel(t)}, all time: ${L.tokens(t.tokens_in + t.tokens_out)} tokens over ${t.sessions} ${t.sessions === 1 ? "session" : "sessions"}. Sessions keep a running total, so they are not split by week.`));
       body.append(note(`Dollars are ${L.COST_LABEL}.`));
     });
     return c;

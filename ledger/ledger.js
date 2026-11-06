@@ -47,7 +47,7 @@
                   - julianday(h.started_at)) * 86400) AS INTEGER) END AS seconds,
     (SELECT COUNT(*) FROM audit a WHERE a.entity = 'handoff' AND a.entity_id = h.id AND a.summary LIKE 'sent back%') AS sent_back_count,
     ${weekOf(AT)} AS week,
-    CASE WHEN julianday(${AT}) <= julianday('now', '-7 days') THEN 1 ELSE 0 END AS week_ago
+    datetime(${AT}) AS at
     FROM handoffs h
     LEFT JOIN harnesses hr ON hr.key = h.to_harness
     LEFT JOIN projects p ON p.id = h.project_id`;
@@ -135,8 +135,14 @@
   function makeLedger({ sql }) {
     if (typeof sql !== "function") throw new Error("makeLedger needs a sql(query, params) function.");
 
-    const clock = () => sql(`SELECT datetime('now') AS now, ${weekOf("datetime('now')")} AS this_week,
-                                    date('now', 'localtime', '-13 days', 'weekday 1') AS last_week`, [])[0];
+    // All of it from one instant, which a test can set. week_point is the same
+    // local wall-clock time a week ago, turned back into UTC: across a DST
+    // change that is 167 or 169 hours ago, not 168, and "last week by now"
+    // means the clock on the wall, not a count of hours.
+    const clock = (at = null) => sql(`SELECT datetime(COALESCE(:p1, 'now')) AS now,
+                                    ${weekOf("datetime(COALESCE(:p1, 'now'))")} AS this_week,
+                                    date(COALESCE(:p1, 'now'), 'localtime', '-13 days', 'weekday 1') AS last_week,
+                                    datetime(COALESCE(:p1, 'now'), 'localtime', '-7 days', 'utc') AS week_point`, [at])[0];
 
     function events(where, params) {
       return sql(`SELECT task_id, status, at FROM status_events WHERE ${where} ORDER BY task_id, at, id`, params);
@@ -178,17 +184,26 @@
      * and last week up to this same moment, which is the fair comparison while
      * this week is still going.
      */
-    function rollup({ projectId = null, weeks = 8 } = {}) {
+    function rollup({ projectId = null, weeks = 8, now: at = null } = {}) {
       const n = Math.max(1, Math.min(52, Math.floor(Number(weeks) || 8)));
-      const now = clock();
-      const params = [];
-      let where = `${weekOf(AT)} >= date(:p1, '-${(n - 1) * 7} days')`;
-      params.push(now.this_week);
-      if (projectId != null) { params.push(Number(projectId)); where += ` AND h.project_id = :p${params.length}`; }
-      const rows = sql(`SELECT ${JOB_COLUMNS} WHERE ${where} ORDER BY h.id`, params);
+      const now = clock(at);
+      // Read at least two weeks whatever was asked for: the comparison with
+      // last week is always made, and weeks: 1 must not compare with nothing.
+      const read = Math.max(n, 2);
+      const scope = (count) => {
+        const params = [now.this_week];
+        let where = `${weekOf(AT)} >= date(:p1, '-${(count - 1) * 7} days')`;
+        if (projectId != null) { params.push(Number(projectId)); where += ` AND h.project_id = :p${params.length}`; }
+        return { where, params };
+      };
+      const { where, params } = scope(n);
+      const wide = scope(read);
+      const all = sql(`SELECT ${JOB_COLUMNS} WHERE ${wide.where} ORDER BY h.id`, wide.params);
+      const first = new Date(Date.parse(`${now.this_week}T00:00:00Z`) - (n - 1) * 7 * 86400000).toISOString().slice(0, 10);
+      const rows = all.filter((r) => r.week >= first);
 
-      const thisWeek = rows.filter((r) => r.week === now.this_week);
-      const lastWeek = rows.filter((r) => r.week === now.last_week);
+      const thisWeek = all.filter((r) => r.week === now.this_week);
+      const lastWeek = all.filter((r) => r.week === now.last_week);
       const byWeek = new Map(groupBy(rows, "week").map((w) => [w.key, w]));
       const series = [];
       // Plain calendar dates, so UTC arithmetic on them is exact.
@@ -216,10 +231,12 @@
         weeks: n,
         this_week: now.this_week,
         last_week: now.last_week,
+        // The cut for last_week_to_date: this wall-clock time a week ago, in UTC.
+        week_point: now.week_point,
         totals: total(rows),
         this_week_totals: total(thisWeek),
         last_week_totals: total(lastWeek),
-        last_week_to_date: total(lastWeek.filter((r) => Number(r.week_ago) === 1)),
+        last_week_to_date: total(lastWeek.filter((r) => r.at <= now.week_point)),
         series,
         by_harness: groupBy(rows, "harness", "harness_label"),
         this_week_by_harness: groupBy(thisWeek, "harness", "harness_label"),
@@ -313,6 +330,9 @@
     return out;
   }
 
+  /** "Claude Code tabs", or "Delphi chat" for the built-in chat, which has no tabs. */
+  const tabLabel = (t) => (t.harness === "chat" ? "Delphi chat" : `${t.harness_label} tabs`);
+
   function statusPhrases(seconds) {
     return Object.entries(seconds || {})
       .filter(([, v]) => v > 0)
@@ -359,7 +379,7 @@
       }
       const st = statusPhrases(answer.status_seconds);
       if (st.length) lines.push(`Its ${plural(answer.agent_tasks, "agent task", "agent tasks")} spent: ${st.join(", ")}.`);
-      for (const t of answer.tabs) lines.push(`${t.harness_label} tabs and chat, all time: ${tokens(t.tokens_in + t.tokens_out)} tokens over ${plural(t.sessions, "session", "sessions")}.`);
+      for (const t of answer.tabs) lines.push(`${tabLabel(t)}, all time: ${tokens(t.tokens_in + t.tokens_out)} tokens over ${plural(t.sessions, "session", "sessions")}.`);
     }
     const max = Math.max(100, Number(budget) || 400) * 4;
     const kept = [];
@@ -373,7 +393,7 @@
     return { lines: kept, cost_note: COST_LABEL, trimmed };
   }
 
-  const api = { COST_LABEL, STATUS_WORDS, makeLedger, total, statusSeconds, statusSecondsMany, tokens, money, duration, phrases, brief, statusPhrases, change, compact };
+  const api = { COST_LABEL, STATUS_WORDS, makeLedger, total, statusSeconds, statusSecondsMany, tokens, money, duration, phrases, brief, tabLabel, statusPhrases, change, compact };
   root.DelphiLedgerCore = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

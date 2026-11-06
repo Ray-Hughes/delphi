@@ -10,6 +10,9 @@
 // survives the job running again. Then the app and the server, on either
 // route, must give the same numbers.
 
+// A zone with DST, before anything reads the clock, so "last week by now"
+// can be checked across both changes. The server and sqlite3 inherit it.
+process.env.TZ = "America/New_York";
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -101,9 +104,10 @@ function fixture(tag) {
                    started_at: at(["-30 minutes"]), finished_at: at([]), updated_at: at([]), review: "accepted" });
   const j3 = job({ ...base, project_id: a.id, task_id: t2.id, to_harness: "codex", state: "failed", status: "failed", turns: 1,
                    started_at: at(["-10 minutes"]), finished_at: at([]), updated_at: at([]) });
-  // Last week, at exactly this point a week ago, so it is in last week by now.
+  // Last week, a minute before this wall-clock time a week ago, so it is in
+  // last week by now. Not 168 hours: this week may have had a DST change.
   const j4 = job({ ...base, project_id: b.id, task_id: t3.id, to_harness: "claude-code", state: "done", status: "harvested", tokens_in: 1000, tokens_out: 100, cost_usd: 0.5, turns: 1,
-                   started_at: at(["-7 days", "-1 hours"]), finished_at: at(["-7 days"]), updated_at: at(["-7 days"]) });
+                   started_at: at(["localtime", "-7 days", "utc", "-1 hours"]), finished_at: at(["localtime", "-7 days", "utc", "-1 minutes"]), updated_at: at(["localtime", "-7 days", "utc", "-1 minutes"]) });
   // Queued and never started: a job, not a run.
   job({ ...base, project_id: b.id, task_id: t4.id, to_harness: "codex", state: "queued", status: "queued" });
   // j1 was sent back once before it ran again, and the review column was
@@ -118,6 +122,9 @@ function fixture(tag) {
   const s = db.createSession({ projectId: a.id, title: "tab", harness: "claude-code" });
   db.addSessionUsage(s.id, { input: 5000, output: 700 });
   db.createSession({ projectId: a.id, title: "empty", harness: "codex" });
+  // Delphi's own chat: no harness.
+  const chat = db.createSession({ projectId: b.id, title: "chat" });
+  db.addSessionUsage(chat.id, { input: 300, output: 20 });
   return { a, b, t1, t2, t3, t4, j1, j2, j3, j4 };
 }
 
@@ -145,7 +152,8 @@ function store(f) {
   check("four weeks in the series, oldest first, ending this week", [all.series.length, all.series[3].week], [4, all.this_week]);
   check("dollars add only what was reported", all.totals.cost_usd, 1.75);
   check("per project", all.by_project.map((p) => [p.label, p.runs]).sort(), [[`Ledger A ${f.tag}`, 3], [`Ledger B ${f.tag}`, 1]].sort());
-  check("sessions are all time, with reported tokens only", all.tabs.map((t) => [t.harness, t.sessions, t.tokens_in]), [["claude-code", 1, 5000]]);
+  check("sessions are all time, with reported tokens only", all.tabs.map((t) => [t.harness, t.sessions, t.tokens_in]), [["chat", 1, 300], ["claude-code", 1, 5000]]);
+  check("tabs and chat are named once each", all.tabs.map(L.tabLabel), ["Delphi chat", "Claude Code tabs"]);
 
   const proj = ledger.rollup({ projectId: f.b.id, weeks: 2 });
   check("one project: only its jobs", [proj.totals.jobs, proj.totals.runs, proj.this_week_totals.runs], [2, 1, 0]);
@@ -184,6 +192,11 @@ async function route(name, env, f, inApp) {
     check("the rollup agrees", [rolled.this_week_totals.runs, rolled.last_week_to_date.runs, rolled.totals.cost_usd], [inApp.all.this_week_totals.runs, inApp.all.last_week_to_date.runs, inApp.all.totals.cost_usd]);
     const byKey = await agent.call("cost_ledger", { project: `lg-a-${f.tag}` });
     check("a project by key, compact", byKey.lines[0].startsWith("This week so far"), true);
+    const one = await agent.call("cost_ledger", { weeks: 1, detail: "full" });
+    check("weeks: 1 still compares with last week", [one.series.length, one.last_week_totals.runs, one.last_week_to_date.runs, one.totals.runs], [1, 1, 1, 3]);
+    const oneBrief = await agent.call("cost_ledger", { weeks: 1, budget: 2000 });
+    check("and says so", oneBrief.lines.some((l) => l.startsWith("Last week by this point: 1 run,")), true);
+    check("tabs are named once", oneBrief.lines.filter((l) => /tabs|chat/.test(l)), ["Delphi chat, all time: 320 tokens over 1 session.", "Claude Code tabs, all time: 5.7k tokens over 1 session."]);
     const tight = await agent.call("cost_ledger", { budget: 100 });
     const queuedLine = (await agent.call("cost_ledger", { task_id: f.t4.id })).lines.find((l) => l.startsWith("Job "));
     check("a job that never started says so, not an empty line", / not started\.$/.test(queuedLine), true);
@@ -199,6 +212,53 @@ async function route(name, env, f, inApp) {
   }
 }
 
+/** The sqlite3 binary as the server's binary route uses it: one process a query, parameters as literals. */
+function binarySql(file) {
+  const { execFileSync } = require("child_process");
+  const lit = (v) => (v == null ? "NULL" : typeof v === "number" ? String(v) : `'${String(v).replace(/'/g, "''")}'`);
+  return (query, params = []) => {
+    const text = query.replace(/:p(\d+)/g, (_, i) => lit(params[Number(i) - 1]));
+    const out = execFileSync("sqlite3", ["-json", "-readonly", file, text], { encoding: "utf8", env: process.env });
+    return out.trim() ? JSON.parse(out) : [];
+  };
+}
+
+function dst() {
+  db.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  const routes = [["node:sqlite", db.sqlP], ["sqlite3 binary", binarySql(process.env.DELPHI_DB)]];
+  // Each case: now, and two jobs last week, either side of the same local
+  // wall-clock time a week ago. 168 hours back lands on the wrong side of one.
+  const cases = [
+    // DST ended Sunday 1 November 2026. Wednesday 4 Nov 15:00 EST is 20:00 UTC;
+    // Wednesday 28 Oct 15:00 EDT is 19:00 UTC, an hour short of 168.
+    { name: "after DST ends", now: "2026-11-04 20:00:00", before: "2026-10-28 18:30:00", after: "2026-10-28 19:30:00", point: "2026-10-28 19:00:00" },
+    // DST began Sunday 8 March 2026. Wednesday 11 Mar 15:00 EDT is 19:00 UTC;
+    // Wednesday 4 Mar 15:00 EST is 20:00 UTC, an hour past 168.
+    { name: "after DST begins", now: "2026-03-11 19:00:00", before: "2026-03-04 19:30:00", after: "2026-03-04 20:30:00", point: "2026-03-04 20:00:00" },
+  ];
+  // In the repeated or the skipped hour there is no single right answer; the
+  // point must still be within an hour of 168 hours back, never further.
+  for (const [what, now] of [["in the repeated hour", "2026-11-01 05:30:00"], ["in the skipped hour", "2026-03-08 07:30:00"]]) {
+    const point = L.makeLedger({ sql: db.sqlP }).rollup({ weeks: 1, now }).week_point;
+    const hours = (Date.parse(now.replace(" ", "T") + "Z") - Date.parse(point.replace(" ", "T") + "Z")) / 3600000;
+    check(`a now ${what} cuts 167 to 169 hours back (${hours})`, hours >= 167 && hours <= 169, true);
+  }
+  for (const c of cases) {
+    const p = db.createProject({ key: `lg-dst-${c.now.slice(5, 7)}`, name: `DST ${c.name}` });
+    for (const at of [c.before, c.after]) {
+      db.handle().prepare("INSERT INTO handoffs (project_id, to_harness, request, kind, state, status, started_at, finished_at, updated_at) VALUES (?, 'claude-code', 'w', 'do', 'done', 'harvested', datetime(?, '-10 minutes'), ?, ?)").run(p.id, at, at, at);
+    }
+    db.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    for (const [route, sql] of routes) {
+      section(`last week by now, ${c.name}, ${route}`);
+      const r = L.makeLedger({ sql }).rollup({ projectId: p.id, weeks: 1, now: c.now });
+      check("the point is the same wall-clock time a week ago", r.week_point, c.point);
+      check("both jobs are last week", r.last_week_totals.runs, 2);
+      check("only the one before that time is in by now", r.last_week_to_date.runs, 1);
+    }
+  }
+}
+
 async function main() {
   pure();
   const f = { ...fixture("x"), tag: "x" };
@@ -206,6 +266,7 @@ async function main() {
   ipc(f);
   await route("node:sqlite", {}, f, inApp);
   await route("sqlite3 binary", { DELPHI_SQLITE_ROUTE: "binary" }, f, inApp);
+  dst();
   console.log(`\n${checks - failures}/${checks} checks passed`);
   fs.rmSync(dir, { recursive: true, force: true });
   process.exit(failures ? 1 : 0);
