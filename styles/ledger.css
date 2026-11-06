@@ -1,0 +1,40 @@
+/* The cost and time ledger (ui/ledger.js): the card in Runs, the card in a
+   project's Overview, and the one-line summary for the drawer. Tokens only.
+
+   Numbers are tabular so a column of durations lines up, and "not reported"
+   is faint ink in words rather than a blank or a zero, because an empty cell
+   reads as nothing spent. */
+
+.lg-box { padding: 12px 14px 14px; }
+.lg-body { display: block; }
+
+.lg-table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.lg-table th, .lg-table td { padding: 5px 6px; text-align: right; border-bottom: 1px solid var(--line-soft); vertical-align: baseline; }
+.lg-table thead th { font-size: 11.5px; font-weight: 600; color: var(--ink-dim); }
+.lg-table .lg-k { text-align: left; font-weight: 500; color: var(--ink-dim); padding-left: 0; }
+.lg-table td { color: var(--ink); font-weight: 560; }
+.lg-table tr:last-child th, .lg-table tr:last-child td { border-bottom: 0; }
+
+.lg-missing { color: var(--ink-dim); font-weight: 400; font-style: italic; }
+/* Named for a screen reader, not drawn: the corner cell of the table. */
+.lg-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+.lg-note { margin-top: 10px; font-size: 12px; line-height: 1.55; color: var(--ink-dim); }
+.lg-sub { margin: 14px 0 6px; font-size: 11.5px; font-weight: 650; color: var(--ink-dim); letter-spacing: 0.01em; }
+
+/* One grid for every row, so the figures start at the same place under each name. */
+.lg-groups { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); column-gap: 12px; row-gap: 4px; font-size: 12.5px; line-height: 1.45; }
+.lg-group { display: contents; }
+.lg-group-name { max-width: 190px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lg-group-v { color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+
+.lg-bars { display: flex; align-items: flex-end; gap: 6px; height: 44px; padding: 2px 0; border-bottom: 1px solid var(--line); }
+.lg-bar-col { flex: 1; height: 100%; display: flex; align-items: flex-end; }
+.lg-bar { display: block; width: 100%; min-height: 0; background: var(--accent); border-radius: 3px 3px 0 0; opacity: 0.85; }
+.lg-bar-col:last-child .lg-bar { opacity: 1; }
+.lg-bar.none { background: transparent; }
+.lg-bars-axis { display: flex; justify-content: space-between; margin-top: 4px; font-size: 11px; color: var(--ink-dim); }
+
+.lg-line { font-size: 12.5px; line-height: 1.5; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+.lg-line-k { font-weight: 600; color: var(--ink); }
+.lg-line-st { color: var(--ink-faint); }

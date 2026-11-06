@@ -61,6 +61,8 @@ const OUTSIDE_TOO = [
   // Move, copy, associate and flag: the server's tools and the app's IPC use
   // the one store.
   "items",
+  // The cost and time ledger: the window and cost_ledger do the same sums.
+  "ledger",
 ];
 
 function resourcesDir(context) {
