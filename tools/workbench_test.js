@@ -467,13 +467,14 @@ async function main() {
   check("naming one works", chosen.workbench.repo_name, "b");
   const byName = await benches.start(db.createTask({ projectId: multi.id, title: "By name" }).id, { repo: "a", runSetup: false });
   check("so does naming it by name", byName.workbench.repo_name, "a");
-  const wsProject = db.createProject({ key: "ws", name: "Workspace only" });
+  // A folder given to a project afterwards (Add folder links it, or its
+  // settings set it) has its repos row at once, so Start finds one.
+  const wsProject = db.createProject({ key: "ws", name: "Folder later" });
   const wsRepo = path.join(work, "ws-repo");
   execFileSync(GIT, ["clone", "--quiet", origin, wsRepo], { stdio: "ignore" });
-  const space = db.createWorkspace({ name: "ws-repo", path: wsRepo });
-  db.linkProjectWorkspace(wsProject.id, space.id, { primary: true });
-  const rws = await benches.start(db.createTask({ projectId: wsProject.id, title: "From a workspace" }).id, { runSetup: false });
-  check("a workspace folder is adopted into repos", [rws.created,
+  db.updateProject(wsProject.id, { path: wsRepo });
+  const rws = await benches.start(db.createTask({ projectId: wsProject.id, title: "From a folder set later" }).id, { runSetup: false });
+  check("a folder set later has its repos row", [rws.created,
     db.handle().prepare("SELECT path, is_primary FROM repos WHERE project_id = ?").all(wsProject.id).map((r) => [r.path, r.is_primary])],
     [true, [[fs.realpathSync(wsRepo), 1]]]);
   const loose = db.createTask({ title: "No project" });
@@ -513,7 +514,7 @@ async function mcp(t1) {
     const resolved = await agent.call("sheet_resolve", { task: String(tm.id) });
     check("$ runs default to the Workbench", [resolved.cwd, resolved.cwd_source, resolved.workbench.id], [made.workbench.path, "workbench", made.workbench.id]);
     const plain = await agent.call("sheet_resolve", { task: String(task("no bench").id) });
-    check("without one, the project's repo", [plain.cwd, plain.cwd_source], [fs.realpathSync(app), "repo"]);
+    check("without one, the project's folder", [plain.cwd, plain.cwd_source], [fs.realpathSync(app), "folder"]);
     const listed = await agent.call("workbench_list", { project: "wb" });
     check("listed with status words", listed.some((w) => w.id === made.workbench.id && w.status.words === "Ready"), true);
     write(path.join(made.workbench.path, "agent.txt"), "x\n");

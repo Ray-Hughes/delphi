@@ -46,6 +46,13 @@
        theme's bright one, so dark puts the page's ink on it instead. */
     --btn-fg:      #fff;
     --on-good:     #fff;
+    /* The fills white button text sits on. --accent and --crit are the design's
+       values and stay for dots, rules and borders; as a button's ground they
+       fail 4.5:1 under white in places (#6366F1 is 4.47, the dark theme's
+       violet 4.23 and its red 3.76), so each is darkened, at the same hue, by
+       just enough to pass. Red already passes here and is the same value. */
+    --btn-primary: #6265F1;
+    --crit-fill:   #DC2626;
 
     /* The one place the window is glass: the bar that lists scroll under. */
     --glass:       rgba(255, 255, 255, 0.72);
@@ -151,6 +158,7 @@
     --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.13);
     --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.12);
     --btn-fg: #fff; --on-good: #090D16;
+    --btn-primary: #8655F6; --crit-fill: #EB1616;
     --glass: rgba(17, 24, 39, 0.72);
 
     --tc-blue:   #7c9bff;
@@ -195,6 +203,7 @@
   --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.13);
   --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.12);
   --btn-fg: #fff; --on-good: #090D16;
+  --btn-primary: #8655F6; --crit-fill: #EB1616;
   --glass: rgba(17, 24, 39, 0.72);
 
   --tc-blue:   #7c9bff;

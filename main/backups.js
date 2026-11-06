@@ -226,7 +226,30 @@ function createBackups({ dataDir, dbPath, source, sqlite, now = () => new Date()
     }
   }
 
-  return { dir, snapshot, named, daily, prune, list, preview, requestRestore, applyPending, beforeOpen, counts };
+  /**
+   * A snapshot before the folder migration (workbench/folders.js) runs, read
+   * before the file is opened the way beforeOpen is. needs is that file's
+   * needsAdoption, asked of this handle. The update snapshot, when this launch
+   * took one, is the same file a moment earlier, so it is reused rather than
+   * the database copied twice. Returns { file } or null when nothing will
+   * migrate; throws when a snapshot was needed and could not be made, so the
+   * caller can hold the migration back.
+   */
+  async function beforeMigration({ needs, reuse = null, label = "before-folders" }) {
+    if (!fs.existsSync(dbPath)) return null;
+    let handle = null;
+    try {
+      handle = new sqlite.DatabaseSync(dbPath);
+      const query = (q, params = []) => handle.prepare(String(q).replace(/:p(\d+)/g, "?$1")).all(...params);
+      if (!needs(query)) return null;
+      if (reuse && fs.existsSync(reuse)) return { file: reuse, reused: true };
+      return { file: await named(label, handle) };
+    } finally {
+      if (handle) handle.close();
+    }
+  }
+
+  return { dir, snapshot, named, daily, prune, list, preview, requestRestore, applyPending, beforeOpen, beforeMigration, counts };
 }
 
 module.exports = { createBackups, localDay, KEEP_DAILY, KEEP_NAMED_DAYS };

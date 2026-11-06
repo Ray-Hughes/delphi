@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 // Every call returns {ok, data} or {ok:false, error}. Unwrapping here means the
 // renderer can await a plain value and handle failure in one place, rather than
@@ -248,6 +248,23 @@ contextBridge.exposeInMainWorld("delphi", {
   },
   dialog: {
     pickFolder: (title, options) => call("dialog:pickFolder", title, options),
+  },
+  // A project is a folder. inspect() with no path shows the picker; with one
+  // (a drop) it looks at that folder. Neither writes anything.
+  folders: {
+    inspect: (folder) => call("folders:inspect", folder || null),
+    create: (payload) => call("folders:create", payload),
+    set: (projectId, folder) => call("folders:set", projectId, folder),
+    clear: (projectId) => call("folders:clear", projectId),
+    conflicts: () => call("folders:conflicts"),
+    keep: (id) => call("folders:keep", id),
+    give: (id, toProjectId) => call("folders:give", id, toProjectId),
+    merge: (id, fromProjectId) => call("folders:merge", id, fromProjectId),
+  },
+  // The path of a dropped file or folder. File.path is gone in this Electron,
+  // and only the preload can ask; the window gets the path and nothing else.
+  pathForFile: (file) => {
+    try { return webUtils.getPathForFile(file) || null; } catch { return null; }
   },
   alerts: {
     list: (opts) => call("alerts:list", opts),

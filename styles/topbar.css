@@ -135,6 +135,7 @@ body.panel .top-row { padding-left: 12px; }
 .pop .items { padding: 0 6px 6px; }
 .pop .foot { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--line); flex: none; }
 .pop .foot .grow { flex: 1; }
+.pop .foot .btn { display: inline-flex; align-items: center; gap: 6px; }
 .pop .foot .hint { color: var(--ink-faint); font-size: 11.5px; display: inline-flex; align-items: center; gap: 4px; }
 
 .opt {

@@ -83,6 +83,23 @@ containing a newline breaks it halfway through.
 `delphi.db-wal`. Run `PRAGMA wal_checkpoint(TRUNCATE)` before committing
 `delphi.db`, or the committed copy will be missing recent rows.
 
+**What a crash can lose, and what a power cut can.** Every connection sets
+`PRAGMA synchronous = FULL`: `db.js` at open, the server at connect on the
+`node:sqlite` route, and the first line of every script on the binary route,
+because each of those is a new connection and Apple's `sqlite3` defaults to
+NORMAL. Said on purpose so the routes agree, rather than by whatever each was
+compiled with. So when the app or an agent crashes or is killed, no committed
+write is lost on either route: the WAL is in the operating system's cache and
+the next open replays it. A power cut or a kernel panic is different. macOS
+`fsync` does not flush the drive's own cache and `fullfsync` is left off (it
+costs 10 to 20ms a commit), so the very last commit can be lost, though the file
+is never corrupted. What covers that is the copies: a snapshot every day in
+`DATA_DIR/backups/` (seven kept, by SQLite's online backup, so it includes
+the WAL) and a named one before anything big (an update, the folder migration,
+a restore), each with a `restore_points` row. Settings, "Where your data lives",
+restores one: the current file is snapshotted first, then the app relaunches and
+puts the chosen one in place before anything opens it.
+
 **Some modules are shared by the app and the MCP server, and the rest are
 twinned.** The older code the server needs is duplicated from `db.js` on purpose,
 because the server may have no `node:sqlite` and cannot read inside `app.asar`.
@@ -130,8 +147,18 @@ see it.** One folder and one branch per task, in `<repo>.workbenches/` beside th
 repository (or under `DELPHI_WORKBENCH_DIR`). The verbs are Start, Open, Park,
 Finish and Discard, and git's own words stay in `workbench/git.js`, which turns
 its errors into sentences. It has nothing to do with the older `workspaces` and
-`project_workspaces` tables, which are folders attached to a project; a
-Workbench is attached to a task.
+`project_workspaces` tables, which the folder migration read once and nothing
+reads now; a Workbench is attached to a task.
+
+**A project is a folder, and a folder is one project's.** `projects.path` is
+the folder, normalised (`workbench/folders.js normalise`) and unique where it is
+set, by an index the migration makes once no two projects share one; it is not
+in `schema.sql`, which runs first and would fail on a database that still has a
+shared folder. Every caller that needs a folder asks `folderFor` or
+`projectFolders` there: jobs, `$ ` runs, Workbench Start, `sheet_resolve` and
+sessions. A primary `repos` row counts only through the project's own folder, so
+a project in No folder resolves nowhere. The folder is written in one place,
+`db.js updateProject`, which moves the primary repos row with it.
 
 **The never-lose-work rules are why `workbench/` refuses more than it does.**
 Finish removes the folder only when nothing is unsaved and nothing is unpushed,

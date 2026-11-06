@@ -583,6 +583,7 @@ async function refresh() {
     ? state.allTasks
     : await window.delphi.tasks.list({ projectId: null, includeDone: true });
   try { state.runs = await window.delphi.runs.list({ limit: 300 }); } catch { state.runs = []; }
+  if (window.DelphiNeeds) await DelphiNeeds.load();
   render();
   reloadFlags();
 }
@@ -1187,6 +1188,7 @@ function render() {
   // at once collide on a line rather than on a function.
   if (window.DelphiRecovery) DelphiRecovery.remember({ projectId: state.projectId, view: state.view });
   if (window.DelphiTopbar) DelphiTopbar.paint();
+  if (window.DelphiAddFolder) DelphiAddFolder.paintFix(state);
   // --- end MOUNTS ---
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
@@ -1884,9 +1886,11 @@ function renderProjectSettings(root) {
     el("div", { className: "row" }, nameInput), nameMsg));
 
   // --- folder ----------------------------------------------------------------
-  // Where an agent works when nothing more specific says: the last place a job
-  // looks, after the repositories and the workspaces. The refusal a job gives
-  // when a project has none sends people here by name, so it has to be here.
+  // The project's folder: where its jobs, runs, Workbenches and sessions work,
+  // and the one place it is written (db.js updateProject). One folder is one
+  // project's, so choosing a folder another project has is refused by name.
+  // The refusal a job gives when a project has none sends people here, so it
+  // has to be here.
   const folderMsg = el("span", { className: "hint" });
   const folderInput = commitOnEnter(el("input", { className: "field", value: project.path || "", placeholder: "/path/to/the/code" }));
   folderInput.onblur = () => {
@@ -1904,75 +1908,16 @@ function renderProjectSettings(root) {
       save({ path: picked }, folderMsg);
     } catch (error) { folderMsg.className = "err-msg"; folderMsg.textContent = error.message; }
   };
+  const folderFacts = el("div", { className: "hint" });
+  if (project.path) {
+    folderFacts.textContent = [project.owner_repo || null, project.default_branch ? `default branch ${project.default_branch}` : null,
+      project.folder_missing ? "not on disk right now" : null].filter(Boolean).join(" · ");
+  }
   const folderBox = settingSection("Folder",
-    "Where agents work on this project when it has no repository or workspace of its own. A run that changes code still gets its own Workbench beside it; one that only answers reads from here.",
-    el("div", { className: "row" }, folderInput, folderPick), folderMsg);
+    "Where agents work on this project: its jobs, its runs and its sessions. A run that changes code still gets its own Workbench beside it; one that only answers reads from here. A folder belongs to one project.",
+    el("div", { className: "row" }, folderInput, folderPick), folderFacts, folderMsg);
   folderBox.id = "project-folder";
   root.append(folderBox);
-
-  // --- workspaces ----------------------------------------------------------
-  // A project is work, and work happens in folders: sometimes one, sometimes
-  // four. SSNR spans caseflow, caseflow-efolder, the MPI person update service
-  // and the veteran API, so this is a list rather than a field.
-  const wsRow = el("div", { className: "row wrap" });
-
-  const paintWorkspaces = async () => {
-    wsRow.textContent = "";
-    const live = currentProject();
-    if (!live) return;
-    const linked = await window.delphi.workspaces.forProject(live.id);
-
-    if (!linked.length) {
-      wsRow.append(el("span", { className: "hint", textContent: "Not in any workspace yet." }));
-    }
-
-    for (const w of linked) {
-      const chip = el("span", { className: "chip ws-chip" + (w.is_primary ? " primary" : "") });
-      chip.append(el("span", { textContent: w.name, title: w.path }));
-      if (w.is_primary) chip.append(el("span", { className: "hint", textContent: "main" }));
-
-      // Left click promotes, so the folder a session defaults to can be changed
-      // without a menu. The x removes the link and never the folder.
-      chip.onclick = async () => {
-        await window.delphi.workspaces.link(live.id, w.id, { primary: true });
-        await paintWorkspaces();
-        await refresh();
-      };
-      chip.title = w.is_primary ? `${w.path}\nThe main folder for this project` : `${w.path}\nClick to make this the main folder`;
-
-      const drop = el("button", { className: "chip-x", textContent: "×", title: "Remove from this workspace" });
-      drop.onclick = async (e) => {
-        e.stopPropagation();
-        await window.delphi.workspaces.unlink(live.id, w.id);
-        await paintWorkspaces();
-        await refresh();
-      };
-      chip.append(drop);
-      wsRow.append(chip);
-    }
-
-    const linkedIds = new Set(linked.map((w) => w.id));
-    const available = state.workspaces.filter((w) => !linkedIds.has(w.id));
-    if (available.length) {
-      const add = el("button", { className: "btn sm", textContent: "+ Add workspace" });
-      add.onclick = (e) => {
-        rowMenu(e.clientX, e.clientY, available.map((w) => ({
-          label: w.name,
-          run: async () => {
-            await window.delphi.workspaces.link(live.id, w.id, { primary: linked.length === 0 });
-            await paintWorkspaces();
-            await refresh();
-          },
-        })));
-      };
-      wsRow.append(add);
-    }
-  };
-  paintWorkspaces();
-
-  root.append(settingSection("Workspaces",
-    "The folders this project's work happens in. One project can span several, which is why this is a list: clicking a chip makes it the main folder, and the x removes the link without touching anything on disk.",
-    wsRow));
 
   // --- summary -------------------------------------------------------------
   const sumMsg = el("span", { className: "hint" });
@@ -2370,8 +2315,21 @@ function projectMenu(p, x, y, button = null, fromKeyboard = false) {
     { node: projectSwatchRow(p.colour, async (colour) => { closeRowMenu(); await set({ colour }); }) },
     "-",
     ...statuses,
-    ...workspaceChoices(p),
     "-",
+    // A project with no folder is offered one here, from the switcher's "..."
+    // as well as its settings, through the same checks Add folder makes.
+    p.path
+      ? { label: "Change folder…", run: () => navigate({ projectId: p.id, view: "project", query: "" }).then(() => document.getElementById("project-folder")?.scrollIntoView({ block: "center" })) }
+      : { label: "Give it a folder…", run: async () => {
+        try {
+          const look = await window.delphi.folders.inspect(null);
+          if (!look || look.cancelled) return;
+          if (!look.ok) { notify(look.why, { error: true }); return; }
+          await window.delphi.folders.set(p.id, look.top);
+          notify(`${p.name} has a folder now: ${look.shown}.`);
+        } catch (error) { notifyError(error); }
+        await refresh();
+      } },
     // The field is cleared by hand the way the row's own click does it: navigate
     // drops the query from the state and the box goes on showing what was typed.
     { label: "Settings", run: () => { $("search").value = ""; return navigate({ projectId: p.id, view: "project", query: "" }); } },
@@ -2380,29 +2338,6 @@ function projectMenu(p, x, y, button = null, fromKeyboard = false) {
   ];
   if (button && x == null) keyedMenu(button, items, { fromKeyboard });
   else keyedMenu(button, items, { x, y });
-}
-
-/**
- * "Put in <workspace>" for each workspace a project is not already in.
- *
- * Most projects were made by agents over MCP, which never links a folder, and a
- * project in no workspace is the one the sidebar used to lose. Filing it is a
- * right click here rather than a trip into Settings. The first link is made the
- * main one, the way Settings does it, so sessions have a folder to run in.
- */
-function workspaceChoices(p) {
-  const inside = state.workspaces.filter((w) => (state.wsMembers.get(w.id) || []).includes(p.id));
-  const open = state.workspaces.filter((w) => !inside.includes(w));
-  if (!open.length) return [];
-  return ["-", ...open.map((w) => ({
-    label: `Put in ${w.name}`,
-    run: async () => {
-      try {
-        await window.delphi.workspaces.link(p.id, w.id, { primary: inside.length === 0 });
-      } catch (error) { alert(error.message); return; }
-      await refresh();
-    },
-  }))];
 }
 
 // ---------------------------------------------------------------------------
@@ -9985,7 +9920,7 @@ const needsYouCount = () => waitingRuns().filter((r) => !isAnswered(r)).length;
 // The sidebar badge counts everything Needs you shows: agents paused on you,
 // finished runs nobody has reviewed, and flags waiting on a decision. The title
 // bar keeps to the first, because "waiting on you" there means an agent is stuck.
-const needsYouTotal = () => needsYouCount() + reviewRuns().length + (state.flagRows || []).length;
+const needsYouTotal = () => needsYouCount() + reviewRuns().length + (state.flagRows || []).length + (window.DelphiNeeds ? DelphiNeeds.count() : 0);
 const onHomeView = () => !state.query && !state.projectId && HOME_VIEWS.includes(state.view);
 
 /**
@@ -10812,7 +10747,9 @@ function renderInbox(root) {
   const questions = all.filter((r) => r.state === "waiting_on_human");
   const reviews = reviewRuns().sort((a, b) => String(a.finished_at || a.updated_at).localeCompare(String(b.finished_at || b.updated_at)));
   const flags = flagRowsNow();
-  const total = all.length + reviews.length + flags.length;
+  // The folder questions (ui/needs.js) sit above everything else under All.
+  const folderQs = window.DelphiNeeds ? DelphiNeeds.count() : 0;
+  const total = all.length + reviews.length + flags.length + folderQs;
 
   const group = el("div", { className: "seg-sm", role: "group" });
   for (const [key, label] of [["urgency", "By urgency"], ["project", "By project"]]) {
@@ -10848,8 +10785,9 @@ function renderInbox(root) {
   const reviewsShown = f === "all" || f === "reviews" ? reviews : [];
   const flagsShown = f === "all" || f === "proposals" ? flags : [];
   const shownCount = runsShown.length + reviewsShown.length + flagsShown.length;
+  if (f === "all" && folderQs) DelphiNeeds.mount(page);
 
-  if (!shownCount) {
+  if (!shownCount && !(f === "all" && folderQs)) {
     page.append(emptyState(total ? "Nothing of this kind" : "Nothing needs you",
       "When an agent asks to start work or asks a question, when a run finishes and wants a look, or when someone flags an item as filed in the wrong place, it waits here until you answer."));
   } else {
@@ -10888,7 +10826,7 @@ function renderInbox(root) {
         groups.forEach((row) => box.append(flagNode(row)));
       }
     }
-    page.append(box);
+    if (box.childNodes.length) page.append(box);
   }
   page.append(el("div", { className: "rule-note" },
     el("b", { textContent: "What is here: " }), "things an agent is blocked on you for, finished runs nobody has reviewed, and proposals about where an item belongs. Your own tasks are in All work. ",
@@ -13359,8 +13297,7 @@ async function openHarness(key) {
     projectId: project.id,
     title: harness ? harness.label : key,
     harness: key,
-    workspaceId: state.workspaceId,
-    cwd: sessionFolder({ workspace_id: state.workspaceId }),
+    cwd: sessionFolder({ project_id: project.id }),
   });
   state.sessions = await window.delphi.sessions.list(project.id);
   await openSession(created.id);
@@ -13368,20 +13305,15 @@ async function openHarness(key) {
 
 
 /**
- * The folder a session runs in.
- *
- * Recorded on the session, because a project spanning four repos has no single
- * answer. Falls back to the workspace currently open, then to the project's old
- * path column for sessions made before workspaces existed.
+ * The folder a session runs in: the one it was started in, then its
+ * project's. The rule workbench/folders.js gives the main process, less the
+ * disk check, which the window cannot make; the main process makes it when the
+ * session starts. A session that recorded only a workspace had that folder
+ * written into its cwd by the folder migration.
  */
 function sessionFolder(session) {
-  if (session && session.workspace_id) {
-    const w = state.workspaces.find((x) => x.id === session.workspace_id);
-    if (w) return w.path;
-  }
-  const open = state.workspaces.find((w) => w.id === state.workspaceId);
-  if (open) return open.path;
-  const project = currentProject();
+  if (session && session.cwd) return session.cwd;
+  const project = (session && session.project_id != null ? projectById(session.project_id) : null) || currentProject();
   return project && project.path ? project.path : null;
 }
 
@@ -13394,11 +13326,9 @@ async function newSession() {
     // the right first behaviour when nobody has chosen anything yet.
     agent: "boss",
     provider: null,
-    // The folder it runs in, which is the workspace it was started from. A
-    // project can span four repos, so this cannot be derived from the project
-    // afterwards: only the person starting the session knows which one they
-    // meant, and being in that workspace is them saying so.
-    workspaceId: state.workspaceId,
+    // The folder it runs in: the project's, written down now so the session
+    // keeps it if the project's folder changes later.
+    cwd: sessionFolder({ project_id: project.id }),
   });
   state.sessions = await window.delphi.sessions.list(project.id);
   await openSession(created.id);
@@ -14489,6 +14419,7 @@ const shell = {
     focusComposer();
   },
   newProject: () => createProject(),
+  addFolder: () => DelphiAddFolder.open(),
   openSettings: (anchor) => {
     if (anchor === "archived") revealArchived = true;
     return goTo({ projectId: null, view: "settings", query: "" });
@@ -14546,6 +14477,8 @@ function openBar(query = "") {
 }
 
 DelphiTopbar.init(shell);
+DelphiAddFolder.init({ ...shell, refresh: () => refresh(), notify: (text, o) => notify(text, o) });
+DelphiNeeds.init({ refresh: () => refresh(), notify: (text) => notify(text) });
 DelphiKeys.install({
   commands: () => COMMANDS,
   // A panel, a menu, a dialog or a popover owns the keyboard while it is open.

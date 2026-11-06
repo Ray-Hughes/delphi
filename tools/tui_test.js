@@ -665,7 +665,8 @@ async function main() {
     // flags differ between BSD and util-linux, and some systems lack it, so
     // this is a skip there rather than a failure; everything above runs anyway.
     const db = require("../db");
-    const project = db.createProject({ key: "pty", name: "PTY", path: dir });
+    // Its own folder: a folder is one project's, and TUI above has dir.
+    const project = db.createProject({ key: "pty", name: "PTY", path: fs.mkdtempSync(path.join(dir, "pty-")) });
     const task = db.createTask({ projectId: project.id, title: "pty check" });
     const argv = [process.execPath, CLI, "open", String(task.id)];
     const quote = (a) => `'${a.replace(/'/g, "'\\''")}'`;

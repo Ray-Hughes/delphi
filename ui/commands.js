@@ -66,7 +66,7 @@ globalThis.DelphiCommands = (() => {
    *   state()            the renderer's state
    *   go(target)         navigate there, clearing any search
    *   projectFor()       the project Pads and Chat open from All projects
-   *   newTask(), newNote(), newProject(), openSettings(), toggleTheme(),
+   *   newTask(), newNote(), newProject(), addFolder(), openSettings(), toggleTheme(),
    *   undoLast(), openSwitcher(), openTask(id), scrollTop()
    *   themeIs()          "dark" or "light", as the window is showing it now
    */
@@ -96,7 +96,8 @@ globalThis.DelphiCommands = (() => {
       { id: "switch-project", group: "Commands", title: "Switch project", keys: "⌘P", run: () => app.openSwitcher() },
       { id: "new-task", group: "Commands", title: "New task", keys: "⌘N", run: () => app.newTask() },
       { id: "new-note", group: "Commands", title: "New note", run: () => app.newNote() },
-      { id: "new-project", group: "Commands", title: "New project", run: () => app.newProject() },
+      { id: "add-folder", group: "Commands", title: "Add folder as project", run: () => app.addFolder() },
+      { id: "new-project", group: "Commands", title: "New project without a folder", run: () => app.newProject() },
       { id: "theme", group: "Commands", get title() { return app.themeIs() === "dark" ? "Switch to light theme" : "Switch to dark theme"; }, run: () => app.toggleTheme() },
       { id: "undo-last", group: "Commands", title: "Undo the last change", run: () => app.undoLast() },
     ];

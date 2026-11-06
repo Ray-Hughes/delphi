@@ -268,7 +268,12 @@ CREATE TABLE IF NOT EXISTS repos (
   base_branch  TEXT,   -- null = detect (origin/HEAD, then main, then master)
   setup_cmd    TEXT,   -- null = not detected yet; '' = detected, nothing to run
   copy_files   TEXT,   -- null = '.env,.env.local'; comma separated, untracked, never overwritten
-  setup_cmd_detected INTEGER NOT NULL DEFAULT 0   -- 1 = setup_cmd is what Delphi detected, 0 = a person set it (or nothing yet)
+  setup_cmd_detected INTEGER NOT NULL DEFAULT 0,  -- 1 = setup_cmd is what Delphi detected, 0 = a person set it (or nothing yet)
+  -- What git said about the folder when it was added or last looked at, for the
+  -- switcher and the project page. Detected, never typed: base_branch above is
+  -- the person's override, and NULL there means use default_branch.
+  remote_url     TEXT,
+  default_branch TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_repos_project ON repos(project_id);
 
@@ -874,3 +879,28 @@ CREATE TABLE IF NOT EXISTS restore_points (
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_restore_points_created ON restore_points(created_at);
+
+-- A folder Delphi knows about that is not a project's, or no longer is. One row
+-- per folder (path is the git top level, worktrees resolved), so however many
+-- times it is seen it is one question for a person, never a project made
+-- behind their back. via says how it got here: 'migration' for a workspace no
+-- project was linked to, 'conflict' for a folder two projects had shared until
+-- each folder became one project's (detail names both, and what each held). A
+-- person's answer goes in state, and an answered row never asks again. No CHECK
+-- on via or state, for the reason projects.task_view has none.
+-- agent/schema_later.js holds the same text.
+CREATE TABLE IF NOT EXISTS discovered_folders (
+  id          INTEGER PRIMARY KEY,
+  path        TEXT NOT NULL UNIQUE,
+  first_seen  TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+  seen_by     TEXT,
+  via         TEXT,
+  state       TEXT NOT NULL DEFAULT 'new',
+  project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  detail      TEXT,
+  answered_at TEXT
+);
+-- The unique index on projects(path) is not here. This file runs before the
+-- folder migration (workbench/folders.js), and on a database where two projects
+-- still share a folder it would fail and stop the whole file.

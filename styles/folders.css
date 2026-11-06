@@ -1,0 +1,71 @@
+/* Folders: the Add folder sheet, the drop target, the fix-it bar and the
+   shared-folder question in Needs you (ui/addfolder.js, ui/needs.js).
+
+   The fix-it bar is amber, not red: a folder that is not there is often a
+   drive that is not mounted, and nothing has been lost either way. */
+
+/* The sheet: the .ask shell, a little wider for a path and a remote. */
+.af { width: min(520px, 100%); }
+.af-facts { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg); }
+.af-fact { display: flex; gap: 12px; align-items: baseline; padding: 8px 12px; border-bottom: 1px solid var(--line-soft); font-size: 12.5px; }
+.af-fact:last-child { border-bottom: 0; }
+.af-k { color: var(--ink-dim); font-size: 12px; flex: 0 0 110px; }
+.af-v { color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+.af-v.warn { color: var(--warn-ink); }
+.af-note { color: var(--ink-dim); font-size: 12.5px; }
+.af-match {
+  display: flex; gap: 10px; align-items: center; padding: 10px 12px;
+  border: 1px solid var(--accent-line); border-radius: var(--r-sm); background: var(--accent-soft);
+  font-size: 12.5px; color: var(--ink);
+}
+.af-match svg { color: var(--accent-ink); flex: none; }
+.af-fields { display: flex; gap: 10px; }
+.af-field { display: flex; flex-direction: column; gap: 4px; flex: 2; min-width: 0; }
+.af-keyfield { flex: 1; }
+.af-field .af-k { flex: none; }
+
+/* A folder being dragged over the window. Under any sheet, over everything else. */
+.af-drop {
+  position: fixed; inset: 0; z-index: 45; pointer-events: none;
+  display: grid; place-items: center;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  outline: 2px dashed var(--accent-line); outline-offset: -12px;
+}
+.af-drop-card {
+  display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 22px 28px;
+  border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-2);
+  color: var(--ink-dim); font-size: 12.5px;
+}
+.af-drop-card svg { width: 28px; height: 28px; color: var(--accent-ink); }
+.af-drop-card b { color: var(--ink); font-size: 14px; }
+
+/* The fix-it bar, where the recovery banner sits. */
+.folder-fix {
+  display: flex; align-items: center; gap: 12px; flex: 0 0 auto;
+  margin: var(--s4) var(--s6) 0; padding: 10px 12px 10px 14px;
+  border: 1px solid var(--line); border-radius: var(--r-lg);
+  background: linear-gradient(90deg, var(--warn-soft), transparent 70%), var(--surface);
+  box-shadow: var(--shadow-1);
+}
+.folder-fix-dot { width: 8px; height: 8px; border-radius: 99px; background: var(--warn); flex: none; box-shadow: 0 0 0 3px var(--warn-soft); }
+.folder-fix-words { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; font-size: 12.5px; color: var(--ink-dim); }
+.folder-fix-words b { color: var(--ink); font-weight: 600; }
+.folder-fix-words .mono { color: var(--ink); }
+.folder-fix-msg:empty { display: none; }
+.folder-fix-msg { color: var(--crit-ink); }
+.folder-fix-acts { display: flex; gap: 6px; flex: none; }
+
+/* The shared-folder question, at the top of Needs you. */
+.fc-box { margin-bottom: var(--s4); }
+.fc { padding: 12px 14px; border-top: 1px solid var(--line-soft); display: flex; flex-direction: column; gap: 6px; }
+.fc-head { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink); }
+.fc-head svg { color: var(--accent-ink); flex: none; }
+.fc-head b { font-weight: 600; }
+.fc-words { margin: 0 0 0 24px; font-size: 12.5px; color: var(--ink-dim); }
+.fc-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-left: 24px; }
+.fc-confirm {
+  display: flex; align-items: center; gap: 8px; margin-left: 24px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg); font-size: 12.5px; color: var(--ink);
+}
+.fc-msg:empty { display: none; }
+.fc-msg { margin-left: 24px; font-size: 12.5px; }

@@ -161,13 +161,14 @@
   .btn:hover { background: var(--raised); color: var(--ink); border-color: var(--ink-faint); }
   .btn.wide { width: 100%; }
   .btn.sm { padding: 3px 9px; font-size: 12px; }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .btn.primary:hover { filter: brightness(1.08); color: #fff; }
+  .btn.primary { background: var(--btn-primary); border-color: var(--btn-primary); color: var(--btn-fg); }
+  /* Darker on hover, never lighter: lighter would take the text under 4.5:1. */
+  .btn.primary:hover { filter: brightness(0.92); color: var(--btn-fg); }
   /* Outlined at rest and filled only on hover, which is the treatment .ctx-item
      .danger already uses: a destructive verb should be legible as one without
      shouting from the middle of a settings pane. */
   .btn.danger { color: var(--crit-ink); border-color: color-mix(in srgb, var(--crit) 40%, transparent); }
-  .btn.danger:hover { background: var(--crit); border-color: var(--crit); color: #fff; }
+  .btn.danger:hover { background: var(--crit-fill); border-color: var(--crit-fill); color: var(--btn-fg); }
   .btn:disabled { opacity: 0.45; }
   .btn.danger:disabled:hover { background: var(--surface); color: var(--crit-ink); border-color: color-mix(in srgb, var(--crit) 40%, transparent); }
 
@@ -863,7 +864,7 @@
     color: var(--bg); font-size: 12px; font-weight: 600; cursor: default;
   }
   .bulk-btn:hover { background: color-mix(in srgb, var(--bg) 32%, transparent); }
-  .bulk-btn.danger:hover { background: var(--crit); color: #fff; }
+  .bulk-btn.danger:hover { background: var(--crit-fill); color: var(--btn-fg); }
   .bulk-close {
     border: 0; background: none; color: var(--bg); opacity: 0.7;
     font-size: 13px; cursor: default; padding: 4px 6px;
@@ -1062,11 +1063,11 @@
   }
   .ctx-item:hover { background: var(--accent); color: #fff; }
   .ctx-item.danger { color: var(--crit-ink); }
-  .ctx-item.danger:hover { background: var(--crit); color: #fff; }
+  .ctx-item.danger:hover { background: var(--crit-fill); color: var(--btn-fg); }
   .ctx-sep { height: 1px; background: var(--line-soft); margin: 4px 2px; }
   /* Reached by the arrows, where there is no hover to show which item is next. */
   .ctx-item:focus-visible { background: var(--accent); color: var(--btn-fg); outline: none; }
-  .ctx-item.danger:focus-visible { background: var(--crit); }
+  .ctx-item.danger:focus-visible { background: var(--crit-fill); }
 
   /* View picker ------------------------------------------------------------
      The trigger is a .btn carrying the current view, and the popup is the .ctx
@@ -1895,7 +1896,7 @@
   .wb-split { display: inline-flex; }
   .wb-split .btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
   .wb-split .btn + .btn { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; padding: 3px 6px; }
-  .wb-split .btn.primary + .btn.primary { border-left-color: color-mix(in srgb, var(--btn-fg) 35%, var(--accent)); }
+  .wb-split .btn.primary + .btn.primary { border-left-color: color-mix(in srgb, var(--btn-fg) 35%, var(--btn-primary)); }
   .wb-split svg { width: 10px; height: 10px; }
   .ctx.wb-menu:focus { outline: none; }
   .wb-menu .ctx-item { display: flex; align-items: center; gap: var(--s3); }
@@ -2920,8 +2921,8 @@
   .run .acts .btn svg { width: 12px; height: 12px; }
   .run .acts .ts-linkbtn { font-size: 12px; font-weight: 560; }
   .btn.stop { color: var(--crit-ink); }
-  .btn.stop:hover { background: var(--crit); color: var(--btn-fg); border-color: var(--crit); }
-  .btn.stop.kill { background: var(--crit); color: var(--btn-fg); border-color: var(--crit); font-weight: 600; }
+  .btn.stop:hover { background: var(--crit-fill); color: var(--btn-fg); border-color: var(--crit-fill); }
+  .btn.stop.kill { background: var(--crit-fill); color: var(--btn-fg); border-color: var(--crit-fill); font-weight: 600; }
   .res { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; }
   .res.ok { color: var(--run-ok); } .res.fail { color: var(--run-fail); } .res.stopped { color: var(--ink-faint); }
   .res::before { content: ""; width: 6px; height: 6px; border-radius: 99px; background: currentColor; }
@@ -2950,7 +2951,7 @@
   .wr .acts .btn.ok { color: var(--good-ink); border-color: color-mix(in srgb, var(--good) 45%, var(--line)); font-weight: 600; }
   .wr .acts .btn.ok:hover { background: var(--good-ink); color: var(--on-good); border-color: var(--good-ink); }
   .wr .acts .btn.no { color: var(--crit-ink); }
-  .wr .acts .btn.no:hover { background: var(--crit); color: var(--btn-fg); border-color: var(--crit); }
+  .wr .acts .btn.no:hover { background: var(--crit-fill); color: var(--btn-fg); border-color: var(--crit-fill); }
   .wr .when { font-size: 11.5px; color: var(--ink-faint); white-space: nowrap; }
   .wr .side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
   .wr .cmd {
@@ -3219,7 +3220,7 @@
   .prop-acts .btn.ok { color: var(--good-ink); border-color: color-mix(in srgb, var(--good) 45%, var(--line)); font-weight: 600; }
   .prop-acts .btn.ok:hover { background: var(--good-ink); color: var(--on-good); border-color: var(--good-ink); }
   .prop-acts .btn.no { color: var(--crit-ink); }
-  .prop-acts .btn.no:hover { background: var(--crit); color: var(--btn-fg); border-color: var(--crit); }
+  .prop-acts .btn.no:hover { background: var(--crit-fill); color: var(--btn-fg); border-color: var(--crit-fill); }
   .prop .reply, .prop .reject-why { display: flex; gap: 6px; margin-top: 10px; align-items: center; flex-wrap: wrap; }
   .prop .reply .field, .prop .reject-why .field { flex: 1; min-width: 200px; height: 30px; padding: 4px 10px; }
   .prop .reject-why label { font-size: 12px; color: var(--ink-dim); display: inline-flex; align-items: center; gap: 5px; }

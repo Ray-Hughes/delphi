@@ -107,7 +107,8 @@ function suite(label, delphi) {
   const hiId = Number((hi.err.match(/entry (\d+)/) || [])[1]);
   const hiRow = entryRow(hiId);
   check("the entry is ok with short output inline", [hiRow.kind, hiRow.body, hiRow.meta.state, hiRow.meta.out, hiRow.meta.lines], ["run", "echo hi", "ok", "hi", 1]);
-  check("it ran in the project's folder", hiRow.meta.cwd, folder);
+  // The folder is stored as its real path (workbench/folders.js normalise).
+  check("it ran in the project's folder", hiRow.meta.cwd, fs.realpathSync(folder));
   check("the log is under DATA_DIR/sheets/<task>/<entry>.log", fs.readFileSync(path.join(dir, "sheets", String(task.id), `${hiId}.log`), "utf8"), "hi\n");
 
   const failing = delphi(["run", tag, "--cwd", dir, "--", "echo nope; exit 3"]);

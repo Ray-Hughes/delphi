@@ -552,6 +552,7 @@ const SHEET_LOG_DIR = path.join(RESOLVED.dataDir, "sheets");
 // guarded and recorded like any other `$ ` entry.
 const { makeWorkbenchStore } = require("../workbench/store");
 const { createWorkbench } = require("../workbench/workbench");
+const folderRule = require("../workbench/folders");
 const { runEntry } = require("../sheet/run");
 const benchStore = makeWorkbenchStore({ sql, actor: ACTOR, who: WHO, step: currentStep });
 const benches = createWorkbench({
@@ -685,28 +686,17 @@ function sheetContext(taskId) {
 }
 
 /**
- * The folder a command for this task should run in, and where that came from.
- *
- * The task's Workbench first, because that is where its work is and running
- * a command anywhere else is how one task's build ends up in another's folder.
- * Then the primary repo, then the project's primary workspace folder, then the
- * project's own folder. repos is empty in most real databases, which is why the
- * other two count.
+ * The folder a command for this task should run in, and where that came from:
+ * its live Workbench, then its project's folder, then the other folders the
+ * project works in. The rule is workbench/folders.js's, the one the app's own
+ * `$ ` runs and jobs use, so an agent and a person running the same command on
+ * the same task run it in the same place.
  */
 function resolveTaskFolder(task) {
-  const exists = (p) => { try { return Boolean(p) && fs.statSync(p).isDirectory(); } catch { return false; } };
-  const bench = benchStore.live(task.id);
-  if (bench && bench.state !== "missing" && exists(bench.path)) return { cwd: bench.path, cwd_source: "workbench" };
-  if (task.project_id == null) return { cwd: null, cwd_source: null };
-  const repos = sql("SELECT path FROM repos WHERE project_id = :p1 ORDER BY is_primary DESC, id", [task.project_id]);
-  for (const r of repos) if (exists(r.path)) return { cwd: r.path, cwd_source: "repo" };
-  const spaces = sql(
-    `SELECT w.path FROM project_workspaces pw JOIN workspaces w ON w.id = pw.workspace_id
-      WHERE pw.project_id = :p1 ORDER BY pw.is_primary DESC, w.sort_order, w.id`, [task.project_id]);
-  for (const w of spaces) if (exists(w.path)) return { cwd: w.path, cwd_source: "folder" };
-  const project = sql("SELECT path FROM projects WHERE id = :p1", [task.project_id])[0];
-  if (project && exists(project.path)) return { cwd: project.path, cwd_source: "folder" };
-  return { cwd: null, cwd_source: null };
+  if (task.project_id == null && !benchStore.live(task.id)) return { cwd: null, cwd_source: null };
+  const found = folderRule.folderFor(sql, { taskId: task.id, projectId: task.project_id, live: (id) => benchStore.live(id) });
+  const source = { workbench: "workbench", project: "folder", repo: "repo" }[found.source] || null;
+  return { cwd: found.path, cwd_source: found.path ? source : null };
 }
 
 const PROMOTE_DIRECTIVE =
