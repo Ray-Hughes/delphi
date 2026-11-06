@@ -3562,6 +3562,25 @@
     border: 1px solid color-mix(in srgb, var(--kind-agent) 40%, var(--line)); border-radius: 99px; padding: 1px 8px; white-space: nowrap;
   }
   .suggested-tag b { font-family: var(--mono); font-weight: 600; }
+
+  /* The pointing hand on everything that does something when clicked. Last in
+     the sheet, so it wins over the many rules above that gave controls the
+     plain arrow the way a native Mac app does; people read the arrow as "not
+     clickable". Rows that only have an onclick get .has-click from app.js on
+     first hover. A disabled or busy control goes back to the arrow, and text
+     fields keep the text cursor. */
+  a[href], button, select, summary, label[for],
+  input[type="checkbox"], input[type="radio"], input[type="range"], input[type="color"],
+  [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="menuitemcheckbox"],
+  [role="menuitemradio"], [role="option"], [role="switch"], [role="checkbox"], [role="radio"],
+  [role="treeitem"], .clickable, .has-click { cursor: pointer !important; }
+  /* !important because the arrow above is set by more specific rules (.btn,
+     .list-row.clickable and the like) in seventy places; order alone does not
+     beat them. The exceptions below are !important for the same reason. */
+  button:disabled, [aria-disabled="true"], [disabled], .is-busy { cursor: default !important; }
+  input[type="text"], input[type="search"], input:not([type]), textarea, [contenteditable="true"] { cursor: text !important; }
+  .board .tcard, .cal-day .tcard, .cal-tray-body .tcard, .run .grip { cursor: grab !important; }
+  .board .tcard:active, .cal-day .tcard:active, .cal-tray-body .tcard:active { cursor: grabbing !important; }
 </style>
 </head>
 <body>

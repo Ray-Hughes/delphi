@@ -139,6 +139,30 @@ const el = (tag, props = {}, ...kids) => {
 };
 
 /**
+ * The pointing hand, on anything a click does something to.
+ *
+ * The stylesheet used to give controls the plain arrow, as a native Mac app
+ * does, and people read that as "this is not a link". A rule in index.html now
+ * covers everything that says it is interactive (buttons, links, roles, the
+ * clickable class). That cannot see the rows and chips that only have an
+ * onclick assigned after they were made, over two hundred of them, so this
+ * looks for one on the way up from whatever the pointer is over and marks the
+ * first it finds, once. Disabled controls keep the arrow.
+ */
+document.addEventListener("mouseover", (e) => {
+  for (let node = e.target; node && node !== document.body && node.nodeType === 1; node = node.parentElement) {
+    if (node.dataset.pointerChecked) return;
+    if (typeof node.onclick === "function") {
+      // A class rather than an inline style, so the stylesheet can still give
+      // the arrow back while the control is disabled or busy.
+      node.dataset.pointerChecked = "1";
+      node.classList.add("has-click");
+      return;
+    }
+  }
+}, { passive: true });
+
+/**
  * A colour from the database, fit to put in a style attribute, or the
  * fallback. Project and epic colours are written by agents over MCP, and a
  * value such as "red; background-image: url(...)" would otherwise carry CSS of
