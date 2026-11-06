@@ -141,6 +141,11 @@ function fixture(file) {
   ins("INSERT INTO sessions (id, project_id, workspace_id, title) VALUES (2, 1, 2, 'older session')");
   ins("INSERT INTO sessions (id, project_id, cwd, title) VALUES (3, 8, ?, 'co session')", P);
   ins("INSERT INTO repos (project_id, name, path, is_primary, base_branch) VALUES (8, 'caseflow', ?, 0, 'master')", P);
+  // A primary row somewhere else than the project's folder, with settings made
+  // for that other folder. It must stay where it is (review round 1).
+  ins("INSERT INTO repos (project_id, name, path, is_primary, setup_cmd, base_branch) VALUES (2, 'efolder', ?, 1, 'bin/setup', 'master')", U);
+  // A session of the project that moves, which never wrote down its folder.
+  ins("INSERT INTO sessions (id, project_id, title) VALUES (4, 8, 'co session, no cwd')");
   h.close();
 }
 
@@ -168,17 +173,22 @@ async function migrationOn(name, makeRoute) {
   check("a session with only a workspace gets its folder", r.sql("SELECT cwd FROM sessions WHERE id = 2", [])[0].cwd, P);
   check("each folder has its primary repos row",
     r.sql("SELECT project_id, path FROM repos WHERE is_primary = 1 ORDER BY project_id", []).map((x) => [x.project_id, x.path]), [[1, P], [2, Q], [3, W3]]);
-  check("the other workspace becomes an also-works-in folder", r.sql("SELECT path FROM repos WHERE project_id = 2 AND is_primary = 0", []).map((x) => x.path), [X]);
+  check("the other workspace becomes an also-works-in folder", r.sql("SELECT path FROM repos WHERE project_id = 2 AND is_primary = 0 ORDER BY id", []).map((x) => x.path), [U, X]);
+  check("a primary row at another folder is demoted where it stands, settings kept, never moved",
+    r.sql("SELECT path, is_primary, setup_cmd, base_branch FROM repos WHERE project_id = 2 AND path = :p1", [U]), [{ path: U, is_primary: 0, setup_cmd: "bin/setup", base_branch: "master" }]);
+  check("and the folder's own primary row is new, with nothing carried over",
+    r.sql("SELECT setup_cmd, base_branch FROM repos WHERE project_id = 2 AND is_primary = 1", []), [{ setup_cmd: null, base_branch: null }]);
+  check("a moved project's session with no folder of its own keeps the folder it ran in", r.sql("SELECT cwd FROM sessions WHERE id = 4", [])[0].cwd, P);
   check("the workspace icon goes where the project had none", r.sql("SELECT icon FROM projects WHERE id = 3", [])[0].icon, "chart");
   check("recorded, and the unique index made", [Boolean(r.sql("SELECT value FROM meta WHERE key = 'folders_adopted'", [])[0]), did.index.ok,
     r.sql("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'idx_projects_path'", [])[0].n], [true, true, 1]);
   check("no longer needed", rule.needsAdoption(r.sql), false);
   const again = rule.adoptFolders({ sql: r.sql, batch: r.batch });
-  check("a second run does nothing", [again.ran, r.sql("SELECT COUNT(*) AS n FROM repos", [])[0].n, r.sql("SELECT COUNT(*) AS n FROM discovered_folders", [])[0].n], [false, 4, 2]);
+  check("a second run does nothing", [again.ran, r.sql("SELECT COUNT(*) AS n FROM repos", [])[0].n, r.sql("SELECT COUNT(*) AS n FROM discovered_folders", [])[0].n], [false, 5, 2]);
   await rejects("the index refuses a second project on a folder", () => r.sql("UPDATE projects SET path = :p1 WHERE id = 8", [P]), /UNIQUE/);
   check("the resolver: SSNR works in caseflow", rule.folderFor(r.sql, { projectId: 1 }).path, P);
   check("Central Office has no folder", rule.folderFor(r.sql, { projectId: 8 }), { path: null, source: null, missing: null });
-  check("changeit: its folder, then the one it also works in", rule.projectFolders(r.sql, 2).map((f) => [f.path, f.source]), [[Q, "project"], [X, "repo"]]);
+  check("changeit: its folder, then the ones it also works in", rule.projectFolders(r.sql, 2).map((f) => [f.path, f.source]), [[Q, "project"], [U, "repo"], [X, "repo"]]);
   if (r.handle) r.handle.close();
 }
 
@@ -203,10 +213,14 @@ async function main() {
     h.exec(fs.readFileSync(path.join(__dirname, "..", "schema.sql"), "utf8"));
     h.prepare("INSERT INTO projects (id, key, name, path, created_at) VALUES (1, 'b', 'Newer', ?, '2026-09-01')").run(P);
     h.prepare("INSERT INTO projects (id, key, name, path, created_at) VALUES (2, 'a', 'Older', ?, '2026-08-01')").run(P);
+    // Two empty folders, which the index (skipping NULL, not '') would refuse.
+    h.prepare("INSERT INTO projects (id, key, name, path) VALUES (3, 'e1', 'Empty one', '')").run();
+    h.prepare("INSERT INTO projects (id, key, name, path) VALUES (4, 'e2', 'Empty two', '')").run();
     h.close();
     const r = nodeRoute(file);
     const did = rule.adoptFolders(r);
     check("the older keeps it", did.conflicts[0].kept.name, "Older");
+    check("an empty folder is no folder, and the index is made", [did.index.ok, r.sql("SELECT COUNT(*) AS n FROM projects WHERE path = ''", [])[0].n], [true, 0]);
     r.handle.close();
   }
 
@@ -225,8 +239,16 @@ async function main() {
   const b = db.createProject({ key: "beta", name: "Beta" });
   await rejects("so is moving one onto it", () => db.updateProject(b.id, { path: A }), /already Alpha's project/);
   db.updateProject(a.id, { path: B });
-  check("changing the folder moves the repos row with it", db.sqlP("SELECT path, is_primary FROM repos WHERE project_id = :p1", [a.id]), [{ path: B, is_primary: 1 }]);
+  check("changing the folder makes a primary row there and demotes the old one where it stands",
+    db.sqlP("SELECT path, is_primary FROM repos WHERE project_id = :p1 ORDER BY id", [a.id]), [{ path: A, is_primary: 0 }, { path: B, is_primary: 1 }]);
   db.updateProject(a.id, { path: A });
+  check("never moved: the row at the old folder is primary again, the other demoted",
+    db.sqlP("SELECT path, is_primary FROM repos WHERE project_id = :p1 ORDER BY id", [a.id]), [{ path: A, is_primary: 1 }, { path: B, is_primary: 0 }]);
+  db.updateProject(a.id, { path: B });
+  db.undoLast(1);
+  check("undoing a folder change takes the primary row back with it",
+    [db.getProject(a.id).path, db.sqlP("SELECT path FROM repos WHERE project_id = :p1 AND is_primary = 1", [a.id]).map((x) => x.path)], [A, [A]]);
+  db.sqlP("DELETE FROM repos WHERE project_id = :p1 AND path = :p2", [a.id, B]);
 
   section("the resolver");
   db.createRepo({ projectId: b.id, name: "stale", path: B, isPrimary: 1 });
@@ -252,12 +274,15 @@ async function main() {
   await rejects("answered once, never twice", () => db.keepFolderAnswer(q1), /answered already/);
   db.sqlP("DELETE FROM discovered_folders WHERE id = :p1", [q1]);
   const q2 = ask(A);
+  const stranger = db.createProject({ key: "stranger", name: "Stranger" });
+  await rejects("give only to a project that shared the folder", () => db.giveFolder(q2, stranger.id), /not one of the projects that shared/);
   const given = db.giveFolder(q2, c.id);
   check("give swaps the folder", [db.getProject(a.id).path, db.getProject(c.id).path, given.from], [null, A, a.id]);
   check("and Alpha no longer resolves there", rule.folderFor(db.sqlP, { projectId: a.id }).path, null);
   check("answered", db.sqlP("SELECT state FROM discovered_folders WHERE id = :p1", [q2])[0].state, "given");
   const undone = db.undoLast(2);
   check("History puts it back", [undone.undone, db.getProject(a.id).path, db.getProject(c.id).path], [2, A, null]);
+  check("and the question is asked again", db.sqlP("SELECT state FROM discovered_folders WHERE id = :p1", [q2])[0].state, "new");
 
   section("Add folder (main/folders.js)");
   const git = require("../workbench/git");
@@ -295,6 +320,10 @@ async function main() {
     [made.path, db.sqlP("SELECT remote_url, default_branch FROM repos WHERE project_id = :p1 AND is_primary = 1", [made.id])[0]],
     [repo, { remote_url: "git@github.com:department-of-veterans-affairs/caseflow-efolder.git", default_branch: "main" }]);
   check("History has the create", db.sqlP("SELECT action, entity FROM audit WHERE entity = 'project' AND entity_id = :p1", [made.id]), [{ action: "create", entity: "project" }]);
+  const throwaway = await folders.create({ path: plain, name: "Throwaway", key: "throwaway" });
+  const createdRow = db.sqlP("SELECT id FROM audit WHERE entity = 'project' AND action = 'create' AND entity_id = :p1", [throwaway.id])[0].id;
+  db.undo(createdRow);
+  check("History can undo a project Add folder made: its own repos row is not held work", Boolean(db.getProject(throwaway.id)), false);
   const again = await folders.inspect(tree);
   check("a folder that is already a project names it", again.existing, { id: made.id, name: "eFolder", archived: false });
   await rejects("and creating it twice is refused", () => folders.create({ path: repo, name: "Again" }), /already eFolder's project/);
@@ -309,12 +338,25 @@ async function main() {
   db.createSession({ projectId: c.id, title: "co chat" });
   db.sqlP("DELETE FROM discovered_folders WHERE id = :p1", [q2]);
   const q3 = ask(A);
+  await rejects("merge only a project that shared the folder", async () => folders.merge(q3, stranger.id), /not one of the projects that shared/);
+  const beforeMerge = db.newestAudit();
   const merged = folders.merge(q3, c.id);
   check("everything moves and Central Office is archived, not deleted",
     [merged.merged, db.sqlP("SELECT COUNT(*) AS n FROM notes WHERE project_id = :p1", [a.id])[0].n, db.sqlP("SELECT COUNT(*) AS n FROM sessions WHERE project_id = :p1", [a.id])[0].n, db.getProject(c.id).status],
     [true, 1, 1, "archived"]);
   check("answered as merged", db.sqlP("SELECT state FROM discovered_folders WHERE id = :p1", [q3])[0].state, "merged");
   check("each move is in History", db.sqlP("SELECT COUNT(*) AS n FROM audit WHERE summary LIKE '%moved%' OR summary LIKE '%Moved%'", [])[0].n >= 2, true);
+  for (const id of db.auditSince(beforeMerge).reverse()) db.undo(id);
+  check("the whole merge comes undone: note, session and project back, the question open again",
+    [db.sqlP("SELECT COUNT(*) AS n FROM notes WHERE project_id = :p1", [c.id])[0].n, db.sqlP("SELECT COUNT(*) AS n FROM sessions WHERE project_id = :p1", [c.id])[0].n,
+     db.getProject(c.id).status, db.sqlP("SELECT state FROM discovered_folders WHERE id = :p1", [q3])[0].state],
+    [1, 1, "active", "new"]);
+  db.sqlP("INSERT INTO discovered_folders (path, via, state, detail) VALUES ('/not/json', 'conflict', 'given', '{not json')", []);
+  db.updateProject(c.id, { summary: "a change to undo" });
+  check("a question with an unreadable detail never stops an undo", db.undoLast(1).undone, 1);
+  const fromHere = db.newestAudit();
+  db.sqlP("INSERT INTO audit (action, entity, entity_id, summary, actor, actor_type) VALUES ('update', 'project', :p1, 'by an agent', 'claude-code:9', 'agent')", [c.id]);
+  check("an agent's row in between is not part of a window answer", db.auditSince(fromHere), []);
 
   section("a snapshot before the migration (main/backups.js)");
   const { createBackups } = require("../main/backups");

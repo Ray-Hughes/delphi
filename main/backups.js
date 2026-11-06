@@ -97,7 +97,11 @@ function createBackups({ dataDir, dbPath, source, sqlite, now = () => new Date()
     const temp = `${target}.partial`;
     try { fs.rmSync(temp, { force: true }); } catch {}
     await sqlite.backup(from, temp);
+    // The copy on disk before its name says it is whole, and the name on disk
+    // before anything (a migration) relies on it being there.
+    fsyncFile(temp);
     fs.renameSync(temp, target);
+    fsyncDir(dir);
     return target;
   }
 
@@ -411,6 +415,8 @@ function createBackups({ dataDir, dbPath, source, sqlite, now = () => new Date()
     for (const suffix of ["-wal", "-shm"]) {
       if (fs.existsSync(dbPath + suffix)) fs.renameSync(dbPath + suffix, free(path.join(folder, `stray${suffix}`)));
     }
+    fsyncDir(folder);
+    fsyncDir(path.dirname(dbPath));
   }
 
   function putBack(folder) {
@@ -426,6 +432,9 @@ function createBackups({ dataDir, dbPath, source, sqlite, now = () => new Date()
       fs.copyFileSync(`${file}-wal`, `${dbPath}-wal.partial`);
       fsyncFile(`${dbPath}-wal.partial`);
       fs.renameSync(`${dbPath}-wal.partial`, `${dbPath}-wal`);
+      // The -wal's name lands before the database's: a database that appears
+      // without the WAL it was snapshotted with is missing its last commits.
+      fsyncDir(home);
     }
     fs.copyFileSync(file, `${dbPath}.partial`);
     fsyncFile(`${dbPath}.partial`);

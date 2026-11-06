@@ -526,6 +526,22 @@ function undo(auditId) {
     // Inside the same transaction as the restore, for the reason writeScratchpad
     // gives: half a sync is worse than none.
     if (entry.entity === "scratchpad" && entry.action !== "delete") deriveInPlace(entry.entity_id);
+    // A folder put back takes its primary repos row with it, as setting it
+    // did: the row at that folder (demoted when the folder changed, never
+    // moved) is the primary one again.
+    if (entry.entity === "project" && entry.action === "update") {
+      const was = JSON.parse(entry.before_json || "{}");
+      const became = JSON.parse(entry.after_json || "{}");
+      if (was.path && "path" in became && !folderRule.same(was.path, became.path)) {
+        for (const [q, p] of folderRule.primaryRepoStatements(sqlP, entry.entity_id, was.path)) sqlP(q, p);
+      }
+    }
+    // A folder question answered by this change is asked again once the
+    // answer is undone, rather than staying answered over a reversed answer.
+    run(`UPDATE discovered_folders SET state = 'new', answered_at = NULL
+          WHERE via = 'conflict' AND state IN ('given', 'merged')
+            AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(detail) THEN COALESCE(json_extract(detail, '$.answer_audit'), '[]') ELSE '[]' END) j
+                         WHERE j.value = :id)`, { id: Number(auditId) });
     run("UPDATE audit SET undone = 1, undone_at = datetime('now') WHERE id = :id", { id: auditId });
   })();
   return listAudit(100);
@@ -579,7 +595,9 @@ function applyUndo(entry) {
 
   // A job's or a session's own row has no table to replay into. Refused in
   // words here too, for a caller that skipped undo()'s check.
-  if (!table) throw new Error(undoRules().refusal(entry) || `Nothing can be put back for a ${entry.entity}.`);
+  // A session's move is the exception: the item store reverses it from __op.
+  const itemMove = entry.action === "update" && before && before.__op && entry.entity === "session";
+  if (!table && !itemMove) throw new Error(undoRules().refusal(entry) || `Nothing can be put back for a ${entry.entity}.`);
 
   // A move, an association or its removal carries exactly what it changed in
   // __op, and is reversed from that alone. Replaying the stored row instead
@@ -616,7 +634,13 @@ function applyUndo(entry) {
       // reverse, so one of these blocked everything older than it.
       if (!getProject(entry.entity_id)) return;
       const held = projectContents(entry.entity_id);
-      const total = held ? held.tasks + held.notes + held.links + held.organizers + held.repos : 0;
+      // The primary repos row at the project's own folder is part of making it
+      // (Add folder writes it in the same unit), not work put in since. Unless a
+      // Workbench hangs off it, which is.
+      const own = Number(one(`SELECT COUNT(*) AS n FROM repos r JOIN projects p ON p.id = r.project_id
+                               WHERE r.project_id = :id AND r.is_primary = 1 AND r.path = p.path
+                                 AND NOT EXISTS (SELECT 1 FROM workbenches w WHERE w.repo_id = r.id)`, { id: entry.entity_id }).n);
+      const total = held ? held.tasks + held.notes + held.links + held.organizers + held.repos - own : 0;
       if (total) {
         throw new Error(
           "This project holds work now, so undoing its creation would take all of it. " +
@@ -682,7 +706,11 @@ function undoLast(count = 1) {
     // So are a job's and a session's own rows, and a Workbench's or a job's
     // note on a task, which changed nothing that could be put back. Stopping
     // at one used to block every older change beneath it.
-    `SELECT id FROM audit WHERE undone = 0 AND entity NOT IN ('handoff', 'session')
+    // A session's move between projects is not bookkeeping: it is put back
+    // like any other move, which a merge's undo needs.
+    `SELECT id FROM audit WHERE undone = 0
+        AND (entity NOT IN ('handoff', 'session')
+             OR (entity = 'session' AND CASE WHEN json_valid(before_json) THEN json_extract(before_json, '$.__op.kind') END = 'move'))
         AND (before_json IS NULL OR (before_json NOT LIKE '{"__flag":%' AND before_json NOT LIKE '{"__note":%'))
       ORDER BY id DESC LIMIT :count`,
     { count }
@@ -3033,8 +3061,16 @@ function conflictRow(id) {
   return row;
 }
 
-const answerConflict = (id, state) =>
-  run("UPDATE discovered_folders SET state = :state, answered_at = datetime('now') WHERE id = :id", { id: Number(id), state });
+// The History rows an answer wrote are kept on the question, so undoing any
+// of them asks it again (see undo()).
+const answerConflict = (id, state, auditIds = []) =>
+  run(`UPDATE discovered_folders SET state = :state, answered_at = datetime('now'),
+         detail = json_set(COALESCE(detail, '{}'), '$.answer_audit', json(:ids)) WHERE id = :id`,
+      { id: Number(id), state, ids: JSON.stringify(auditIds.map(Number)) });
+const newestAudit = () => Number(one("SELECT COALESCE(MAX(id), 0) AS n FROM audit").n);
+// The window's own rows only: an agent writing to the same file in between is
+// not part of the answer, and undoing its row must not ask the question again.
+const auditSince = (from) => all("SELECT id FROM audit WHERE id > :from AND actor IS :actor ORDER BY id", { from, actor: WINDOW.actor }).map((r) => Number(r.id));
 
 /** "Keep it this way": the folder stays where the migration put it. */
 function keepFolderAnswer(id) {
@@ -3054,18 +3090,25 @@ function giveFolder(id, toProjectId) {
   const row = conflictRow(id);
   const to = getProject(Number(toProjectId));
   if (!to) throw new Error("That project is not there any more.");
+  // Only to a project that gave this folder up: the id comes from the window,
+  // and any other would hand the folder to a project that never had it.
+  const detail = JSON.parse(row.detail || "{}");
+  if (!(detail.moved || []).some((m) => Number(m.id) === Number(to.id))) {
+    throw new Error(`${to.name} is not one of the projects that shared ${row.path}.`);
+  }
   if (to.path && !folderRule.same(to.path, row.path)) throw new Error(`${to.name} has a folder of its own now (${to.path}).`);
+  const from = newestAudit();
   const holder = folderRule.ownerOf(sqlP, row.path, { except: to.id });
   if (holder) updateProject(Number(holder.id), { path: null });
   updateProject(to.id, { path: row.path });
-  answerConflict(id, "given");
+  answerConflict(id, "given", auditSince(from));
   return { from: holder ? Number(holder.id) : null, to: to.id, path: row.path };
 }
 
 /** Marks the question answered by a merge, once main/folders.js has moved everything. */
-function mergedFolderAnswer(id) {
+function mergedFolderAnswer(id, auditIds = []) {
   conflictRow(id);
-  answerConflict(id, "merged");
+  answerConflict(id, "merged", auditIds);
 }
 
 // Which database this is, as this connection sees it. The app's heartbeat is
@@ -3121,7 +3164,7 @@ module.exports = {
   projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
   adoptProjectPaths,
   folderConflicts, keepFolderAnswer, giveFolder, mergedFolderAnswer, conflictRow,
-  folderAdoption: () => folderAdoption, holdFolderAdoption,
+  folderAdoption: () => folderAdoption, holdFolderAdoption, newestAudit, auditSince,
   listSessions, getSession, createSession, updateSession, deleteSession, sessionChanges,
   listArchivedSessions,
   listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness, trustHarnessCommand,

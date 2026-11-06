@@ -134,10 +134,12 @@ function takenSentence(owner) {
  * The statements that make a project's primary repos row sit at its folder.
  *
  * A row already at that path becomes the primary one. Otherwise the old
- * primary row follows the folder when nothing hangs off it (a folder moved on
- * disk keeps its base branch and setup), and stays behind, demoted, when a
- * Workbench does, because workbenches.repo_id points at it and the never-lose
- * rules keep those rows. Failing both, a new row.
+ * primary row is demoted, where it stands, and a new row is made for the
+ * folder. A repos row is never moved to another path: its base branch, setup
+ * command and files to copy were set for its own folder (a project whose
+ * primary row was caseflow-efolder must not carry efolder's setup into
+ * bip-appeals-config), and a Workbench may hang off it. Demoted, it is one of
+ * the folders the project also works in, which a person can remove.
  */
 function primaryRepoStatements(sql, projectId, folder, { name = null, remote = undefined, branch = undefined } = {}) {
   const pid = Number(projectId);
@@ -153,18 +155,12 @@ function primaryRepoStatements(sql, projectId, folder, { name = null, remote = u
     if (branch !== undefined) statements.push(["UPDATE repos SET default_branch = :p1 WHERE id = :p2", [branch, id]]);
   };
   const at = repos.find((r) => same(r.path, folder)) || repos.find((r) => same(normalise(r.path), folder));
-  const primary = repos.find((r) => Number(r.is_primary));
   if (at) {
     if (!Number(at.is_primary)) {
       statements.push(["UPDATE repos SET is_primary = CASE WHEN id = :p1 THEN 1 ELSE 0 END WHERE project_id = :p2", [num(at.id), pid]]);
     }
     if (!same(at.path, folder)) statements.push(["UPDATE repos SET path = :p1 WHERE id = :p2", [folder, num(at.id)]]);
     setDetected(num(at.id));
-    return statements;
-  }
-  if (primary && !Number(primary.benches)) {
-    statements.push(["UPDATE repos SET path = :p1, name = :p2 WHERE id = :p3", [folder, name || path.basename(folder), num(primary.id)]]);
-    setDetected(num(primary.id));
     return statements;
   }
   statements.push(["UPDATE repos SET is_primary = 0 WHERE project_id = :p1", [pid]]);
@@ -339,6 +335,11 @@ function adoptFolders({ sql, batch, now = () => new Date() }) {
       const released = releaseStatements(sql, p.id, folder);
       statements.push(...released.statements);
       kept.push(...released.kept.map((r) => ({ ...r, project_id: Number(p.id) })));
+      // Its conversations ran in this folder, through the project's own
+      // folder or the workspace link removed below, whether or not they wrote
+      // it down. Written down now, so each still opens where it was (plan 1.3,
+      // step 3) once the project is in No folder.
+      statements.push(["UPDATE sessions SET cwd = :p1 WHERE project_id = :p2 AND (cwd IS NULL OR cwd = '')", [folder, Number(p.id)]]);
       const spaceIds = spaces.filter((w) => same(normalise(w.path), folder)).map((w) => Number(w.id));
       for (const wid of spaceIds) statements.push(["DELETE FROM project_workspaces WHERE project_id = :p1 AND workspace_id = :p2", [Number(p.id), wid]]);
     }
@@ -415,6 +416,9 @@ function adoptFolders({ sql, batch, now = () => new Date() }) {
 function ensureIndex(sql) {
   try {
     if (sql("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_projects_path'", []).length) return { ok: true };
+    // An empty folder is no folder. Two '' rows would collide in the index
+    // (it skips NULL, not ''), and the index would never be made.
+    sql("UPDATE projects SET path = NULL WHERE path = ''", []);
     if (sharedFolders(sql).length) return { ok: false, why: "two projects still share a folder" };
     sql(INDEX, []);
     return { ok: true, made: true };

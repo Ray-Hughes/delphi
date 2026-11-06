@@ -27,6 +27,9 @@
 // error that also stopped undoLast dead.
 const TABLES = { task: "tasks", note: "notes", project: "projects", link: "links", scratchpad: "scratchpads" };
 const BOOKKEEPING = ["handoff", "session"];
+// A session can only be moved (items/store.js never copies or associates
+// one), and undoLast() selects exactly that.
+const ITEM_OPS = ["move"];
 const LABELS = { task: "title", note: "title", project: "name", link: "label", scratchpad: "title" };
 
 // Columns a later write may change without that being a change anyone made to
@@ -350,7 +353,12 @@ function makeUndoRules({ sql } = {}) {
 
   function refusal(entry) {
     if (!entry) return "No such audit entry.";
-    if (BOOKKEEPING.includes(entry.entity)) {
+    // A session moved to another project is a person's change to where it
+    // lives, made by the item store and reversed by it from its __op, like a
+    // task's or a note's move. Everything else a session writes is its own
+    // bookkeeping.
+    const moved = entry.entity === "session" && ITEM_OPS.includes((parse(entry.before_json) || {}).__op?.kind);
+    if (BOOKKEEPING.includes(entry.entity) && !moved) {
       return entry.entity === "handoff"
         ? "That is a job's own record, which changed no task or note. Stop or reject the job instead."
         : "That is a session's own record, which changed no task or note, so there is nothing to put back.";

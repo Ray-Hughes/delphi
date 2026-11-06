@@ -181,14 +181,15 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
     const row = db.conflictRow(id);
     const detail = JSON.parse(row.detail || "{}");
     const into = db.getProject(Number((detail.kept || {}).id));
-    const from = db.getProject(Number(fromId));
-    if (!into || !from) throw new Error("One of those projects is not there any more.");
-    if (Number(from.id) === Number(into.id)) throw new Error("A project cannot be merged into itself.");
+    const source = db.getProject(Number(fromId));
+    if (!into || !source) throw new Error("One of those projects is not there any more.");
+    if (Number(source.id) === Number(into.id)) throw new Error("A project cannot be merged into itself.");
     // Only a project this question moved out. The id comes from the window,
     // and any other one would be a project merged and archived by mistake.
-    if (!(detail.moved || []).some((m) => Number(m.id) === Number(from.id))) throw new Error(`${from.name} is not one of the projects that shared ${row.path}.`);
+    if (!(detail.moved || []).some((m) => Number(m.id) === Number(source.id))) throw new Error(`${source.name} is not one of the projects that shared ${row.path}.`);
     const store = items();
-    const ids = (q) => db.sqlP(q, [from.id]).map((r) => Number(r.id));
+    const from = db.newestAudit();
+    const ids = (q) => db.sqlP(q, [source.id]).map((r) => Number(r.id));
     const queue = [
       ["organizer", ids("SELECT id FROM organizers WHERE project_id = :p1 ORDER BY id")],
       ["task", ids("SELECT id FROM tasks WHERE project_id = :p1 AND parent_id IS NULL ORDER BY id")],
@@ -209,9 +210,9 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
         }
       }
     }
-    db.updateProject(from.id, { status: "archived" });
-    db.mergedFolderAnswer(id);
-    return { merged: true, moved, into: into.id, archived: from.id };
+    db.updateProject(source.id, { status: "archived" });
+    db.mergedFolderAnswer(id, db.auditSince(from));
+    return { merged: true, moved, into: into.id, archived: source.id };
   }
 
   /**
