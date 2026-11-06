@@ -1198,10 +1198,10 @@ function render() {
   const valid = state.query
     ? ["oracle", "tasks"]
     : state.projectId
-    ? ["overview", "chat", "tasks", "queue", "pads", "notes", "links", "activity", "project", "workspace"]
+    ? ["overview", "chat", "tasks", "queue", "pads", "notes", "memory", "links", "activity", "project", "workspace"]
     : state.workspaceId
-    ? ["new", "tasks", "queue", "graph", "activity", "workspace"]
-    : ["new", "tasks", "queue", "graph", "reminders", "history", "settings", ...HOME_VIEWS];
+    ? ["new", "tasks", "queue", "graph", "memory", "activity", "workspace"]
+    : ["new", "tasks", "queue", "graph", "memory", "reminders", "history", "settings", ...HOME_VIEWS];
   if (!valid.includes(state.view)) state.view = valid[0];
 
   const p = currentProject();
@@ -1245,6 +1245,8 @@ function render() {
   if (window.DelphiTopbar) DelphiTopbar.paint();
   if (window.DelphiAddFolder) DelphiAddFolder.paintFix(state);
   if (window.DelphiToday) DelphiToday.paint(state);
+  if (window.DelphiTasks) DelphiTasks.paint(state);
+  if (window.DelphiMemory) DelphiMemory.paint(state);
   // --- end MOUNTS ---
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
@@ -1275,7 +1277,7 @@ function render() {
     oracle: renderOracle,
     overview: renderOverview,
     chat: renderChat,
-    tasks: renderTasks,
+    tasks: (root) => (window.DelphiTasks && DelphiTasks.owns(state) ? DelphiTasks.render(root) : renderTasks(root)),
     pads: renderPads,
     notes: renderNotes,
     links: renderLinks,
@@ -1290,6 +1292,7 @@ function render() {
     runs: renderRuns,
     inbox: renderInbox,
     today: (root) => DelphiToday.render(root),
+    memory: (root) => DelphiMemory.render(root),
   })[state.view];
 
   // Several views are async. Without this, a throw inside one leaves an empty
@@ -14643,12 +14646,39 @@ DelphiToday.init({
   },
 });
 COMMANDS.push(...DelphiToday.commands());
+// The Tasks tab (ui/tasks.js): quick entry, inline edit, pills, List or Kanban.
+DelphiTasks.init({ ...shell, refresh: () => refresh(), repaint: () => render(), notify: (text) => notify(text), openTask: (id) => openTaskSheet(id), isAgent, isOverdue, taskMenu: (t, x, y) => taskMenu(t, x, y), quickLook: (id) => quickLook(id), projectById, projectName: (id) => (projectById(id) || {}).name || "", setProjectMode: (mode) => setTaskViewMode(mode), busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay") || window.DelphiPalette?.isOpen()) });
+COMMANDS.push(...DelphiTasks.commands());
+// Memory (ui/memory.js): the tab, Log a fact, and the cards with reasons. The
+// open task is the sheet's until the drawer lends its own.
+DelphiMemory.init({
+  ...shell, refresh: () => refresh(), notify: (text, o) => notify(text, o),
+  projectName: (id) => (projectById(id) || {}).name || "", projectColour: (id) => (projectById(id) || {}).colour || null,
+  openTaskId: () => (window.DelphiDrawer && DelphiDrawer.taskId ? DelphiDrawer.taskId() : null) ?? (openSheet && openSheet.taskId) ?? null,
+  taskById: (id) => (state.everyTask || []).find((t) => t.id === Number(id)) || null,
+  blocked: () => dialogStack.length > 0 || Boolean(window.DelphiSettingsPanel && DelphiSettingsPanel.isOpen()),
+  afterFact: async () => { if (openSheet && openSheet.live) await openSheet.live(); },
+  // The whole row, never the list's trimmed one: the sheet saves what it opened with.
+  openNote: async (n) => {
+    let full = (state.notes || []).find((x) => x.id === n.id);
+    if (!full) { try { full = (await window.delphi.notes.list(n.project_id ?? null)).find((x) => x.id === n.id); } catch {} }
+    if (full) openNoteSheet(full); else notify("That note is gone.", { error: true });
+  },
+});
+COMMANDS.push(...DelphiMemory.commands());
+// The weekly review (ui/weekly.js), lent Finish so an idle Workbench is put away the one careful way.
+if (window.DelphiWeekly) {
+  DelphiWeekly.init({ ...shell, refresh: () => refresh(), repaint: () => { if (onHomeView()) repaintKeepingFocus(); },
+    notify: (text) => notify(text), openTask: (id) => openTaskSheet(id), isAgent, projectName: (id) => (projectById(id) || {}).name || "",
+    finishWorkbench: (wbId, taskId, opts) => finishWorkbench(wbId, taskId, opts) });
+  COMMANDS.push(...DelphiWeekly.commands());
+}
 DelphiKeys.install({
   commands: () => COMMANDS,
   // A panel, a menu, a dialog or a popover owns the keyboard while it is open.
   // body > .overlay, not .overlay: on Windows the body itself carries an
   // "overlay" class for the window controls, and would make every key dead.
-  busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay")),
+  busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay") || DelphiTasks.isOpen()),
   openBar: () => openBar(),
   openSwitcher: () => DelphiTopbar.openSwitcher(),
   openTask: async (id, how) => {
@@ -14658,6 +14688,7 @@ DelphiKeys.install({
       else await openTaskFull(id);
       return;
     }
+    if (how === "edit" && DelphiTasks.startEdit(id)) return;
     await openTaskSheet(id);
     if (how === "edit") { if (window.DelphiDrawer && DelphiDrawer.isOpen()) DelphiDrawer.editTitle(); else document.querySelector(".ts-title")?.focus(); }
   },

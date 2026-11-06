@@ -32,6 +32,7 @@
     { id: "workbenches", label: "Workbenches", icon: "branch", group: "Work", lede: "A Workbench is a task's own folder and branch, so two pieces of work never share a checkout." },
     { id: "memory", label: "Memory", icon: "memory", group: "Work", lede: "Where agents keep their working notes, how notes open, and the folder everything is mirrored to." },
     { id: "focus", label: "Focus and Today", icon: "focus", group: "Habits", lede: "Reminders, snoozing, and what Today brings to the top." },
+    { id: "brief", label: "Brief and weekly review", icon: "clock", group: "Habits", lede: "When Today offers the weekly review: a look back at the week, a tidy of what went quiet, and next week's few objectives." },
     { id: "data", label: "Data and backups", icon: "db", group: "System", lede: "Where Delphi keeps everything, and how to get back to an earlier day." },
     { id: "privacy", label: "Privacy", icon: "lock", group: "System", lede: "What leaves this computer, who it goes to, and what never does." },
     { id: "advanced", label: "Advanced", icon: "wrench", group: "System", lede: "Numbers most people never touch, the files behind these pages, and the old Settings page." },
@@ -290,6 +291,24 @@
       desc: "How long Snooze puts a reminder off.",
       notChanged: "Reminders already snoozed.",
       synonyms: ["snooze", "later", "postpone", "remind me later"],
+    },
+
+    // --- Brief and weekly review -------------------------------------------
+    {
+      key: "weeklyReviewEnabled", section: "brief", group: "Weekly review", type: "bool", default: true,
+      label: "Offer the weekly review on Today",
+      desc: "On your review day Today shows a Weekly review card until you save next week's objectives.",
+      notChanged: "Cmd+K's Weekly review or the weekly_review tool for agents, which work every day either way.",
+      synonyms: ["weekly", "review", "retro", "retrospective", "planning", "objectives", "sunsama"],
+    },
+    {
+      key: "weeklyReviewDay", section: "brief", group: "Weekly review", type: "enum", default: "friday",
+      choices: [["monday", "Monday"], ["tuesday", "Tuesday"], ["wednesday", "Wednesday"], ["thursday", "Thursday"],
+                ["friday", "Friday"], ["saturday", "Saturday"], ["sunday", "Sunday"]],
+      label: "Review day",
+      desc: "The day Today offers the review. It always looks back over the seven days before it, whichever day it is.",
+      notChanged: "Which week the review covers, or the daily brief.",
+      synonyms: ["day", "weekday", "friday", "sunday", "when"],
     },
 
     // --- Advanced ----------------------------------------------------------

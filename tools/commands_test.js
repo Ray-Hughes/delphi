@@ -68,8 +68,9 @@ async function main() {
     ["reminders", proj, [["go", { projectId: null, view: "reminders" }]]],
     ["tasks", proj, [["go", { view: "tasks" }]]],
     ["queue", proj, [["go", { view: "queue" }]]],
-    ["memory", proj, [["go", { view: "notes" }]]],
-    ["memory", all, [["go", { view: "graph" }]]],
+    ["memory", proj, [["go", { view: "memory" }]]],
+    ["memory", all, [["go", { view: "memory" }]]],
+    ["notes", proj, [["go", { view: "notes" }]]],
     ["links", proj, [["go", { view: "links" }]]],
     ["mind-map", proj, [["go", { projectId: null, view: "graph" }]]],
     ["pads", proj, [["go", { view: "pads" }]]],
@@ -111,7 +112,7 @@ async function main() {
   const lit = (view, extra = {}) => C.tabOf({ view, query: "", ...extra });
   check("Needs you and What's new are Today", [lit("inbox"), lit("new")], ["today", "today"]);
   check("the queue is part of Tasks", lit("queue"), "tasks");
-  check("notes, links and the mind map are Memory", [lit("notes"), lit("links"), lit("graph")], ["memory", "memory", "memory"]);
+  check("notes, links and the mind map are Memory", [lit("memory"), lit("notes"), lit("links"), lit("graph")], ["memory", "memory", "memory", "memory"]);
   check("Overview, History and Settings light none", [lit("overview"), lit("activity"), lit("settings")], [null, null, null]);
   check("a search lights none", lit("tasks", { query: "x" }), null);
 

@@ -2019,6 +2019,9 @@ globalThis.DelphiDrawer = (() => {
     close: () => (cur ? cur.close() : undefined),
     editTitle: () => { const b = document.querySelector(".dw .dw-title-btn"); if (b) b.click(); },
     isOpen: () => Boolean(cur),
+    // The task open here, for Log a fact (ui/memory.js) and anything else that
+    // files against "the task on screen".
+    taskId: () => { const h = host && host.sheet(); return h && h.drawer && h.taskId ? h.taskId : null; },
     // Pure, for tools/drawer_test.js.
     stuck, related, ordered, composed,
   };
