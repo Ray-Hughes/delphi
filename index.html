@@ -1308,6 +1308,9 @@
   .ctx-item.danger { color: var(--crit); }
   .ctx-item.danger:hover { background: var(--crit); color: #fff; }
   .ctx-sep { height: 1px; background: var(--line-soft); margin: 4px 2px; }
+  /* Reached by the arrows, where there is no hover to show which item is next. */
+  .ctx-item:focus-visible { background: var(--accent); color: var(--btn-fg); outline: none; }
+  .ctx-item.danger:focus-visible { background: var(--crit); }
 
   /* View picker ------------------------------------------------------------
      The trigger is a .btn carrying the current view, and the popup is the .ctx
@@ -3070,6 +3073,36 @@
   .fold-row .grow { flex: 1; }
   .fold-row:focus-visible, .sb-proj:focus-visible, .nav .proj:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .sb-kids { margin: 0 0 4px 22px; border-left: 1px solid var(--line-soft); padding-left: 4px; }
+  /* The open project drawn under a folded More projects. Set a little apart
+     and tagged, so it does not read as the last row of the group above. */
+  .sb-proj.outside { margin-top: 2px; }
+  .sb-proj .open-tag {
+    font-size: 9.5px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--accent); opacity: .75;
+  }
+  /* What the list under a project is, said once above it. */
+  .gs-head {
+    display: flex; align-items: center; gap: 5px; padding: 4px 8px 2px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink-faint);
+  }
+  .gs-info {
+    width: 14px; height: 14px; padding: 0; border-radius: 50%;
+    border: 1px solid var(--line); background: none; color: var(--ink-faint);
+    font: 600 9px/12px var(--font); text-transform: none; cursor: help;
+  }
+  .gs-info:hover, .gs-info:focus-visible { color: var(--ink); border-color: var(--ink-faint); outline: none; }
+  /* A session row is two lines: what it is called, then which agent and when. */
+  .gs.sess { align-items: flex-start; }
+  .gs.sess .sd { margin-top: 5px; }
+  .gs-txt { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+  .gs-txt .nm { color: var(--ink); }
+  .gs-meta { font-size: 10.5px; color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; }
+  .gs.sess .srow-acts { align-self: center; }
+  .srow-btn.more { font-size: 14px; width: 20px; height: 20px; }
+  .srow-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; color: var(--ink); }
+  .gs.sub:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  /* A sentence in a menu where an item would be, saying why it is not there. */
+  .ctx-note { max-width: 240px; padding: 6px 10px; font-size: 11.5px; line-height: 1.4; color: var(--ink-dim); white-space: normal; }
   .sidebar-foot.home { display: flex; gap: 6px; }
   .sidebar-foot.home .btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; height: 32px; padding: 0 12px; }
   .sidebar-foot.home .btn.wide { flex: 1; }

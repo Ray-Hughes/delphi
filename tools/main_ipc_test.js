@@ -118,6 +118,9 @@ async function main() {
     "workbench:list", "workbench:advanced", "repos:update", "sheet:run", "sheet:interrupt"]) {
     check(`${c} is in preload and handled`, [called.includes(c), handlers.has(c)], [true, true]);
   }
+  for (const c of ["sessions:changes", "sessions:archive", "sessions:delete"]) {
+    check(`${c} is in preload and handled`, [called.includes(c), handlers.has(c)], [true, true]);
+  }
   for (const event of ["onWorkbenchEvent", "onWorkbenchPrompt", "onSheetRunOutput", "onSheetRunDone"]) {
     check(`preload exposes ${event}`, preload.includes(`${event}:`), true);
   }
@@ -275,6 +278,11 @@ async function main() {
     [await refusedSet({ pinnedProjects: [pinA.id, 999999] }), await refusedSet({ pinnedProjects: "1" }),
      (await call("settings:set", { pinnedProjects: [pinB.id, String(pinA.id), pinB.id] })).pinnedProjects],
     ["No project 999999", "pinnedProjects must be a list of project ids", [pinB.id, pinA.id]]);
+  check("hidden from Active keeps existing projects with their time, and drops the rest",
+    [await refusedSet({ hiddenFromActive: "1" }),
+     (await call("settings:set", { hiddenFromActive: [{ id: pinA.id, at: "2026-01-02 03:04:05" }, { id: 999999, at: "2026-01-02 03:04:05" }, { id: pinA.id, at: "nonsense" }] })).hiddenFromActive.map((h) => [h.id, /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(h.at)])],
+    ["hiddenFromActive must be a list of { id, at }", [[pinA.id, true]]]);
+  await call("settings:set", { hiddenFromActive: [] });
   check("a refused field changes nothing", (await call("settings:get")).jobConcurrency, 8);
   check("and the dispatcher reads them on its next pass", JSON.parse(fs.readFileSync(path.join(process.env.DELPHI_DATA_DIR, "settings.json"), "utf8")).jobHarnessLimits, { codex: 0, "claude-code": 2 });
   await call("settings:set", { jobConcurrency: 3, jobHarnessLimits: {}, pinnedProjects: [] });
