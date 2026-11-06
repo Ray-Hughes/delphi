@@ -418,7 +418,7 @@ async function main() {
     await app.feed("/ledger\r/status blocked\r");
     check("/status", client.calls.filter((c) => c[0] === "update_task").pop()[1], { id: 42, status: "blocked" });
     await app.feed("/status nope\r");
-    check("a bad status says what is allowed", frame(app).pop().includes("todo, doing, blocked, done"), true);
+    check("a bad status says what is allowed", frame(app).pop().includes("todo, doing, review, blocked, done"), true);
     await app.feed("/bogus\r");
     check("unknown command", frame(app).pop().includes("No command /bogus"), true);
     await app.feed("/task 57\r");

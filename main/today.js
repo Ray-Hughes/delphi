@@ -105,6 +105,7 @@ function createToday({ sql, dataDir, clock = () => Date.now() }) {
       lastSeen: saved.lastSeen || null,
       firstRun: !saved.lastSeen,
       stuck,
+      review: brief.inReview(sql, { now, projectId }),
       banner: brief.bannerOf(stuck),
       brief: brief.brief(sql, { since: shownSince, now, projectId, stuckRows: stuck }),
     };

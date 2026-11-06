@@ -138,7 +138,7 @@ globalThis.DelphiToday = (() => {
    */
   const fadeOf = (s) => (s ? Math.max(0, Math.min(1, (s.days - 3) / 27)) : 0);
 
-  const STATUS_WORD = { todo: "To do", doing: "In progress", blocked: "Blocked", done: "Done" };
+  const STATUS_WORD = { todo: "To do", doing: "In progress", review: "In review", blocked: "Blocked", done: "Done" };
   const statusWord = (status) => STATUS_WORD[status] || "In progress";
 
   /** One task as a row you can click: status, number, title, project, marks, age. */
@@ -162,6 +162,15 @@ globalThis.DelphiToday = (() => {
     }
     row.setAttribute("aria-label", `#${t.id} ${t.title}, ${statusWord(t.status)}${stuck ? `, ${stuck.words}` : ""}`);
     row.onclick = () => app.openTask(t.id);
+    return row;
+  }
+
+  /** A task in review, under Needs you: what it is and how long it has waited on you. */
+  function reviewTaskRow(t) {
+    const tag = el("span", { className: "td-tag review", textContent: t.days ? `Review ${t.days}d` : "Review", title: t.words });
+    tag.setAttribute("aria-label", t.words);
+    const row = taskRow(t, { tags: [tag] });
+    row.setAttribute("aria-label", `#${t.id} ${t.title}, in review. ${t.words}`);
     return row;
   }
 
@@ -194,7 +203,9 @@ globalThis.DelphiToday = (() => {
     const overdue = take(open.filter((t) => dueState(t) === "overdue")
       .sort((a, b) => String(a.due).localeCompare(String(b.due)) || pri(a) - pri(b)));
     const due = take(open.filter((t) => dueState(t) === "today").sort((a, b) => pri(a) - pri(b) || a.id - b.id));
-    const doing = take(open.filter((t) => !["todo", "blocked", "done"].includes(t.status) && mine(t))
+    // Not review: that is finished work waiting on your look, and it is under
+    // Needs you, not in the queue of things you are doing.
+    const doing = take(open.filter((t) => !["todo", "review", "blocked", "done"].includes(t.status) && mine(t))
       .sort((a, b) => pri(a) - pri(b) || String(b.updated_at).localeCompare(String(a.updated_at))));
     return [...overdue.map((t) => ({ t, why: "overdue" })), ...due.map((t) => ({ t, why: "due" })), ...doing.map((t) => ({ t, why: "doing" }))];
   }
@@ -434,7 +445,10 @@ globalThis.DelphiToday = (() => {
   function needsSection(root) {
     const n = app.needs();
     const folders = window.DelphiNeeds ? DelphiNeeds.count() : 0;
-    const total = n.waiting.length + n.reviews.length + n.flags.length + folders;
+    // Tasks in review are a person's turn by definition, so they wait here
+    // with how long they have waited, never under Gone quiet.
+    const inReview = (data && data.review) || [];
+    const total = n.waiting.length + n.reviews.length + n.flags.length + inReview.length + folders;
     const all = button(total ? `All ${total} in Needs you` : "Open Needs you", "btn sm ghost");
     all.onclick = () => app.go({ projectId: null, view: "inbox" });
     const sec = section("Needs you", total, null);
@@ -445,6 +459,7 @@ globalThis.DelphiToday = (() => {
     const rows = [
       ...n.waiting.map((r) => () => app.rows.waiting(r)),
       ...n.reviews.map((r) => () => app.rows.review(r)),
+      ...inReview.map((t) => () => reviewTaskRow(t)),
       ...n.flags.map((r) => () => app.rows.flag(r)),
     ];
     if (rows.length) {
@@ -653,7 +668,7 @@ globalThis.DelphiToday = (() => {
     const day = new Date().toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
     const q = app ? focusQueue(s.everyTask || []).length : 0;
     const n = app ? app.needs() : { waiting: [], reviews: [], flags: [] };
-    const waiting = n.waiting.length + n.reviews.length + n.flags.length;
+    const waiting = n.waiting.length + n.reviews.length + n.flags.length + ((data && data.review) || []).length;
     const bits = [day];
     if (q) bits.push(`${plural(q, "thing", "things")} for you`);
     if (waiting) bits.push(`${waiting} waiting on you`);

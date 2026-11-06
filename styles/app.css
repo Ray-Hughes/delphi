@@ -604,6 +604,7 @@
   }
   .chip.high { color: var(--crit-ink); background: transparent; border-color: var(--crit); }
   .chip.doing { color: var(--accent-ink); background: var(--accent-soft); }
+  .chip.review { color: var(--ink); background: color-mix(in srgb, var(--tc-purple) 18%, transparent); }
   .chip.blocked { color: var(--warn-ink); background: transparent; border-color: var(--warn); }
   .chip.overdue { color: var(--crit-ink); background: transparent; border-color: var(--crit); font-weight: 600; }
   .chip.ref { font-family: var(--mono); font-size: 11px; }
@@ -812,6 +813,7 @@
   .cell-select:hover { border-color: var(--ink-faint); }
   .cell-select.st-doing { color: var(--accent-ink); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
   .cell-select.st-blocked { color: var(--crit-ink); border-color: color-mix(in srgb, var(--crit) 40%, transparent); }
+  .cell-select.st-review { color: var(--ink); border-color: color-mix(in srgb, var(--tc-purple) 55%, transparent); }
   .cell-select.st-done { color: var(--good-ink); border-color: color-mix(in srgb, var(--good) 40%, transparent); }
 
   /* Present rather than hidden until hover. A control nobody can see is a
@@ -843,6 +845,7 @@
   .tgroup .tcol-dot { width: 7px; height: 7px; border-radius: 99px; background: var(--ink-faint); }
   .tgroup.st-doing .tcol-dot { background: var(--accent); }
   .tgroup.st-blocked .tcol-dot { background: var(--crit); }
+  .tgroup.st-review .tcol-dot { background: var(--tc-purple); }
   .tgroup.st-done .tcol-dot { background: var(--good); }
   .tgroup-name { font-size: 11px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; }
 
@@ -889,6 +892,7 @@
   .tcol-dot { width: 7px; height: 7px; border-radius: 99px; background: var(--ink-faint); }
   .tcol-head.st-doing .tcol-dot { background: var(--accent); }
   .tcol-head.st-blocked .tcol-dot { background: var(--crit); }
+  .tcol-head.st-review .tcol-dot { background: var(--tc-purple); }
   .tcol-head.st-done .tcol-dot { background: var(--good); }
   .tcol-name { font-size: 11.5px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
   .tcol-n { font-size: 10.5px; font-weight: 700; color: var(--ink-faint); }
@@ -1036,6 +1040,7 @@
   }
   .pill.high    { color: var(--crit-ink); border-color: color-mix(in srgb, var(--crit) 40%, transparent); }
   .pill.doing   { color: var(--accent-ink); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .pill.review  { color: var(--ink); border-color: color-mix(in srgb, var(--tc-purple) 55%, transparent); }
   .pill.blocked { color: var(--crit-ink); background: color-mix(in srgb, var(--crit) 12%, transparent); }
   .pill.overdue { color: var(--crit-ink); background: color-mix(in srgb, var(--crit) 12%, transparent); }
   /* Queued for an agent. Its own colour because it is not a status: a task can
@@ -1548,6 +1553,7 @@
   .dot-status { width: 9px; height: 9px; border-radius: 99px; flex: 0 0 9px; margin-top: 6px; background: var(--ink-faint); }
   .dot-status.st-doing { background: var(--accent); }
   .dot-status.st-blocked { background: var(--crit); }
+  .dot-status.st-review { background: var(--tc-purple); }
   .dot-status.st-done { background: var(--good); }
   .qlook-grid {
     display: grid; grid-template-columns: 110px minmax(0, 1fr);
@@ -1635,6 +1641,7 @@
   .ts-chip-empty { color: var(--ink-faint); }
   .tone-doing   { border-color: var(--accent); color: var(--accent-ink); }
   .tone-blocked { border-color: var(--crit); color: var(--crit-ink); }
+  .tone-review  { border-color: var(--tc-purple); color: var(--ink); }
   .tone-done    { border-color: var(--good); color: var(--good-ink); }
   .tone-high    { border-color: var(--crit); color: var(--crit-ink); }
   .tone-overdue { border-color: var(--crit); color: var(--crit-ink); }
@@ -2001,6 +2008,7 @@
   .tl-dot { width: 9px; height: 9px; border-radius: 99px; margin-top: 4px; flex: 0 0 9px; background: var(--ink-faint); z-index: 1; }
   .tl-dot.st-doing { background: var(--accent); }
   .tl-dot.st-blocked { background: var(--crit); }
+  .tl-dot.st-review { background: var(--tc-purple); }
   .tl-dot.st-done { background: var(--good); }
   .tl-status { display: flex; gap: 7px; align-items: baseline; font-size: 13px; font-weight: 600; }
   .tl-when { display: flex; gap: 6px; align-items: center; font-size: 11px; }
@@ -2944,6 +2952,8 @@
   }
   .wr.approve { --wk: var(--warn); }
   .wr.question { --wk: var(--kind-ask); }
+  /* A task in review: its status ring where an agent row has its avatar. */
+  .wr .rv-ring { margin: 3px 0 0 6px; }
   .wr .t { font-size: 13.5px; line-height: 1.4; margin-top: 3px; overflow-wrap: anywhere; }
   .wr .t b { font-weight: 620; }
   .wr .s { flex-wrap: wrap; margin-top: 6px; }

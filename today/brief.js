@@ -26,9 +26,14 @@ const { inferAuthorType } = require("../sheet/format");
 // someone else by definition, so it can go amber but never red: red is for
 // work somebody said they were doing. To-do is the backlog and is never
 // stuck, and neither is anything done.
+//
+// In review is never stuck either. It is finished work waiting on a person,
+// so a quiet review task is not stale agent work but a person's turn, and it
+// is shown under Needs you (inReview below) with how long it has waited.
+// Marking it "No movement" would blame the agent for the wait.
 const AMBER_DAYS = 3;
 const RED_DAYS = 7;
-const NEVER_STUCK = ["todo", "done"];
+const NEVER_STUCK = ["todo", "review", "done"];
 
 const DAY_MS = 86400000;
 const CHARS_PER_TOKEN = 4;
@@ -188,7 +193,7 @@ function stuck(sql, { now = new Date(), projectId = null } = {}) {
               t.project_id, p.name AS project_name, p.colour AS project_colour,
               ${LAST_ACTIVITY} AS last_at
          FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
-        WHERE t.status NOT IN ('todo', 'done') AND ${LIVE_PROJECT} AND ${inScope("t", 2)})
+        WHERE t.status NOT IN ('todo', 'review', 'done') AND ${LIVE_PROJECT} AND ${inScope("t", 2)})
       WHERE (last_at != '' AND julianday(:p1) - julianday(last_at) >= ${AMBER_DAYS})
          OR (due IS NOT NULL AND due != '')`,
     [at, projectId == null ? null : Number(projectId)]);
@@ -215,6 +220,36 @@ function stuck(sql, { now = new Date(), projectId = null } = {}) {
   const PRI = { high: 0, med: 1, low: 2 };
   return out.sort((a, b) => (a.level === b.level ? 0 : a.level === "red" ? -1 : 1)
     || (PRI[a.priority] ?? 1) - (PRI[b.priority] ?? 1) || b.days - a.days || a.id - b.id);
+}
+
+/**
+ * Every task in review, for Needs you: oldest wait first. since is when it
+ * last entered review (its newest status event saying so, else the row's
+ * updated_at for a task with no such event), and days is whole days since.
+ * Subtasks are left out: a subtask in review is shown by its parent's row.
+ */
+function inReview(sql, { now = new Date(), projectId = null } = {}) {
+  const at = stamp(now);
+  const rows = sql(
+    `SELECT t.id, t.title, t.priority, t.due, t.assignee, t.project_id, p.name AS project_name, p.colour AS project_colour,
+            COALESCE((SELECT max(datetime(e.at)) FROM status_events e WHERE e.task_id = t.id AND e.status = 'review'),
+                     datetime(t.updated_at)) AS since,
+            (SELECT e.actor FROM status_events e WHERE e.task_id = t.id AND e.status = 'review' ORDER BY e.at DESC, e.id DESC LIMIT 1) AS moved_by
+       FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+      WHERE t.status = 'review' AND t.parent_id IS NULL AND ${LIVE_PROJECT} AND ${inScope("t", 1)}
+      ORDER BY since, t.id`,
+    [projectId == null ? null : Number(projectId)]);
+  const nowMs = msOf(at);
+  return rows.map((r) => {
+    const since = msOf(r.since);
+    const days = Number.isFinite(since) ? Math.max(0, Math.floor((nowMs - since) / DAY_MS)) : 0;
+    return {
+      id: Number(r.id), title: r.title, status: "review", priority: r.priority, due: r.due || null, assignee: r.assignee || null,
+      project_id: r.project_id == null ? null : Number(r.project_id), project_name: r.project_name || null,
+      project_colour: r.project_colour || null, since: stamp(r.since), moved_by: r.moved_by || null, days,
+      words: days ? `Waiting on your review for ${days} ${days === 1 ? "day" : "days"}` : "Waiting on your review since today",
+    };
+  });
 }
 
 /**
@@ -477,4 +512,4 @@ function seenUpTo(shown) {
   return stamp(newest || shown.until);
 }
 
-module.exports = { LAST_ACTIVITY, AMBER_DAYS, RED_DAYS, KINDS, stamp, levelOf, markOf, movementWords, dueAt, dueSoonHours, stuck, bannerOf, brief, compact, seenUpTo };
+module.exports = { LAST_ACTIVITY, AMBER_DAYS, RED_DAYS, KINDS, stamp, levelOf, markOf, movementWords, dueAt, dueSoonHours, stuck, inReview, bannerOf, brief, compact, seenUpTo };

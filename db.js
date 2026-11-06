@@ -60,6 +60,44 @@ function open() {
   // After the schema, because on a fresh database the table it rebuilds has just
   // been created with the right constraint and there is nothing to do.
   widenAuditEntities(db);
+  // In review, the fifth status: tasks and status_events rebuilt once to allow
+  // it (agent/schema_later.js rebuildStatuses). After the schema, so the
+  // restore_points table it writes its row into exists, and before anything
+  // reads a task. main.js snapshots the file first and holds this back when it
+  // could not: the rebuild drops and remakes the table every task lives in,
+  // and the way back from a bad one is that copy. A rebuild that fails rolls
+  // back, and the database opens as it was, with review refused by sentence.
+  const statusQuery = (statement) => db.prepare(statement).all();
+  // Opened by anything other than main.js (a script, the smoke test, an
+  // importer pointed at a real file), nothing has taken the snapshot, so this
+  // takes its own: VACUUM INTO, which is synchronous and, like the online
+  // backup, a consistent copy that includes the -wal. No copy, no rebuild.
+  if (!statusGate.hold && !statusGate.point && schemaLater.needsStatusRebuild(statusQuery)) {
+    try {
+      // Beside the file being opened when it is not the data folder's own (a
+      // DELPHI_DB elsewhere), so a script's database is never copied in among
+      // the person's backups.
+      const home = path.resolve(path.dirname(DB_PATH)) === path.resolve(paths.DATA_DIR) ? paths.DATA_DIR : path.dirname(DB_PATH);
+      const dir = path.join(home, "backups");
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, `before-review-${new Date().toISOString().replace(/\.\d+Z$/, "").replace(/:/g, "-")}.db`);
+      db.prepare("VACUUM INTO ?").run(file);
+      statusGate = { hold: false, point: { file, label: "Before adding In review" } };
+    } catch (error) {
+      console.error("no snapshot before the In review rebuild, so it is held back", error);
+      statusGate = { hold: true, point: null };
+    }
+  }
+  if (statusGate.hold) {
+    statusRebuild = { ran: false, held: true };
+  } else {
+    try {
+      statusRebuild = schemaLater.rebuildStatuses(statusQuery, { point: statusGate.point });
+    } catch (error) {
+      statusRebuild = { ran: false, error: String(error.message || error) };
+      console.error("could not rebuild the task tables for In review; nothing was changed", error);
+    }
+  }
   // One folder, one project (workbench/folders.js). After the schema, so the
   // tables it writes exist, and before anything reads a project. main.js takes
   // a snapshot first and may hold it back when the snapshot failed: a
@@ -85,6 +123,30 @@ let folderAdoption = null;
 let folderGate = () => true;
 /** main.js holds the migration back when the snapshot before it failed. */
 function holdFolderAdoption(hold) { folderGate = () => !hold; }
+
+// The same for the In review rebuild: held when the snapshot failed, and told
+// which snapshot it came after when one was taken, so the restore point is
+// written in the rebuild's own transaction. statusRebuild is what it did.
+let statusGate = { hold: false, point: null };
+let statusRebuild = null;
+function prepareStatusRebuild({ hold = false, file = null } = {}) {
+  statusGate = { hold: Boolean(hold), point: file ? { file, label: "Before adding In review" } : null };
+}
+const statusRebuildResult = () => statusRebuild;
+
+/** Throws a sentence saying why when this database cannot store review yet. */
+function assertReviewReady(status) {
+  if (status !== "review") return;
+  const query = (statement) => open().prepare(statement).all();
+  if (schemaLater.reviewReady(query)) return;
+  const why = !schemaLater.needsStatusRebuild(query)
+    ? "this database's task table is not one Delphi recognises, so it was left alone"
+    : statusRebuild && statusRebuild.held
+      ? "Delphi could not take a backup first"
+      : `it failed and was rolled back (${(statusRebuild && statusRebuild.error) || "no reason given"})`;
+  throw new Error(`In review needs a one-time upgrade of this database, which has not happened: ${why}. ` +
+    "Restart Delphi to try again. Nothing was changed.");
+}
 
 /**
  * Widens the CHECK on audit.entity, once.
@@ -1221,9 +1283,10 @@ function listTasks({ projectId = null, organizerId = null, includeDone = false, 
      LEFT JOIN organizers o ON o.id = t.organizer_id
      ${where}
      ORDER BY
-       -- ELSE is a status a newer Delphi wrote (In review): it reads as in
-       -- progress, so it sorts straight after doing rather than with done.
-       CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 2 WHEN 'todo' THEN 3 WHEN 'done' THEN 4 ELSE 1 END,
+       -- In review sorts straight after doing: it is work that has been
+       -- done and waits on a look. ELSE is a status a newer Delphi wrote,
+       -- which reads as in progress and so sorts with it, never with done.
+       CASE t.status WHEN 'doing' THEN 0 WHEN 'review' THEN 1 WHEN 'blocked' THEN 2 WHEN 'todo' THEN 3 WHEN 'done' THEN 4 ELSE 1 END,
        CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END,
        COALESCE(t.due, '9999-99-99'),
        t.id DESC`,
@@ -1244,6 +1307,7 @@ function createTask({
     organizerId = null;
   }
   assertOrganizerFits(organizerId, { projectId, parentId });
+  assertReviewReady(status);
 
   const r = run(
     // completed_at is derived from status here for the same reason updateTask
@@ -1310,7 +1374,15 @@ function updateTask(id, fields, { actor = null } = {}) {
     }
   }
 
-  const sets = Object.keys(next).filter((k) => allowed.includes(k));
+  assertReviewReady(next.status);
+  // In review waits on a person, so nobody holds it: a claim an agent had on
+  // the work ends when the work goes up for review, or the queue would show it
+  // in flight until the lease ran out.
+  if (next.status === "review" && before && before.claimed_by) {
+    next.claimed_by = null;
+    next.claim_expires = null;
+  }
+  const sets = Object.keys(next).filter((k) => allowed.includes(k) || ((k === "claimed_by" || k === "claim_expires") && next.status === "review"));
   if (!sets.length) return one("SELECT * FROM tasks WHERE id = :id", { id });
   const assignments = sets.map((k) => `${k} = :${k}`).join(", ");
   // completed_at is derived rather than passed in, so it can never disagree with status.
@@ -3165,6 +3237,7 @@ module.exports = {
   adoptProjectPaths,
   folderConflicts, keepFolderAnswer, giveFolder, mergedFolderAnswer, conflictRow,
   folderAdoption: () => folderAdoption, holdFolderAdoption, newestAudit, auditSince,
+  prepareStatusRebuild, statusRebuild: statusRebuildResult, reviewReady: () => schemaLater.reviewReady((statement) => open().prepare(statement).all()),
   listSessions, getSession, createSession, updateSession, deleteSession, sessionChanges,
   listArchivedSessions,
   listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness, trustHarnessCommand,

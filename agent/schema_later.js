@@ -522,4 +522,176 @@ function apply(query) {
   return result;
 }
 
-module.exports = { LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, apply, addLaterColumns, hasTable, columnsOf, allColumns };
+// ---------------------------------------------------------------------------
+// In review: the one table rebuild
+//
+// A task's status is a CHECK, and a CHECK cannot be altered, so In review (a
+// fifth status, between doing and done) needs tasks and status_events rebuilt:
+// a new table made from the old one's own definition with the wider list,
+// every row copied across by column name, the old one dropped, the new one
+// renamed into its place, and its indexes and triggers made again from the
+// text SQLite kept for them. That is SQLite's documented twelve-step ALTER.
+//
+// The definition is the stored one, not schema.sql's, because the stored one
+// is what this database really has: the columns schema_later added over the
+// years, in the order they were added, and whatever an older schema.sql said.
+// Only the status CHECK is changed in it, and only when it reads exactly as the
+// old list. A definition this does not recognise is left alone and said so,
+// rather than guessed at.
+//
+// Who runs it: the app, and only the app, in db.open after main.js has taken a
+// snapshot of the file. The MCP server never does, on either route. On the
+// sqlite3 binary route every call is its own process, so there is no
+// transaction that spans a look at the schema and the rebuild; the rebuild
+// would have to be one script written from a schema read in an earlier
+// process. If the app (or another server, and an agent tab starts one each)
+// rebuilt the table in between, that script would copy the rows into a table
+// made from the stale definition and put the narrow CHECK back, or fail half
+// way through someone else's rebuild. There is also no node:sqlite there to
+// take the snapshot the rebuild must come after. On the node:sqlite route the
+// server could hold a transaction, but forty servers racing the app for one
+// rebuild, none of them able to snapshot first, is the wrong shape too. So the
+// server reads an old table as it always has (an unknown status already reads
+// as doing, slice 0) and refuses only a write of review, with the sentence
+// that says to open the app once. That costs an agent nothing it had before.
+
+const STATUS_TABLES = ["tasks", "status_events"];
+const OLD_STATUS_CHECK = /CHECK\s*\(\s*status\s+IN\s*\(\s*'todo'\s*,\s*'doing'\s*,\s*'blocked'\s*,\s*'done'\s*\)\s*\)/gi;
+const NEW_STATUS_CHECK = "CHECK (status IN ('todo', 'doing', 'review', 'blocked', 'done'))";
+const REVIEW_CHECK = /CHECK\s*\(\s*status\s+IN\s*\([^)]*'review'/i;
+
+const tableSql = (query, name) =>
+  ((query(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '${plainName(name)}'`) || [])[0] || {}).sql || null;
+
+/**
+ * Where each status table stands: "old" (the four-status CHECK, so it needs the
+ * rebuild), "ready" (it already allows review), "missing", or "unknown" (a
+ * status CHECK this does not recognise, which nothing here will touch).
+ */
+function statusTables(query) {
+  const out = {};
+  for (const name of STATUS_TABLES) {
+    const text = tableSql(query, name);
+    if (!text) out[name] = "missing";
+    else if (REVIEW_CHECK.test(text)) out[name] = "ready";
+    else out[name] = (text.match(OLD_STATUS_CHECK) || []).length === 1 ? "old" : "unknown";
+  }
+  return out;
+}
+
+/** True when the database still has the four-status CHECK somewhere and the rebuild has work to do. */
+function needsStatusRebuild(query) {
+  return Object.values(statusTables(query)).includes("old");
+}
+
+/** True when a task may be stored as review: both tables allow it. */
+function reviewReady(query) {
+  const t = statusTables(query);
+  return t.tasks === "ready" && t.status_events === "ready";
+}
+
+const quote = (value) => (value == null ? "NULL" : `'${String(value).replace(/'/g, "''")}'`);
+
+/**
+ * The rebuild. query takes one statement per call and runs on one connection,
+ * which is db.js's node:sqlite handle; see the note above for why nothing else
+ * calls this. One transaction, taken with BEGIN IMMEDIATE so the write lock is
+ * held from the first look to the commit, and checked again inside it, so a
+ * second open (or a second process) finds nothing to do and changes nothing.
+ *
+ * point, when given, is the snapshot taken before this ran: a restore_points
+ * row of kind 'rebuild' is written in the same transaction, so the row exists
+ * exactly when the rebuild does.
+ *
+ * Returns { ran, tables, rows } or throws, having rolled back, with the
+ * database as it was.
+ */
+function rebuildStatuses(query, { point = null } = {}) {
+  if (!needsStatusRebuild(query)) return { ran: false, tables: [], rows: {} };
+  const fkWas = Number(((query("PRAGMA foreign_keys") || [])[0] || {}).foreign_keys) === 1;
+  // Off for the drop: with foreign keys on, DROP TABLE tasks first deletes
+  // every row, and ON DELETE CASCADE would take every Sheet entry, status event
+  // and subtask with it. It cannot be changed inside a transaction, hence here.
+  // The connection's settings go back in the finally whatever happens, foreign
+  // keys first, because a connection left with them off silently stops cascading.
+  let fkOff = false;
+  let legacyOn = false;
+  // On for the rename: since SQLite 3.26 RENAME re-checks every view and every
+  // trigger on other tables, and one that names tasks (a person's own view, a
+  // trigger on comments) fails it with "no such table" in the moment between
+  // the drop and the rename, which would roll this back on every launch. The
+  // legacy rename checks nothing and rewrites nothing, which is exactly right
+  // here: the new table takes the old one's name, so every reference to it by
+  // name is already correct. SQLite's own twelve-step procedure says as much.
+  const legacyWas = Number(((query("PRAGMA legacy_alter_table") || [])[0] || {}).legacy_alter_table) === 1;
+  const done = { ran: false, tables: [], rows: {} };
+  try {
+    if (fkWas) { query("PRAGMA foreign_keys = OFF"); fkOff = true; }
+    if (!legacyWas) { query("PRAGMA legacy_alter_table = ON"); legacyOn = true; }
+    query("BEGIN IMMEDIATE");
+    try {
+      const state = statusTables(query);
+      const todo = STATUS_TABLES.filter((name) => state[name] === "old");
+      if (!todo.length) { query("ROLLBACK"); return done; }
+      // A dangling reference that was there before is not this rebuild's to
+      // fix, but one that appears during it is a row this lost the link to.
+      const danglingBefore = (query("PRAGMA foreign_key_check") || []).length;
+      // The same for views: one that was already broken (it names a column
+      // long gone) is not this rebuild's to judge, and must not block it.
+      const viewReads = (name) => { try { query(`SELECT * FROM "${String(name).replace(/"/g, '""')}" LIMIT 0`); return true; } catch { return false; } };
+      const viewsBefore = (query("SELECT name FROM sqlite_master WHERE type = 'view'") || []).map((v) => v.name).filter(viewReads);
+      for (const name of todo) {
+        const fresh = `${name}_rebuilt`;
+        const definition = tableSql(query, name);
+        const columns = columnsOf(query, name);
+        const count = Number(query(`SELECT COUNT(*) AS n FROM ${plainName(name)}`)[0].n);
+        const top = query(`SELECT MAX(rowid) AS m FROM ${plainName(name)}`)[0].m;
+        const extras = query(`SELECT type, name, sql FROM sqlite_master WHERE tbl_name = '${plainName(name)}' AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name`) || [];
+        const head = /^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"[^"]+"|'[^']+'|`[^`]+`|\[[^\]]+\]|\w+)/i;
+        if (!head.test(definition)) throw new Error(`the ${name} table's definition does not start the way it should`);
+        const widened = definition.replace(OLD_STATUS_CHECK, NEW_STATUS_CHECK).replace(head, `CREATE TABLE ${fresh}`);
+        query(widened);
+        const names = columns.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+        query(`INSERT INTO ${fresh} (${names}) SELECT ${names} FROM ${plainName(name)}`);
+        query(`DROP TABLE ${plainName(name)}`);
+        query(`ALTER TABLE ${fresh} RENAME TO ${plainName(name)}`);
+        for (const x of extras) query(x.sql);
+        // Checked before the commit: the same columns in the same order, every
+        // row, the same highest id, and every index and trigger back.
+        const after = columnsOf(query, name);
+        if (JSON.stringify(after) !== JSON.stringify(columns)) throw new Error(`the rebuilt ${name} table has different columns`);
+        const n = Number(query(`SELECT COUNT(*) AS n FROM ${plainName(name)}`)[0].n);
+        if (n !== count) throw new Error(`the rebuilt ${name} table has ${n} rows, not ${count}`);
+        if (query(`SELECT MAX(rowid) AS m FROM ${plainName(name)}`)[0].m !== top) throw new Error(`the rebuilt ${name} table's ids changed`);
+        const back = new Set((query(`SELECT name FROM sqlite_master WHERE tbl_name = '${plainName(name)}' AND type IN ('index', 'trigger')`) || []).map((r) => r.name));
+        const lost = extras.filter((x) => !back.has(x.name)).map((x) => x.name);
+        if (lost.length) throw new Error(`the rebuilt ${name} table is missing ${lost.join(", ")}`);
+        if (!REVIEW_CHECK.test(tableSql(query, name) || "")) throw new Error(`the rebuilt ${name} table still refuses review`);
+        done.tables.push(name);
+        done.rows[name] = n;
+      }
+      // Every view that read before still reads, now that what it names is back.
+      const broken = viewsBefore.filter((name) => !viewReads(name));
+      if (broken.length) throw new Error(`the rebuild broke the view ${broken.join(", ")}`);
+      const danglingAfter = (query("PRAGMA foreign_key_check") || []).length;
+      if (danglingAfter > danglingBefore) throw new Error(`the rebuild left ${danglingAfter - danglingBefore} rows pointing at nothing`);
+      if (point) {
+        // After the newest History row, which is the moment the snapshot holds.
+        query(`INSERT INTO restore_points (kind, label, backup_path, audit_id)
+               VALUES ('rebuild', ${quote(point.label || "Before adding In review")}, ${quote(point.file || null)},
+                       (SELECT MAX(id) FROM audit))`);
+      }
+      query("COMMIT");
+      done.ran = true;
+      return done;
+    } catch (error) {
+      try { query("ROLLBACK"); } catch {}
+      throw error;
+    }
+  } finally {
+    try { if (fkOff) query("PRAGMA foreign_keys = ON"); } finally { if (legacyOn) query("PRAGMA legacy_alter_table = OFF"); }
+  }
+}
+
+module.exports = { LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, apply, addLaterColumns, hasTable, columnsOf, allColumns,
+  STATUS_TABLES, statusTables, needsStatusRebuild, reviewReady, rebuildStatuses };

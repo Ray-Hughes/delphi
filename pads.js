@@ -170,13 +170,20 @@ function anchoredIds(body) {
  * What a pad line says a task should look like.
  *
  * status is deliberately not a straight mapping from the checkbox. A checkbox
- * has two states and a task has four, so an unticked box cannot mean "todo"
+ * has two states and a task has five, so an unticked box cannot mean "todo"
  * unconditionally: a task somebody moved to doing or blocked on the board would
  * be dragged back to todo by the next pad write, and the board would look like
  * it kept forgetting. An unticked box therefore means "not done", and only
  * changes a status that was done.
+ *
+ * In review is not done, so its line is unticked and an unticked line leaves
+ * it in review, like doing or blocked. Ticking it is moving it on to done,
+ * which is a person's call: finishReview is false for an agent's write, and
+ * then a ticked line leaves the task in review (the writer unticks the line
+ * again, so the pad and the board agree).
  */
-function statusFor(done, current) {
+function statusFor(done, current, { finishReview = true } = {}) {
+  if (done && current === "review" && !finishReview) return "review";
   if (done) return "done";
   if (current === "done" || !current) return "todo";
   return current;

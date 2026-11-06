@@ -104,6 +104,8 @@
 .tk-st-ring.big { width: 14px; height: 14px; }
 .st-doing .tk-st-ring, .tk-st-ring.st-doing { border-color: var(--accent); background: linear-gradient(90deg, var(--accent) 50%, transparent 50%); }
 .st-blocked .tk-st-ring, .tk-st-ring.st-blocked { border-color: var(--crit); background: linear-gradient(var(--crit), var(--crit)) center / 7px 1.6px no-repeat; }
+/* In review: three quarters round, the work done and a look still to come. */
+.st-review .tk-st-ring, .tk-st-ring.st-review { border-color: var(--tc-purple); background: conic-gradient(var(--tc-purple) 0 75%, transparent 0); }
 .st-done .tk-st-ring, .tk-st-ring.st-done { border-color: var(--good); background: var(--good); }
 
 /* The subtask pill, and its checklist. */
@@ -161,7 +163,7 @@
 .tk-empty b { color: var(--ink); font-weight: 600; }
 
 /* Kanban */
-.tk-board { display: grid; grid-template-columns: repeat(4, minmax(220px, 1fr)); gap: 14px; overflow-x: auto; padding-bottom: 6px; }
+.tk-board { display: grid; grid-template-columns: repeat(var(--tk-cols, 5), minmax(200px, 1fr)); gap: 14px; overflow-x: auto; padding-bottom: 6px; }
 .tk-col { min-width: 0; border-radius: var(--r-lg); padding: 2px; }
 .tk-col.over { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-line); }
 .tk-col-h { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 6px; }

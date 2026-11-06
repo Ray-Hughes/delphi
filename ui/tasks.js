@@ -29,9 +29,26 @@ globalThis.DelphiTasks = (() => {
   // -------------------------------------------------------------------------
   // The rules, with no DOM
 
-  const STATUSES = [["todo", "To do"], ["doing", "In progress"], ["blocked", "Blocked"], ["done", "Done"]];
+  // The one list of statuses this view knows. The board's columns, their count
+  // in the grid, the status select, the list's group order, the empty column
+  // words and the status filters are all read from it, so a status is added
+  // here once rather than as a fifth literal in five places. Board order runs
+  // left to right the way work does; rank is the list's group order (work in
+  // hand first, as db.js listTasks sorts), and filter is the words a metrics
+  // filter for it reads as, where it has one.
+  const STATUS_DEFS = [
+    { key: "todo", label: "To do", rank: 3, empty: "Nothing to do." },
+    { key: "doing", label: "In progress", rank: 0, empty: "Nothing in progress. Drag a card here.", filter: "in progress" },
+    { key: "blocked", label: "Blocked", rank: 2, empty: "Nothing blocked.", filter: "blocked" },
+    // Finished work waiting on a person, who moves it on to done or back to doing.
+    { key: "review", label: "In review", rank: 1, empty: "Nothing waiting on a review.", filter: "in review" },
+    { key: "done", label: "Done", rank: 4, empty: "Nothing done yet.", filter: "done" },
+  ];
+  const STATUSES = STATUS_DEFS.map((d) => [d.key, d.label]);
   const STATUS_LABEL = new Map(STATUSES);
   const KNOWN = new Set(STATUSES.map(([s]) => s));
+  const STATUS_RANK = new Map(STATUS_DEFS.map((d) => [d.key, d.rank]));
+  const EMPTY = Object.fromEntries(STATUS_DEFS.map((d) => [d.key, d.empty]));
   /** A status this version cannot name reads as in progress, as everywhere else (app.js statusOf). */
   const statusOf = (t) => (KNOWN.has(t && t.status) ? t.status : "doing");
   const PRIORITIES = [["high", "High"], ["med", "Medium"], ["low", "Low"]];
@@ -168,14 +185,14 @@ globalThis.DelphiTasks = (() => {
   }
 
   // The four filters the metrics strip sets (state.taskFilter), as app.js reads them.
+  // statusOf, so a status this version cannot name is filtered as in progress,
+  // which is where it is drawn.
   const TASK_FILTERS = {
-    doing: [(t) => statusOf(t) === "doing", "in progress"],
-    blocked: [(t) => t.status === "blocked", "blocked"],
+    ...Object.fromEntries(STATUS_DEFS.filter((d) => d.filter).map((d) => [d.key, [(t) => statusOf(t) === d.key, d.filter]])),
     overdue: [(t, ctx) => Boolean(ctx.isOverdue && ctx.isOverdue(t)), "overdue"],
-    done: [(t) => t.status === "done", "done"],
   };
-
-  const STATUS_ORDER = ["doing", "blocked", "todo", "done"];
+  // A key with no rank sorts with in progress rather than first.
+  const rankOf = (key) => (STATUS_RANK.has(key) ? STATUS_RANK.get(key) : STATUS_RANK.get("doing"));
 
   /**
    * The tasks as groups, in the order they are drawn: [{ key, label, tasks }].
@@ -218,7 +235,7 @@ globalThis.DelphiTasks = (() => {
       }
     }
     const groups = [...by.values()];
-    if (opts.group === "status") groups.sort((a, b) => STATUS_ORDER.indexOf(a.key) - STATUS_ORDER.indexOf(b.key));
+    if (opts.group === "status") groups.sort((a, b) => rankOf(a.key) - rankOf(b.key));
     else if (opts.group === "priority") groups.sort((a, b) => PRI[a.key] - PRI[b.key]);
     else if (opts.group === "project" || opts.group === "epic") {
       // The project last touched comes first, so the feed reads newest first
@@ -230,7 +247,7 @@ globalThis.DelphiTasks = (() => {
     return groups;
   }
 
-  /** The Kanban columns: always the four statuses, in board order, empty ones kept. */
+  /** The Kanban columns: always every status, in board order, empty ones kept. */
   function columns(tasks, opts, ctx = {}) {
     const groups = arrange(tasks, { ...opts, group: "status" }, ctx);
     const by = new Map(groups.map((g) => [g.key, g.tasks]));
@@ -1048,10 +1065,10 @@ globalThis.DelphiTasks = (() => {
     return c;
   }
 
-  const EMPTY = { todo: "Nothing to do.", doing: "Nothing in progress. Drag a card here.", blocked: "Nothing blocked.", done: "Nothing done yet." };
-
   function paintBoard(box, ctx) {
     const wrap = el("div", { className: "tk-board" });
+    // The grid is as wide as the list of statuses, not a count in the CSS.
+    wrap.style.setProperty("--tk-cols", String(ctx.columns.length));
     for (const col of ctx.columns) {
       const column = el("section", { className: `tk-col st-${col.status}` });
       column.setAttribute("aria-label", `${col.label}, ${col.tasks.length}`);

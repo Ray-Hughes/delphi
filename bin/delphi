@@ -404,7 +404,7 @@ async function finishFlow(client, taskId) {
   if (!done) done = await client.call("workbench_finish", { task_id: taskId });
   say(`Finished. The folder is put away and the branch ${done.branch} is kept.`);
   if (done.recover) say(done.recover);
-  if (person && done.task_status === "doing" && await yes(`Mark task ${taskId} done?`)) {
+  if (person && (done.task_status === "doing" || done.task_status === "review") && await yes(`Mark task ${taskId} done?`)) {
     await client.call("update_task", { id: taskId, status: "done" });
     say(`Task ${taskId} is done.`);
   }

@@ -31,6 +31,7 @@ const { isNewer } = require("./version");
 const locate = require("./agent/locate");
 const identity = require("./agent/identity");
 const folderRule = require("./workbench/folders");
+const schemaLater = require("./agent/schema_later");
 
 // Before anything reads it. Packaged, the name comes from the bundle, but running
 // from a checkout Electron falls back to its own name and the macOS menu bar reads
@@ -650,6 +651,17 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.error("snapshot before the folder migration; holding the migration back until one can be taken", error);
     db.holdFolderAdoption(true);
+  }
+  // The In review rebuild also runs inside the first open, and drops and
+  // remakes the table every task lives in, so the same rule: a copy from
+  // before it, or no rebuild this launch. One copy serves both when both run.
+  // The restore point is written by the rebuild itself, in its transaction.
+  try {
+    const shot = await backups.beforeMigration({ needs: schemaLater.needsStatusRebuild, reuse: (migrated && migrated.file) || (updated && updated.file), label: "before-review" });
+    db.prepareStatusRebuild({ file: shot ? shot.file : null });
+  } catch (error) {
+    console.error("snapshot before the In review rebuild; holding it back until one can be taken", error);
+    db.prepareStatusRebuild({ hold: true });
   }
   // Before the window, so the harness strip has rows to draw on the first paint.
   // Guarded because a database that has no registry is still a working tracker,

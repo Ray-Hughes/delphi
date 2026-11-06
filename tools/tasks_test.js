@@ -50,9 +50,14 @@ check("an empty title is refused", T.editPatch(task, { title: "   " }), { error:
 check("status and priority", T.editPatch(task, { title: task.title, status: "doing", priority: "high" }), { patch: { status: "doing", priority: "high" } });
 check("an unknown status is ignored", T.editPatch(task, { status: "nonsense" }), { patch: null });
 check("an unknown priority is ignored", T.editPatch(task, { priority: "urgent" }), { patch: null });
-const review = { id: 8, title: "Review me", status: "review", priority: "high" };
-check("In review, drawn as In progress, saved untouched, is not rewritten", T.editPatch(review, { title: "Review me", status: "doing", priority: "high" }), { patch: null });
-check("In review moved on purpose is written", T.editPatch(review, { status: "done" }), { patch: { status: "done" } });
+// A status a newer Delphi wrote is drawn as In progress and never rewritten as
+// doing by an untouched save (slice 0). In review is a status of its own now.
+const later = { id: 8, title: "Ship me", status: "shipped", priority: "high" };
+check("a status this version cannot name, drawn as In progress, saved untouched, is not rewritten", T.editPatch(later, { title: "Ship me", status: "doing", priority: "high" }), { patch: null });
+check("and moved on purpose is written", T.editPatch(later, { status: "done" }), { patch: { status: "done" } });
+const review = { id: 9, title: "Review me", status: "review", priority: "high" };
+check("In review saved untouched is not rewritten", T.editPatch(review, { title: "Review me", status: "review", priority: "high" }), { patch: null });
+check("In review sent back to In progress is written", T.editPatch(review, { status: "doing" }), { patch: { status: "doing" } });
 check("a task with no priority reads as med", T.editPatch({ id: 9, title: "x", status: "todo", priority: null }, { priority: "med" }), { patch: null });
 
 section("subtask pills");
@@ -72,8 +77,10 @@ check("never below nought", T.toggleSub({ subtask_count: 2, subtask_done: 0 }, {
 section("a Kanban drop writes a status, and only a change");
 check("todo to doing", T.dropPatch({ status: "todo" }, "doing"), { status: "doing" });
 check("back where it was", T.dropPatch({ status: "blocked" }, "blocked"), null);
-check("In review dropped on In progress stays In review", T.dropPatch({ status: "review" }, "doing"), null);
+check("an unknown status dropped on In progress, where it is drawn, writes nothing", T.dropPatch({ status: "shipped" }, "doing"), null);
+check("In review dropped on In progress goes back to doing", T.dropPatch({ status: "review" }, "doing"), { status: "doing" });
 check("In review dropped on Done", T.dropPatch({ status: "review" }, "done"), { status: "done" });
+check("dropped on In review", T.dropPatch({ status: "doing" }, "review"), { status: "review" });
 check("not a column", T.dropPatch({ status: "todo" }, "nowhere"), null);
 check("no task", T.dropPatch(null, "done"), null);
 
@@ -103,17 +110,21 @@ check("by project, newest project first, no project last, done and subtasks left
   shape(T.arrange(tasks, global)), [["p2", [2]], ["p1", [4, 1]], ["none", [6]]]);
 check("show completed brings done back", shape(T.arrange(tasks, { ...global, showDone: true }))[1], ["p1", [3, 4, 1]]);
 const proj = T.normalise(null, "project");
-check("by status: doing (In review with it), blocked, todo, done",
-  shape(T.arrange(tasks, proj)), [["doing", [2, 4]], ["blocked", [6]], ["todo", [1]], ["done", [3]]]);
+check("by status: doing, In review, blocked, todo, done",
+  shape(T.arrange(tasks, proj)), [["doing", [2]], ["review", [4]], ["blocked", [6]], ["todo", [1]], ["done", [3]]]);
+check("an unknown status groups with doing, never first",
+  shape(T.arrange([...tasks, { id: 7, title: "g", status: "shipped", priority: "med", project_id: 1, updated_at: tasks[0].updated_at }], proj))[0], ["doing", [2, 7]]);
+check("the metrics filter, in review", shape(T.arrange(tasks, global, { taskFilter: "review" })), [["p1", [4]]]);
 check("by priority", shape(T.arrange(tasks, { ...proj, group: "priority" })), [["high", [6, 2]], ["med", [4]], ["low", [1]]]);
 check("no grouping, by title", shape(T.arrange(tasks, { ...proj, group: "none", order: "title" })), [["all", [2, 1, 4, 6]]]);
 check("the filter field", shape(T.arrange(tasks, global, { query: "#6" })), [["none", [6]]]);
 check("the filter words all have to match", T.arrange(tasks, global, { query: "zzz" }).length, 0);
 check("the metrics filter, blocked", shape(T.arrange(tasks, global, { taskFilter: "blocked" })), [["none", [6]]]);
 check("the metrics filter, done, shows done", shape(T.arrange(tasks, global, { taskFilter: "done" })), [["p1", [3]]]);
-check("Kanban keeps all four columns, empty ones too",
+check("Kanban keeps every status as a column, empty ones too, In review before Done",
   T.columns(tasks.filter((t) => t.status !== "blocked"), proj).map((c) => [c.status, c.tasks.length]),
-  [["todo", 1], ["doing", 2], ["blocked", 0], ["done", 1]]);
+  [["todo", 1], ["doing", 1], ["blocked", 0], ["review", 1], ["done", 1]]);
+check("the columns are the status list", T.columns([], proj).map((c) => c.status), T.STATUSES.map(([s]) => s));
 
 section("avatars");
 check("two words", T.initials("Raymond Hughes"), "RH");

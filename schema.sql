@@ -51,8 +51,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   legacy_id    TEXT,                       -- the old T-number, so notes still line up
   title        TEXT NOT NULL,
   detail       TEXT,
+  -- review is In review: the work is finished and waits on a person, who
+  -- moves it on to done or back to doing. No agent claims it. A database made
+  -- before it existed is rebuilt once to allow it (agent/schema_later.js).
   status       TEXT NOT NULL DEFAULT 'todo'
-                 CHECK (status IN ('todo', 'doing', 'blocked', 'done')),
+                 CHECK (status IN ('todo', 'doing', 'review', 'blocked', 'done')),
   priority     TEXT NOT NULL DEFAULT 'med'
                  CHECK (priority IN ('high', 'med', 'low')),
   owner        TEXT,
@@ -158,7 +161,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_ledger ON comments(task_id, promoted);
 CREATE TABLE IF NOT EXISTS status_events (
   id      INTEGER PRIMARY KEY,
   task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  status  TEXT NOT NULL CHECK (status IN ('todo', 'doing', 'blocked', 'done')),
+  status  TEXT NOT NULL CHECK (status IN ('todo', 'doing', 'review', 'blocked', 'done')),
   actor   TEXT,
   at      TEXT NOT NULL DEFAULT (datetime('now'))
 );

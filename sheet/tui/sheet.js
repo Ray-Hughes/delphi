@@ -46,9 +46,9 @@ const WORKBENCH_MS = 10000;
 const TAIL_KEEP = 400;
 const LIVE_TAIL_ROWS = 3;
 const OUTPUT_ROWS = 200;
-const STATUSES = ["todo", "doing", "blocked", "done"];
-// A status a newer Delphi wrote (In review) is shown as the one it most nearly
-// is, the way the app shows it, so the two never name the same task differently.
+const STATUSES = ["todo", "doing", "review", "blocked", "done"];
+// A status a newer Delphi wrote is shown as the one it most nearly is, the way
+// the app shows it, so the two never name the same task differently.
 const statusOf = (s) => (STATUSES.includes(s) ? s : "doing");
 const FILE_KINDS = { d: "decision", g: "gotcha", r: "reference", n: "note" };
 const HINT = "y copies clean";

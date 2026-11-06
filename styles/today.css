@@ -54,6 +54,7 @@
 .td-st { flex: none; width: 12px; height: 12px; border-radius: 99px; border: 1.6px solid var(--ink-faint); }
 .td-st.doing { border-color: var(--accent); background: linear-gradient(90deg, var(--accent) 50%, transparent 50%); }
 .td-st.blocked { border-color: var(--warn); background: var(--warn-soft); }
+.td-st.review { border-color: var(--tc-purple); background: conic-gradient(var(--tc-purple) 0 75%, transparent 0); }
 .td-st.done { border-color: var(--good); background: var(--good); }
 
 /* Stuck: the marks, the edge, and the fade. */
@@ -61,6 +62,8 @@
   font-size: 11px; font-weight: 600; letter-spacing: .01em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .td-tag.amber { color: var(--warn-ink); background: var(--warn-soft); }
 .td-tag.red { color: var(--crit-ink); background: var(--crit-soft); }
+/* Waiting on a person, not stuck: its own colour, never amber or red. */
+.td-tag.review { color: var(--ink); background: color-mix(in srgb, var(--tc-purple) 18%, transparent); }
 .td-row.quiet.amber { box-shadow: inset 2px 0 0 var(--warn); }
 .td-row.quiet.red { box-shadow: inset 2px 0 0 var(--crit); }
 .td-row.quiet .td-title { color: color-mix(in srgb, var(--ink-faint) var(--td-fade, 0%), var(--ink)); }

@@ -571,6 +571,44 @@ const todayBrief = require("../today/brief");
 // The weekly review, shared with the window's (main/weekly.js). Read only here.
 const weeklyReview = require("../today/weekly");
 const ITEM_AUTHOR_TYPE = AUTHOR_TYPE || sheetFormat.inferAuthorType(ACTOR);
+
+// In review, the fifth status (owner decision): finished work waiting on a
+// person. An agent may put a task up for review, and only a person moves it on,
+// to done or back to doing; no agent claims it (the queue names the statuses
+// it hands out, and review is not one). "A person" is the command line's
+// default author type, which an agent could set too: like the rest of this
+// file's rules it is a courtesy that keeps an agent from doing it in passing,
+// not a boundary. The agent's own task means one no other agent holds a live
+// claim on, so one agent cannot take another's work out of its hands.
+const BY_PERSON = ITEM_AUTHOR_TYPE === "human";
+// Read when a write of review is asked for, never cached: the app may rebuild
+// the table while this server runs. Why this server never rebuilds it is at
+// rebuildStatuses in agent/schema_later.js.
+function assertReviewReady() {
+  const query = (statement) => DATABASE.query(statement);
+  if (schemaLater.reviewReady(query)) return;
+  if (!schemaLater.needsStatusRebuild(query)) {
+    throw new Error("This database's task table is not one Delphi recognises, so it cannot store In review. Nothing was changed.");
+  }
+  throw new Error("This database has not been upgraded for In review yet. Open the Delphi app once and it will upgrade it " +
+    "(after taking a backup), then try again. Nothing was changed.");
+}
+/** Refuses an agent's status change that In review does not allow, with the sentence that says why. */
+function assertReviewMove(task, to) {
+  if (!to || to === task.status) return;
+  if (to === "review") {
+    assertReviewReady();
+    if (task.status === "done" && !BY_PERSON) throw new Error(`Task ${task.id} is done already. Reopen it first if it needs another look.`);
+    if (!BY_PERSON && task.claimed_by && task.claimed_by !== ACTOR && task.claim_expires && task.claim_expires >= sql("SELECT datetime('now') AS n")[0].n) {
+      throw new Error(`Task ${task.id} is held by ${task.claimed_by}, so it is theirs to put up for review.`);
+    }
+    return;
+  }
+  if (task.status === "review" && !BY_PERSON) {
+    throw new Error(`Task ${task.id} is in review, waiting on a person. A person moves it on, to done or back to doing; ` +
+      "add a Sheet entry (add_comment) if you have something they should see.");
+  }
+}
 const itemStore = makeItemStore({
   sql, batch, actor: ACTOR, authorType: ITEM_AUTHOR_TYPE, settings: () => readSettings(),
   derive: (padId) => derivePad(padId), who: WHO, step: currentStep,
@@ -827,7 +865,10 @@ function derivePad(padId) {
       const said = [];
       const set = (column, value) => { values.push(value); sets.push(`${column} = :p${values.length}`); };
       if (current.title && current.title !== task.title) { set("title", current.title); said.push("title changed"); }
-      const status = pads.statusFor(current.done, task.status);
+      // A ticked line moves a task on to done, and only a person moves one on
+      // from review: for an agent the task stays in review and its line is
+      // unticked again below, so the pad never says done when the board does not.
+      const status = pads.statusFor(current.done, task.status, { finishReview: BY_PERSON });
       if (status !== task.status) {
         set("status", status);
         sets.push(status === "done" ? "completed_at = datetime('now')" : "completed_at = NULL");
@@ -869,9 +910,16 @@ function derivePad(padId) {
     }
 
     idByEntry.set(current.at, task.id);
-    filed.push({ id: task.id, title: current.title, status: pads.statusFor(current.done, task.status) });
+    const now = pads.statusFor(current.done, task.status, { finishReview: BY_PERSON });
+    // Said back to the agent, so an untick it did not ask for is not a surprise.
+    filed.push({ id: task.id, title: current.title, status: now,
+      ...(current.done && now === "review" ? { note: "In review, waiting on a person, so its line was left unticked" } : {}) });
 
     if (current.taskId !== task.id) body = pads.anchorLine(body, current, task.id);
+    if (current.done && now === "review") {
+      const line = pads.parse(body)[current.at];
+      if (line) body = pads.writeLine(body, line, { done: false });
+    }
   }
 
   // The anchors are part of the write that made them: the step's own row for
@@ -1073,7 +1121,7 @@ const TOOLS = {
       properties: {
         project_id: { type: "number" },
         include_done: { type: "boolean" },
-        status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
+        status: { type: "string", enum: ["todo", "doing", "review", "blocked", "done"] },
       },
     },
     run: (a) => {
@@ -1090,7 +1138,7 @@ const TOOLS = {
                 ${asked != null ? `CASE WHEN t.project_id IS ${asked} THEN NULL ELSE p.key END` : "NULL"} AS home
          FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
          ${where.length ? "WHERE " + where.join(" AND ") : ""}
-         ORDER BY CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 2 WHEN 'todo' THEN 3 WHEN 'done' THEN 4 ELSE 1 END,
+         ORDER BY CASE t.status WHEN 'doing' THEN 0 WHEN 'review' THEN 1 WHEN 'blocked' THEN 2 WHEN 'todo' THEN 3 WHEN 'done' THEN 4 ELSE 1 END,
                   CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, t.id DESC
          LIMIT 200`,
         params
@@ -1141,7 +1189,7 @@ const TOOLS = {
 
   update_task: {
     description:
-      "Change a task. Set status to done when work is finished, blocked when waiting on someone.",
+      "Change a task. Set status to done when work is finished, review when it is finished and a person should look before it counts as done, blocked when waiting on someone. A task in review is a person's to move on.",
     schema: {
       type: "object",
       required: ["id"],
@@ -1149,7 +1197,7 @@ const TOOLS = {
         id: { type: "number" },
         title: { type: "string" },
         detail: { type: "string" },
-        status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
+        status: { type: "string", enum: ["todo", "doing", "review", "blocked", "done"] },
         priority: { type: "string", enum: ["high", "med", "low"] },
         due: { type: "string" },
         project_id: { type: "number", description: "Moves it, subtasks too: only a task you filed in the last day, else flag_item" },
@@ -1159,6 +1207,8 @@ const TOOLS = {
     run: (a) => {
       let before = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
       if (!before) throw new Error(`No task ${a.id}`);
+      // Before the move below, so a refused status change moves nothing.
+      assertReviewMove(before, a.status);
       // A change of project is a move (owner decision D2). An agent may move a
       // task it filed itself in the last day, which is fixing its own
       // misfiling, the common case; anything else is a person's call, so it is
@@ -1187,7 +1237,9 @@ const TOOLS = {
       const fields = ["title", "detail", "status", "priority", "due", "assignee"].filter((f) => a[f] !== undefined);
       if (!fields.length) return before;
       const params = fields.map((f) => a[f]);
-      const sets = fields.map((f, i) => `${f} = :p${i + 1}`).join(", ");
+      // Nobody holds a task in review: the claim ends when the work goes up.
+      const unclaim = a.status === "review" ? ", claimed_by = NULL, claim_expires = NULL" : "";
+      const sets = fields.map((f, i) => `${f} = :p${i + 1}`).join(", ") + unclaim;
       params.push(a.id);
       const done = a.status === "done" ? ", completed_at = datetime('now')" : a.status ? ", completed_at = NULL" : "";
       // The timeline should not be able to tell whether a person or an agent
@@ -1363,26 +1415,31 @@ const TOOLS = {
       properties: {
         task_id: { type: "number" },
         summary: { type: "string", description: "What you did, and what the next person needs to know" },
+        review: { type: "boolean", description: "Finish into In review rather than done, when a person should look first" },
       },
     },
     run: (a) => {
       const before = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
       if (!before) throw new Error(`No task ${a.task_id}`);
+      const to = a.review ? "review" : "done";
+      assertReviewMove(before, to);
       // Promoted, so every finished run lands in the ledger: it is the one
       // entry the next person or agent always wants.
       const stepId = auditor.step();
       auditor.run([
         ...sheetEntry(before, "commented", a.summary, { promoted: true, stepId }),
-        ...auditor.update("task", a.task_id, { summary: "status to done", label: before.title, stepId }, [
-          [`UPDATE tasks SET status = 'done', completed_at = datetime('now'),
-               claimed_by = NULL, claim_expires = NULL, queue = NULL,
-               updated_at = datetime('now') WHERE id = :p1`, [a.task_id]],
-          ...(before.status !== "done"
-            ? [["INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'done', :p2)", [a.task_id, ACTOR]]] : []),
+        // Into review it keeps its queue, so a person who sends it back to
+        // doing puts it straight back in front of the agents.
+        ...auditor.update("task", a.task_id, { summary: `status to ${to}`, label: before.title, stepId }, [
+          [`UPDATE tasks SET status = :p2, completed_at = CASE WHEN :p2 = 'done' THEN datetime('now') END,
+               claimed_by = NULL, claim_expires = NULL, queue = CASE WHEN :p2 = 'done' THEN NULL ELSE queue END,
+               updated_at = datetime('now') WHERE id = :p1`, [a.task_id, to]],
+          ...(before.status !== to
+            ? [["INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)", [a.task_id, to, ACTOR]]] : []),
         ]),
       ]);
       const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
-      const notice = workbenchNotice(a.task_id);
+      const notice = to === "done" ? workbenchNotice(a.task_id) : null;
       return notice ? { ...after, workbench: notice } : after;
     },
   },

@@ -48,8 +48,10 @@ for (const [status, days, want] of [
   ["todo", 40, null], ["done", 40, null],
   ["doing", 2, null], ["doing", 3, "amber"], ["doing", 6, "amber"], ["doing", 7, "red"], ["doing", 90, "red"],
   ["blocked", 3, "amber"], ["blocked", 30, "amber"],
-  // A status a newer Delphi wrote (In review) reads as in progress (slice 0).
-  ["review", 7, "red"],
+  // A status a newer Delphi wrote reads as in progress (slice 0).
+  ["shipped", 7, "red"],
+  // In review waits on a person: Needs you shows it, and it is never stuck.
+  ["review", 3, null], ["review", 30, null],
 ]) check(`${status} for ${days} days is ${want || "not stuck"}`, brief.levelOf(status, days), want);
 check("the marks are words as well as colour", [brief.markOf("amber", 4), brief.markOf("red", 9)], ["Idle 4d", "9d"]);
 {
@@ -255,7 +257,7 @@ section("lastSeen: focused for more than a minute, and away for a while");
   check("seenUpTo: an empty brief is seen to its end", brief.seenUpTo({ until: "2026-11-06 10:00:00", groups: [] }), "2026-11-06 10:00:00");
   const again = createToday({ sql: db.sqlP, dataDir: data, clock: () => now + 3600 * 1000 });
   check("a relaunch starts from the last look", again.since(), "2026-11-06 09:25:45");
-  check("view hands back the stuck list, the banner and the brief", Object.keys(again.view()).sort(), ["banner", "brief", "firstRun", "lastSeen", "since", "stuck"]);
+  check("view hands back the stuck list, the banner and the brief", Object.keys(again.view()).sort(), ["banner", "brief", "firstRun", "lastSeen", "review", "since", "stuck"]);
 }
 
 // ---------------------------------------------------------------------------

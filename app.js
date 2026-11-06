@@ -139,13 +139,14 @@ const today = () => TIME.localDay();
 const isOverdue = (t) => t.status !== "done" && TIME.dueState(t.due) === "overdue";
 
 /**
- * The status this version knows how to draw. A newer Delphi adds statuses
- * (In review), and a person who downgrades keeps that database; a task this
- * version cannot name is shown as in progress, because that is what it most
- * nearly is, and it then still appears in a column instead of in none. Only
- * what is drawn changes: the stored value is never rewritten from here.
+ * The status this version knows how to draw. In review (review) is finished
+ * work waiting on a person. A newer Delphi may add more, and a person who
+ * downgrades keeps that database; a task this version cannot name is shown as
+ * in progress, because that is what it most nearly is, and it then still
+ * appears in a column instead of in none. Only what is drawn changes: the
+ * stored value is never rewritten from here.
  */
-const KNOWN_STATUSES = new Set(["todo", "doing", "blocked", "done"]);
+const KNOWN_STATUSES = new Set(["todo", "doing", "review", "blocked", "done"]);
 const statusOf = (t) => (KNOWN_STATUSES.has(t && t.status) ? t.status : "doing");
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
@@ -1223,7 +1224,7 @@ function render() {
     $("subtitle").textContent = "Agents working for you, across every project. Each run has its own Workbench and its own live Sheet; open one to watch it.";
   } else if (state.view === "inbox") {
     $("title").textContent = "Needs you";
-    $("subtitle").textContent = "What waits on you, across all projects: agents paused until you answer, finished runs to review, and proposals about where an item belongs. Answering here clears it everywhere.";
+    $("subtitle").textContent = "What waits on you, across all projects: agents paused until you answer, finished runs to review, tasks in review, and proposals about where an item belongs. Answering here clears it everywhere.";
   } else {
     $("title").textContent = "All work";
     $("subtitle").textContent = "Everything open, across every project";
@@ -1377,6 +1378,7 @@ function renderMetrics() {
   const figures = [
     ["Open", open.length, null],
     ["Doing", open.filter((t) => statusOf(t) === "doing").length, "good"],
+    ["In review", open.filter((t) => t.status === "review").length, null],
     ["Blocked", open.filter((t) => t.status === "blocked").length, "warn"],
     ["Overdue", open.filter(isOverdue).length, "crit"],
   ];
@@ -1428,6 +1430,7 @@ async function renderOverview(root) {
   const overdue = open.filter(isOverdue).length;
   const blocked = open.filter((t) => t.status === "blocked").length;
   const doing = open.filter((t) => statusOf(t) === "doing").length;
+  const inReview = open.filter((t) => t.status === "review").length;
 
   // Summary first: what needs attention before what merely exists.
   const stats = el("div", { className: "stats" });
@@ -1457,6 +1460,7 @@ async function renderOverview(root) {
   stats.append(
     stat(open.length, "Open", null, () => showTasks(null)),
     stat(doing, "In progress", doing ? "good" : null, () => showTasks("doing")),
+    stat(inReview, "In review", null, () => showTasks("review")),
     stat(blocked, "Blocked", blocked ? "warn" : null, () => showTasks("blocked")),
     stat(overdue, "Overdue", overdue ? "crit" : null, () => showTasks("overdue")),
     stat(state.notes.length, "Memory", null, () => navigate({ view: "notes" })),
@@ -1470,7 +1474,7 @@ async function renderOverview(root) {
 
   // --- what to do next -----------------------------------------------------
   const priority = [...open].sort((a, b) => {
-    const rank = (t) => (isOverdue(t) ? 0 : statusOf(t) === "doing" ? 1 : t.status === "blocked" ? 2 : 3);
+    const rank = (t) => (isOverdue(t) ? 0 : statusOf(t) === "review" ? 1 : statusOf(t) === "doing" ? 1 : t.status === "blocked" ? 2 : 3);
     return rank(a) - rank(b) || (a.priority === "high" ? -1 : 1);
   }).slice(0, 6);
 
@@ -2453,7 +2457,7 @@ async function renderWhatsNew(root) {
         meta.append(chip);
       }
       if (item.status && item.status !== "todo") {
-        meta.append(el("span", { className: `chip ${item.status === "blocked" ? "blocked" : "doing"}`, textContent: item.status }));
+        meta.append(el("span", { className: `chip ${item.status === "blocked" ? "blocked" : item.status === "review" ? "review" : "doing"}`, textContent: item.status }));
       }
       if (item.priority === "high") meta.append(el("span", { className: "chip high", textContent: "high" }));
       if (item.ref) meta.append(el("span", { className: "chip ref", textContent: item.ref }));
@@ -3422,10 +3426,12 @@ function paintPanel(panel, select) {
    the timeline like any other move. Nothing knows it came from a board.
 --------------------------------------------------------------------------- */
 
+// The order ui/tasks.js STATUS_DEFS draws its board in.
 const BOARD_COLUMNS = [
   ["todo", "To do"],
   ["doing", "In progress"],
   ["blocked", "Blocked"],
+  ["review", "In review"],
   ["done", "Done"],
 ];
 
@@ -3743,7 +3749,7 @@ function viewPicker() {
   return trigger;
 }
 
-/** Tasks grouped into the four statuses, in board order. */
+/** Tasks grouped by status, in board order. */
 function groupByStatus(tasks) {
   return BOARD_COLUMNS.map(([status, label]) => ({
     status,
@@ -4486,6 +4492,7 @@ function renderTasks(root) {
   // whole list, and clearing the filter is a render away rather than a reload.
   const filters = {
     doing: [(t) => statusOf(t) === "doing", "in progress"],
+    review: [(t) => t.status === "review", "in review"],
     blocked: [(t) => t.status === "blocked", "blocked"],
     overdue: [isOverdue, "overdue"],
     done: [(t) => t.status === "done", "done"],
@@ -4631,7 +4638,7 @@ function rowMenu(x, y, items, { onClose = null, className = "" } = {}) {
   return menu;
 }
 
-const STATUS_WORD = { todo: "To do", doing: "In progress", blocked: "Blocked", done: "Done" };
+const STATUS_WORD = { todo: "To do", doing: "In progress", review: "In review", blocked: "Blocked", done: "Done" };
 
 /**
  * The task at a glance, without opening it.
@@ -4717,7 +4724,8 @@ function taskMenu(t, x, y, { after = null } = {}) {
     ...(t.status === "done"
       ? [{ label: "Reopen", run: () => set({ status: "todo" }) }]
       : [{ label: "Mark done", run: () => set({ status: "done" }) }]),
-    ...(statusOf(t) === "doing" ? [] : [{ label: "Start", run: () => set({ status: "doing" }) }]),
+    ...(statusOf(t) === "doing" ? [] : [{ label: t.status === "review" ? "Back to in progress" : "Start", run: () => set({ status: "doing" }) }]),
+    ...(t.status === "review" || t.status === "done" ? [] : [{ label: "Put up for review", run: () => set({ status: "review" }) }]),
     ...(t.status === "blocked"
       ? [{ label: "Unblock", run: () => set({ status: "todo" }) }]
       : [{ label: "Block", run: () => set({ status: "blocked" }) }]),
@@ -5063,6 +5071,7 @@ function taskRow(t) {
   const right = el("div", { className: "t-right" });
   if (t.priority === "high") right.append(el("span", { className: "pill high", textContent: "high" }));
   if (statusOf(t) === "doing") right.append(el("span", { className: "pill doing", textContent: "In progress" }));
+  if (t.status === "review") right.append(el("span", { className: "pill review", textContent: "In review" }));
   if (t.status === "blocked") right.append(el("span", { className: "pill blocked", textContent: "Blocked" }));
   if (isOverdue(t)) right.append(el("span", { className: "pill overdue", textContent: t.due }));
   else if (t.due) right.append(el("span", { className: "t-due", textContent: t.due }));
@@ -7409,6 +7418,7 @@ async function paintDataInfo(section, dl) {
 const STATUSES = [
   ["todo", "To do"],
   ["doing", "In progress"],
+  ["review", "In review"],
   ["blocked", "Blocked"],
   ["done", "Done"],
 ];
@@ -9041,7 +9051,7 @@ async function openTaskSheet(taskId) {
     return wrap;
   }
 
-  const STATUS_LABEL = { todo: "To do", doing: "In progress", blocked: "Blocked", done: "Done" };
+  const STATUS_LABEL = { todo: "To do", doing: "In progress", review: "In review", blocked: "Blocked", done: "Done" };
 
   function paintMeta() {
     meta.textContent = "";
@@ -10016,7 +10026,12 @@ const needsYouCount = () => waitingRuns().filter((r) => !isAnswered(r)).length;
 // The sidebar badge counts everything Needs you shows: agents paused on you,
 // finished runs nobody has reviewed, and flags waiting on a decision. The title
 // bar keeps to the first, because "waiting on you" there means an agent is stuck.
-const needsYouTotal = () => needsYouCount() + reviewRuns().length + (state.flagRows || []).length + (window.DelphiNeeds ? DelphiNeeds.count() : 0);
+const needsYouTotal = () => needsYouCount() + reviewRuns().length + reviewTasks().length + (state.flagRows || []).length + (window.DelphiNeeds ? DelphiNeeds.count() : 0);
+// Tasks in review: finished work that waits on a person to move it on, so it
+// is Needs you's by definition. Parents only; a subtask shows by its parent.
+// Not an archived project's, as today/brief.js inReview leaves them out.
+const reviewTasks = () => (state.everyTask || []).filter((t) => t.status === "review" && !t.parent_id && (t.project_id == null || projectById(t.project_id)))
+  .sort((a, b) => String(a.updated_at).localeCompare(String(b.updated_at)) || a.id - b.id);
 const onHomeView = () => !state.query && !state.projectId && HOME_VIEWS.includes(state.view);
 
 /**
@@ -10845,9 +10860,10 @@ function renderInbox(root) {
   const questions = all.filter((r) => r.state === "waiting_on_human");
   const reviews = reviewRuns().sort((a, b) => String(a.finished_at || a.updated_at).localeCompare(String(b.finished_at || b.updated_at)));
   const flags = flagRowsNow();
+  const inReview = reviewTasks();
   // The folder questions (ui/needs.js) sit above everything else under All.
   const folderQs = window.DelphiNeeds ? DelphiNeeds.count() : 0;
-  const total = all.length + reviews.length + flags.length + folderQs;
+  const total = all.length + reviews.length + inReview.length + flags.length + folderQs;
 
   const group = el("div", { className: "seg-sm", role: "group" });
   for (const [key, label] of [["urgency", "By urgency"], ["project", "By project"]]) {
@@ -10863,6 +10879,7 @@ function renderInbox(root) {
     ["approvals", "Approvals", approvals.length, "approve"],
     ["questions", "Questions", questions.length, "question"],
     ...(reviewOn() ? [["reviews", "Reviews", reviews.length, "review"]] : []),
+    ["inreview", "In review", inReview.length, "review"],
   ];
   if (!filters.some(([key]) => key === state.inboxFilter)) state.inboxFilter = "all";
   const chips = el("div", { className: "chips" });
@@ -10882,7 +10899,8 @@ function renderInbox(root) {
   const runsShown = f === "approvals" ? approvals : f === "questions" ? questions : f === "all" ? all : [];
   const reviewsShown = f === "all" || f === "reviews" ? reviews : [];
   const flagsShown = f === "all" || f === "proposals" ? flags : [];
-  const shownCount = runsShown.length + reviewsShown.length + flagsShown.length;
+  const inReviewShown = f === "all" || f === "inreview" ? inReview : [];
+  const shownCount = runsShown.length + reviewsShown.length + inReviewShown.length + flagsShown.length;
   if (f === "all" && folderQs) DelphiNeeds.mount(page);
 
   if (!shownCount && !(f === "all" && folderQs)) {
@@ -10899,6 +10917,7 @@ function renderInbox(root) {
       };
       for (const r of runsShown) add(r.project_id, r.project_name, () => waitingRow(r));
       for (const r of reviewsShown) add(r.project_id, r.project_name, () => reviewRow(r));
+      for (const t of inReviewShown) add(t.project_id, t.project_name, () => reviewTaskRow(t));
       for (const row of flagsShown) add(row.project_id, projectNameOf(row.project_id, "No project"), () => flagNode(row));
       for (const [, g] of byProject) {
         box.append(el("div", { className: "sub-h" }, g.name || "No project", el("span", { className: "r", textContent: plural(g.nodes.length, "waiting", "waiting") })));
@@ -10912,6 +10931,10 @@ function renderInbox(root) {
       if (reviewsShown.length) {
         box.append(el("div", { className: "sub-h" }, "Ready for your review", el("span", { className: "r", textContent: "oldest first" })));
         reviewsShown.forEach((r) => box.append(reviewRow(r)));
+      }
+      if (inReviewShown.length) {
+        box.append(el("div", { className: "sub-h" }, "Tasks in review", el("span", { className: "r", textContent: "waiting on you to move them on" })));
+        inReviewShown.forEach((t) => box.append(reviewTaskRow(t)));
       }
       const singles = flagsShown.filter((r) => !r.group);
       const groups = flagsShown.filter((r) => r.group);
@@ -10927,7 +10950,7 @@ function renderInbox(root) {
     if (box.childNodes.length) page.append(box);
   }
   page.append(el("div", { className: "rule-note" },
-    el("b", { textContent: "What is here: " }), "things an agent is blocked on you for, finished runs nobody has reviewed, and proposals about where an item belongs. Your own tasks are in All work. ",
+    el("b", { textContent: "What is here: " }), "things an agent is blocked on you for, finished runs nobody has reviewed, tasks in review, and proposals about where an item belongs. Your own tasks are in All work. ",
     el("b", { textContent: "What leaves: " }), "answering, approving, rejecting or reviewing clears it everywhere at once."));
   root.append(page);
 }
@@ -12589,6 +12612,36 @@ async function reviewRunDialog(run) {
     await window.delphi.runs.create(next.create);
     notify(`Handed back to ${label}. It starts when a slot is free.`);
   });
+}
+
+/**
+ * A task in review, under Needs you, with the two ways a person moves it on:
+ * Done, or back to in progress for more work. Either is an ordinary status
+ * write, so it lands in History and can be undone there.
+ */
+function reviewTaskRow(t) {
+  const row = el("div", { className: "wr review" });
+  row.dataset.row = `review-task-${t.id}`;
+  const title = el("div", { className: "t" }, el("b", { textContent: `#${t.id}` }), ` ${t.title || ""}`);
+  const s = el("div", { className: "s" }, projectDot(t.project_id), el("span", { textContent: t.project_name || "" }));
+  if (t.assignee) s.append(el("span", { className: "who", textContent: t.assignee }));
+  const main = el("div", { style: "min-width:0" }, el("span", { className: "k", textContent: "In review" }), title, s);
+  const move = (status, words) => async () => {
+    try { await window.delphi.tasks.update(t.id, { status }); notify(`#${t.id} ${words}.`); refresh(); } catch (error) { notify(String(error.message || error)); }
+  };
+  const done = el("button", { className: "btn primary", type: "button", textContent: "Done" });
+  done.onclick = move("done", "is done");
+  const back = el("button", { className: "btn", type: "button", textContent: "Back to in progress" });
+  back.onclick = move("doing", "is back in progress");
+  const open = el("button", { className: "btn", type: "button", textContent: "Open" });
+  open.onclick = () => openTaskSheet(t.id);
+  const since = t.updated_at;
+  const ring = el("span", { className: "tk-st-ring st-review rv-ring" });
+  ring.setAttribute("aria-hidden", "true");
+  row.append(ring, main, el("div", { className: "side" },
+    withData(el("div", { className: "when", textContent: spanWords(TIME.secondsSince(since)) }), { since }),
+    el("div", { className: "acts" }, done, back, open)));
+  return row;
 }
 
 /** A finished run nobody has looked at, as Needs you shows it. */
