@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 // test-runtime: electron
 //
-// The sidebar, driven in the real renderer with no window on screen.
+// Projects and sessions, driven in the real renderer with no window on screen.
 //
 //   electron tools/sidebar_test.js
+//
+// Direction B moved both out of the sidebar: projects into the switcher at the
+// top, and a project's AI sessions into the menu beside the Chat tab. The rules
+// below did not move, so this drives them where they live now.
 //
 // Opening a project used to land on its chat, with a "+ New session" row right
 // under the pointer that had just clicked, and a person found a session they
@@ -90,23 +94,26 @@ async function main() {
     for (let t = 0; t < ms; t += 100) { if (await js(code)) return true; await wait(100); }
     return false;
   };
-  const click = (row) => js(`(() => { const n = document.querySelector('[data-row="${row}"]'); if (!n) return false; n.click(); return true; })()`);
-  await until(`!!document.querySelector('[data-row="proj-${project.id}"]')`);
+  // Only inside an open popover: the sidebar's old rows must not be what is found.
+  const click = (row) => js(`(() => { const n = document.querySelector('.pop [data-row="${row}"]'); if (!n) return false; n.click(); return true; })()`);
+  // A project, picked in the switcher the way a person does.
+  const pick = (id) => js(`(() => { DelphiTopbar.openSwitcher(); const n = document.querySelector('.switcher [data-pick="${id}"]'); if (!n) return false; n.click(); return true; })()`);
+  const openSessions = () => js(`(() => { const b = document.querySelector('.sessions-btn'); if (!b) return false; if (!document.querySelector('.sessions-pop')) b.click(); return true; })()`);
+  await until(`!!document.querySelector('#switcher .scope')`);
   // Native dialogs would block a hidden window.
   await js("window.confirm = () => true; window.alert = () => {}; 0");
 
   console.log("\nopening a project makes no session");
   check("the project starts with none", sessions(project.id), 0);
-  check("its row is in the sidebar", await click(`proj-${project.id}`), true);
+  check("its row is in the switcher", await pick(project.id), true);
   await until(`state.projectId === ${project.id}`);
   await wait(500);
   check("it lands on the Overview, not the chat", await js("state.view"), "overview");
   check("and still has no session", sessions(project.id), 0);
-  check("the sessions are labelled", await js(`document.querySelector(".gs-head")?.textContent.startsWith("AI sessions")`), true);
   // Back and forth, and the keyboard, the ways a stray session used to appear.
-  await click(`proj-${other.id}`);
+  await pick(other.id);
   await until(`state.projectId === ${other.id}`);
-  await js(`document.querySelector('[data-row="proj-${project.id}"]').focus()`);
+  await js(`(() => { DelphiTopbar.openSwitcher(); const f = document.querySelector('.pop-find'); f.value = "Sidebar"; f.dispatchEvent(new Event("input")); f.focus(); return 1; })()`);
   win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Return" });
   await until(`state.projectId === ${project.id}`);
   await wait(500);
@@ -114,6 +121,9 @@ async function main() {
   await js(`navigate({ view: "chat" })`);
   await wait(500);
   check("nor does opening its Chat tab", sessions(project.id), 0);
+  check("the Chat tab has the sessions menu", await openSessions(), true);
+  await until(`!!document.querySelector(".sessions-pop .gs-head")`);
+  check("the sessions are labelled", await js(`document.querySelector(".sessions-pop .gs-head")?.textContent.startsWith("AI sessions")`), true);
 
   console.log("\nonly New AI session makes one");
   check("the row is there", await click("sess-new"), true);
@@ -134,18 +144,20 @@ async function main() {
 
   console.log("\nbringing an archived session back");
   await js(`refresh()`);
-  await until(`!!document.querySelector('[data-row="sess-archived"]')`);
-  check("the list offers its archive", await js(`document.querySelector('[data-row="sess-archived"]').textContent`), "Show archived (1)");
-  await js(`document.querySelector('[data-row="sess-archived"]').focus()`);
+  await until(`!!document.querySelector('.sessions-btn')`);
+  await openSessions();
+  await until(`!!document.querySelector('.pop [data-row="sess-archived"]')`);
+  check("the list offers its archive", await js(`document.querySelector('.pop [data-row="sess-archived"]').textContent`), "Show archived (1)");
+  await js(`document.querySelector('.pop [data-row="sess-archived"]').focus()`);
   win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Return" });
-  await until(`!!document.querySelector('[data-row="arch-${kept.id}"]')`);
+  await until(`!!document.querySelector('.pop [data-row="arch-${kept.id}"]')`);
   check("Enter unfolds it, with Restore on the row",
-    await js(`!!document.querySelector('[data-row="arch-${kept.id}"] button[data-act="restore-${kept.id}"]')`), true);
-  await js(`document.querySelector('[data-act="restore-${kept.id}"]').click()`);
-  await until(`!!document.querySelector('[data-row="sess-${kept.id}"]')`);
+    await js(`!!document.querySelector('.pop [data-row="arch-${kept.id}"] button[data-act="restore-${kept.id}"]')`), true);
+  await js(`document.querySelector('.pop [data-act="restore-${kept.id}"]').click()`);
+  await until(`!!document.querySelector('.pop [data-row="sess-${kept.id}"]')`);
   check("Restore puts it back in the list", [db.getSession(kept.id).status, db.listSessions(project.id).map((s) => s.id)], ["active", [kept.id]]);
   check("with focus on it", await js(`document.activeElement?.dataset.row`), `sess-${kept.id}`);
-  check("and the archive toggle goes when it is empty", await js(`!!document.querySelector('[data-row="sess-archived"]')`), false);
+  check("and the archive toggle goes when it is empty", await js(`!!document.querySelector('.pop [data-row="sess-archived"]')`), false);
 
   console.log("\nhide from Active");
   await js(`refresh()`);
@@ -156,7 +168,6 @@ async function main() {
   check("hidden, it moves to More projects", await js(`sidebarGroups().groupOf({ id: ${other.id} })`), "rest");
   const saved = JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8")).hiddenFromActive;
   check("the setting is kept", saved.map((h) => h.id), [other.id]);
-  check("the fold says what it is", await js(`document.querySelector('[data-row="fold"]').textContent.includes("More projects (1)")`), true);
   // Touched after the hide: a second later, because stamps are to the second.
   await wait(1100);
   db.createTask({ projectId: other.id, title: "something new" });

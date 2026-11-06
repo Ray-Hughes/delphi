@@ -1,0 +1,186 @@
+/* The Direction B top area (ui/topbar.js), the Cmd+K bar (ui/palette.js) and
+   the line icons (ui/icons.js). Measurements are the v2 mockup's.
+
+   Glass is used in two places only: the top area, which lists scroll under,
+   and the popovers over it. Nowhere else, because blur on anything that moves
+   costs frames and reads as decoration. A system asking for less transparency
+   gets the same surfaces solid. */
+
+svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+svg.i.sm { width: 14px; height: 14px; }
+svg.i.xs { width: 12px; height: 12px; }
+kbd { font: 500 10.5px/1 var(--mono); color: var(--ink-faint); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 2px 4px; background: var(--surface); }
+
+/* The sidebar is not drawn; see index.html. More specific than .sidebar,
+   which sets its own display. */
+.body > .sidebar[hidden] { display: none; }
+
+/* --- the top area ----------------------------------------------------------- */
+
+.top {
+  flex: 0 0 auto;
+  background: var(--glass);
+  backdrop-filter: blur(14px) saturate(1.4);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  border-bottom: 1px solid var(--line);
+  position: relative;
+  z-index: 20;
+}
+.top-row {
+  height: 48px;
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 14px 0 12px;
+  /* The whole row moves the window, like the title bar it replaces; each
+     control in it opts back out. */
+  -webkit-app-region: drag;
+}
+.top-row > *:not(.grow) { -webkit-app-region: no-drag; }
+/* With a popover open, a click anywhere has to reach the page to close it. */
+body.pop-open .top-row { -webkit-app-region: no-drag; }
+/* Room for the window buttons, on whichever side the platform puts them.
+   The class comes from the main process, the only place that knows. */
+body.mac .top-row { padding-left: 84px; }
+body.overlay .top-row { padding-right: 148px; }
+body.panel .top-row { padding-left: 12px; }
+.top .grow { flex: 1; }
+.top-mark { width: 26px; height: 26px; border-radius: 7px; flex: none; }
+
+.scope {
+  display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px 0 6px;
+  border-radius: 7px; border: 1px solid transparent; background: none; color: var(--ink);
+  cursor: pointer; transition: background .12s, border-color .12s; max-width: 380px;
+}
+.scope:hover, .scope.open { background: var(--raised); border-color: var(--line); }
+.scope .nm { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scope svg.i { color: var(--ink-faint); }
+.sq {
+  width: 20px; height: 20px; border-radius: 5px; flex: none;
+  display: grid; place-items: center; font: 600 10.5px/1 var(--font); color: var(--btn-fg);
+}
+.sq.all { background: linear-gradient(135deg, var(--accent), var(--accent-ink)); }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px; border-radius: 5px;
+  border: 1px solid var(--line); color: var(--ink-dim); font-size: 11.5px; white-space: nowrap; background: var(--surface);
+  max-width: 180px; overflow: hidden; text-overflow: ellipsis;
+}
+.chip.mono { font-family: var(--mono); font-size: 11px; }
+.chip.quiet { color: var(--ink-faint); }
+
+.searchbtn {
+  display: flex; align-items: center; gap: 8px; height: 32px; min-width: 420px; padding: 0 6px 0 10px;
+  border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--ink-faint);
+  font-size: 12.5px; cursor: pointer;
+}
+.searchbtn:hover { border-color: color-mix(in srgb, var(--ink-faint) 50%, var(--line)); }
+.searchbtn .grow { flex: 1; text-align: left; }
+@media (max-width: 1100px) { .searchbtn { min-width: 260px; } }
+
+#live, #top-acts { display: flex; align-items: center; gap: 4px; }
+#top-acts .btn.primary { margin-left: 6px; display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 10px; }
+#top-acts .btn.primary kbd { color: color-mix(in srgb, var(--btn-fg) 80%, transparent); border-color: color-mix(in srgb, var(--btn-fg) 30%, transparent); background: transparent; margin-left: 2px; }
+.icon-btn {
+  position: relative; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px;
+  border: 0; background: none; color: var(--ink-faint); cursor: pointer; transition: background .12s, color .12s;
+}
+.icon-btn:hover { background: var(--raised); color: var(--ink); }
+.icon-btn .n {
+  position: absolute; top: 1px; right: 1px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 99px;
+  background: var(--accent); color: var(--btn-fg); font: 600 9px/14px var(--font); text-align: center;
+}
+
+/* --- the view tabs ----------------------------------------------------------- */
+
+.tabs-b { display: flex; align-items: center; gap: 2px; padding: 8px 24px 0; }
+.tabs-b .vt {
+  position: relative; height: 34px; padding: 0 10px; border: 0; background: none; cursor: pointer;
+  color: var(--ink-faint); font-size: 13px; display: flex; align-items: center; gap: 6px;
+}
+.tabs-b .vt:hover { color: var(--ink); }
+.tabs-b .vt.on { color: var(--ink); font-weight: 600; }
+.tabs-b .vt.on::after { content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--accent); }
+.tabs-b .count { color: var(--ink-faint); font-weight: 400; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.tabs-b .count.hot { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 99px; background: var(--accent); color: var(--btn-fg); font: 600 10px/16px var(--font); text-align: center; }
+.tabs-b .grow { flex: 1; }
+.tabs-b .hint { color: var(--ink-faint); font-size: 11.5px; display: inline-flex; align-items: center; gap: 4px; }
+.tabs-b .keys-hint kbd { opacity: .8; }
+.tabs-b .sessions-btn { margin-right: 12px; gap: 4px; }
+@media (max-width: 900px) { .tabs-b .keys-hint { display: none; } }
+
+/* The page heading keeps its title and numbers; its old tab strip is empty. */
+.head .tabs:empty { display: none; }
+.head { padding-bottom: var(--s4); }
+
+/* A row the keyboard is on (J and K). */
+#content [data-task-id].kbd-hi { box-shadow: inset 2px 0 0 var(--accent); background: var(--accent-soft); }
+
+/* --- popovers: the switcher, the sessions menu and the bar ----------------------- */
+
+.pop {
+  position: fixed; z-index: 60;
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  backdrop-filter: blur(22px) saturate(1.5);
+  -webkit-backdrop-filter: blur(22px) saturate(1.5);
+  border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow-3);
+  display: flex; flex-direction: column; overflow: hidden;
+  animation: popin .14s var(--ease);
+}
+@keyframes popin { from { opacity: 0; transform: translateY(-4px) scale(.99); } to { opacity: 1; transform: none; } }
+.pop .pop-search { display: flex; align-items: center; gap: 8px; height: 42px; padding: 0 12px; border-bottom: 1px solid var(--line); color: var(--ink-faint); flex: none; }
+.pop .pop-search input { flex: 1; border: 0; outline: 0; background: transparent; font-size: 13px; color: var(--ink); min-width: 0; }
+.pop .pop-search input::placeholder { color: var(--ink-faint); }
+.pop-body { overflow-y: auto; min-height: 0; }
+.pop .lab { padding: 10px 14px 4px; font-size: 11px; font-weight: 600; color: var(--ink-faint); letter-spacing: .02em; display: flex; align-items: center; gap: 8px; }
+.pop .lab .grow { flex: 1; }
+.pop .lab-note { font-weight: 400; letter-spacing: 0; }
+.pop .items { padding: 0 6px 6px; }
+.pop .foot { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--line); flex: none; }
+.pop .foot .grow { flex: 1; }
+.pop .foot .hint { color: var(--ink-faint); font-size: 11.5px; display: inline-flex; align-items: center; gap: 4px; }
+
+.opt {
+  display: grid; grid-template-columns: 26px 1fr auto; gap: 0 10px; align-items: center;
+  width: 100%; padding: 7px 8px; border-radius: 8px; text-align: left; cursor: pointer; color: var(--ink);
+}
+.opt:hover, .opt.hi { background: color-mix(in srgb, var(--raised) 85%, transparent); }
+.opt.hi { box-shadow: inset 0 0 0 1px var(--line); }
+.opt .sq { width: 26px; height: 26px; border-radius: 7px; font-size: 11px; }
+.opt .txt { min-width: 0; }
+.opt .l1 { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; min-width: 0; }
+.opt .l1 .nm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.opt .l1 .on { color: var(--accent-ink); display: inline-flex; }
+.opt .l2 { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--ink-faint); margin-top: 1px; min-width: 0; white-space: nowrap; overflow: hidden; }
+.opt .l2 .mono { font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+.opt .r { display: flex; align-items: center; gap: 6px; color: var(--ink-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.opt .r .more { width: 24px; height: 24px; opacity: 0; }
+.opt:hover .r .more, .opt.hi .r .more, .opt .r .more:focus-visible { opacity: 1; }
+.opt .agents { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-ink); }
+.opt.more-row { grid-template-columns: 1fr; padding-left: 44px; color: var(--ink-faint); font-size: 12px; }
+.tag { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; border-radius: 5px; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tag.red { color: var(--crit-ink); background: var(--crit-soft); }
+.pal-empty { padding: 14px; color: var(--ink-faint); font-size: 12.5px; }
+
+.switcher { width: 480px; max-height: min(640px, calc(100vh - 80px)); }
+.sessions-pop { width: 320px; max-height: min(560px, calc(100vh - 120px)); padding: 6px 0; }
+
+/* The bar: centred, over a scrim the click closes. */
+.pal-scrim { position: fixed; inset: 0; z-index: 59; background: transparent; }
+.cmdk { top: 96px; left: 50%; width: 640px; margin-left: -320px; max-height: calc(100vh - 140px); }
+.cmdk .pop-search { height: 52px; }
+.cmdk .pop-search input { font-size: 15px; }
+.cmdk .pop-search > svg.i { color: var(--ink-faint); }
+.cmdk .pal-list { overflow-y: auto; min-height: 0; padding-bottom: 6px; }
+.cmdk .pal-list .opt { grid-template-columns: 22px 1fr auto; margin: 0 6px; width: calc(100% - 12px); }
+.cmdk .opt .ic { color: var(--ink-faint); display: grid; place-items: center; }
+.cmdk .opt .l1 { font-weight: 400; display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.cmdk .opt mark { background: none; color: var(--accent-ink); font-weight: 600; }
+.cmdk .pal-scope { cursor: pointer; }
+@media (max-width: 700px) { .cmdk { left: 16px; right: 16px; width: auto; margin-left: 0; } }
+
+@media (prefers-reduced-transparency: reduce) {
+  .top { background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .pop { background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none; }
+}
+
+/* The session list was drawn indented under its project in the sidebar. In
+   its own menu there is nothing to be indented under. */
+.sessions-pop .gkids { margin: 0 6px; padding-left: 0; border-left: 0; }

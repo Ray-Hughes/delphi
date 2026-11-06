@@ -846,8 +846,9 @@ async function restoreSession(session) {
   await refresh();
   // Folded past three, the restored row may not be drawn; the list's first
   // row is then the nearest place for focus.
-  const back = document.querySelector(`#projects [data-row="sess-${session.id}"]`) ||
-    document.querySelector('#projects [data-row="sess-new"]');
+  // The list is in the top area's sessions menu now, or the old sidebar.
+  const back = document.querySelector(`.sessions-pop [data-row="sess-${session.id}"], #projects [data-row="sess-${session.id}"]`) ||
+    document.querySelector('.sessions-pop [data-row="sess-new"], #projects [data-row="sess-new"]');
   if (back) back.focus({ preventScroll: true });
 }
 
@@ -1139,7 +1140,9 @@ function renderTabs() {
 }
 
 function render() {
-  renderSidebar();
+  // Direction B draws no sidebar and no tab strip here; the top area does
+  // both (MOUNTS below). renderSidebar() and renderTabs() stay, unused, until
+  // the cleanup slice, so going back is putting the two calls back.
 
   const p = currentProject();
   if (state.query) {
@@ -1176,7 +1179,6 @@ function render() {
   $("back").hidden = state.history.length === 0;
 
   renderMetrics();
-  renderTabs();
   paintTitleLive();
 
   // --- MOUNTS ---
@@ -1184,6 +1186,7 @@ function render() {
   // line per module, added by the slice that builds it, so two slices working
   // at once collide on a line rather than on a function.
   if (window.DelphiRecovery) DelphiRecovery.remember({ projectId: state.projectId, view: state.view });
+  if (window.DelphiTopbar) DelphiTopbar.paint();
   // --- end MOUNTS ---
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
@@ -3880,6 +3883,7 @@ function padChip(t) {
 
 function taskCard(t, { draggable = false, showDue = true } = {}) {
   const card = el("div", { className: "tcard" + (t.status === "done" ? " done" : "") + colourClass(t) });
+  card.dataset.taskId = String(t.id);
   card.append(el("div", { className: "tcard-title", textContent: t.title }));
 
   const foot = el("div", { className: "tcard-foot" });
@@ -4345,6 +4349,7 @@ const TABLE_COLUMNS = ["", "Task", "Status", "Assignee", "Due", "Priority", ""];
 /** One task as a table row. */
 function taskTableRow(t) {
   const row = el("div", { className: "trow" + (t.status === "done" ? " done" : "") + (selected.has(t.id) ? " picked" : "") + colourClass(t) });
+  row.dataset.taskId = String(t.id);
 
   row.append(selectBox(t, row));
 
@@ -5000,6 +5005,7 @@ function epicMenuItems(t, repaint = refresh) {
  */
 function taskRow(t) {
   const row = el("div", { className: "task" + (t.status === "done" ? " done" : "") + colourClass(t) });
+  row.dataset.taskId = String(t.id);
 
   const check = el("div", { className: "check", textContent: "✓", tabIndex: 0, role: "checkbox" });
   check.setAttribute("aria-checked", String(t.status === "done"));
@@ -12736,6 +12742,10 @@ function sidebarPlace() {
  */
 let sidebarSig = null;
 function renderSidebar() {
+  // Direction B: the sidebar is not drawn, and the one part of it still in use,
+  // a project's AI sessions, lives in the top area's menu. Every caller that
+  // repainted the sidebar repaints that instead. Remove this line to go back.
+  if (window.DelphiTopbar) { DelphiTopbar.refreshSessions(); return; }
   const { late, touched } = projectPulse();
   const sig = JSON.stringify([
     state.projects, state.pinned, state.hidden, state.sessionsAllFor, state.archivedOpenFor, (state.archivedSessions || []).map((x) => [x.id, x.title]), state.harnesses.map((h) => h.label), !!state.restOpen, state.projectId, state.view, state.query, sidebarPlace(),
@@ -14405,11 +14415,6 @@ document.addEventListener("keydown", (e) => {
     render();
     return;
   }
-  if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-    e.preventDefault();
-    $("search").focus();
-    $("search").select();
-  }
 });
 
 // Frameless panel mode has no traffic lights, so the title bar does not need to
@@ -14456,8 +14461,104 @@ function focusComposer() {
 // Every place and action the Cmd+K bar and the G-then-letter keys can reach,
 // one row each: { id, title, keys, run }. The bar and the keys read this list
 // rather than keeping their own, so a place cannot be reachable from one and
-// missing from the other. Empty until the slice that builds the bar.
-const COMMANDS = [];
+// missing from the other.
+// The places and actions themselves live in ui/commands.js, which a Node test
+// can load; this is where app.js lends them its functions.
+const themeIs = () => (state.theme === "system"
+  ? (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+  : state.theme);
+/** The project Pads and Chat open from All projects: the last one open, else the default. */
+function projectFor() {
+  let recent = [];
+  try { recent = JSON.parse(localStorage.getItem("delphi.recentProjects") || "[]"); } catch {}
+  const id = recent.find((x) => projectById(x)) ?? state.settings.scratchpadProjectId;
+  return projectById(id) ? id : (state.projects[0] ? state.projects[0].id : null);
+}
+const shell = {
+  state: () => state,
+  go: (target) => goTo({ query: "", ...target }),
+  goTab: (id) => goTo({ query: "", ...DelphiCommands.tabTarget(id, state, projectFor) }),
+  projectFor,
+  openBar: () => openBar(),
+  openSwitcher: () => DelphiTopbar.openSwitcher(),
+  newTask: async () => { await goTo({ view: "tasks", query: "" }); focusComposer(); },
+  newNote: async () => {
+    const projectId = someProjectId();
+    if (!projectId) { await createProject(); return; }
+    await goTo({ projectId, view: "notes", query: "" });
+    focusComposer();
+  },
+  newProject: () => createProject(),
+  openSettings: (anchor) => {
+    if (anchor === "archived") revealArchived = true;
+    return goTo({ projectId: null, view: "settings", query: "" });
+  },
+  themeIs,
+  toggleTheme: async () => {
+    const next = themeIs() === "dark" ? "light" : "dark";
+    applyTheme(next);
+    render();
+    try { await window.delphi.settings.set({ theme: next }); } catch (error) { notifyError(error); }
+  },
+  undoLast: async () => {
+    try {
+      const { undone, stopped } = await window.delphi.audit.undoLast(1);
+      if (stopped) alert(stopped); else if (!undone) alert("Nothing to undo.");
+    } catch (error) { alert(`Nothing to undo: ${error.message}`); }
+    await refresh();
+  },
+  scrollTop: () => { const c = $("content"); if (c) c.scrollTop = 0; },
+  needsYou: () => needsYouTotal(),
+  runningIn: (projectId) => runsIn(["running"]).filter((r) => r.project_id === projectId).length,
+  lateIn: (projectId) => state.everyTask.filter((t) => t.project_id === projectId && isOverdue(t)).length,
+  tabCount: (id) => {
+    const inProject = state.projectId != null;
+    switch (id) {
+      case "today": return needsYouTotal();
+      case "tasks": return state.query ? 0 : state.allTasks.filter((t) => t.status !== "done").length;
+      case "memory": return inProject ? state.notes.length : state.projects.reduce((n, p) => n + (p.note_count || 0), 0);
+      case "pads": return inProject ? state.pads.length : 0;
+      case "chat": return inProject ? state.sessions.length : 0;
+      case "runs": return runsIn(["running"]).length;
+      default: return 0;
+    }
+  },
+  projectMenu: (p, button) => projectMenu(p, null, null, button),
+  sessionKids: () => sessionKids(),
+};
+const COMMANDS = DelphiCommands.make(shell);
+
+/** The Cmd+K bar, lent what it needs to search, open and run. */
+function openBar(query = "") {
+  // Not over an open panel, from the menu or anywhere else: see ui/keys.js.
+  if (openSheet || document.querySelector("body > .overlay")) return;
+  DelphiTopbar.closePop();
+  DelphiPalette.open({
+    commands: () => COMMANDS,
+    state: () => state,
+    projectName: (id) => (projectById(id) || {}).name || "",
+    openTask: (id) => openTaskSheet(id),
+    openNote: (n) => goTo({ projectId: n.project_id, view: "notes", query: "" }),
+    // The results page the search field used to lead to, Oracle answers and all.
+    searchAll: (q) => { $("search").value = q; return navigate({ query: q, view: "oracle" }); },
+    ask: (q) => { $("search").value = q; return navigate({ query: q, view: "oracle" }); },
+  }, { query });
+}
+
+DelphiTopbar.init(shell);
+DelphiKeys.install({
+  commands: () => COMMANDS,
+  // A panel, a menu, a dialog or a popover owns the keyboard while it is open.
+  // body > .overlay, not .overlay: on Windows the body itself carries an
+  // "overlay" class for the window controls, and would make every key dead.
+  busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay")),
+  openBar: () => openBar(),
+  openSwitcher: () => DelphiTopbar.openSwitcher(),
+  openTask: async (id, how) => {
+    await openTaskSheet(id);
+    if (how === "edit") document.querySelector(".ts-title")?.focus();
+  },
+});
 // --- end COMMANDS ---
 
 /** Navigating from the menu empties the search box with the query, so the field
@@ -14473,8 +14574,7 @@ const someProjectId = () => state.projectId || (state.projects[0] && state.proje
 window.delphi.onMenu(async ({ action, view, theme }) => {
   switch (action) {
     case "search":
-      $("search").focus();
-      $("search").select();
+      openBar();
       return;
 
     case "back":
@@ -14611,6 +14711,9 @@ async function reopen() {
   // Replies to flags are drawn only while they hold something, so a kept one
   // is put back where that check looks.
   for (const d of R.draftsOf("flag")) runDrafts.set(`freply-${d.id}`, d.text);
+  // The switcher is the only scope now; a workspace scope from an older run
+  // would narrow every list with no way in the window to widen it.
+  state.workspaceId = null;
   const back = R.lastPlace();
   if (back.view) {
     state.projectId = back.projectId ?? null;

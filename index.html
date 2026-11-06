@@ -8,21 +8,32 @@
 <link rel="stylesheet" href="styles/tokens.css" />
 <link rel="stylesheet" href="styles/app.css" />
 <link rel="stylesheet" href="styles/recovery.css" />
+<link rel="stylesheet" href="styles/topbar.css" />
 </head>
 <body>
-  <header class="titlebar">
-    <!-- The name sits with the window chrome now. The mark went to the rail,
-         where it is the way back to everything rather than decoration. -->
-    <span class="wordmark">Delphi<span class="sub">Oracle</span></span>
-    <div class="search"><input id="search" type="search" placeholder="Ask the Oracle, or search" aria-label="Ask the Oracle" /></div>
-    <div class="spacer"></div>
-    <!-- Who is working and what is waiting, on every view. Painted by
-         paintTitleLive() from the same list the Runs page reads. -->
-    <button class="tb-live" id="tb-live" type="button" hidden></button>
+  <!-- Direction B: one top area and no sidebar. The switcher, the bar, the
+       tabs and the buttons on the right are painted by ui/topbar.js; #tb-live
+       is still paintTitleLive()'s, from the same list the Runs page reads. -->
+  <header class="top" id="top">
+    <div class="top-row">
+      <img class="top-mark" src="assets/mark-64.png" alt="Delphi" width="26" height="26" />
+      <div id="switcher"></div>
+      <span class="grow"></span>
+      <div id="bar"></div>
+      <span class="grow"></span>
+      <div id="live"><button class="tb-live" id="tb-live" type="button" hidden></button></div>
+      <div id="top-acts"></div>
+      <!-- What the old search field held. app.js still reads and clears it
+           around a search, and the bar writes the query into it. -->
+      <input id="search" type="search" hidden aria-hidden="true" tabindex="-1" />
+    </div>
+    <nav class="tabs-b" id="viewtabs" aria-label="Views"></nav>
   </header>
 
   <div class="body">
-    <nav class="sidebar">
+    <!-- Not drawn in Direction B. Kept, hidden, until the cleanup slice, so the
+         code that still paints it has its elements and a revert is one line. -->
+    <nav class="sidebar" hidden>
       <!-- Places, then projects: Today, Needs you, Runs, All work and Memory,
            then pinned, active and everything else. One column, no rail: a
            folder is something a project has, not a level above it. -->
@@ -61,6 +72,13 @@
   <!-- Picking up after any exit: the place, drafts, the banner, backups. -->
   <script src="ui/recovery.js"></script>
   <script src="ui/backups.js"></script>
+  <!-- The Direction B shell: icons, the command registry, the Cmd+K bar, the
+       keys and the top area. Before app.js, which hands them its callbacks. -->
+  <script src="ui/icons.js"></script>
+  <script src="ui/commands.js"></script>
+  <script src="ui/palette.js"></script>
+  <script src="ui/keys.js"></script>
+  <script src="ui/topbar.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
