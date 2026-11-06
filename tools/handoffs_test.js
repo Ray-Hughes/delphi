@@ -34,7 +34,8 @@ function attempt(fn) {
 }
 
 const p = db.createProject({ key: "ho", name: "Handoffs", path: dir });
-const other = db.createProject({ key: "ot", name: "Other", path: dir });
+// No folder: a folder is one project's, and these tests only list handoffs.
+const other = db.createProject({ key: "ot", name: "Other" });
 db.createHandoff({ projectId: p.id, toHarness: "codex", request: "review this" });
 db.createHandoff({ projectId: other.id, toHarness: "claude-code", request: "and this" });
 

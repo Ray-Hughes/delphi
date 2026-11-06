@@ -19,7 +19,8 @@
 
 globalThis.DelphiSettingsPanel = (() => {
   const SS = globalThis.DelphiSettingsSchema;
-  const isMac = /Mac/.test(navigator.platform || "");
+  // ui/core.js's isMac(), read once: the platform does not change while open.
+  const MAC = isMac();
 
   // The icons Direction B's set (ui/icons.js) does not have yet, in its own
   // grid and stroke, so they sit beside the others unseen.
@@ -83,7 +84,8 @@ globalThis.DelphiSettingsPanel = (() => {
    * The accent is written as a stylesheet rather than as properties on the
    * root, because each theme needs its own pair and "System" switches between
    * them live: the same three selectors styles/tokens.css uses, later in the
-   * document, so they win at equal specificity. From the schema's palette only,
+   * document, so they win at equal specificity. --btn-primary (white text's
+   * ground) is the fill itself, which every curated fill passes 4.5:1 under. From the schema's palette only,
    * never from the value as stored, so nothing typed into settings.json can
    * carry CSS of its own in.
    */
@@ -94,7 +96,7 @@ globalThis.DelphiSettingsPanel = (() => {
     let tag = document.getElementById("delphi-accent");
     if (!tag) { tag = document.createElement("style"); tag.id = "delphi-accent"; document.head.append(tag); }
     const vars = ([fill, ink], dark) =>
-      `--accent: ${fill}; --accent-ink: ${ink}; --accent-soft: ${alpha(fill, dark ? 0.16 : 0.10)}; --accent-line: ${alpha(fill, dark ? 0.5 : 0.38)};`;
+      `--accent: ${fill}; --accent-ink: ${ink}; --btn-primary: ${fill}; --accent-soft: ${alpha(fill, dark ? 0.16 : 0.10)}; --accent-line: ${alpha(fill, dark ? 0.5 : 0.38)};`;
     tag.textContent = `:root { ${vars(a.light, false)} }\n`
       + `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { ${vars(a.dark, true)} } }\n`
       + `:root[data-theme="dark"] { ${vars(a.dark, true)} }`;
@@ -113,7 +115,7 @@ globalThis.DelphiSettingsPanel = (() => {
 
   /** An accelerator as keycaps: Control+Shift+T as the three a Mac shows. */
   function capsOf(accel) {
-    const map = { Command: "⌘", Cmd: "⌘", CommandOrControl: isMac ? "⌘" : "Ctrl", CmdOrCtrl: isMac ? "⌘" : "Ctrl", Control: isMac ? "⌃" : "Ctrl", Ctrl: isMac ? "⌃" : "Ctrl", Alt: isMac ? "⌥" : "Alt", Option: "⌥", Shift: "⇧", Super: isMac ? "⌘" : "Win", Meta: isMac ? "⌘" : "Win" };
+    const map = { Command: "⌘", Cmd: "⌘", CommandOrControl: MAC ? "⌘" : "Ctrl", CmdOrCtrl: MAC ? "⌘" : "Ctrl", Control: MAC ? "⌃" : "Ctrl", Ctrl: MAC ? "⌃" : "Ctrl", Alt: MAC ? "⌥" : "Alt", Option: "⌥", Shift: "⇧", Super: MAC ? "⌘" : "Win", Meta: MAC ? "⌘" : "Win" };
     return String(accel || "").split("+").filter(Boolean).map((p) => map[p] || p);
   }
   /** A value as the panel shows it: a shortcut as its keycaps, the rest as the schema says. */
@@ -160,7 +162,7 @@ globalThis.DelphiSettingsPanel = (() => {
   /** The in-window accelerators, lower case with CmdOrCtrl resolved, for conflicts. */
   const norm = (accel) => String(accel || "").split("+").map((p) => {
     const l = p.toLowerCase();
-    if (["commandorcontrol", "cmdorctrl"].includes(l)) return isMac ? "command" : "control";
+    if (["commandorcontrol", "cmdorctrl"].includes(l)) return MAC ? "command" : "control";
     if (l === "cmd") return "command";
     if (l === "ctrl") return "control";
     if (l === "option") return "alt";
@@ -186,7 +188,7 @@ globalThis.DelphiSettingsPanel = (() => {
     }
     if (!key) return null;
     const mods = [];
-    if (e.metaKey) mods.push(isMac ? "Command" : "Super");
+    if (e.metaKey) mods.push(MAC ? "Command" : "Super");
     if (e.ctrlKey) mods.push("Control");
     if (e.altKey) mods.push("Alt");
     if (e.shiftKey) mods.push("Shift");
@@ -529,7 +531,7 @@ globalThis.DelphiSettingsPanel = (() => {
 
   const harnessInitials = (h) => ({ "claude-code": "CC", codex: "Cx", copilot: "Co" })[h.key] || (h.label || "?").slice(0, 2);
   const harnessClass = (h) => ({ "claude-code": "claude", codex: "codex", copilot: "copilot" })[h.key] || "custom";
-  const homeShort = (p) => String(p || "").replace(/^\/Users\/[^/]+/, "~");
+  const homeShort = (p) => tilde(p);
 
   const PAINT = {
     overview(root) {
@@ -763,6 +765,41 @@ globalThis.DelphiSettingsPanel = (() => {
 
     workbenches(root) {
       root.append(...schemaGroups("workbenches"));
+      // Each project's folder: one folder, one project. Changed through
+      // folders:set, which makes the same checks Add folder does.
+      const projects = (lent.state && lent.state().projects) || [];
+      const rows = projects.map((p) => {
+        const r = el("div", { className: "sp-prow" });
+        r.dataset.key = `folder-${p.id}`;
+        const change = btn(p.path ? "Change..." : "Choose...", async () => {
+          let chosen = null;
+          try { chosen = await window.delphi.dialog.pickFolder(`The folder for ${p.name}`, { buttonLabel: "Use this folder", defaultPath: p.path || undefined }); } catch {}
+          if (!chosen) return;
+          try { await window.delphi.folders.set(p.id, chosen); p.path = chosen; status(`${p.name} now uses ${homeShort(chosen)}.`, "good"); }
+          catch (error) { status(String(error.message || error), "crit"); }
+          if (lent.refresh) lent.refresh();
+          repaint();
+        });
+        r.append(
+          el("span", { className: "sq", style: `background:${safeColour(p.colour, "var(--ink-faint)")}`, textContent: (p.name || "?")[0] }),
+          el("span", { className: "pn", textContent: p.name, style: "flex:0 0 230px" }),
+          el("span", { className: `pn mono${p.path ? "" : " hint"}`, textContent: p.path ? homeShort(p.path) : "No folder", title: p.path || "" }),
+          change);
+        if (p.path) {
+          r.append(btn("Clear", async () => {
+            const ok = await ask({ title: `Take ${p.name} off its folder?`, body: "The folder and everything in it stay as they are, and so do the project's tasks and its Workbench settings. Jobs then have nowhere to run until it has a folder again.", confirm: "Clear the folder" });
+            if (!ok) return;
+            try { await window.delphi.folders.clear(p.id); p.path = null; status(`${p.name} has no folder now.`, "good"); }
+            catch (error) { status(String(error.message || error), "crit"); }
+            if (lent.refresh) lent.refresh();
+            repaint();
+          }));
+        }
+        return r;
+      });
+      const add = infoRow("Add folder as project", "A repository on this computer becomes a project, with its remote and default branch. One folder belongs to one project.",
+        btn([I("folderplus", "xs"), "Add folder..."], () => { close(); if (lent.addFolder) lent.addFolder(); }));
+      root.append(group("Projects and their folders", [add, ...rows]));
       root.append(group("Per repository", [infoRow("Base branch, setup command and files to copy",
         "These belong to each repository, so they are on the project's own settings, under Workbench.",
         btn(["Project settings", I("right", "xs")], () => { const id = lent.state && lent.state().projectId; close(); if (lent.openProject) lent.openProject(id); }))]));
@@ -1156,7 +1193,6 @@ globalThis.DelphiSettingsPanel = (() => {
     // dialog) owns the keys until it closes.
     const overlays = document.querySelectorAll("body > .overlay");
     if (overlays.length && overlays[overlays.length - 1] !== P.scrim) return;
-    const mod = e.metaKey || e.ctrlKey;
     const own = () => { e.preventDefault(); e.stopPropagation(); };
 
     if (P.rec) {
@@ -1177,8 +1213,8 @@ globalThis.DelphiSettingsPanel = (() => {
       if (P.query) { setQuery(""); P.input.focus(); } else close();
       return;
     }
-    if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") { own(); focusSearch(); return; }
-    if (mod && e.key === ",") { own(); focusSearch(); return; }
+    if (modKey(e) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") { own(); focusSearch(); return; }
+    if (modKey(e) && e.key === ",") { own(); focusSearch(); return; }
     if (e.key === "Tab") {
       // The focus stays inside the panel.
       const all = [...P.box.querySelectorAll("button, input, select, [tabindex]:not([tabindex='-1'])")]
@@ -1247,12 +1283,12 @@ globalThis.DelphiSettingsPanel = (() => {
     input.setAttribute("aria-controls", "sp-content");
     const find = el("label", { className: "sp-find" }, I("search", "sm"), input);
     const count = el("span", { className: "cnt" });
-    find.append(count, el("span", { className: "sp-caps" }, kbd(isMac ? "⌘" : "Ctrl"), kbd("F")));
+    find.append(count, el("span", { className: "sp-caps" }, kbd(modLabel()), kbd("F")));
     const closeBtn = el("button", { className: "sp-x", type: "button", title: "Close (Esc)" }, I("x"));
     closeBtn.setAttribute("aria-label", "Close settings");
     closeBtn.onclick = () => close();
     const head = el("header", { className: "sp-head" }, el("h2", { id: "sp-title", textContent: "Settings" }), el("span", { className: "vr" }), find,
-      el("span", { className: "sp-caps", title: "Settings opens with" }, kbd(isMac ? "⌘" : "Ctrl"), kbd(",")), closeBtn);
+      el("span", { className: "sp-caps", title: "Settings opens with" }, kbd(modLabel()), kbd(",")), closeBtn);
     const nav = el("nav", { className: "sp-nav" });
     nav.setAttribute("aria-label", "Settings sections");
     const content = el("div", { className: "sp-content", id: "sp-content", role: "region", tabIndex: -1 });
@@ -1260,7 +1296,7 @@ globalThis.DelphiSettingsPanel = (() => {
     saved.setAttribute("aria-live", "polite");
     const foot = el("footer", { className: "sp-foot" },
       el("span", {}, kbd("↑"), kbd("↓"), "sections"), el("span", {}, kbd("Tab"), "into settings"),
-      el("span", {}, kbd(isMac ? "⌘" : "Ctrl"), kbd("F"), "search"), el("span", {}, kbd("Esc"), "close"), saved);
+      el("span", {}, kbd(modLabel()), kbd("F"), "search"), el("span", {}, kbd("Esc"), "close"), saved);
     box.append(head, el("div", { className: "sp-body" }, nav, content), foot);
     scrim.append(box);
     scrim.onmousedown = (e) => { if (e.target === scrim) close(); };

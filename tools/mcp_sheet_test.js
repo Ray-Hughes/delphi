@@ -196,7 +196,8 @@ async function route(name, env) {
       check(`resolves ${ref}`, (await client.call("sheet_resolve", { task: ref })).task.id, task.id);
     }
     const resolved = await client.call("sheet_resolve", { task: String(task.id) });
-    check("the folder is the project's", [resolved.cwd, resolved.cwd_source], [folder, "folder"]);
+    // Stored as its real path: the folder is normalised when it is written.
+    check("the folder is the project's", [resolved.cwd, resolved.cwd_source], [fs.realpathSync(folder), "folder"]);
     check("logs go beside the database", resolved.log_dir, path.join(dir, "sheets"));
     check("no Workbench yet", resolved.workbench, null);
     const nowhere = await client.call("sheet_resolve", { task: String(orphan.id) });

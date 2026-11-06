@@ -9,7 +9,10 @@
 <link rel="stylesheet" href="styles/app.css" />
 <link rel="stylesheet" href="styles/recovery.css" />
 <link rel="stylesheet" href="styles/topbar.css" />
+<link rel="stylesheet" href="styles/folders.css" />
 <link rel="stylesheet" href="styles/settings.css" />
+<!-- pointer.css stays last: it overrides the arrow cursor everything above sets. -->
+<link rel="stylesheet" href="styles/pointer.css" />
 </head>
 <body>
   <!-- Direction B: one top area and no sidebar. The switcher, the bar, the
@@ -54,6 +57,7 @@
             </svg>
           </button>
           <div class="grow">
+            <nav class="crumbs" id="crumbs" aria-label="Breadcrumb" hidden></nav>
             <h1 id="title">Loading</h1>
             <div class="sub" id="subtitle"></div>
           </div>
@@ -80,6 +84,10 @@
   <script src="ui/palette.js"></script>
   <script src="ui/keys.js"></script>
   <script src="ui/topbar.js"></script>
+  <!-- Folders: Add folder as project, the fix-it bar, and the folder
+       questions in Needs you. Before app.js, which lends them its callbacks. -->
+  <script src="ui/addfolder.js"></script>
+  <script src="ui/needs.js"></script>
   <!-- Settings: the one list of settings, then the floating panel built from it. -->
   <script src="settings/schema.js"></script>
   <script src="ui/settings.js"></script>

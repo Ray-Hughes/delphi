@@ -1,0 +1,19 @@
+/* The pointing hand on everything that does something when clicked.
+
+   The rest of the stylesheets give many controls the plain arrow, the way a
+   native Mac app does, and people read the arrow as "not clickable". These
+   rules are !important because the arrow is set by more specific selectors in
+   dozens of places, and order alone does not beat them; the exceptions after
+   are !important for the same reason. Rows that only have an onclick get
+   .has-click from ui/core.js on first hover. Keep this file linked last. */
+a[href], button, select, summary, label[for],
+input[type="checkbox"], input[type="radio"], input[type="range"], input[type="color"],
+[role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="menuitemcheckbox"],
+[role="menuitemradio"], [role="option"], [role="switch"], [role="checkbox"], [role="radio"],
+[role="treeitem"], .clickable, .has-click { cursor: pointer !important; }
+
+button:disabled, [aria-disabled="true"], [disabled], .is-busy { cursor: default !important; }
+input[type="text"], input[type="search"], input:not([type]), textarea, [contenteditable="true"] { cursor: text !important; }
+
+.board .tcard, .cal-day .tcard, .cal-tray-body .tcard, .run .grip, [draggable="true"] { cursor: grab !important; }
+.board .tcard:active, .cal-day .tcard:active, .cal-tray-body .tcard:active, [draggable="true"]:active { cursor: grabbing !important; }

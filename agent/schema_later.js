@@ -87,6 +87,9 @@ const LATER_COLUMNS = [
   // 1 when setup_cmd holds what Delphi detected from the lock files, 0 once a
   // person has set it, so Settings can say which it is showing.
   ["repos", "setup_cmd_detected", "INTEGER NOT NULL DEFAULT 0"],
+  // What git said about a project's folder: see schema.sql.
+  ["repos", "remote_url", "TEXT"],
+  ["repos", "default_branch", "TEXT"],
   // A Finish or Discard in progress (state 'closing'). See schema.sql.
   ["workbenches", "closing_mode", "TEXT"],
   ["workbenches", "closing_ref", "TEXT"],
@@ -247,6 +250,20 @@ const LATER_TABLES = [
   label       TEXT NOT NULL,
   backup_path TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+)`],
+  // Folders that are no project's, and the shared folder each project gave up.
+  // See schema.sql and workbench/folders.js.
+  ["discovered_folders", `CREATE TABLE IF NOT EXISTS discovered_folders (
+  id          INTEGER PRIMARY KEY,
+  path        TEXT NOT NULL UNIQUE,
+  first_seen  TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+  seen_by     TEXT,
+  via         TEXT,
+  state       TEXT NOT NULL DEFAULT 'new',
+  project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  detail      TEXT,
+  answered_at TEXT
 )`],
 ];
 

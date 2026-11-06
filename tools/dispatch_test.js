@@ -85,6 +85,13 @@ git(app, "commit", "--quiet", "-m", "first");
 git(app, "push", "--quiet", "origin", "main");
 
 const project = db.createProject({ key: "jobs", name: "Jobs", path: app });
+// A folder is one project's, so the other projects below get their own clone
+// of the same repository rather than sharing this one.
+const cloneOf = (name) => {
+  const to = path.join(dir, "code", name);
+  execFileSync(GIT, ["clone", "--quiet", origin, to], { stdio: "ignore" });
+  return to;
+};
 
 // The guard, as Claude Code would find it: a PreToolUse hook for Bash.
 fs.mkdirSync(path.join(home, ".claude"));
@@ -364,7 +371,7 @@ async function main() {
   check("a reply cannot start it without an approval", [d.get(sa.job_id).approval, /was rejected/.test(afterStop || "")], ["rejected", true]);
 
   section("a job runs in its task's project, never one named beside it");
-  const other = db.createProject({ key: "other", name: "Other", path: app });
+  const other = db.createProject({ key: "other", name: "Other", path: cloneOf("other") });
   db.updateProject(other.id, { auto_approve: true, allow_unguarded: true });
   const strictTask = db.createTask({ projectId: project.id, title: "belongs to Jobs" });
   let xp = null;
@@ -389,6 +396,9 @@ async function main() {
   d.tick();
   const agentPid = await waitFor("the agent to start", () => d.get(sj.id).agent_pid);
   await waitFor("its command on the Sheet", () => entriesOf(st.id).some((e) => e.kind === "run"));
+  // Read from the row while the turn is still running: a crash now would
+  // never reach the end of the turn, and Resume needs the session to resume.
+  check("the harness's session is kept as soon as it is named, mid-turn", [d.get(sj.id).state, d.get(sj.id).native_session], ["running", "sess-claude-hang"]);
   d.stop(sj.id);
   await d.idle();
   const stopped = d.get(sj.id);
@@ -629,7 +639,7 @@ async function main() {
   await quick.idle();
 
   section("guards");
-  const unguardedProject = db.createProject({ key: "strict", name: "Strict", path: app });
+  const unguardedProject = db.createProject({ key: "strict", name: "Strict", path: cloneOf("strict") });
   const noGuard = makeDispatcher({ guardStatus: () => ({ installed: false, file: null }) });
   const gt = db.createTask({ projectId: unguardedProject.id, title: "guarded?" });
   const gj = noGuard.create({ projectId: unguardedProject.id, harness: "claude-code", request: "edit", taskId: gt.id, kind: "do" });

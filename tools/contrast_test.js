@@ -102,7 +102,9 @@ for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinne
 }
 
 // Text set on a solid fill: the ink a component puts on it, and the fill.
-const ON_FILLS = [["--on-good", "--good-ink"]];
+// The primary button and every danger fill carry --btn-fg (white): the owner's
+// call was to darken the fill, not change the text, so these are the pairs.
+const ON_FILLS = [["--on-good", "--good-ink"], ["--btn-fg", "--btn-primary"], ["--btn-fg", "--crit-fill"]];
 for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinned }]]) {
   console.log(`\n${theme}: text on fills, at least 4.5:1`);
   for (const [ink, fill] of ON_FILLS) {

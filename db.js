@@ -14,6 +14,7 @@ const pads = require("./pads");
 const schemaLater = require("./agent/schema_later");
 const identity = require("./agent/identity");
 const auditLib = require("./agent/audit");
+const folderRule = require("./workbench/folders");
 
 // Decided by agent/locate.js, the same rule the MCP server and the command line
 // use, so the window and every agent are looking at one file. See paths.js.
@@ -59,17 +60,31 @@ function open() {
   // After the schema, because on a fresh database the table it rebuilds has just
   // been created with the right constraint and there is nothing to do.
   widenAuditEntities(db);
-  // Safe to call here: db is already assigned, so the helpers this goes through
-  // find the connection rather than recursing into open(). Guarded because a
-  // database that adopts nothing still works, and one that refuses to open does
-  // not.
-  try {
-    adoptProjectPaths();
-  } catch (error) {
-    console.error("could not adopt project paths into workspaces", error);
+  // One folder, one project (workbench/folders.js). After the schema, so the
+  // tables it writes exist, and before anything reads a project. main.js takes
+  // a snapshot first and may hold it back when the snapshot failed: a
+  // migration with no copy from before it is the one thing not to do.
+  // Guarded because a database that cannot adopt its folders still works, and
+  // one that refuses to open does not. adoptProjectPaths no longer runs: it
+  // copied folders the other way, into workspaces, which nothing reads now.
+  if (folderGate()) {
+    try {
+      folderAdoption = folderRule.adoptFolders({ sql: sqlP, batch: batchP });
+      if (!folderAdoption.index.ok) console.error(`folders: no unique index yet (${folderAdoption.index.why})`);
+    } catch (error) {
+      folderAdoption = { ran: false, error: String(error.message || error) };
+      console.error("could not give each folder one project", error);
+    }
   }
   return db;
 }
+
+// What the folder migration did when this connection opened, for the restore
+// point main.js writes. null until open, or when it was held back.
+let folderAdoption = null;
+let folderGate = () => true;
+/** main.js holds the migration back when the snapshot before it failed. */
+function holdFolderAdoption(hold) { folderGate = () => !hold; }
 
 /**
  * Widens the CHECK on audit.entity, once.
@@ -495,7 +510,17 @@ function undo(auditId) {
     // change made since. See agent/audit.js makeUndoRules.
     const refused = undoRules().refusal(entry);
     if (refused) throw new Error(refused);
-    applyUndo(entry);
+    try {
+      applyUndo(entry);
+    } catch (error) {
+      // Putting a folder back that another project has since taken would give
+      // one folder two projects, which the unique index refuses by its own
+      // name. Said as what is in the way instead.
+      if (/UNIQUE constraint failed: projects\.path/.test(String(error.message))) {
+        throw new Error("That folder is another project's now, so this cannot be put back. Give that project a different folder first, then undo again.");
+      }
+      throw error;
+    }
     // Putting a pad body back leaves the board reading from text that is no
     // longer there, so the projection is taken again from the restored body.
     // Inside the same transaction as the restore, for the reason writeScratchpad
@@ -764,9 +789,14 @@ function getProject(id) {
   return one("SELECT * FROM projects WHERE id = :id", { id });
 }
 
-function createProject({ key, name, summary = null, colour = "#7c8698", path = null, icon = null }) {
+function createProject({ key, name, summary = null, colour = "#7c8698", path = null, icon = null, remote = undefined, branch = undefined }) {
   const slug = slugKey(key);
   if (!slug) throw new Error("A project key needs at least one letter or digit");
+  // One spelling of a folder, and one project per folder, said as a sentence
+  // before the unique index can say it as a constraint name.
+  path = folderRule.normalise(path);
+  const owner = path ? folderRule.ownerOf(sqlP, path) : null;
+  if (owner) throw new Error(folderRule.takenSentence(owner));
 
   // Checked before the insert rather than left to the UNIQUE constraint, which
   // reaches the window as "UNIQUE constraint failed: projects.key" and says
@@ -789,13 +819,17 @@ function createProject({ key, name, summary = null, colour = "#7c8698", path = n
      VALUES (:key, :name, :summary, :colour, :path, :icon, :sort_order)`,
     { key: slug, name, summary, colour, path, icon, sort_order: order }
   );
-  const created = getProject(Number(r.lastInsertRowid));
+  const id = Number(r.lastInsertRowid);
+  // The folder's repos row in the same unit, so the folder and its Workbench
+  // settings are never one without the other.
+  if (path) for (const [q, p] of folderRule.primaryRepoStatements(sqlP, id, path, { remote, branch })) sqlP(q, p);
+  const created = getProject(id);
   record({ action: "create", entity: "project", entityId: created.id,
            summary: "created", label: created.name, after: created });
   return created;
 }
 
-function updateProject(id, fields) {
+function updateProject(id, fields, detected = {}) {
   const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view", "path", "icon", "auto_approve", "allow_unguarded"];
   // What agents may do here unasked. Only ever 0 or 1, and only ever from the
   // window: the MCP server has no way to write either, so no agent can approve
@@ -812,6 +846,16 @@ function updateProject(id, fields) {
   if (fields.status !== undefined && !PROJECT_STATUSES.includes(fields.status)) {
     throw new Error(`status must be one of ${PROJECT_STATUSES.join(", ")}`);
   }
+  // The folder is written in one place, here: normalised, refused by name when
+  // another project has it, and its primary repos row moved with it in the
+  // same unit, because every resolver reads repos and a stale row would win.
+  let folder;
+  if (fields.path !== undefined) {
+    folder = folderRule.normalise(fields.path);
+    const owner = folder ? folderRule.ownerOf(sqlP, folder, { except: id }) : null;
+    if (owner) throw new Error(folderRule.takenSentence(owner));
+    fields = { ...fields, path: folder };
+  }
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getProject(id);
   const before = rowOf("project", id);
@@ -820,6 +864,9 @@ function updateProject(id, fields) {
     ...Object.fromEntries(sets.map((k) => [k, fields[k]])),
     id,
   });
+  if (folder && before && folder !== before.path) {
+    for (const [q, p] of folderRule.primaryRepoStatements(sqlP, id, folder, { remote: detected.remote, branch: detected.branch })) sqlP(q, p);
+  }
   const after = getProject(id);
 
   // Nothing was recorded here until now, which left the audit trail exactly
@@ -2970,6 +3017,57 @@ function adoptProjectPaths() {
   return withPath.length;
 }
 
+// ---------------------------------------------------------------------------
+// Folders: one per project. The rule and the migration are in
+// workbench/folders.js; these are the window's writes.
+
+/** The shared-folder questions the migration left for a person. */
+const folderConflicts = () => folderRule.conflicts(sqlP);
+
+function conflictRow(id) {
+  const row = one("SELECT * FROM discovered_folders WHERE id = :id AND via = 'conflict'", { id: Number(id) });
+  if (!row) throw new Error("That question is no longer there.");
+  // Answered once, from the window, and never asked again: a second click on a
+  // stale copy of the item must not undo the first answer.
+  if (row.state !== "new") throw new Error("That question has been answered already.");
+  return row;
+}
+
+const answerConflict = (id, state) =>
+  run("UPDATE discovered_folders SET state = :state, answered_at = datetime('now') WHERE id = :id", { id: Number(id), state });
+
+/** "Keep it this way": the folder stays where the migration put it. */
+function keepFolderAnswer(id) {
+  conflictRow(id);
+  answerConflict(id, "kept");
+  return { kept: true };
+}
+
+/**
+ * "Give the folder to ...": the project that kept it goes to No folder and the
+ * other takes it. Two project updates in one step, each with its History row,
+ * so History can put either back. Its repos row is left where it is: a
+ * project with no folder reads no primary row, so it no longer resolves there,
+ * and its Workbench settings are still there if the folder comes back.
+ */
+function giveFolder(id, toProjectId) {
+  const row = conflictRow(id);
+  const to = getProject(Number(toProjectId));
+  if (!to) throw new Error("That project is not there any more.");
+  if (to.path && !folderRule.same(to.path, row.path)) throw new Error(`${to.name} has a folder of its own now (${to.path}).`);
+  const holder = folderRule.ownerOf(sqlP, row.path, { except: to.id });
+  if (holder) updateProject(Number(holder.id), { path: null });
+  updateProject(to.id, { path: row.path });
+  answerConflict(id, "given");
+  return { from: holder ? Number(holder.id) : null, to: to.id, path: row.path };
+}
+
+/** Marks the question answered by a merge, once main/folders.js has moved everything. */
+function mergedFolderAnswer(id) {
+  conflictRow(id);
+  answerConflict(id, "merged");
+}
+
 // Which database this is, as this connection sees it. The app's heartbeat is
 // deliberately not here: see agent/identity.js for why it is a file.
 const dbIdentity = () => identity.current((statement) => open().prepare(statement).all());
@@ -2983,7 +3081,7 @@ const ATOMIC = [
   "setQueue", "claimNext", "releaseClaim", "completeClaim", "extendClaim", "reclaimExpired",
   "createNote", "updateNote", "deleteNote", "createScratchpad", "appendScratchpad", "patchScratchpad",
   "deleteScratchpad", "derive", "createLink", "deleteLink", "createAlert", "createHandoff", "updateHandoff",
-  "createExternalTask", "deleteSession",
+  "createExternalTask", "deleteSession", "keepFolderAnswer", "giveFolder", "mergedFolderAnswer",
 ];
 
 module.exports = {
@@ -3022,6 +3120,8 @@ module.exports = {
   listWorkspaces, getWorkspace, workspaceByPath, createWorkspace, updateWorkspace, deleteWorkspace,
   projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
   adoptProjectPaths,
+  folderConflicts, keepFolderAnswer, giveFolder, mergedFolderAnswer, conflictRow,
+  folderAdoption: () => folderAdoption, holdFolderAdoption,
   listSessions, getSession, createSession, updateSession, deleteSession, sessionChanges,
   listArchivedSessions,
   listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness, trustHarnessCommand,

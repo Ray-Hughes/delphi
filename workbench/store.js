@@ -12,6 +12,7 @@
  */
 
 const { makeAuditor } = require("../agent/audit");
+const folders = require("./folders");
 
 const STATES = ["active", "parked", "finished", "discarded", "missing", "closing"];
 // Live is what the unique indexes count. Missing is live on purpose: it is
@@ -187,26 +188,13 @@ function makeWorkbenchStore({ sql, actor = "agent", who = null, step = null } = 
   }
 
   /**
-   * Every folder the task's project says its code is in, best first: repos
-   * (primary first), then the project's workspace folders (primary first),
-   * then projects.path. repos is empty in most real databases, which is why the
-   * other two count at all. Whether each is a git repository is not known here.
+   * Every folder the task's project says its code is in, best first: the
+   * project's own folder, then the others it also works in. The rule is
+   * workbench/folders.js's, which every caller that needs a folder asks.
    */
   function repoFolders(projectId) {
     if (projectId == null) return [];
-    const pid = idOf(projectId, "project_id");
-    const out = [];
-    for (const r of sql("SELECT id, name, path, is_primary FROM repos WHERE project_id = :p1 ORDER BY is_primary DESC, id", [pid])) {
-      out.push({ repo_id: Number(r.id), name: r.name, path: r.path, source: "repo", is_primary: Number(r.is_primary) ? 1 : 0 });
-    }
-    for (const w of sql(`SELECT w.name, w.path, pw.is_primary FROM project_workspaces pw
-                           JOIN workspaces w ON w.id = pw.workspace_id
-                          WHERE pw.project_id = :p1 ORDER BY pw.is_primary DESC, w.sort_order, w.id`, [pid])) {
-      out.push({ repo_id: null, name: w.name, path: w.path, source: "workspace", is_primary: Number(w.is_primary) ? 1 : 0 });
-    }
-    const project = sql("SELECT name, path FROM projects WHERE id = :p1", [pid])[0];
-    if (project && project.path) out.push({ repo_id: null, name: project.name, path: project.path, source: "project", is_primary: 0 });
-    return out;
+    return folders.projectFolders(sql, idOf(projectId, "project_id"));
   }
 
   function repo(id) {

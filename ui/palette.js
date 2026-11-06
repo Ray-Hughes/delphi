@@ -209,6 +209,10 @@ globalThis.DelphiPalette = (() => {
     // hides the whole window when nothing else is open.
     function trap(e) {
       if (!current) return;
+      // Escape while an input method is composing cancels the composition and
+      // is the IME's; it must not close the bar, nor reach app.js and hide the
+      // window.
+      if (e.key === "Escape" && e.isComposing) { e.stopPropagation(); return; }
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); return; }
       if (e.target !== input) return;
       if (e.key === "ArrowDown") { e.preventDefault(); moved = true; light(Math.min(items.length - 1, hi + 1)); }

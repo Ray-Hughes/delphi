@@ -563,6 +563,12 @@ async function main() {
       else check(`${rel} is in app.asar`, inSimulatedAsar(config, rel), "it is in extraResources too, which takes it out of the archive");
     }
     console.log(`  ok   ${sheets.length} stylesheets and the ${styled.length - sheets.length} files they name checked the same way`);
+    // The OFL lets the fonts be bundled on condition their licence goes with
+    // them, so a build that ships the fonts without it is out of licence.
+    for (const rel of ["assets/fonts/Inter-OFL.txt", "assets/fonts/JetBrainsMono-OFL.txt"]) {
+      check(`${rel}, the bundled font's licence, exists`, exists(rel));
+      check(`${rel} is in app.asar beside the font`, inFiles(config, rel) && inSimulatedAsar(config, rel));
+    }
     for (const rel of OUTSIDE_TOO) {
       check(`OUTSIDE_TOO ${rel} exists`, exists(rel));
       check(`OUTSIDE_TOO ${rel} is in files, so the app has it too`, inFiles(config, rel) || inFiles(config, `${rel}/`) || config.files.includes(`${rel}/`));

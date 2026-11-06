@@ -66,10 +66,14 @@ globalThis.DelphiCommands = (() => {
    *   state()            the renderer's state
    *   go(target)         navigate there, clearing any search
    *   projectFor()       the project Pads and Chat open from All projects
-   *   newTask(), newNote(), newProject(), openSettings(), toggleTheme(),
+   *   newTask(), newNote(), newProject(), addFolder(), openSettings(), toggleTheme(),
    *   undoLast(), openSwitcher(), openTask(id), scrollTop()
    *   themeIs()          "dark" or "light", as the window is showing it now
    */
+  // The platform's spelling of a shortcut, from ui/core.js in the window. A
+  // test that loads this file alone gets the Mac's.
+  const keys = (k) => (typeof shortcut === "function" ? shortcut(k) : `\u2318${k}`);
+
   function make(app) {
     const go = (target) => (target ? app.go(target) : undefined);
     const inProject = () => app.state().projectId != null;
@@ -91,15 +95,62 @@ globalThis.DelphiCommands = (() => {
       { id: "go-overview", group: "Go to", title: "Project overview", place: "overview", when: inProject, run: () => go({ view: "overview" }) },
       { id: "go-project-settings", group: "Go to", title: "Project settings", place: "project-settings", when: inProject, run: () => go({ view: "project" }) },
       { id: "go-all", group: "Go to", title: "All projects", place: "all", run: () => go({ projectId: null, view: "new" }) },
-      { id: "settings", group: "Commands", title: "Settings", keys: "⌘,", place: "settings", run: () => app.openSettings() },
+      { id: "settings", group: "Commands", title: "Settings", keys: keys(","), place: "settings", run: () => app.openSettings() },
       { id: "archived", group: "Commands", title: "Archived projects", place: "archived", run: () => app.openSettings("archived") },
-      { id: "switch-project", group: "Commands", title: "Switch project", keys: "⌘P", run: () => app.openSwitcher() },
-      { id: "new-task", group: "Commands", title: "New task", keys: "⌘N", run: () => app.newTask() },
+      { id: "switch-project", group: "Commands", title: "Switch project", keys: keys("P"), run: () => app.openSwitcher() },
+      { id: "new-task", group: "Commands", title: "New task", keys: keys("N"), run: () => app.newTask() },
       { id: "new-note", group: "Commands", title: "New note", run: () => app.newNote() },
-      { id: "new-project", group: "Commands", title: "New project", run: () => app.newProject() },
+      { id: "add-folder", group: "Commands", title: "Add folder as project", run: () => app.addFolder() },
+      { id: "new-project", group: "Commands", title: "New project without a folder", run: () => app.newProject() },
       { id: "theme", group: "Commands", get title() { return app.themeIs() === "dark" ? "Switch to light theme" : "Switch to dark theme"; }, run: () => app.toggleTheme() },
       { id: "undo-last", group: "Commands", title: "Undo the last change", run: () => app.undoLast() },
     ];
+  }
+
+  /**
+   * The heading of a view outside the six tabs. Each used to be named by the
+   * tab strip it sat in; with that gone, a page with the project's name over
+   * it (or "All work") gave no clue it was Settings or History. So each has its
+   * own title, and a breadcrumb back to where it belongs. Null for a view the
+   * tabs already name, whose heading stays the project's or the scope's.
+   */
+  const PLACES = {
+    all: {
+      settings: ["Settings", "How Delphi looks, which agents it can run, and where it keeps your data."],
+      history: ["History", "Every change, by whom, across every project. Each one can be undone."],
+      queue: ["Queue", "Tasks waiting for an agent to pick them up, across every project."],
+      reminders: ["Reminders", "What is set to remind you, and when."],
+      graph: ["Mind map", "What your notes and tasks mention, and which of those things turn up together."],
+      new: ["What's new", "What changed lately, across every project."],
+    },
+    project: {
+      project: ["Settings", "This project's name, folder and colour, and how agents may work in it."],
+      activity: ["History", "Every change in this project, by whom. Each one can be undone."],
+      links: ["Links", "The links kept in this project."],
+      queue: ["Queue", "This project's tasks waiting for an agent to pick them up."],
+    },
+  };
+  function heading(state, projectName = "") {
+    if (state.query) return null;
+    const inProject = state.projectId != null;
+    const place = (inProject ? PLACES.project : state.workspaceId ? {} : PLACES.all)[state.view];
+    if (!place) return null;
+    const home = inProject
+      ? { label: projectName || "This project", target: { view: "overview" } }
+      : { label: "All projects", target: { projectId: null, view: "new" } };
+    return { title: place[0], subtitle: place[1], crumbs: state.view === "new" && !inProject ? [{ label: "All projects", target: null }] : [home] };
+  }
+
+  /**
+   * The two ways to see a search, Oracle and Matches, as the toggle on the
+   * results page draws them. A target never names the query, so switching
+   * keeps it: navigate() changes only what it is given.
+   */
+  function searchViews(state) {
+    return [
+      { id: "oracle", label: "Oracle", count: (state.oracleHits || []).length, target: { view: "oracle" } },
+      { id: "tasks", label: "Matches", count: (state.tasks || []).length + (state.notes || []).length, target: { view: "tasks" } },
+    ].map((v) => ({ ...v, on: state.view === v.id }));
   }
 
   /** The command a G chord's second key names, if any. */
@@ -123,7 +174,7 @@ globalThis.DelphiCommands = (() => {
     return hits.sort((a, b) => Number(b.title.toLowerCase().startsWith(words[0])) - Number(a.title.toLowerCase().startsWith(words[0])));
   }
 
-  return { TABS, tabOf, tabTarget, make, chord, match };
+  return { TABS, tabOf, tabTarget, make, chord, match, heading, searchViews };
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = globalThis.DelphiCommands;

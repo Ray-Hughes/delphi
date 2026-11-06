@@ -804,5 +804,5 @@ async function createChatSession({
 
 module.exports = {
   ADAPTERS, claudeSheetMapper, copilotSheetMapper, codexSheetMapper, createSheetWriter, openingContext, sheetContext,
-  findSession, harnessRow, guardRefusal, chatTurn, createChatSession,
+  findSession, harnessRow, guardRefusal, chatTurn, createChatSession, SESSION_ID,
 };

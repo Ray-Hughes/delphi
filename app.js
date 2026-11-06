@@ -583,6 +583,7 @@ async function refresh() {
     ? state.allTasks
     : await window.delphi.tasks.list({ projectId: null, includeDone: true });
   try { state.runs = await window.delphi.runs.list({ limit: 300 }); } catch { state.runs = []; }
+  if (window.DelphiNeeds) await DelphiNeeds.load();
   render();
   reloadFlags();
 }
@@ -1139,16 +1140,81 @@ function renderTabs() {
   }
 }
 
+/**
+ * The breadcrumb over a view outside the six tabs: where it belongs, then its
+ * own name. Hidden for every other view, whose heading already says where it is.
+ */
+function paintCrumbs(place) {
+  const box = $("crumbs");
+  if (!box) return;
+  box.textContent = "";
+  box.hidden = !place;
+  if (!place) return;
+  const sep = () => { const s = el("span", { className: "crumb-sep", textContent: "/" }); s.setAttribute("aria-hidden", "true"); return s; };
+  for (const c of place.crumbs) {
+    if (c.target) {
+      const b = el("button", { className: "crumb", type: "button", textContent: c.label });
+      b.onclick = () => goTo({ ...c.target, query: "" });
+      box.append(b);
+    } else {
+      box.append(el("span", { className: "crumb-now", textContent: c.label }));
+    }
+    box.append(sep());
+  }
+  const now = el("span", { className: "crumb-now here", textContent: place.title });
+  now.setAttribute("aria-current", "page");
+  box.append(now);
+}
+
+/**
+ * Oracle or Matches, on the search page. The tab strip that offered both went
+ * with the sidebar, which left the full Matches list (every task and note the
+ * words hit) with no way in. Switching keeps the query: only the view changes.
+ */
+function paintSearchViews() {
+  const box = $("tabs");
+  if (!box) return;
+  box.textContent = "";
+  if (!state.query) return;
+  const seg = el("div", { className: "seg search-views", role: "group" });
+  seg.setAttribute("aria-label", "Show the search as");
+  for (const v of DelphiCommands.searchViews(state)) {
+    const b = el("button", { type: "button" }, v.label);
+    if (v.count) b.append(el("span", { className: "n", textContent: String(v.count) }));
+    b.setAttribute("aria-pressed", String(v.on));
+    b.onclick = () => { if (!v.on) navigate(v.target); };
+    seg.append(b);
+  }
+  box.append(seg);
+}
+
 function render() {
   // Direction B draws no sidebar and no tab strip here; the top area does
   // both (MOUNTS below). renderSidebar() and renderTabs() stay, unused, until
   // the cleanup slice, so going back is putting the two calls back.
 
+  // A view that does not exist for the current selection falls back rather than
+  // rendering blank. Before the heading, which is named for the view it settles on.
+  const valid = state.query
+    ? ["oracle", "tasks"]
+    : state.projectId
+    ? ["overview", "chat", "tasks", "queue", "pads", "notes", "links", "activity", "project", "workspace"]
+    : state.workspaceId
+    ? ["new", "tasks", "queue", "graph", "activity", "workspace"]
+    : ["new", "tasks", "queue", "graph", "reminders", "history", "settings", ...HOME_VIEWS];
+  if (!valid.includes(state.view)) state.view = valid[0];
+
   const p = currentProject();
+  const place = DelphiCommands.heading(state, p ? p.name : "");
+  paintCrumbs(place);
+  paintSearchViews();
   if (state.query) {
     $("title").textContent = "Search";
     $("subtitle").textContent =
       `${plural(state.tasks.length, "task", "tasks")} and ${plural(state.notes.length, "note", "notes")} matching “${state.query}”`;
+  } else if (place) {
+    $("title").textContent = place.title;
+    $("subtitle").textContent = place.subtitle;
   } else if (p) {
     $("title").textContent = p.name;
     $("subtitle").textContent = p.summary || "";
@@ -1163,20 +1229,10 @@ function render() {
     $("subtitle").textContent = "Everything open, across every project";
   }
 
-  // A view that does not exist for the current selection falls back rather than
-  // rendering blank.
-  const valid = state.query
-    ? ["oracle", "tasks"]
-    : state.projectId
-    ? ["overview", "chat", "tasks", "queue", "pads", "notes", "links", "activity", "project", "workspace"]
-    : state.workspaceId
-    ? ["new", "tasks", "queue", "graph", "activity", "workspace"]
-    : ["new", "tasks", "queue", "graph", "reminders", "history", "settings", ...HOME_VIEWS];
-  if (!valid.includes(state.view)) state.view = valid[0];
-
   // Hidden rather than disabled when there is nowhere to go: a button that is
   // always present but usually dead trains people to stop looking at it.
   $("back").hidden = state.history.length === 0;
+  $("back").title = `Back (${isMac() ? "Command" : "Ctrl"} + [)`;
 
   renderMetrics();
   paintTitleLive();
@@ -1187,6 +1243,7 @@ function render() {
   // at once collide on a line rather than on a function.
   if (window.DelphiRecovery) DelphiRecovery.remember({ projectId: state.projectId, view: state.view });
   if (window.DelphiTopbar) DelphiTopbar.paint();
+  if (window.DelphiAddFolder) DelphiAddFolder.paintFix(state);
   // --- end MOUNTS ---
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
@@ -1681,7 +1738,7 @@ async function archiveProject(project) {
   const leaving = state.projectId === project.id;
   const ok = confirm(
     `Archive “${project.name}”?\n\n` +
-    "It leaves the sidebar and every list, and nothing in it is deleted: the tasks, notes, links and epics all stay exactly as they are.\n\n" +
+    "It leaves the project switcher and every list, and nothing in it is deleted: the tasks, notes, links and epics all stay exactly as they are.\n\n" +
     (leaving
       ? "You will land on Settings, under All work, where archived projects are listed with a button to bring each one back.\n\n"
       : "Archived projects are listed under Settings, in All work, with a button to bring each one back.\n\n") +
@@ -1880,13 +1937,15 @@ function renderProjectSettings(root) {
     save({ name: value }, nameMsg);
   };
   root.append(settingSection("Name",
-    "What this project is called everywhere it appears: the sidebar, the title, and any task that belongs to it.",
+    "What this project is called everywhere it appears: the project switcher, the title, and any task that belongs to it.",
     el("div", { className: "row" }, nameInput), nameMsg));
 
   // --- folder ----------------------------------------------------------------
-  // Where an agent works when nothing more specific says: the last place a job
-  // looks, after the repositories and the workspaces. The refusal a job gives
-  // when a project has none sends people here by name, so it has to be here.
+  // The project's folder: where its jobs, runs, Workbenches and sessions work,
+  // and the one place it is written (db.js updateProject). One folder is one
+  // project's, so choosing a folder another project has is refused by name.
+  // The refusal a job gives when a project has none sends people here, so it
+  // has to be here.
   const folderMsg = el("span", { className: "hint" });
   const folderInput = commitOnEnter(el("input", { className: "field", value: project.path || "", placeholder: "/path/to/the/code" }));
   folderInput.onblur = () => {
@@ -1904,75 +1963,16 @@ function renderProjectSettings(root) {
       save({ path: picked }, folderMsg);
     } catch (error) { folderMsg.className = "err-msg"; folderMsg.textContent = error.message; }
   };
+  const folderFacts = el("div", { className: "hint" });
+  if (project.path) {
+    folderFacts.textContent = [project.owner_repo || null, project.default_branch ? `default branch ${project.default_branch}` : null,
+      project.folder_missing ? "not on disk right now" : null].filter(Boolean).join(" · ");
+  }
   const folderBox = settingSection("Folder",
-    "Where agents work on this project when it has no repository or workspace of its own. A run that changes code still gets its own Workbench beside it; one that only answers reads from here.",
-    el("div", { className: "row" }, folderInput, folderPick), folderMsg);
+    "Where agents work on this project: its jobs, its runs and its sessions. A run that changes code still gets its own Workbench beside it; one that only answers reads from here. A folder belongs to one project.",
+    el("div", { className: "row" }, folderInput, folderPick), folderFacts, folderMsg);
   folderBox.id = "project-folder";
   root.append(folderBox);
-
-  // --- workspaces ----------------------------------------------------------
-  // A project is work, and work happens in folders: sometimes one, sometimes
-  // four. SSNR spans caseflow, caseflow-efolder, the MPI person update service
-  // and the veteran API, so this is a list rather than a field.
-  const wsRow = el("div", { className: "row wrap" });
-
-  const paintWorkspaces = async () => {
-    wsRow.textContent = "";
-    const live = currentProject();
-    if (!live) return;
-    const linked = await window.delphi.workspaces.forProject(live.id);
-
-    if (!linked.length) {
-      wsRow.append(el("span", { className: "hint", textContent: "Not in any workspace yet." }));
-    }
-
-    for (const w of linked) {
-      const chip = el("span", { className: "chip ws-chip" + (w.is_primary ? " primary" : "") });
-      chip.append(el("span", { textContent: w.name, title: w.path }));
-      if (w.is_primary) chip.append(el("span", { className: "hint", textContent: "main" }));
-
-      // Left click promotes, so the folder a session defaults to can be changed
-      // without a menu. The x removes the link and never the folder.
-      chip.onclick = async () => {
-        await window.delphi.workspaces.link(live.id, w.id, { primary: true });
-        await paintWorkspaces();
-        await refresh();
-      };
-      chip.title = w.is_primary ? `${w.path}\nThe main folder for this project` : `${w.path}\nClick to make this the main folder`;
-
-      const drop = el("button", { className: "chip-x", textContent: "×", title: "Remove from this workspace" });
-      drop.onclick = async (e) => {
-        e.stopPropagation();
-        await window.delphi.workspaces.unlink(live.id, w.id);
-        await paintWorkspaces();
-        await refresh();
-      };
-      chip.append(drop);
-      wsRow.append(chip);
-    }
-
-    const linkedIds = new Set(linked.map((w) => w.id));
-    const available = state.workspaces.filter((w) => !linkedIds.has(w.id));
-    if (available.length) {
-      const add = el("button", { className: "btn sm", textContent: "+ Add workspace" });
-      add.onclick = (e) => {
-        rowMenu(e.clientX, e.clientY, available.map((w) => ({
-          label: w.name,
-          run: async () => {
-            await window.delphi.workspaces.link(live.id, w.id, { primary: linked.length === 0 });
-            await paintWorkspaces();
-            await refresh();
-          },
-        })));
-      };
-      wsRow.append(add);
-    }
-  };
-  paintWorkspaces();
-
-  root.append(settingSection("Workspaces",
-    "The folders this project's work happens in. One project can span several, which is why this is a list: clicking a chip makes it the main folder, and the x removes the link without touching anything on disk.",
-    wsRow));
 
   // --- summary -------------------------------------------------------------
   const sumMsg = el("span", { className: "hint" });
@@ -1987,7 +1987,7 @@ function renderProjectSettings(root) {
     save({ summary: sumInput.value.trim() }, sumMsg);
   };
   root.append(settingSection("Summary",
-    "One line, shown under the title and as the tooltip on the sidebar row. Leave it empty if the name says enough.",
+    "One line, shown under the title, and in the project switcher when the project has no folder. Leave it empty if the name says enough.",
     el("div", { className: "row" }, sumInput), sumMsg));
 
   // --- key -----------------------------------------------------------------
@@ -2021,7 +2021,7 @@ function renderProjectSettings(root) {
   colour.oninput = queueColour;
   colour.onchange = queueColour;
   root.append(settingSection("Colour",
-    "The dot beside this project in the sidebar, and the flash of colour on its tasks wherever they appear next to another project's.",
+    "The square beside this project in the project switcher, and the flash of colour on its tasks wherever they appear next to another project's.",
     el("div", { className: "row" }, colour, colourMsg)));
 
   // --- status --------------------------------------------------------------
@@ -2370,8 +2370,21 @@ function projectMenu(p, x, y, button = null, fromKeyboard = false) {
     { node: projectSwatchRow(p.colour, async (colour) => { closeRowMenu(); await set({ colour }); }) },
     "-",
     ...statuses,
-    ...workspaceChoices(p),
     "-",
+    // A project with no folder is offered one here, from the switcher's "..."
+    // as well as its settings, through the same checks Add folder makes.
+    p.path
+      ? { label: "Change folder…", run: () => navigate({ projectId: p.id, view: "project", query: "" }).then(() => document.getElementById("project-folder")?.scrollIntoView({ block: "center" })) }
+      : { label: "Give it a folder…", run: async () => {
+        try {
+          const look = await window.delphi.folders.inspect(null);
+          if (!look || look.cancelled) return;
+          if (!look.ok) { notify(look.why, { error: true }); return; }
+          await window.delphi.folders.set(p.id, look.top);
+          notify(`${p.name} has a folder now: ${look.shown}.`);
+        } catch (error) { notifyError(error); }
+        await refresh();
+      } },
     // The field is cleared by hand the way the row's own click does it: navigate
     // drops the query from the state and the box goes on showing what was typed.
     { label: "Settings", run: () => { $("search").value = ""; return navigate({ projectId: p.id, view: "project", query: "" }); } },
@@ -2380,29 +2393,6 @@ function projectMenu(p, x, y, button = null, fromKeyboard = false) {
   ];
   if (button && x == null) keyedMenu(button, items, { fromKeyboard });
   else keyedMenu(button, items, { x, y });
-}
-
-/**
- * "Put in <workspace>" for each workspace a project is not already in.
- *
- * Most projects were made by agents over MCP, which never links a folder, and a
- * project in no workspace is the one the sidebar used to lose. Filing it is a
- * right click here rather than a trip into Settings. The first link is made the
- * main one, the way Settings does it, so sessions have a folder to run in.
- */
-function workspaceChoices(p) {
-  const inside = state.workspaces.filter((w) => (state.wsMembers.get(w.id) || []).includes(p.id));
-  const open = state.workspaces.filter((w) => !inside.includes(w));
-  if (!open.length) return [];
-  return ["-", ...open.map((w) => ({
-    label: `Put in ${w.name}`,
-    run: async () => {
-      try {
-        await window.delphi.workspaces.link(p.id, w.id, { primary: inside.length === 0 });
-      } catch (error) { alert(error.message); return; }
-      await refresh();
-    },
-  }))];
 }
 
 // ---------------------------------------------------------------------------
@@ -4315,7 +4305,7 @@ function paintBulkBar() {
     button("Delete", "Delete every selected task",
       async () => {
         const n = selected.size;
-        await act((id) => window.delphi.tasks.remove(id));
+        await act((id) => removeTask(id));
         setTimeout(() => alert(`${n} ${n === 1 ? "task" : "tasks"} deleted. Restore from this project's History tab.`), 30);
       }, true)
   );
@@ -7235,7 +7225,7 @@ async function renderSettings(root) {
   const arch = el("div", { className: "setting" });
   arch.append(el("h3", { textContent: "Archived projects" }));
   arch.append(el("p", {
-    textContent: "Archiving takes a project out of the sidebar and out of every list without deleting any of it, and this is the only place archived projects can be reached from. Restoring brings one back with everything it holds, marked active: nothing records whether it was paused or blocked before it was archived.",
+    textContent: "Archiving takes a project out of the project switcher and out of every list without deleting any of it, and this is the only place archived projects can be reached from. Restoring brings one back with everything it holds, marked active: nothing records whether it was paused or blocked before it was archived.",
   }));
 
   let archived = [];
@@ -7253,7 +7243,7 @@ async function renderSettings(root) {
     arch.append(el("p", { className: "err-msg", style: "margin:0", textContent: archivedError }));
   } else if (!archived.length) {
     arch.append(el("p", { className: "hint", style: "margin:0",
-      textContent: "Nothing is archived. A project is archived from the Settings tab inside it, or from the menu on its sidebar row." }));
+      textContent: "Nothing is archived. A project is archived from the Settings tab inside it, or from the ... menu on its row in the project switcher." }));
   } else {
     const box = el("div", { className: "list-box" });
     for (const p of archived) {
@@ -8457,11 +8447,21 @@ window.delphi.onSheetRunDone(({ entryId, taskId, entry }) => {
  * tabs rather than a scroll. The discussion sits beside the work instead of
  * underneath it, with the composer pinned where your hands already are.
  */
+/** Deletes a task, and the drafts its boxes were keeping: there is nothing left to type them into. */
+async function removeTask(id) {
+  const done = await window.delphi.tasks.remove(id);
+  if (window.DelphiRecovery) DelphiRecovery.clearTaskDrafts(id);
+  return done;
+}
+
 async function openTaskSheet(taskId) {
   if (openSheet) await openSheet.close();
 
   let detail = await window.delphi.tasks.detail(taskId);
   if (!detail) return;
+  // What this task's boxes keep their drafts under: its id and when it was
+  // made, never the id alone (see ui/recovery.js).
+  const draftOf = window.DelphiRecovery ? DelphiRecovery.taskDraftId(detail.task) || taskId : taskId;
 
   let pane = "details";   // details | activity
   let editingDesc = false;
@@ -8559,7 +8559,7 @@ async function openTaskSheet(taskId) {
     del.setAttribute("aria-label", "Delete task");
     del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M7 7l1 13h8l1-13"/></svg>';
     del.onclick = async () => {
-      await window.delphi.tasks.remove(taskId);
+      await removeTask(taskId);
       await closeSheet();
       // Said at the moment it happens, because that is when someone needs to
       // know it can be taken back.
@@ -8969,9 +8969,9 @@ async function openTaskSheet(taskId) {
   title.setAttribute("aria-label", "Task title");
   // The title is never empty, so a kept edit comes back only when it differs.
   if (window.DelphiRecovery) {
-    const kept = DelphiRecovery.draft("title", taskId);
+    const kept = DelphiRecovery.draft("title", draftOf);
     if (kept && kept !== detail.task.title) title.value = kept;
-    title.addEventListener("input", () => DelphiRecovery.saveDraft("title", taskId, title.value === detail.task.title ? "" : title.value));
+    title.addEventListener("input", () => DelphiRecovery.saveDraft("title", draftOf, title.value === detail.task.title ? "" : title.value));
   }
   const growTitle = () => {
     title.style.height = "auto";
@@ -9120,15 +9120,15 @@ async function openTaskSheet(taskId) {
       const area = el("textarea", { className: "ts-desc-edit", value: text, spellcheck: false });
       area.placeholder = "What does finishing this actually involve";
       if (window.DelphiRecovery) {
-        const kept = DelphiRecovery.draft("desc", taskId);
+        const kept = DelphiRecovery.draft("desc", draftOf);
         if (kept != null && kept !== text) area.value = kept;
-        area.addEventListener("input", () => DelphiRecovery.saveDraft("desc", taskId, area.value === text ? "" : area.value));
+        area.addEventListener("input", () => DelphiRecovery.saveDraft("desc", draftOf, area.value === text ? "" : area.value));
       }
       const save = async () => {
         editingDesc = false;
         if (area.value !== text) await write({ detail: area.value }, "description saved");
         else paintDesc();
-        if (window.DelphiRecovery) DelphiRecovery.clearDraft("desc", taskId);
+        if (window.DelphiRecovery) DelphiRecovery.clearDraft("desc", draftOf);
       };
       area.onblur = save;
       desc.append(area);
@@ -9773,7 +9773,7 @@ async function openTaskSheet(taskId) {
   composerKind.setAttribute("aria-live", "polite");
   const composer = el("textarea", { className: "ts-composer-box", placeholder: "Write to the Sheet" });
   composer.setAttribute("aria-label", "Write to the Sheet");
-  if (window.DelphiRecovery) DelphiRecovery.bindDraft(composer, "sheet", taskId);
+  if (window.DelphiRecovery) DelphiRecovery.bindDraft(composer, "sheet", draftOf);
   const send = el("button", { className: "btn primary sm", textContent: "Comment" });
 
   /**
@@ -9846,7 +9846,7 @@ async function openTaskSheet(taskId) {
     }
     sending = false;
     composer.value = "";
-    if (window.DelphiRecovery) DelphiRecovery.clearDraft("sheet", taskId);
+    if (window.DelphiRecovery) DelphiRecovery.clearDraft("sheet", draftOf);
     senseComposer();
     detail = await window.delphi.tasks.detail(taskId) || detail;
     paintAll({ stick: true });
@@ -9929,7 +9929,7 @@ async function openTaskSheet(taskId) {
       await window.delphi.tasks.update(taskId, updates);
       refresh();
     }
-    if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", taskId);
+    if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
   };
 
   overlay.onclick = (e) => { if (e.target === overlay) closeSheet(); };
@@ -9994,7 +9994,7 @@ const needsYouCount = () => waitingRuns().filter((r) => !isAnswered(r)).length;
 // The sidebar badge counts everything Needs you shows: agents paused on you,
 // finished runs nobody has reviewed, and flags waiting on a decision. The title
 // bar keeps to the first, because "waiting on you" there means an agent is stuck.
-const needsYouTotal = () => needsYouCount() + reviewRuns().length + (state.flagRows || []).length;
+const needsYouTotal = () => needsYouCount() + reviewRuns().length + (state.flagRows || []).length + (window.DelphiNeeds ? DelphiNeeds.count() : 0);
 const onHomeView = () => !state.query && !state.projectId && HOME_VIEWS.includes(state.view);
 
 /**
@@ -10822,7 +10822,9 @@ function renderInbox(root) {
   const questions = all.filter((r) => r.state === "waiting_on_human");
   const reviews = reviewRuns().sort((a, b) => String(a.finished_at || a.updated_at).localeCompare(String(b.finished_at || b.updated_at)));
   const flags = flagRowsNow();
-  const total = all.length + reviews.length + flags.length;
+  // The folder questions (ui/needs.js) sit above everything else under All.
+  const folderQs = window.DelphiNeeds ? DelphiNeeds.count() : 0;
+  const total = all.length + reviews.length + flags.length + folderQs;
 
   const group = el("div", { className: "seg-sm", role: "group" });
   for (const [key, label] of [["urgency", "By urgency"], ["project", "By project"]]) {
@@ -10858,8 +10860,9 @@ function renderInbox(root) {
   const reviewsShown = f === "all" || f === "reviews" ? reviews : [];
   const flagsShown = f === "all" || f === "proposals" ? flags : [];
   const shownCount = runsShown.length + reviewsShown.length + flagsShown.length;
+  if (f === "all" && folderQs) DelphiNeeds.mount(page);
 
-  if (!shownCount) {
+  if (!shownCount && !(f === "all" && folderQs)) {
     page.append(emptyState(total ? "Nothing of this kind" : "Nothing needs you",
       "When an agent asks to start work or asks a question, when a run finishes and wants a look, or when someone flags an item as filed in the wrong place, it waits here until you answer."));
   } else {
@@ -10898,7 +10901,7 @@ function renderInbox(root) {
         groups.forEach((row) => box.append(flagNode(row)));
       }
     }
-    page.append(box);
+    if (box.childNodes.length) page.append(box);
   }
   page.append(el("div", { className: "rule-note" },
     el("b", { textContent: "What is here: " }), "things an agent is blocked on you for, finished runs nobody has reviewed, and proposals about where an item belongs. Your own tasks are in All work. ",
@@ -11275,7 +11278,7 @@ async function deleteItem(item, { after = null, onDelete = null } = {}) {
     if (!ok) return;
   }
   try {
-    if (item.entity === "task") await window.delphi.tasks.remove(item.id);
+    if (item.entity === "task") await removeTask(item.id);
     else if (item.entity === "note") await window.delphi.notes.remove(item.id);
     else if (item.entity === "link") await window.delphi.links.remove(item.id);
     else if (item.entity === "scratchpad") {
@@ -11882,7 +11885,7 @@ async function openFlagDialog(item, { after = null } = {}) {
   sendBtn.onclick = () => send();
   const foot = el("div", { className: "fl-foot" },
     el("span", { className: "hint" }, el("span", { className: "kbd", textContent: "Esc" }), "cancel ",
-      el("span", { className: "kbd", textContent: "Cmd Enter" }), "send"),
+      el("span", { className: "kbd", textContent: isMac() ? "\u2318 Enter" : "Ctrl Enter" }), "send"),
     el("span", { className: "grow" }), cancel, sendBtn);
 
   box.append(top, el("div", { className: "fl-body" }, left, right), foot);
@@ -13369,8 +13372,7 @@ async function openHarness(key) {
     projectId: project.id,
     title: harness ? harness.label : key,
     harness: key,
-    workspaceId: state.workspaceId,
-    cwd: sessionFolder({ workspace_id: state.workspaceId }),
+    cwd: sessionFolder({ project_id: project.id }),
   });
   state.sessions = await window.delphi.sessions.list(project.id);
   await openSession(created.id);
@@ -13378,20 +13380,15 @@ async function openHarness(key) {
 
 
 /**
- * The folder a session runs in.
- *
- * Recorded on the session, because a project spanning four repos has no single
- * answer. Falls back to the workspace currently open, then to the project's old
- * path column for sessions made before workspaces existed.
+ * The folder a session runs in: the one it was started in, then its
+ * project's. The rule workbench/folders.js gives the main process, less the
+ * disk check, which the window cannot make; the main process makes it when the
+ * session starts. A session that recorded only a workspace had that folder
+ * written into its cwd by the folder migration.
  */
 function sessionFolder(session) {
-  if (session && session.workspace_id) {
-    const w = state.workspaces.find((x) => x.id === session.workspace_id);
-    if (w) return w.path;
-  }
-  const open = state.workspaces.find((w) => w.id === state.workspaceId);
-  if (open) return open.path;
-  const project = currentProject();
+  if (session && session.cwd) return session.cwd;
+  const project = (session && session.project_id != null ? projectById(session.project_id) : null) || currentProject();
   return project && project.path ? project.path : null;
 }
 
@@ -13404,11 +13401,9 @@ async function newSession() {
     // the right first behaviour when nobody has chosen anything yet.
     agent: "boss",
     provider: null,
-    // The folder it runs in, which is the workspace it was started from. A
-    // project can span four repos, so this cannot be derived from the project
-    // afterwards: only the person starting the session knows which one they
-    // meant, and being in that workspace is them saying so.
-    workspaceId: state.workspaceId,
+    // The folder it runs in: the project's, written down now so the session
+    // keeps it if the project's folder changes later.
+    cwd: sessionFolder({ project_id: project.id }),
   });
   state.sessions = await window.delphi.sessions.list(project.id);
   await openSession(created.id);
@@ -13778,7 +13773,7 @@ function renderChat(root) {
     tabs.append(note);
   }
 
-  tabs.append(el("span", { className: "pane-kbd", textContent: "⌘J" }));
+  tabs.append(el("span", { className: "pane-kbd", textContent: shortcut("J") }));
   wrap.append(tabs);
 
   if (state.pane === "terminal") {
@@ -13792,7 +13787,7 @@ function renderChat(root) {
   if (!state.sessionId) {
     stream.append(emptyState(
       "No session yet",
-      "Start one from the sidebar. It will belong to this project, and run in this workspace."));
+      "Start one from the AI sessions menu beside the Chat tab. It will belong to this project, and run in this workspace."));
   } else if (!state.messages.length) {
     const empty = el("div", { className: "gempty" });
     empty.append(
@@ -14385,16 +14380,18 @@ window.addEventListener("mouseup", (e) => {
 });
 
 document.addEventListener("keydown", (e) => {
+  // Every key of an IME composition, Escape included, is the input method's.
+  if (e.isComposing) return;
   // While the sheet is open it owns the keyboard apart from Escape. Navigating
   // behind it would leave it orphaned over a page it does not belong to, and
   // lose whatever was being written.
   if (openSheet && e.key !== "Escape") {
-    if ((e.metaKey || e.ctrlKey) && ["[", "ArrowLeft", "f"].includes(e.key)) e.preventDefault();
+    if (modKey(e) && ["[", "ArrowLeft", "f"].includes(e.key)) e.preventDefault();
     return;
   }
 
   // The shortcuts macOS already uses for Back, so there is nothing new to learn.
-  if ((e.metaKey || e.ctrlKey) && (e.key === "[" || e.key === "ArrowLeft")) {
+  if (modKey(e) && (e.key === "[" || e.key === "ArrowLeft")) {
     e.preventDefault();
     goBack();
     return;
@@ -14484,6 +14481,13 @@ function projectFor() {
   const id = recent.find((x) => projectById(x)) ?? state.settings.scratchpadProjectId;
   return projectById(id) ? id : (state.projects[0] ? state.projects[0].id : null);
 }
+/** How many of the items fall under each key, as a Map. */
+function countBy(items, keyOf) {
+  const counts = new Map();
+  for (const item of items) { const k = keyOf(item); counts.set(k, (counts.get(k) || 0) + 1); }
+  return counts;
+}
+
 const shell = {
   state: () => state,
   go: (target) => goTo({ query: "", ...target }),
@@ -14499,6 +14503,7 @@ const shell = {
     focusComposer();
   },
   newProject: () => createProject(),
+  addFolder: () => DelphiAddFolder.open(),
   // The floating panel (ui/settings.js). An anchor means the old page, which
   // still holds what has not moved yet: archived projects, the AI providers.
   // It lives in the All view, so getting there leaves whichever project is open.
@@ -14523,8 +14528,10 @@ const shell = {
   },
   scrollTop: () => { const c = $("content"); if (c) c.scrollTop = 0; },
   needsYou: () => needsYouTotal(),
-  runningIn: (projectId) => runsIn(["running"]).filter((r) => r.project_id === projectId).length,
-  lateIn: (projectId) => state.everyTask.filter((t) => t.project_id === projectId && isOverdue(t)).length,
+  // Per project, counted in one pass each, for a switcher that draws a row
+  // per project: asked per row, each was a pass over every task or run.
+  runningByProject: () => countBy(runsIn(["running"]), (r) => r.project_id),
+  lateByProject: () => countBy(state.everyTask.filter(isOverdue), (t) => t.project_id),
   tabCount: (id) => {
     const inProject = state.projectId != null;
     switch (id) {
@@ -14559,6 +14566,7 @@ if (window.DelphiSettingsPanel) {
     refresh: () => refresh(),
     openOld: (anchor) => shell.openSettings(anchor || "old"),
     openProject: (id) => goTo({ projectId: id || someProjectId(), view: "project", query: "" }),
+    addFolder: () => shell.addFolder(),
     go: (target) => shell.go(target),
     harnessSheet: (h, done) => openHarnessSheet(h, done),
     trustRow: (h, repaint) => harnessTrustRow(h, repaint),
@@ -14583,6 +14591,8 @@ function openBar(query = "") {
 }
 
 DelphiTopbar.init(shell);
+DelphiAddFolder.init({ ...shell, refresh: () => refresh(), notify: (text, o) => notify(text, o) });
+DelphiNeeds.init({ refresh: () => refresh(), notify: (text) => notify(text) });
 DelphiKeys.install({
   commands: () => COMMANDS,
   // A panel, a menu, a dialog or a popover owns the keyboard while it is open.
@@ -14745,6 +14755,14 @@ async function reopen() {
   const R = window.DelphiRecovery;
   if (!R) return refresh();
   R.pruneDrafts();
+  // The launch after a restore: what was typed before it belonged to the file
+  // that was replaced. Only drafts older than the restore go, so a reload of
+  // the window later in the same run keeps what was typed since.
+  try {
+    const info = await window.delphi.backups.list();
+    const last = info && info.lastRestore;
+    if (last && last.ok) R.dropDraftsBefore(Date.parse(last.at) || Date.now());
+  } catch {}
   // Replies to flags are drawn only while they hold something, so a kept one
   // is put back where that check looks.
   for (const d of R.draftsOf("flag")) runDrafts.set(`freply-${d.id}`, d.text);

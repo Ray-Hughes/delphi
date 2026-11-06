@@ -30,6 +30,7 @@ const paths = require("./paths");
 const { isNewer } = require("./version");
 const locate = require("./agent/locate");
 const identity = require("./agent/identity");
+const folderRule = require("./workbench/folders");
 
 // Before anything reads it. Packaged, the name comes from the bundle, but running
 // from a checkout Electron falls back to its own name and the macOS menu bar reads
@@ -640,10 +641,23 @@ app.whenReady().then(async () => {
   // the file open. See main/backups.js.
   const restored = backups.applyPending();
   if (restored && !restored.ok) console.error(`could not restore ${restored.from}: ${restored.error}`);
+  // No database, and a restore's folder holding one: said loudly, before the
+  // first open quietly makes an empty file over the gap.
+  if (!askAboutLostDatabase()) return;
   // A new version on an old file: a copy of it as the old version left it,
   // before opening migrates it. Awaited, because the first open is next.
   let updated = null;
   try { updated = await backups.beforeOpen(app.getVersion()); } catch (error) { console.error("snapshot before the update", error); }
+  // The folder migration runs inside the first open. A copy from before it
+  // first, or no migration this launch: it changes which project has which
+  // folder, and the way back from that is the copy.
+  let migrated = null;
+  try {
+    migrated = await backups.beforeMigration({ needs: folderRule.needsAdoption, reuse: updated && updated.file });
+  } catch (error) {
+    console.error("snapshot before the folder migration; holding the migration back until one can be taken", error);
+    db.holdFolderAdoption(true);
+  }
   // Before the window, so the harness strip has rows to draw on the first paint.
   // Guarded because a database that has no registry is still a working tracker,
   // and refusing to start over it would be a poor trade.
@@ -679,13 +693,18 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.error("reading how the last run ended", error);
   }
-  markRestorePoints({ restored, updated });
+  markRestorePoints({ restored, updated, folders: migrated && db.folderAdoption() && db.folderAdoption().ran ? { file: migrated.file, ...db.folderAdoption() } : null });
   benches.housekeep().then((report) => {
     if ((report.missing.length || report.restored.length || report.adopted.length || (report.reconciled || []).length) && win && !win.isDestroyed()) {
       win.webContents.send("db-changed");
     }
   }, (error) => console.error("workbench housekeeping", error));
   createWindow();
+  // What git says about each folder, for the switcher. Not awaited: a folder
+  // on a drive that is not mounted can keep git waiting.
+  folderTools.detectAll().then((n) => {
+    if (n && win && !win.isDestroyed()) win.webContents.send("db-changed");
+  }, (error) => console.error("detecting folders", error));
   createTray();
   refreshMenu();
   registerHotkey(settings.hotkey);
@@ -1011,7 +1030,7 @@ function errorExtras(error) {
   return out;
 }
 
-handle("projects:list", () => db.listProjects());
+handle("projects:list", () => folderTools.listProjects());
 // Its own channel rather than a flag on projects:list, because every caller of
 // that one wants the working set and would have to opt out of the archive.
 handle("projects:archived", () => db.listArchivedProjects());
@@ -1192,17 +1211,12 @@ handle("sheet:log", (id) => readSheetLog(sheets.get(id)));
 const appRuns = new Map();
 
 /**
- * Where a command typed in the composer runs: the task's Workbench, then the
- * project's repositories and folders in the order a Workbench Start would pick
- * them, then the home folder. The same order sheet_resolve gives the CLI.
+ * Where a command typed in the composer runs: the task's Workbench, then its
+ * project's folders (workbench/folders.js, the rule sheet_resolve gives the
+ * CLI and agents), then the home folder.
  */
 function runFolder(taskId) {
-  const isDir = (p) => { try { return Boolean(p) && fs.statSync(p).isDirectory(); } catch { return false; } };
-  const bench = benchStore.live(taskId);
-  if (bench && bench.state !== "missing" && isDir(bench.path)) return bench.path;
-  const task = benchStore.task(taskId);
-  for (const folder of benchStore.repoFolders(task.project_id)) if (isDir(folder.path)) return folder.path;
-  return app.getPath("home");
+  return folderRule.folderFor(db.sqlP, { taskId, live: (id) => benchStore.live(id) }).path || app.getPath("home");
 }
 
 /**
@@ -1828,6 +1842,7 @@ handle("harness:start", ({ sessionId, prompt, system, autoAllow }) =>
 const { createDispatcher } = require("./agent/dispatch");
 const { createRecovery, register: registerRecovery } = require("./main/recovery");
 const { createBackups } = require("./main/backups");
+const { createFolders, register: registerFolders } = require("./main/folders");
 const { makeWorkbenchStore: makeJobBenchStore } = require("./workbench/store");
 // Its own Workbench verbs, attributed to Delphi rather than to "you": a
 // Workbench a job started was started by the dispatcher, on a person's say-so.
@@ -1917,16 +1932,48 @@ const backups = createBackups({
 });
 
 /**
+ * When there is no database at the live path but backups/replaced-* holds
+ * one, which is what an older Delphi left when it was stopped part way through
+ * a restore. Opening the path would make a new empty database and the tracker
+ * would look wiped, so the person chooses first. False means quit.
+ */
+function askAboutLostDatabase() {
+  let lost = null;
+  try { lost = backups.orphaned(); } catch (error) { console.error("looking for a set-aside database", error); }
+  if (!lost) return true;
+  const newest = lost.replaced[0];
+  const when = new Date(newest.at).toLocaleString();
+  const choice = dialog.showMessageBoxSync({
+    type: "warning", noLink: true, defaultId: 0, cancelId: 1,
+    buttons: ["Restore it", "Quit", "Start with an empty database"],
+    message: "Delphi found no database, but a restore set one aside",
+    detail: `There is no database at ${lost.dbPath}. A restore that did not finish moved the one that was there to ${newest.folder}${newest.wal ? ", with its -wal" : ""}. It was last changed ${when}.\n\n` +
+      "Restore it puts that file back, copied, so the folder keeps its own. Starting empty makes a new database and leaves the folder where it is for 30 days.",
+  });
+  if (choice === 1) { app.quit(); return false; }
+  try {
+    if (choice === 0) backups.putBack(newest.folder);
+    else backups.moveStrays(newest.folder);
+  } catch (error) {
+    dialog.showErrorBox("Delphi could not put the database back", `${error.message}\n\nNothing was deleted. The file is still in ${newest.folder}.`);
+    app.quit();
+    return false;
+  }
+  return true;
+}
+
+/**
  * The rows that say a snapshot was taken before something big, once the
  * database is open, and this version written into meta for the next launch to
  * compare. A failure here costs the History line, never the launch.
  */
-function markRestorePoints({ restored, updated }) {
-  const point = (kind, label, file) => {
+function markRestorePoints({ restored, updated, folders = null }) {
+  const point = (kind, label, file, auditId = null) => {
     try {
-      db.sqlP("INSERT INTO restore_points (kind, label, backup_path) VALUES (:p1, :p2, :p3)", [kind, label, file || null]);
+      db.sqlP("INSERT INTO restore_points (kind, label, backup_path, audit_id) VALUES (:p1, :p2, :p3, :p4)", [kind, label, file || null, auditId]);
     } catch (error) { console.error("recording a restore point", error); }
   };
+  if (folders) point("migration", "Before giving each folder one project", folders.file, folders.auditId || null);
   if (updated) point("update", `Before updating from ${updated.from || "an earlier version"} to ${updated.to}`, updated.file);
   if (restored && restored.ok) point("restore", `Before restoring ${path.basename(restored.from)}`, restored.pre);
   try {
@@ -1945,6 +1992,28 @@ function scheduleSnapshots() {
   setTimeout(take, 8000).unref?.();
   setInterval(take, 24 * 3600 * 1000).unref?.();
 }
+
+// ---------------------------------------------------------------------------
+// Folders: Add folder as project, a folder that moved, and the shared-folder
+// question. The rules are in workbench/folders.js and main/folders.js.
+
+const folderTools = createFolders({
+  db, git: require("./workbench/git"),
+  pick: async () => {
+    const result = await dialog.showOpenDialog(win, {
+      title: "Add a folder as a project", buttonLabel: "Add folder",
+      // Beside the folder of the project added last, where the next one
+      // usually is, rather than at the top of the disk.
+      defaultPath: (() => {
+        const last = db.sqlP("SELECT path FROM projects WHERE path IS NOT NULL ORDER BY id DESC LIMIT 1", [])[0];
+        return last && fs.existsSync(path.dirname(last.path)) ? path.dirname(last.path) : app.getPath("home");
+      })(),
+      properties: ["openDirectory"],
+    });
+    return result.canceled || !result.filePaths.length ? null : result.filePaths[0];
+  },
+});
+registerFolders(handle, { folders: folderTools, db });
 
 handle("backups:list", () => ({ dir: backups.dir, backups: backups.list(), lastRestore }));
 handle("backups:preview", (name) => backups.preview(name));
@@ -2036,19 +2105,12 @@ handle("harness:stop", (sessionId) => {
 });
 
 /**
- * Which folder a session runs in.
- *
- * A project can span four repositories, and a harness needs one answer. The
- * session's own choice wins; then the workspace marked primary; then the
- * project's own path, which is the older way of saying the same thing.
+ * Which folder a session runs in: the one it was started in, then its
+ * project's. The rule is workbench/folders.js's, the same one every other
+ * caller asks.
  */
 function sessionFolder(session) {
-  if (session.cwd) return session.cwd;
-  const spaces = db.workspacesForProject(session.project_id) || [];
-  const primary = spaces.find((w) => w.is_primary) || spaces[0];
-  if (primary) return primary.path;
-  const project = db.getProject(session.project_id);
-  return project ? project.path : null;
+  return folderRule.folderFor(db.sqlP, { sessionCwd: session.cwd, projectId: session.project_id }).path;
 }
 
 // ---------------------------------------------------------------------------

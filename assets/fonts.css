@@ -5,7 +5,8 @@
    Inter is the variable font, one file per script for every weight, so 600 and
    700 are real weights rather than a bolder smear of 400. JetBrains Mono is
    two static weights; a 500 asked for falls back to 400, which is the face it
-   would most nearly be. Both are under the SIL Open Font License. */
+   would most nearly be. Both are under the SIL Open Font License, whose text
+   ships beside them in fonts/Inter-OFL.txt and fonts/JetBrainsMono-OFL.txt. */
 @font-face{font-family:'Inter';font-style:normal;font-weight:400;font-display:swap;src:url('fonts/inter-400-724915.woff2') format('woff2');unicode-range:U+0460-052F, U+1C80-1C8A, U+20B4, U+2DE0-2DFF, U+A640-A69F, U+FE2E-FE2F;}
 @font-face{font-family:'Inter';font-style:normal;font-weight:400;font-display:swap;src:url('fonts/inter-400-e34c5f.woff2') format('woff2');unicode-range:U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;}
 @font-face{font-family:'Inter';font-style:normal;font-weight:400;font-display:swap;src:url('fonts/inter-400-6e1a6b.woff2') format('woff2');unicode-range:U+1F00-1FFF;}

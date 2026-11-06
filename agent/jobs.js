@@ -24,6 +24,7 @@
 
 const fs = require("fs");
 const crypto = require("crypto");
+const { projectFolders } = require("../workbench/folders");
 
 const STATES = ["queued", "needs_approval", "running", "waiting_on_human", "done", "failed", "stopped"];
 // Not finished: a job in one of these still holds its task.
@@ -77,17 +78,12 @@ function approvalFor({ requesterType = null, autoApprove = false } = {}) {
 }
 
 /**
- * Every folder a project says its work is in, best first: repositories, then
- * workspace folders, then projects.path. The same order a Workbench Start uses.
+ * Every folder a project says its work is in, best first: its own folder,
+ * then the others it also works in. workbench/folders.js holds the rule, the
+ * same one a Workbench Start and a `$ ` run use.
  */
 function folders(sql, projectId) {
-  const out = [];
-  for (const r of sql("SELECT path FROM repos WHERE project_id = :p1 ORDER BY is_primary DESC, id", [projectId])) out.push(r.path);
-  for (const w of sql(`SELECT w.path FROM project_workspaces pw JOIN workspaces w ON w.id = pw.workspace_id
-                        WHERE pw.project_id = :p1 ORDER BY pw.is_primary DESC, w.sort_order, w.id`, [projectId])) out.push(w.path);
-  const p = sql("SELECT path FROM projects WHERE id = :p1", [projectId])[0];
-  if (p && p.path) out.push(p.path);
-  return [...new Set(out.filter(Boolean))];
+  return [...new Set(projectFolders(sql, projectId).map((f) => f.path).filter(Boolean))];
 }
 
 const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
@@ -102,7 +98,7 @@ function folderProblem(sql, projectId) {
   const list = folders(sql, projectId);
   if (!list.length) {
     return `Project ${project.name} has no folder, so there is nowhere for an agent to work. ` +
-      `In Delphi, open the project's settings and set its Folder to where its code is (or add a repository to it), then ask again.`;
+      `In Delphi, open the project's settings and set its Folder to where its code is, then ask again.`;
   }
   if (!list.some(isDir)) {
     return `Project ${project.name}'s folder (${list[0]}) is not there any more. ` +
