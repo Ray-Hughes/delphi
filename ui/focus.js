@@ -15,11 +15,12 @@
 //   - Break: 15, 30 or 60 minutes behind a blur nothing gets through, which
 //     survives a restart because its end is a setting
 //
-// Which task is first is the queue's order, not a new one: priority, then due
-// date, then a person's rank, then oldest first. That is db.js's priority and
-// due order with agent/jobs.js PICK_ORDER as the tie-break (queue_rank, then
-// id). Tasks carry no queue_rank column today, so the rank is read when a row
-// has one and is otherwise null, which sorts last exactly as it does for jobs.
+// Which task is first is the one order Delphi has for a person's work:
+// priority, then due date (none last), then oldest first, with a rank in
+// between that sorts the way agent/jobs.js PICK_ORDER does (queue_rank, nulls
+// last). Tasks carry no queue_rank column today, so in practice it is oldest
+// first. Today's "Up next in Focus" and its Your day list read the same order
+// through order() below, so the card, F, Cmd+K and Done all agree.
 // Only a person's own work: nothing assigned to an agent, claimed by one, left
 // in an agent's queue, or with an agent's job open on it.
 //
@@ -203,14 +204,18 @@ globalThis.DelphiFocus = (() => {
 
   function init(lent) {
     app = lent;
-    document.addEventListener("keydown", onKey, true);
+    // On the window, in the capture phase: ahead of every document listener,
+    // so a break or Focus hears a key before any page or dialog behind it.
+    window.addEventListener("keydown", onKey, true);
     window.delphi.onDbChanged(() => { if (S.open && !S.busy) reload(); });
     paintEntry();
     // A break that was running when Delphi closed. Its end is a setting, so the
     // window comes back behind the blur, counting down to the same moment.
     window.delphi.settings.get().then((s) => {
       const r = resumeBreak(s && s.focusBreakUntil);
-      if (r.state === "running") enter().finally(() => startBreak(null, r.endsAt));
+      // The blur first, at once, and Focus loads underneath it: waiting for
+      // the tasks first would leave the window usable for that long.
+      if (r.state === "running") { startBreak(null, r.endsAt); enter(); }
       else if (r.state === "ended") window.delphi.settings.set({ focusBreakUntil: null }).catch(() => {});
     }).catch(() => {});
   }
@@ -223,7 +228,7 @@ globalThis.DelphiFocus = (() => {
     const slot = document.getElementById("focus-entry");
     if (!slot) return;
     slot.textContent = "";
-    const b = el("button", { className: "btn fx-entry", type: "button" }, I("focus", "sm"), el("span", { textContent: "Focus" }));
+    const b = el("button", { className: "btn fx-enter", type: "button" }, I("focus", "sm"), el("span", { textContent: "Focus" }));
     const k = focusLetter();
     if (k !== "off") b.append(kbd(k.toUpperCase()));
     b.title = k !== "off" ? `Focus mode (${k.toUpperCase()})` : "Focus mode";
@@ -235,7 +240,8 @@ globalThis.DelphiFocus = (() => {
   async function load() {
     const [tasks, runs] = await Promise.all([
       window.delphi.tasks.list({ projectId: null, includeDone: true }),
-      window.delphi.runs.list({ limit: 300 }).catch(() => []),
+      // By state, not the newest few hundred: an old job still open holds its task.
+      window.delphi.runs.list({ states: OPEN_JOB, limit: 500 }).catch(() => []),
     ]);
     S.data = tasks || [];
     S.runs = runs || [];
@@ -291,7 +297,9 @@ globalThis.DelphiFocus = (() => {
     if (S.view.task) S.since = Date.now();
     S.returnTo = document.activeElement;
     for (const node of [document.getElementById("top"), document.querySelector("body > .body")]) {
-      if (node && !node.inert) { node.inert = true; S.inerted.push(node); }
+      // Taken even when a break already made it inert (a restart starts the
+      // blur before Focus), so the end of the break does not hand it back.
+      if (node && !S.inerted.includes(node)) { node.inert = true; S.inerted.push(node); }
     }
     document.body.classList.add("in-focus");
     root.hidden = false;
@@ -359,7 +367,9 @@ globalThis.DelphiFocus = (() => {
 
   /** Announced to a screen reader, once, politely. */
   function say(text) {
-    const live = root && root.querySelector(".fx-live");
+    // During a break everything but the blur is inert, and an inert live
+    // region is never read, so the break has its own.
+    const live = S.brk && S.brk.node ? S.brk.node.querySelector(".fx-live") : root && root.querySelector(".fx-live");
     if (!live) return;
     live.textContent = "";
     setTimeout(() => { live.textContent = text; }, 30);
@@ -723,10 +733,14 @@ globalThis.DelphiFocus = (() => {
   }
 
   async function undoDone(t, was) {
+    if (S.busy) return;
+    S.busy = true;
+    for (const n of root.querySelectorAll(".fx-toast")) n.remove();
     try {
       await window.delphi.tasks.update(t.id, { status: was === "doing" ? "doing" : "todo" });
-    } catch (error) { toast(errOf(error), { error: true }); return; }
+    } catch (error) { S.busy = false; toast(errOf(error), { error: true }); return; }
     S.stack.push(t.id);
+    S.busy = false;
     await reload();
     S.why = "back";
     paint({ arrive: true });
@@ -814,6 +828,9 @@ globalThis.DelphiFocus = (() => {
     where.setAttribute("aria-label", "Into which project");
     for (const p of projects) where.append(el("option", { value: String(p.id), textContent: p.name }));
     if (st.projectId != null) where.value = String(st.projectId);
+    // A default the list does not hold (no project, or an archived one) shows
+    // the first option; the interruption goes where the dropdown says.
+    st.projectId = where.value ? Number(where.value) : null;
     where.onchange = () => { st.projectId = Number(where.value); };
     const left = el("div", { className: "ic-left" }, titleIn, el("div", { className: "ic-hand" }, el("span", { textContent: "Into" }), where));
     const verdict = el("div", { className: "verdict" });
@@ -944,6 +961,7 @@ globalThis.DelphiFocus = (() => {
       return;
     }
     st.busy = true;
+    S.busy = true;
     go.disabled = true;
     try {
       if (o === "later") {
@@ -972,8 +990,10 @@ globalThis.DelphiFocus = (() => {
         toast(line);
         say(line);
       }
+      S.busy = false;
       app.refresh();
     } catch (error) {
+      S.busy = false;
       st.busy = false;
       go.disabled = false;
       if (S.dialog && st.err) { st.err.textContent = errOf(error); st.err.hidden = false; }
@@ -1069,7 +1089,10 @@ globalThis.DelphiFocus = (() => {
     const b = S.brk;
     if (!b) return;
     const node = b.node;
+    let live = node.querySelector(".fx-live");
+    if (!live) { live = el("div", { className: "fx-live fx-sr", role: "status" }); live.setAttribute("aria-live", "polite"); }
     node.textContent = "";
+    node.append(live);
     const t = S.view && S.view.task;
     const inner = el("div", { className: `brk-in${b.over ? " brk-over" : ""}` });
     if (b.over) {
@@ -1150,6 +1173,8 @@ globalThis.DelphiFocus = (() => {
     for (const type of SHUT_EVENTS) window.removeEventListener(type, blockDuringBreak, true);
     clearInterval(b.timer);
     for (const n of b.shut) n.inert = false;
+    // Focus keeps the window behind it out of reach once the break is over.
+    if (S.open) for (const n of S.inerted) n.inert = true;
     b.node.remove();
     S.brk = null;
     if (!b.over) window.delphi.settings.set({ focusBreakUntil: null }).catch(() => {});
@@ -1189,7 +1214,7 @@ globalThis.DelphiFocus = (() => {
       e.stopImmediatePropagation();
       return;
     }
-    if (e.key === "Escape") {
+    if (e.key === "Escape" && !e.isComposing) {
       swallow();
       if (S.pop) closePop(); else exit();
       return;
@@ -1206,6 +1231,9 @@ globalThis.DelphiFocus = (() => {
   function breakKey(e) {
     const node = S.brk.node;
     if (e.key === "Tab") { e.preventDefault(); e.stopImmediatePropagation(); trapTab(e, node); return; }
+    // Quit, hide and minimise are the computer's, not Delphi's: kept from the
+    // page, never from the system. A break picks back up after a quit.
+    if ((e.metaKey || e.ctrlKey) && ["q", "h", "m"].includes(String(e.key || "").toLowerCase())) { e.stopImmediatePropagation(); return; }
     // Over, Enter is Back to it wherever the focus is: the one thing left to do.
     if (e.key === "Enter" && S.brk.over) { e.preventDefault(); e.stopImmediatePropagation(); endBreak(false); return; }
     const onButton = e.target && node.contains(e.target) && e.target.tagName === "BUTTON";
@@ -1233,6 +1261,15 @@ globalThis.DelphiFocus = (() => {
     return true;
   }
 
+  /**
+   * What Focus would show, in order, for Today's card and list: the same pick,
+   * with the stack a person built by switching, against the open jobs Today has.
+   */
+  function order(tasks, runs = []) {
+    const p = pick(tasks, { stack: S.stack, isAgent: (app && app.isAgent) || looksLikeAgent, busy: busyTasks(runs) });
+    return [p.task, p.parked, ...p.next].filter(Boolean);
+  }
+
   /** For Cmd+K. */
   function commands() {
     return [
@@ -1241,7 +1278,7 @@ globalThis.DelphiFocus = (() => {
   }
 
   return {
-    ...pure, pure, init, enter, exit, key, menu, commands, paintEntry,
+    ...pure, pure, init, enter, order, exit, key, menu, commands, paintEntry,
     isOpen: () => S.open, onBreak: () => Boolean(S.brk),
     // For tools/focus_test.js in a hidden window.
     _state: () => S,

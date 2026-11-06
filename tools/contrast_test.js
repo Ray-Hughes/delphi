@@ -113,5 +113,16 @@ for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinne
   }
 }
 
+// Focus's peek is quiet by colour (--ink-dim, checked above), never by
+// opacity: a faded --ink drops under 4.5:1 in both themes and no token check
+// can see it, so the stylesheet itself is read.
+{
+  const focusCss = fs.readFileSync(path.join(__dirname, "..", "styles", "focus.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  const faded = [...focusCss.matchAll(/([^{}]*)\{([^}]*)\}/g)]
+    .filter(([, sel, body]) => /\.fx-next|\.fx-peek/.test(sel) && /opacity\s*:\s*0?\.\d/.test(body)).map(([, sel]) => sel.trim());
+  console.log("\nfocus: text is never faded below AA by opacity");
+  check(".fx-next and .fx-peek set no partial opacity", faded.length === 0, faded.join(", "));
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

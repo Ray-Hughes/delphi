@@ -340,6 +340,8 @@ globalThis.DelphiMemory = (() => {
 
   function onShortcut(e) {
     if (!app || !modKey(e) || e.altKey || String(e.key || "").toLowerCase() !== "l") return;
+    // Behind a Focus break nothing opens: a window-level listener runs ahead of Focus's own.
+    if (window.DelphiFocus && DelphiFocus.onBreak()) return;
     // A terminal's own: Ctrl+L clears the screen there, on Windows and Linux.
     if (e.target && e.target.closest && e.target.closest(".xterm")) return;
     if (fact) { e.preventDefault(); e.stopPropagation(); fact.field.focus(); return; }

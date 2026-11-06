@@ -11,7 +11,7 @@
 
 /* The way in, on the top bar beside the buttons on the right. */
 #focus-entry { display: flex; align-items: center; margin-right: 6px; }
-.btn.fx-entry { display: inline-flex; align-items: center; gap: 7px; color: var(--ink); font-weight: 560; }
+.btn.fx-enter { display: inline-flex; align-items: center; gap: 7px; color: var(--ink); font-weight: 560; }
 .fx-kbd {
   display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px;
   font: 500 10.5px/1 var(--mono); border-radius: 4px;
@@ -159,10 +159,11 @@
 .fx-led { font-size: 10px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; color: var(--kind-ledger); }
 .fx-entry-body { font-size: 13px; line-height: 1.5; color: var(--ink); margin-top: 2px; overflow-wrap: anywhere; }
 
-/* The peek. Dimmed so it is there if you look and quiet if you do not; it
-   comes up to full on hover so its text is never only seen dim. */
-.fx-next { position: sticky; top: 4px; width: 252px; margin-top: 30px; opacity: .6; transition: opacity 160ms ease; }
-.fx-next:hover, .fx-next:focus-within { opacity: 1; }
+/* The peek. Quiet by colour, not opacity: a faded --ink fails AA, and
+   --ink-dim on --surface passes in both themes (tools/contrast_test.js). */
+.fx-next { position: sticky; top: 4px; width: 252px; margin-top: 30px; color: var(--ink-dim); }
+.fx-next .fx-peek .t { color: var(--ink-dim); }
+.fx-next:hover .fx-peek .t, .fx-next:focus-within .fx-peek .t { color: var(--ink); }
 .fx-peek { border: 1px solid var(--line-soft); border-radius: var(--r-lg); padding: 10px 12px; margin-top: 8px; background: var(--surface); }
 .fx-peek .t { font-size: 13px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .fx-peek .m { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11.5px; color: var(--ink-dim); }
