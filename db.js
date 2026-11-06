@@ -2749,20 +2749,54 @@ function listLocks(projectId = null) {
  * is why the window offers only Archive for one. The pattern ends at the
  * closing bracket so session 6 never counts session 16's rows.
  */
+const sessionAuthorPattern = (id) => `%(by %:${Number(id)})`;
+
+// The session_id column for rows written since attribution moved into columns
+// (agent/audit.js), and the summary suffix for the rows before it, which keep
+// only that (owner decision S6).
+const SESSION_AUTHORED = "(session_id = :id OR summary LIKE :pattern)";
+
 function sessionChanges(id) {
   const n = Number(id);
   if (!Number.isInteger(n)) return 0;
-  const r = one("SELECT COUNT(*) AS n FROM audit WHERE summary LIKE :pattern", { pattern: `%(by %:${n})` });
+  const r = one(`SELECT COUNT(*) AS n FROM audit WHERE ${SESSION_AUTHORED}`, { id: n, pattern: sessionAuthorPattern(n) });
   return r ? r.n : 0;
 }
 
+const sessionOnlyArchives = (changed) =>
+  `This session made ${changed} recorded change${changed === 1 ? "" : "s"}, so it can only be archived.`;
+
+/**
+ * Deletes a session History does not name, and refuses one it does.
+ *
+ * The rule is here rather than in the IPC handler, and the delete carries the
+ * test in its own WHERE, because an agent in that session can write an audit
+ * row through the MCP server between a check and a separate delete. One
+ * statement cannot be interleaved; ATOMIC holds the count and the delete in
+ * one unit besides, so the refusal names the count the delete saw.
+ */
 function deleteSession(id) {
   const before = getSession(id);
   if (!before) return null;
+  const changed = sessionChanges(id);
+  if (changed) throw new Error(sessionOnlyArchives(changed));
   // Messages go with it through ON DELETE CASCADE. Not audited, for the reason
   // given in createSession.
-  run("DELETE FROM sessions WHERE id = :id", { id });
+  const r = run(
+    `DELETE FROM sessions WHERE id = :id
+       AND NOT EXISTS (SELECT 1 FROM audit WHERE ${SESSION_AUTHORED})`,
+    { id: Number(id), pattern: sessionAuthorPattern(id) });
+  if (!r.changes && getSession(id)) throw new Error(sessionOnlyArchives(Math.max(1, sessionChanges(id))));
   return before;
+}
+
+/** A project's archived sessions, newest first, for "Show archived" in the sidebar. */
+function listArchivedSessions(projectId) {
+  return all(
+    `SELECT s.*, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count
+     FROM sessions s WHERE s.project_id = :projectId AND s.status = 'archived'
+     ORDER BY s.updated_at DESC, s.id DESC`,
+    { projectId });
 }
 
 const listMessages = (sessionId) =>
@@ -2940,7 +2974,7 @@ const ATOMIC = [
   "setQueue", "claimNext", "releaseClaim", "completeClaim", "extendClaim", "reclaimExpired",
   "createNote", "updateNote", "deleteNote", "createScratchpad", "appendScratchpad", "patchScratchpad",
   "deleteScratchpad", "derive", "createLink", "deleteLink", "createAlert", "createHandoff", "updateHandoff",
-  "createExternalTask",
+  "createExternalTask", "deleteSession",
 ];
 
 module.exports = {
@@ -2980,6 +3014,7 @@ module.exports = {
   projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
   adoptProjectPaths,
   listSessions, getSession, createSession, updateSession, deleteSession, sessionChanges,
+  listArchivedSessions,
   listHarnesses, getHarness, seedHarnesses, createHarness, updateHarness, deleteHarness, trustHarnessCommand,
   listHandoffs, getHandoff, createHandoff, updateHandoff, pendingHandoffs, handoffsSince,
   acquireLock, releaseLock, listLocks,

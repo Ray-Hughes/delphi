@@ -118,7 +118,7 @@ async function main() {
     "workbench:list", "workbench:advanced", "repos:update", "sheet:run", "sheet:interrupt"]) {
     check(`${c} is in preload and handled`, [called.includes(c), handlers.has(c)], [true, true]);
   }
-  for (const c of ["sessions:changes", "sessions:archive", "sessions:delete"]) {
+  for (const c of ["sessions:changes", "sessions:archive", "sessions:delete", "sessions:archived", "sessions:restore"]) {
     check(`${c} is in preload and handled`, [called.includes(c), handlers.has(c)], [true, true]);
   }
   for (const event of ["onWorkbenchEvent", "onWorkbenchPrompt", "onSheetRunOutput", "onSheetRunDone"]) {
@@ -284,6 +284,25 @@ async function main() {
     ["hiddenFromActive must be a list of { id, at }", [[pinA.id, true]]]);
   await call("settings:set", { hiddenFromActive: [] });
   check("a refused field changes nothing", (await call("settings:get")).jobConcurrency, 8);
+  {
+    // The refusal lives in db.deleteSession, so any caller gets it, not only the IPC.
+    const sp = db.createProject({ key: "ipc-sess", name: "IPC sessions" });
+    // busy first: the composer runs above wrote rows as claude-code:1, which
+    // name session 1 by the actor's shape, so the quiet one must not be 1.
+    const busy = db.createSession({ projectId: sp.id, harness: "codex", title: "busy" });
+    const quiet = db.createSession({ projectId: sp.id, title: "quiet" });
+    db.sqlP(`INSERT INTO audit (action, entity, entity_id, summary, label) VALUES ('update', 'task', 1, :p1, 'x')`, [`status to done (by codex:${busy.id})`]);
+    const refusedDelete = await handlers.get("sessions:delete")({}, busy.id);
+    let direct = null;
+    try { db.deleteSession(busy.id); } catch (e) { direct = e.message; }
+    check("a session History names is refused, through the IPC and the db alike",
+      [refusedDelete.ok, /can only be archived/.test(refusedDelete.error), /can only be archived/.test(direct || ""), !!db.getSession(busy.id)],
+      [false, true, true, true]);
+    check("one it does not name is deleted", [(await call("sessions:delete", quiet.id)).id, db.getSession(quiet.id)], [quiet.id, null]);
+    await call("sessions:archive", busy.id);
+    check("archived, it is listed apart", [(await call("sessions:list", sp.id)).length, (await call("sessions:archived", sp.id)).map((x) => x.id)], [0, [busy.id]]);
+    check("and restore brings it back", [(await call("sessions:restore", busy.id)).status, (await call("sessions:list", sp.id)).map((x) => x.id), (await call("sessions:archived", sp.id)).length], ["active", [busy.id], 0]);
+  }
   check("and the dispatcher reads them on its next pass", JSON.parse(fs.readFileSync(path.join(process.env.DELPHI_DATA_DIR, "settings.json"), "utf8")).jobHarnessLimits, { codex: 0, "claude-code": 2 });
   await call("settings:set", { jobConcurrency: 3, jobHarnessLimits: {}, pinnedProjects: [] });
 

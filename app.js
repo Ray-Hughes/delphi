@@ -115,6 +115,10 @@ const state = {
   // The project whose whole session list is unfolded, if any. A project id
   // rather than a flag, so moving to another project folds its list again.
   sessionsAllFor: null,
+  // The open project's archived sessions, and the project whose archive is
+  // unfolded in the sidebar, kept the same way as sessionsAllFor.
+  archivedSessions: [],
+  archivedOpenFor: null,
   // Today opens All work until it is built; this says which of the two was clicked.
   todayPick: false,
   runsEarlier: false,
@@ -528,6 +532,7 @@ async function refresh() {
     state.links = [];
     state.repos = [];
     state.sessions = [];
+    state.archivedSessions = [];
     state.sessionId = null;
     state.organizers = [];
 
@@ -568,6 +573,7 @@ async function refresh() {
       state.links = await window.delphi.links.list(state.projectId);
       state.repos = await window.delphi.repos.list(state.projectId);
       state.sessions = await window.delphi.sessions.list(state.projectId);
+      state.archivedSessions = await window.delphi.sessions.archived(state.projectId);
       state.organizers = await window.delphi.organizers.list(state.projectId);
     } else {
       state.notes = [];
@@ -577,6 +583,7 @@ async function refresh() {
       state.links = [];
       state.repos = [];
       state.sessions = [];
+      state.archivedSessions = [];
       state.sessionId = null;
       state.organizers = [];
     }
@@ -802,7 +809,55 @@ function sessionKids() {
     toggle.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); flip(); } };
     kids.append(toggle);
   }
+
+  // Archive is only a safe thing to offer if it can be undone, so what was
+  // archived is one click from here, drawn faintly with Restore beside it.
+  const archived = state.archivedSessions || [];
+  if (archived.length) {
+    const open = state.archivedOpenFor === state.projectId;
+    const toggle = el("div", { className: "gs sub gs-more", tabIndex: 0, role: "button" },
+      el("span", { className: "nm dim", textContent: open ? "Hide archived" : `Show archived (${archived.length})` }));
+    toggle.dataset.row = "sess-archived";
+    toggle.setAttribute("aria-expanded", String(open));
+    const flip = () => { state.archivedOpenFor = open ? null : state.projectId; renderSidebar(); };
+    toggle.onclick = flip;
+    toggle.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); flip(); } };
+    kids.append(toggle);
+    if (open) {
+      for (const sn of archived) {
+        const row = el("div", { className: "gs sub sess archived" });
+        row.dataset.row = "arch-" + sn.id;
+        const agent = sessionAgent(sn);
+        const when = sessionAgo(sessionLastActive(sn));
+        row.append(
+          el("span", { className: "sd" }),
+          el("span", { className: "gs-txt" },
+            el("span", { className: "nm", textContent: sn.title || "Session" }),
+            el("span", { className: "gs-meta", textContent: [agent === sn.title ? null : agent, when ? `archived, last used ${when}` : "archived"].filter(Boolean).join(" \u00b7 ") })));
+        // A real button, always visible: it is the only thing the row does.
+        const restore = el("button", { className: "srow-btn restore", type: "button", textContent: "Restore" });
+        restore.setAttribute("aria-label", `Restore ${sn.title || "this session"}`);
+        restore.dataset.act = "restore-" + sn.id;
+        restore.onclick = () => restoreSession(sn);
+        row.append(restore);
+        kids.append(row);
+      }
+    }
+  }
   return kids;
+}
+
+/** Puts an archived session back in the list, and focus on it, where it now is. */
+async function restoreSession(session) {
+  try { await window.delphi.sessions.restore(session.id); } catch (error) { alert(error.message); return; }
+  // The last one out folds the archive, so the next archive starts folded.
+  if ((state.archivedSessions || []).length <= 1) state.archivedOpenFor = null;
+  await refresh();
+  // Folded past three, the restored row may not be drawn; the list's first
+  // row is then the nearest place for focus.
+  const back = document.querySelector(`#projects [data-row="sess-${session.id}"]`) ||
+    document.querySelector('#projects [data-row="sess-new"]');
+  if (back) back.focus({ preventScroll: true });
 }
 
 /**
@@ -12657,7 +12712,7 @@ let sidebarSig = null;
 function renderSidebar() {
   const { late, touched } = projectPulse();
   const sig = JSON.stringify([
-    state.projects, state.pinned, state.hidden, state.sessionsAllFor, state.harnesses.map((h) => h.label), !!state.restOpen, state.projectId, state.view, state.query, sidebarPlace(),
+    state.projects, state.pinned, state.hidden, state.sessionsAllFor, state.archivedOpenFor, (state.archivedSessions || []).map((x) => [x.id, x.title]), state.harnesses.map((h) => h.label), !!state.restOpen, state.projectId, state.view, state.query, sidebarPlace(),
     state.runs.map((r) => [r.project_id, r.state]), needsYouTotal(),
     [...late], [...touched], (state.sessions || []).map((x) => [x.id, x.title, x.run_state, x.harness, sessionAgo(sessionLastActive(x))]), state.sessionId, state.pane,
     state.workspaces, state.workspaceId,

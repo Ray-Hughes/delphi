@@ -219,6 +219,8 @@ contextBridge.exposeInMainWorld("delphi", {
     remove: (id) => call("sessions:delete", id),
     changes: (id) => call("sessions:changes", id),
     archive: (id) => call("sessions:archive", id),
+    archived: (projectId) => call("sessions:archived", projectId),
+    restore: (id) => call("sessions:restore", id),
     addUsage: (id, usage) => call("sessions:addUsage", id, usage),
   },
   messages: {

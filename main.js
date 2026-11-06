@@ -2070,15 +2070,13 @@ handle("sessions:list", (projectId) => db.listSessions(projectId));
 handle("sessions:get", (id) => db.getSession(id));
 handle("sessions:create", (payload) => db.createSession(payload));
 handle("sessions:update", (id, fields) => db.updateSession(id, fields));
-// Refused here as well as hidden in the window, because the menu is not the
-// only thing that can send this, and a deleted author leaves History unreadable.
-handle("sessions:delete", (id) => {
-  const changed = db.sessionChanges(id);
-  if (changed) throw new Error(`This session made ${changed} recorded change${changed === 1 ? "" : "s"}, so it can only be archived.`);
-  return db.deleteSession(id);
-});
+// db.deleteSession refuses a session History names, in the same unit as the
+// delete. See there.
+handle("sessions:delete", (id) => db.deleteSession(id));
 handle("sessions:changes", (id) => db.sessionChanges(id));
 handle("sessions:archive", (id) => db.updateSession(id, { status: "archived" }));
+handle("sessions:archived", (projectId) => db.listArchivedSessions(projectId));
+handle("sessions:restore", (id) => db.updateSession(id, { status: "active" }));
 handle("messages:list", (sessionId) => db.listMessages(sessionId));
 handle("messages:append", (payload) => db.appendMessage(payload));
 handle("messages:update", (id, fields) => db.updateMessage(id, fields));

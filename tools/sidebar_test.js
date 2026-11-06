@@ -132,6 +132,21 @@ async function main() {
   check("and an archived one leaves the list", db.listSessions(project.id).map((s) => s.id), [made.id]);
   check("one that changed nothing can be deleted", await js(`window.delphi.sessions.remove(${made.id}).then(() => "deleted", (e) => e.message)`), "deleted");
 
+  console.log("\nbringing an archived session back");
+  await js(`refresh()`);
+  await until(`!!document.querySelector('[data-row="sess-archived"]')`);
+  check("the list offers its archive", await js(`document.querySelector('[data-row="sess-archived"]').textContent`), "Show archived (1)");
+  await js(`document.querySelector('[data-row="sess-archived"]').focus()`);
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Return" });
+  await until(`!!document.querySelector('[data-row="arch-${kept.id}"]')`);
+  check("Enter unfolds it, with Restore on the row",
+    await js(`!!document.querySelector('[data-row="arch-${kept.id}"] button[data-act="restore-${kept.id}"]')`), true);
+  await js(`document.querySelector('[data-act="restore-${kept.id}"]').click()`);
+  await until(`!!document.querySelector('[data-row="sess-${kept.id}"]')`);
+  check("Restore puts it back in the list", [db.getSession(kept.id).status, db.listSessions(project.id).map((s) => s.id)], ["active", [kept.id]]);
+  check("with focus on it", await js(`document.activeElement?.dataset.row`), `sess-${kept.id}`);
+  check("and the archive toggle goes when it is empty", await js(`!!document.querySelector('[data-row="sess-archived"]')`), false);
+
   console.log("\nhide from Active");
   await js(`refresh()`);
   await wait(500);
