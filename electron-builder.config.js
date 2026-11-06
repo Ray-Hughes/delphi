@@ -68,6 +68,9 @@ module.exports = {
     // Who made a change and when undo may reverse it. The stores under sheet/,
     // workbench/ and items/ require it, so it is copied out as well.
     "agent/audit.js",
+    // Ranking and the reasons on memory cards: main/memory.js requires it, and
+    // the server's memory tools do too, so it is copied out as well.
+    "agent/recall.js",
     "sheet/",
     "workbench/",
     // Items across projects and flags: the store and the Oracle's evaluator,
@@ -111,7 +114,7 @@ module.exports = {
   // it. That is how 1.6.0 shipped a main process that died on require("./pads")
   // before it could open a window. The modules both sides need (pads.js, git.js,
   // harness.js, embeddings.js, agent/schema_later.js, agent/launch.js, agent/locate.js,
-  // agent/identity.js, agent/jobs.js, agent/binaries.js, agent/audit.js, sheet/, workbench/, items/) are
+  // agent/identity.js, agent/jobs.js, agent/binaries.js, agent/audit.js, agent/recall.js, sheet/, workbench/, items/) are
   // copied out by tools/after-pack.js instead, from its OUTSIDE_TOO list, after
   // the archive is written. tools/package_test.js reads both lists and the real
   // archive, so neither half can go missing again without a test failing.
@@ -127,8 +130,6 @@ module.exports = {
     // file arrived, and every installed build since shipped a server that died
     // at its first require.
     { from: "agent/directives.js", to: "agent/directives.js" },
-    // Ranking, snippets and budgets for the memory tools. Only the server needs it.
-    { from: "agent/recall.js", to: "agent/recall.js" },
     // Second opinions: another agent's CLI, run read only. Only the server needs it.
     { from: "agent/second_opinion.js", to: "agent/second_opinion.js" },
     // The command line tool. Resources/bin/delphi spawns ../agent/mcp_server.js,

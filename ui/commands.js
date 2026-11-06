@@ -9,7 +9,7 @@
 // today, until the slices that build its own page:
 //   Today    its own page (ui/today.js): what is on, Needs you, the brief
 //   Tasks    the task list, in the current scope
-//   Memory   a project's notes, or the mind map across all of them
+//   Memory   its own page (ui/memory.js): notes as rows, in this project or all
 //   Pads     a project's pads
 //   Chat     a project's chat, sessions and all
 //   Runs     every agent's runs
@@ -34,7 +34,7 @@ globalThis.DelphiCommands = (() => {
   const VIEW_TAB = {
     today: "today", inbox: "today", new: "today", reminders: "today",
     tasks: "tasks", queue: "tasks",
-    notes: "memory", links: "memory", graph: "memory",
+    memory: "memory", notes: "memory", links: "memory", graph: "memory",
     pads: "pads", chat: "chat", runs: "runs",
   };
 
@@ -53,7 +53,7 @@ globalThis.DelphiCommands = (() => {
     switch (id) {
       case "today": return { projectId: null, view: "today" };
       case "tasks": return { view: "tasks" };
-      case "memory": return inProject ? { view: "notes" } : { view: "graph" };
+      case "memory": return { view: "memory" };
       case "pads": return needsProject("pads");
       case "chat": return needsProject("chat");
       case "runs": return { projectId: null, view: "runs" };
@@ -89,6 +89,7 @@ globalThis.DelphiCommands = (() => {
       { id: "go-queue", group: "Go to", title: "Queue: waiting for an agent", place: "queue", run: () => go({ view: "queue" }) },
       { id: "go-reminders", group: "Go to", title: "Reminders", place: "reminders", run: () => go({ projectId: null, view: "reminders" }) },
       { id: "go-mind-map", group: "Go to", title: "Mind map", place: "mind-map", run: () => go({ projectId: null, view: "graph" }) },
+      { id: "go-notes", group: "Go to", title: "Edit notes: every note in full", place: "notes", when: inProject, run: () => go({ view: "notes" }) },
       { id: "go-links", group: "Go to", title: "Links", place: "links", when: inProject, run: () => go({ view: "links" }) },
       { id: "go-history", group: "Go to", title: "History", place: "history",
         run: () => go(inProject() ? { view: "activity" } : { projectId: null, view: "history" }) },

@@ -2008,6 +2008,8 @@ const folderTools = createFolders({
 });
 registerFolders(handle, { folders: folderTools, db });
 require("./main/ledger").register(handle, { db });
+// Memory: the tab, a task's related notes with their reasons, and Log a fact.
+require("./main/memory").register(handle, { memory: require("./main/memory").createMemory({ db, sheets }), afterWrite: scheduleVaultExport });
 
 // Today: stuck tasks and the brief (today/brief.js), and when you were last here.
 const today = require("./main/today").createToday({ sql: db.sqlP, dataDir: paths.DATA_DIR });

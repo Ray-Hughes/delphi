@@ -109,6 +109,64 @@ function clip(text, limit) {
 
 const round = (n) => Math.round(n * 100) / 100;
 
+/** A stored vector, from the hex SQLite hands back on either route. */
+function decode(hex) {
+  const bytes = Buffer.from(String(hex), "hex");
+  const v = new Float32Array(bytes.length / 4);
+  for (let j = 0; j < v.length; j++) v[j] = bytes.readFloatLE(j * 4);
+  return v;
+}
+
+/**
+ * Cosine, not the dot product the query ranking uses: a query vector comes
+ * back normalised from the model, but two stored vectors were written by
+ * whichever model was configured at the time and are not promised to be.
+ */
+function cosine(a, b) {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  return na && nb ? dot / Math.sqrt(na * nb) : 0;
+}
+
+// How near a note's stored vector has to be to the task's before "Similar
+// meaning" is said. Embedding models put almost any two notes in the same
+// language near 0.6: on a real tracker, a task about Prometheus scored 0.63 to
+// 0.64 against five unrelated notes, while a devtest retest scored 0.7 to 0.77
+// against the devtest runbooks it should find.
+const SIMILAR_MIN = 0.68;
+
+// How much of a task's rare words a note must share before "Similar wording"
+// is said. Measured on a real tracker: at 0.3 the cards were the ones a person
+// would have picked; below it, notes sharing two common words crept in.
+const WORDS_MIN = 0.3;
+
+// Strongest first. The card says the first reason it has; the rest go in its
+// tooltip. A fact about where the note came from outranks a guess from its
+// words, and the project's own decisions come last because they are filler.
+const SIGNAL_ORDER = ["sheet", "link", "file", "entity", "workbench", "seen", "meaning", "words", "project"];
+
+/**
+ * One signal as the few words a card shows. Pure, so the window, the server
+ * and a test all say it the same way.
+ */
+function whyRelated(signal) {
+  const s = signal || {};
+  switch (s.kind) {
+    case "sheet": return "From this task's Sheet";
+    case "link": return "Linked to this task";
+    case "file": return `Same file: ${clip(s.name, 40)}`;
+    case "entity": return `Both name ${clip(s.name, 40)}`;
+    case "workbench": return s.task != null ? `Same Workbench, #${s.task}` : "Same Workbench";
+    case "seen": return s.task != null ? `Seen on #${s.task}` : "Seen on a nearby task";
+    case "meaning": return "Similar meaning";
+    case "words": return "Similar wording";
+    case "project": return `Same project, ${s.noteKind || "note"}`;
+    default: return "Related";
+  }
+}
+
 /** The sentence in a body that best matches the query, or its first one. */
 function snippet(body, queryTerms, limit = 160) {
   const list = sentences(body);
@@ -256,10 +314,7 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
       const got = sql(`SELECT id, hex(vector) AS hex FROM embeddings WHERE id IN (${batch.map((w) => w.id).join(",")})`);
       for (const g of got) {
         const w = byId.get(Number(g.id));
-        const bytes = Buffer.from(String(g.hex), "hex");
-        const v = new Float32Array(bytes.length / 4);
-        for (let j = 0; j < v.length; j++) v[j] = bytes.readFloatLE(j * 4);
-        vectors.set(w.key, { stamp: w.stamp, vec: v });
+        vectors.set(w.key, { stamp: w.stamp, vec: decode(g.hex) });
       }
     }
     for (const key of vectors.keys()) if (key.startsWith(`${model}|`) && !live.has(key)) vectors.delete(key);
@@ -598,7 +653,211 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
     }, budget, ["related", "tasks", "notes"]);
   }
 
-  return { search, ask, context, load };
+
+  /**
+   * The notes worth having beside a task, each with the reason it is there.
+   *
+   * No model is called. Every reason is a fact the database already holds, so a
+   * card can say it in a few words and a person can check it: the note was
+   * filed from this task's Sheet, an edge joins the two, both mention the same
+   * file or name, it was filed in the same Workbench or on a task next to this
+   * one, its stored vector is near the task's, or its words are. Only when those
+   * run out do the project's own decisions and gotchas fill the list, and they
+   * say that is all they are. A card shown for no stated reason is a card a
+   * person learns to skip, which is the whole point of slice 15.
+   */
+  function related(taskId, { limit = 6 } = {}) {
+    const id = Number(taskId);
+    if (!Number.isInteger(id)) throw new Error("task_id must be a number.");
+    const task = sql(`SELECT id, title, detail, ref, project_id, parent_id FROM tasks WHERE id = :p1`, [id])[0];
+    if (!task) return null;
+    const c = load();
+    const found = new Map();
+    const add = (noteId, signal) => {
+      const d = c.byKey.get(`note:${Number(noteId)}`);
+      if (!d) return;
+      const list = found.get(d) || [];
+      if (!list.some((s) => s.kind === signal.kind)) list.push(signal);
+      list.hits = (list.hits || 0) + 1;
+      found.set(d, list);
+    };
+    const n = (v) => (v == null ? null : Number(v));
+
+    // Filed from this task's own Sheet: the strongest claim there is.
+    for (const r of sql(`SELECT DISTINCT note_id FROM comments WHERE task_id = :p1 AND note_id IS NOT NULL`, [id])) {
+      add(r.note_id, { kind: "sheet" });
+    }
+
+    const graphed = hasTable("edges") && hasTable("entities");
+    if (graphed) {
+      // An edge between the two, whichever way round it was drawn.
+      for (const r of sql(
+        `SELECT source_id AS note FROM edges WHERE source_type = 'note' AND target_type = 'task' AND target_id = :p1
+         UNION SELECT target_id FROM edges WHERE target_type = 'note' AND source_type = 'task' AND source_id = :p1`, [id])) {
+        add(r.note, { kind: "link" });
+      }
+      // The things both name. The graph's own edges from the task are trusted;
+      // the task's words are read only when the graph has not reached the task
+      // yet, and then as whole words, so "COR" is not found in "correct". A
+      // project entity is left out, and so is any name most notes mention,
+      // because a name on every row explains none of them. The rarest shared
+      // name is the one the card says; each one shared counts toward its order.
+      const text = `${task.title || ""}\n${task.detail || ""}\n${task.ref || ""}`;
+      const indexed = sql(`SELECT COUNT(*) AS n FROM edges WHERE source_type = 'task' AND source_id = :p1
+                            AND target_type = 'entity' AND relation = 'mentions'`, [id])[0];
+      const byGraph = Number(indexed && indexed.n) > 0;
+      const noteCount = c.docs.filter((d) => d.type === "note").length;
+      const tooCommon = Math.max(4, Math.ceil(noteCount * 0.12));
+      const rows = sql(
+        `SELECT e.source_id AS note, en.kind, en.name,
+                (SELECT COUNT(*) FROM edges x WHERE x.target_type = 'entity' AND x.target_id = en.id
+                   AND x.source_type = 'note' AND x.relation = 'mentions') AS spread
+           FROM edges e JOIN entities en ON en.id = e.target_id
+          WHERE e.source_type = 'note' AND e.target_type = 'entity' AND e.relation = 'mentions' AND en.kind != 'project'
+            AND ${byGraph
+              ? "e.target_id IN (SELECT target_id FROM edges WHERE source_type = 'task' AND source_id = :p1 AND target_type = 'entity' AND relation = 'mentions')"
+              : "length(en.name) >= 3 AND instr(lower(:p1), lower(en.name)) > 0"}
+          ORDER BY spread ASC, length(en.name) DESC`, [byGraph ? id : text]);
+      const escape = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      for (const r of rows) {
+        if (Number(r.spread) > tooCommon) continue;
+        if (!byGraph && !new RegExp(`(^|[^A-Za-z0-9_])${escape(r.name)}(?![A-Za-z0-9_])`, "i").test(text)) continue;
+        add(r.note, r.kind === "file" ? { kind: "file", name: r.name } : { kind: "entity", name: r.name });
+      }
+    }
+
+    // Filed in the same Workbench: another task on this task's branch.
+    if (hasTable("workbenches")) {
+      for (const r of sql(
+        `SELECT DISTINCT c.note_id, c.task_id, w2.branch FROM workbenches w1
+         JOIN workbenches w2 ON w2.repo_id = w1.repo_id AND w2.branch = w1.branch AND w2.task_id != w1.task_id
+         JOIN comments c ON c.task_id = w2.task_id AND c.note_id IS NOT NULL
+         WHERE w1.task_id = :p1`, [id])) {
+        add(r.note_id, { kind: "workbench", branch: r.branch, task: n(r.task_id) });
+      }
+    }
+
+    // Filed on the task above this one, below it, or beside it.
+    for (const r of sql(
+      `SELECT c.note_id, c.task_id FROM comments c JOIN tasks t ON t.id = c.task_id
+       WHERE c.note_id IS NOT NULL AND t.id != :p1
+         AND (t.id = :p2 OR t.parent_id = :p1 OR (:p2 IS NOT NULL AND t.parent_id = :p2))
+       ORDER BY c.id DESC`, [id, n(task.parent_id)])) {
+      add(r.note_id, { kind: "seen", task: n(r.task_id) });
+    }
+
+    // Near in meaning, from the vectors already stored for both. The task's own
+    // vector is read, never asked for, so this costs no model call; with none
+    // stored the list is words alone.
+    if (hasTable("embeddings")) {
+      // The newest, when more than one model has embedded the task: it is the
+      // one the notes were most likely embedded with too.
+      const mine = sql(`SELECT model, hex(vector) AS hex FROM embeddings WHERE source_type = 'task' AND source_id = :p1
+                         ORDER BY created_at DESC, id DESC LIMIT 1`, [id])[0];
+      if (mine) {
+        const q = decode(mine.hex);
+        const scored = [];
+        for (const [key, vec] of storedVectors(mine.model)) {
+          if (!key.startsWith("note:") || vec.length !== q.length) continue;
+          const s = cosine(q, vec);
+          if (s >= SIMILAR_MIN) scored.push([key.slice(5), s]);
+        }
+        scored.sort((a, b) => b[1] - a[1]).slice(0, 5).forEach(([noteId, s]) => add(noteId, { kind: "meaning", score: round(s) }));
+      }
+    }
+
+    // Near in wording: BM25 over the notes alone, against the task's words.
+    // Two shared words at least, carrying a fair share of what is rare in the
+    // task (WORDS_MIN of its idf), so a long task title that happens to share
+    // "handoff" and "send" with a note does not make it "similar".
+    const qt = [...new Set(terms(`${task.title || ""} ${task.detail || ""}`))];
+    if (qt.length) {
+      let kept = 0;
+      const whole = qt.reduce((sum, t) => sum + idf(c, t), 0);
+      for (const d of bm25(c, qt)) {
+        if (d.type !== "note") continue;
+        const shared = qt.filter((t) => d.tf.has(t));
+        if (shared.length < Math.min(2, qt.length)) continue;
+        if (shared.reduce((sum, t) => sum + idf(c, t), 0) < WORDS_MIN * whole) continue;
+        add(d.id, { kind: "words", shared: shared.slice(0, 3) });
+        if (++kept >= 5) break;
+      }
+    }
+
+    // What fills the list when the reasons run out: this project's decisions
+    // and gotchas, newest first. They say so, rather than borrowing a reason.
+    if (found.size < limit && task.project_id != null) {
+      for (const r of sql(
+        `SELECT id, kind FROM notes WHERE project_id = :p1 AND kind IN ('decision', 'gotcha')
+         ORDER BY updated_at DESC, id DESC LIMIT :p2`, [Number(task.project_id), limit * 2])) {
+        if (found.size >= limit) break;
+        const d = c.byKey.get(`note:${Number(r.id)}`);
+        if (d && !found.has(d)) add(r.id, { kind: "project", noteKind: r.kind });
+      }
+    }
+
+    also = alsoIn();
+    const cards = [...found.entries()].map(([d, signals]) => {
+      signals.sort((a, b) => SIGNAL_ORDER.indexOf(a.kind) - SIGNAL_ORDER.indexOf(b.kind));
+      return {
+        id: d.id, title: d.row.title, kind: d.row.kind || "note", project: d.row.project || undefined,
+        project_id: d.row.project_id == null ? null : Number(d.row.project_id), updated_at: d.row.updated_at,
+        also_in: alsoFor(d), why: whyRelated(signals[0]),
+        reasons: signals.map((s) => whyRelated(s)),
+        // The trailer a filed note carries says where it came from, which the
+        // reason already does.
+        signal: signals[0].kind, snippet: snippet(String(d.row.body || "").replace(/\s*From task #\d+, entry \d+\s*$/, ""), new Set(qt), 140) || undefined,
+        _rank: SIGNAL_ORDER.indexOf(signals[0].kind), _n: signals.hits,
+      };
+    });
+    cards.sort((a, b) => (a._rank - b._rank) || (b._n - a._n) || String(b.updated_at).localeCompare(String(a.updated_at)));
+    return {
+      task: id,
+      notes: cards.slice(0, Math.max(1, Math.min(Number(limit) || 6, 30))).map(({ _rank, _n, ...card }) => card),
+      total: cards.length,
+    };
+  }
+
+  /** Why a search found a note, in a few words, for the window's Memory search. */
+  function searchWhy(d, r, needle) {
+    const title = String(d.row.title || "").toLowerCase();
+    if (needle && title.includes(needle)) return "In the title";
+    if (needle && d.haystack.includes(needle)) return "In the text";
+    const named = r.graph.entities.find((e) => d.haystack.includes(String(e.name).toLowerCase()));
+    if (named && r.graph.list.includes(d)) return `Names ${named.name}`;
+    if ([...r.queryTerms].some((t) => d.tf.has(t))) return "Similar wording";
+    return "Similar meaning";
+  }
+
+  /**
+   * search, for the window: the notes only, each with its reason. Scoped to a
+   * project (its own notes and those shown in it) when one is named.
+   */
+  async function searchNotes(query, { limit = 30, projectId = null } = {}) {
+    const r = await rank(query, { exact: true });
+    also = alsoIn();
+    const needle = String(query).toLowerCase().trim();
+    let inScope = null;
+    if (projectId != null) {
+      const pid = Number(projectId);
+      inScope = new Set(sql(`SELECT id FROM notes WHERE project_id = :p1`, [pid]).map((x) => Number(x.id)));
+      if (hasTable("item_projects")) {
+        for (const x of sql(`SELECT entity_id FROM item_projects WHERE entity = 'note' AND project_id = :p1`, [pid])) inScope.add(Number(x.entity_id));
+      }
+    }
+    const notes = r.ranked.filter(([d]) => d.type === "note" && (!inScope || inScope.has(d.id)) &&
+      (d.haystack.includes(needle) || [...r.queryTerms].some((t) => d.tf.has(t)) || r.ranking.includes("semantic")));
+    return {
+      query,
+      total: notes.length,
+      notes: notes.slice(0, limit).map(([d, s]) => ({
+        ...noteItem(d, s, r.queryTerms), project_id: d.row.project_id == null ? null : Number(d.row.project_id),
+        updated_at: d.row.updated_at, why: searchWhy(d, r, needle),
+      })),
+    };
+  }
+
+  return { search, ask, context, load, related, searchNotes };
 }
 
-module.exports = { makeRecall, terms, sentences, snippet, clip, fit, plain };
+module.exports = { makeRecall, whyRelated, SIGNAL_ORDER, terms, sentences, snippet, clip, fit, plain };
