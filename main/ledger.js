@@ -16,7 +16,8 @@ const { makeLedger } = require("../ledger/ledger");
 function register(handle, { db }) {
   const ledger = makeLedger({ sql: db.sqlP });
   handle("ledger:forTask", (taskId) => ledger.forTask(taskId));
-  handle("ledger:rollup", (opts) => ledger.rollup(opts || {}));
+  // now is for tests; the window always means now.
+  handle("ledger:rollup", (opts) => ledger.rollup({ projectId: opts && opts.projectId, weeks: opts && opts.weeks }));
   return ledger;
 }
 
