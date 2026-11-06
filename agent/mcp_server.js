@@ -13,6 +13,7 @@
  */
 
 const { execFileSync } = require("child_process");
+const { pathToFileURL } = require("url");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -245,6 +246,18 @@ function openDatabase() {
  * for real: opening it for real migrates it, mints an id in it, or creates it
  * when it is missing, and a server about to refuse a file must not have done
  * any of that to it first.
+ *
+ * Read-only is not enough on its own for a WAL file. With no -wal beside it,
+ * a read-only open creates an empty -wal and -shm and, being read-only, cannot
+ * remove them on close. Debian's sqlite3 deletes both when it closes a file,
+ * so on Linux every refusal left two new files behind; Apple's keeps an empty
+ * -wal, which is why a Mac never showed it. Apple's sqlite3 cannot open such a
+ * file read-only at all, so on a Mac the binary route reported "no id" for a
+ * file that had one. When the -wal is absent or empty, every committed page is
+ * in the main file, so it is opened immutable, which takes no locks and makes
+ * no files. A -wal with frames in it may hold the id itself (the app keeps the
+ * file open and checkpoints when it likes), and immutable would ignore it, so
+ * that case still goes through the log.
  */
 function readIdReadOnly() {
   const statement = "SELECT value FROM meta WHERE key = 'db_id'";
@@ -252,17 +265,42 @@ function readIdReadOnly() {
   if (process.env.DELPHI_SQLITE_ROUTE !== "binary") {
     try { ({ DatabaseSync } = require("node:sqlite")); } catch {}
   }
-  try {
+  const walSize = () => { try { return fs.statSync(DB + "-wal").size; } catch { return 0; } };
+  const immutable = walSize() === 0;
+  // The plain path stays as a fallback for a path SQLite will not take as a
+  // URI (a Windows share, say), which is no worse than before.
+  const found = readIdFrom(statement, DatabaseSync, immutable ? [pathToFileURL(DB).href + "?immutable=1", DB] : [DB]);
+  // A writer that started while it read may have put the id where immutable
+  // cannot see it, so look again through the log. The writer has made the
+  // -shm by then, so this second open makes nothing.
+  if (immutable && walSize() > 0) return readIdFrom(statement, DatabaseSync, [DB]);
+  return found;
+}
+
+function readIdFrom(statement, DatabaseSync, targets) {
+  for (const target of targets) {
     if (DatabaseSync) {
-      const handle = new DatabaseSync(DB, { readOnly: true });
-      try { return (handle.prepare(statement).get() || {}).value || null; } finally { handle.close(); }
+      let handle;
+      try { handle = new DatabaseSync(target, { readOnly: true }); } catch { continue; }
+      try { return (handle.prepare(statement).get() || {}).value || null; }
+      // No meta table, or not a database at all: either way it has no id.
+      catch { return null; } finally { handle.close(); }
     }
-    const out = execFileSync(findSqlite(), ["-readonly", "-json", DB, statement], { encoding: "utf8" }).trim();
-    return out ? (JSON.parse(out)[0] || {}).value || null : null;
-  } catch {
-    // No meta table, or not a database at all: either way it has no id.
-    return null;
+    try {
+      // stderr piped, not inherited: "no such table: meta" is the expected
+      // answer for an old file, and would otherwise land in the client's log
+      // above the refusal.
+      const out = execFileSync(findSqlite(), ["-readonly", "-json", target, statement],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+      return out ? (JSON.parse(out)[0] || {}).value || null : null;
+    } catch (err) {
+      // Only a file it could not open is worth the plain path. Anything else
+      // (no meta table, not a database) is an answer, and asking again
+      // without immutable would make the very files this is avoiding.
+      if (!/unable to open|\buri\b/i.test(String(err.stderr || ""))) return null;
+    }
   }
+  return null;
 }
 
 // An agent the app launched is told which database it is for, by id as well as

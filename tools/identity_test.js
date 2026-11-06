@@ -259,17 +259,47 @@ for (const route of ["node:sqlite", "binary"]) {
 section("DELPHI_DB_ID: a launched server refuses any other database, and touches nothing");
 
 const WRONG = "00000000-0000-4000-8000-000000000000";
-const snapshot = (file) => ["", "-wal"].map((s) => (fs.existsSync(file + s) ? fs.readFileSync(file + s).toString("base64") : null));
+// The sidecars count. A read-only open of a WAL file with no -wal makes an
+// empty -wal and -shm it cannot remove, so a check of the main file alone
+// passed while every refusal on Linux left two files behind.
+const snapshot = (file) => ["", "-wal", "-shm"].map((s) => (fs.existsSync(file + s) ? fs.readFileSync(file + s).toString("base64") : null));
 for (const route of ["node:sqlite", "binary"]) {
   const base = (file) => ({ DELPHI_DB: file, DELPHI_SQLITE_ROUTE: route === "binary" ? "binary" : "", DELPHI_ACTOR: "codex:9" });
   // An old file nothing has migrated: a refusal that ran schema_later or
-  // minted an id first would leave meta and the later columns behind.
-  const old = fixture(path.join(dir, `refuse-old-${route.replace(":", "")}`, "delphi.db"));
-  const before = snapshot(old);
-  const wrongOld = rpc(cleanEnv({ ...base(old), DELPHI_DB_ID: WRONG }), [["add_task", { title: "should never land", project_id: 1 }]]);
-  check(`${route}: an old file and an id it does not have: refused`, [wrongOld.status, /has no Delphi id/.test(wrongOld.stderr)], [1, true]);
-  check(`${route}: and the file is byte for byte as it was, not migrated or given an id`, snapshot(old), before);
-  check(`${route}: no meta table was made in it`, q(old, "SELECT name FROM sqlite_master WHERE name = 'meta'").length, 0);
+  // minted an id first would leave meta and the later columns behind. Set up
+  // both ways a closed WAL file is found, because which one the fixture gets
+  // depends on whose sqlite3 made it: Debian's removes the -wal and -shm on
+  // close, Apple's leaves an empty -wal and the -shm.
+  for (const [i, [shape, setup]] of [
+    ["no -wal or -shm", (f) => { fs.rmSync(f + "-wal", { force: true }); fs.rmSync(f + "-shm", { force: true }); }],
+    ["an empty -wal and no -shm", (f) => { fs.writeFileSync(f + "-wal", ""); fs.rmSync(f + "-shm", { force: true }); }],
+  ].entries()) {
+    const old = fixture(path.join(dir, `refuse-old-${route.replace(":", "")}-${i}`, "delphi.db"));
+    setup(old);
+    const before = snapshot(old);
+    const wrongOld = rpc(cleanEnv({ ...base(old), DELPHI_DB_ID: WRONG }), [["add_task", { title: "should never land", project_id: 1 }]]);
+    check(`${route}, ${shape}: an old file and an id it does not have: refused`, [wrongOld.status, /has no Delphi id/.test(wrongOld.stderr)], [1, true]);
+    check(`${route}, ${shape}: the file and its sidecars are byte for byte as they were, none made`, snapshot(old), before);
+    check(`${route}, ${shape}: no meta table was made in it`, q(old, "SELECT name FROM sqlite_master WHERE name = 'meta'").length, 0);
+    check(`${route}, ${shape}: and nothing on stderr but the refusal`, wrongOld.stderr.trim().split("\n").filter((l) => !/^delphi: /.test(l) && l.trim()), []);
+  }
+
+  // An id that so far exists only in the -wal: the app keeps its file open and
+  // checkpoints when it likes. Reading the main file alone would refuse the
+  // agent the app just launched.
+  {
+    const live = fixture(path.join(dir, `refuse-live-${route.replace(":", "")}`, "delphi.db"));
+    rpc(cleanEnv(base(live)), [["whoami"]]);
+    const NEWER = "11111111-1111-4111-8111-111111111111";
+    const { DatabaseSync } = require("node:sqlite");
+    const holder = new DatabaseSync(live);
+    holder.exec("PRAGMA wal_autocheckpoint = 0");
+    holder.prepare("UPDATE meta SET value = ? WHERE key = 'db_id'").run(NEWER);
+    check(`${route}: (the newer id is only in the -wal)`, fs.statSync(live + "-wal").size > 0, true);
+    const ok = rpc(cleanEnv({ ...base(live), DELPHI_DB_ID: NEWER }), [["whoami"]]);
+    check(`${route}: an id only in the -wal still matches`, [ok.status, ok.results[0] && ok.results[0].db_id], [0, NEWER]);
+    holder.close();
+  }
 
   const file = fixture(path.join(dir, `refuse-${route.replace(":", "")}`, "delphi.db"));
   const id = rpc(cleanEnv(base(file)), [["whoami"]]).results[0].db_id;
