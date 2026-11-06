@@ -38,6 +38,8 @@ check("!low is not read as a leading !", T.parseQuick("!low tidy the readme").ti
 check("!medium is med", T.parseQuick("thing !medium").priority, "med");
 check("an email is not an assignee", T.parseQuick("mail bob@example.com").assignee, null);
 check("an agent name with a colon", T.parseQuick("run it @claude-code:42").assignee, "claude-code:42");
+check("!low-level is words, not a priority", T.parseQuick("fix !low-level bug"), { title: "fix !low-level bug", priority: "med", assignee: null, ref: null });
+check("!high. at the end of a sentence is words too", T.parseQuick("ship it !high.").priority, "med");
 check("nothing but marks is no title", T.parseQuick("  !high @ray ").title, "");
 
 section("inline edit sends only what moved");
@@ -54,6 +56,21 @@ const review = { id: 8, title: "Review me", status: "review", priority: "high" }
 check("In review, drawn as In progress, saved untouched, is not rewritten", T.editPatch(review, { title: "Review me", status: "doing", priority: "high" }), { patch: null });
 check("In review moved on purpose is written", T.editPatch(review, { status: "done" }), { patch: { status: "done" } });
 check("a task with no priority reads as med", T.editPatch({ id: 9, title: "x", status: "todo", priority: null }, { priority: "med" }), { patch: null });
+
+section("inline edit diffs against the task as it was when opened");
+{
+  const opened = { id: 10, title: "Old title", status: "todo", priority: "med" };
+  const base = T.baseOf(opened);
+  // Meanwhile an agent retitled it and started it.
+  const now = { id: 10, title: "Agent title", status: "doing", priority: "med" };
+  check("only priority touched: the agent's title and status stand",
+    T.editPatch(now, { title: "Old title", status: "todo", priority: "high" }, base), { patch: { priority: "high" } });
+  check("nothing touched sends nothing, though the row moved on",
+    T.editPatch(now, { title: "Old title", status: "todo", priority: "med" }, base), { patch: null });
+  check("a title typed by the person still wins",
+    T.editPatch(now, { title: "Mine", status: "todo", priority: "med" }, base), { patch: { title: "Mine" } });
+  check("the base of In review reads as In progress", T.baseOf({ title: "x", status: "review", priority: null }), { title: "x", status: "doing", priority: "med" });
+}
 
 section("subtask pills");
 check("no subtasks, no pill", T.pillOf({ subtask_count: 0 }), null);
@@ -108,6 +125,8 @@ check("by status: doing (In review with it), blocked, todo, done",
 check("by priority", shape(T.arrange(tasks, { ...proj, group: "priority" })), [["high", [6, 2]], ["med", [4]], ["low", [1]]]);
 check("no grouping, by title", shape(T.arrange(tasks, { ...proj, group: "none", order: "title" })), [["all", [2, 1, 4, 6]]]);
 check("the filter field", shape(T.arrange(tasks, global, { query: "#6" })), [["none", [6]]]);
+check("#6 is task 6, not #60", T.matches({ id: 60, title: "sixty" }, "#6"), false);
+check("#60 is task 60", T.matches({ id: 60, title: "sixty" }, "#60"), true);
 check("the filter words all have to match", T.arrange(tasks, global, { query: "zzz" }).length, 0);
 check("the metrics filter, blocked", shape(T.arrange(tasks, global, { taskFilter: "blocked" })), [["none", [6]]]);
 check("the metrics filter, done, shows done", shape(T.arrange(tasks, global, { taskFilter: "done" })), [["p1", [3]]]);
@@ -129,7 +148,9 @@ for (let i = 1; i <= 2000; i++) {
     project_id: i % 16, project_name: `P${i % 16}`, updated_at: `2026-10-${String(1 + (i % 28)).padStart(2, "0")} 10:00:00`,
     subtask_count: i % 5, subtask_done: i % 3 });
 }
-const time = (fn) => { const t0 = process.hrtime.bigint(); for (let k = 0; k < 20; k++) fn(); return Number(process.hrtime.bigint() - t0) / 1e6 / 20; };
+// The fastest of 20 runs, not the mean: several builds share this machine, and
+// a run that waited for the CPU says nothing about what the code costs.
+const time = (fn) => { let best = Infinity; for (let k = 0; k < 20; k++) { const t0 = process.hrtime.bigint(); fn(); best = Math.min(best, Number(process.hrtime.bigint() - t0) / 1e6); } return best; };
 const groupMs = time(() => T.arrange(many, global));
 const filterMs = time(() => T.arrange(many, global, { query: "caseflow 12" }));
 const boardMs = time(() => T.columns(many, proj));
