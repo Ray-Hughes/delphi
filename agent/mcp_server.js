@@ -572,6 +572,10 @@ const itemStore = makeItemStore({
   derive: (padId) => derivePad(padId), who: WHO, step: currentStep,
 });
 
+// The cost and time ledger: read only, the same arithmetic the window shows.
+const ledgerCore = require("../ledger/ledger");
+const ledger = ledgerCore.makeLedger({ sql });
+
 // When sheet_read last swept a task for lost runs. See sheet_read.
 const SWEEP_EVERY_MS = 30000;
 const swept = new Map();
@@ -2133,6 +2137,32 @@ const TOOLS = {
           // The request and reply in full are one run_status away.
           .map((r) => ({ ...r, request: r.request.length > 300 ? `${r.request.slice(0, 297)}...` : r.request, reply: r.reply && r.reply.length > 300 ? `${r.reply.slice(0, 297)}...` : r.reply })),
       };
+    },
+  },
+
+  cost_ledger: {
+    description:
+      "What agent work took: runs, wall-clock time, tokens, API-equivalent cost (not money billed on a subscription), Copilot premium requests, sent-backs, time in status. For a task, a project, or everything, by week and agent. Compact lines by default.",
+    schema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        project_id: { type: "number" },
+        project: { type: "string", description: "Key, instead of project_id" },
+        weeks: { type: "number", description: "Default 4" },
+        budget: { type: "number", description: "Tokens, default 400" },
+        detail: { type: "string", enum: ["brief", "full"] },
+      },
+    },
+    run: (a) => {
+      let answer;
+      if (a.task_id != null) {
+        answer = ledger.forTask(Number(a.task_id));
+        if (!answer) throw new Error(`No task ${a.task_id}.`);
+      } else {
+        answer = ledger.rollup({ projectId: a.project_id ?? resolveProjectId(a), weeks: a.weeks || 4 });
+      }
+      return a.detail === "full" ? answer : ledgerCore.compact(answer, { budget: a.budget });
     },
   },
 

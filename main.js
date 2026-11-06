@@ -2007,6 +2007,7 @@ const folderTools = createFolders({
   },
 });
 registerFolders(handle, { folders: folderTools, db });
+require("./main/ledger").register(handle, { db });
 
 handle("backups:list", () => ({ dir: backups.dir, backups: backups.list(), lastRestore }));
 handle("backups:preview", (name) => backups.preview(name));

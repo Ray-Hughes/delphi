@@ -1620,6 +1620,7 @@ async function renderOverview(root) {
     linkCard.card.append(flush);
   }
   right.append(linkCard.card);
+  if (window.DelphiLedger) right.append(DelphiLedger.projectCard(project.id));
 
   // --- handoffs ------------------------------------------------------------
   // Work one agent has handed to another. Here rather than on its own tab
@@ -10810,6 +10811,7 @@ function renderRuns(root) {
   const right = el("div", { className: "waiting-col" });
   right.append(section("Waiting on you", waiting.length, "paused until you answer",
     box(waiting.map(waitingRow), "Nothing is waiting on you.")));
+  if (window.DelphiLedger) right.append(DelphiLedger.runsCard());
 
   page.append(el("div", { className: "runs-cols" }, left, right));
   root.append(page);

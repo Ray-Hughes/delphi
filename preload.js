@@ -252,6 +252,11 @@ contextBridge.exposeInMainWorld("delphi", {
   dialog: {
     pickFolder: (title, options) => call("dialog:pickFolder", title, options),
   },
+  // The cost and time ledger (main/ledger.js). Read only.
+  ledger: {
+    forTask: (taskId) => call("ledger:forTask", taskId),
+    rollup: (opts) => call("ledger:rollup", opts || {}),
+  },
   // A project is a folder. inspect() with no path shows the picker; with one
   // (a drop) it looks at that folder. Neither writes anything.
   folders: {
