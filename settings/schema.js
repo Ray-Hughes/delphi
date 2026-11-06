@@ -90,6 +90,15 @@
       restart: "window", effect: "window",
     },
 
+    {
+      key: "taskOpenMode", section: "general", group: "Tasks", type: "enum", default: "drawer",
+      choices: [["drawer", "Drawer"], ["centered", "Centered view"]],
+      label: "Open tasks in",
+      desc: "The drawer keeps the list beside the task; the centered view gives the task the middle of the window. Shift and Enter on a task in a list opens it in the other one.",
+      notChanged: "Notes and pads, which open in the drawer either way.",
+      synonyms: ["drawer", "centered", "centred", "modal", "full view", "task panel", "side panel", "task sheet"],
+    },
+
     // --- Appearance --------------------------------------------------------
     {
       // Dark for a new install, the look v2 was designed in (owner decision).

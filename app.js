@@ -5801,6 +5801,7 @@ function openHarnessSheet(harness, done) {
 }
 
 function openNoteSheet(note) {
+  if (window.DelphiDrawer && !openNoteSheet.full) return DelphiDrawer.openNote(note);
   if (openSheet) closeNoteSheet();
 
   const overlay = el("div", { className: "overlay" });
@@ -8474,6 +8475,7 @@ async function removeTask(id) {
 }
 
 async function openTaskSheet(taskId) {
+  if (window.DelphiDrawer && !openTaskSheet.full && (state.settings || {}).taskOpenMode !== "centered") return DelphiDrawer.open(taskId);
   if (openSheet) await openSheet.close();
 
   let detail = await window.delphi.tasks.detail(taskId);
@@ -14605,7 +14607,7 @@ function openBar(query = "") {
     state: () => state,
     projectName: (id) => (projectById(id) || {}).name || "",
     openTask: (id) => openTaskSheet(id),
-    openNote: (n) => goTo({ projectId: n.project_id, view: "notes", query: "" }),
+    openNote: (n) => (window.DelphiDrawer ? DelphiDrawer.openNote(n) : goTo({ projectId: n.project_id, view: "notes", query: "" })),
     // The results page the search field used to lead to, Oracle answers and all.
     searchAll: (q) => { $("search").value = q; return navigate({ query: q, view: "oracle" }); },
     ask: (q) => { $("search").value = q; return navigate({ query: q, view: "oracle" }); },
@@ -14650,9 +14652,34 @@ DelphiKeys.install({
   openBar: () => openBar(),
   openSwitcher: () => DelphiTopbar.openSwitcher(),
   openTask: async (id, how) => {
+    // Shift+Enter is the view the setting does not choose.
+    if (how === "full") {
+      if ((state.settings || {}).taskOpenMode === "centered" && window.DelphiDrawer) await DelphiDrawer.open(id);
+      else await openTaskFull(id);
+      return;
+    }
     await openTaskSheet(id);
-    if (how === "edit") document.querySelector(".ts-title")?.focus();
+    if (how === "edit") { if (window.DelphiDrawer && DelphiDrawer.isOpen()) DelphiDrawer.editTitle(); else document.querySelector(".ts-title")?.focus(); }
   },
+});
+/** The centered view of a task, whatever taskOpenMode says: Shift+Enter and the drawer's Open full view. */
+async function openTaskFull(id) { openTaskSheet.full = true; try { await openTaskSheet(id); } finally { openTaskSheet.full = false; } }
+// The drawer (ui/drawer.js), lent what it draws with. It registers itself as
+// openSheet, so the live updates that reached the old panel reach it too.
+DelphiDrawer.init({
+  state: () => state, sheet: () => openSheet, setSheet: (h) => { openSheet = h; },
+  refresh, goTo, renderMarkdown, handToAgent, handoffText, itemOf, itemVerbs, itemMenu, deleteItem, fromChip,
+  taskMenu, swatchRow, epicMenuItems, rowMenu, closeRowMenu, menuKeys, notify, notifyError, motionOff,
+  statusOf, isOverdue, isAgent, hasColour, colourLabel, gap,
+  reminderChipSpec, alertsForTask, liveAlerts, paintTaskReminders,
+  openFull: (id) => openTaskFull(id),
+  openNoteFull: (n) => { openNoteSheet.full = true; try { openNoteSheet(n); } finally { openNoteSheet.full = false; } },
+  wb: { guard: wbGuard, starting: wbStarting, busy: wbBusyTasks, look: wbLook, chip: wbChip, update: wbUpdate, dialog: wbDialog,
+    closingLong, finish: finishWorkbench, discard: discardWorkbench, pickRepo },
+  runs: { OPEN: RUN_OPEN, WAITING: RUN_WAITING, words: RUN_STATE_WORDS, stateChip: runStateChip, settingFix, open: openRunSheet,
+    buffers: runBuffers, kills: runKills, ended: runsEnded, buffer: runBuffer, pre: runPre, line: runLine,
+    reload: async () => { try { state.runs = await window.delphi.runs.list({ limit: 300 }); } catch {} paintRunsLive(); } },
+  kit: { SIGILS, KIND_WORD, NOTE_KINDS, entryIsAgent, isRunning, elapsed, duration, stripAnsi },
 });
 // --- end COMMANDS ---
 

@@ -1,0 +1,410 @@
+#!/usr/bin/env node
+// test-runtime: electron
+//
+// Everything the old task panel could do is still reachable from the drawer.
+//
+//   electron tools/drawer_test.js
+//
+// Direction B replaces the task panel with the drawer (ui/drawer.js), and the
+// owner asked for a much cleaner one. Cleaner is only safe if nothing went
+// missing on the way, so this lists every feature of the old panel, the way
+// tools/commands_test.js lists every old place, and drives the real renderer
+// to find each one where the drawer puts it: on the surface, behind a fold, or
+// in a menu. A feature dropped from the drawer fails here by name.
+//
+// It also checks the drawer's own rules: the status keys, Escape and focus,
+// the fold state, the composer's kinds, and the pure helpers (stuck, related,
+// the subtask order).
+//
+// main.js is loaded for real against a temp data folder, with a hidden window
+// that never takes focus, as in tools/sidebar_test.js.
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const Module = require("module");
+const { execFileSync } = require("child_process");
+
+const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "delphi-drawer-")));
+process.env.DELPHI_DATA_DIR = dir;
+process.env.DELPHI_DB = path.join(dir, "delphi.db");
+delete process.env.DELPHI_DB_ID;
+for (const real of [path.join(os.homedir(), "va", "delphi", "delphi.db"),
+                    path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db")]) {
+  if (path.resolve(process.env.DELPHI_DB) === real) { console.error("refusing to run against a real database"); process.exit(1); }
+}
+fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ vaultEnabled: false }));
+
+let failures = 0;
+let checks = 0;
+function check(what, got, want) {
+  checks++;
+  const ok = JSON.stringify(got) === JSON.stringify(want);
+  if (!ok) {
+    failures++;
+    console.error(`  FAIL ${what}\n       got  ${JSON.stringify(got)}\n       want ${JSON.stringify(want)}`);
+  } else {
+    console.log(`  ok   ${what}`);
+  }
+}
+
+const electron = require("electron");
+const { app } = electron;
+if (app.setActivationPolicy) app.setActivationPolicy("prohibited");
+const ROOT = path.join(__dirname, "..");
+let win = null;
+class HiddenWindow extends electron.BrowserWindow {
+  constructor(options = {}) { super({ ...options, show: false, paintWhenInitiallyHidden: true, width: 1440, height: 900 }); win = this; }
+  loadFile(file, options) { return super.loadFile(path.resolve(ROOT, file), options); }
+  show() {}
+  focus() {}
+}
+const quiet = new Proxy(function stub() {}, { get: () => quiet, apply: () => quiet, construct: () => quiet });
+const stubbed = new Proxy(electron, {
+  get: (target, key) => {
+    if (key === "BrowserWindow") return HiddenWindow;
+    if (key === "Tray") return quiet;
+    if (key === "globalShortcut") return { register: () => true, unregister() {}, unregisterAll() {}, isRegistered: () => false };
+    return target[key];
+  },
+});
+const realLoad = Module._load;
+Module._load = function load(request, ...rest) {
+  return request === "electron" ? stubbed : realLoad.call(this, request, ...rest);
+};
+
+// A repository with a Workbench in it, made by git, so the Workbench section
+// has a real folder to describe.
+const repoDir = path.join(dir, "repo");
+const wbDir = path.join(dir, "repo.workbenches", "task-wb");
+const git = (...args) => execFileSync("git", args, { cwd: repoDir, stdio: "ignore", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+fs.mkdirSync(repoDir, { recursive: true });
+git("init", "-q", "-b", "main");
+fs.writeFileSync(path.join(repoDir, "README"), "hi\n");
+git("add", ".");
+git("commit", "-qm", "first");
+git("worktree", "add", "-q", "-b", "task-wb", wbDir, "main");
+
+const db = require("../db");
+// db.sqlP binds :p1 to :pN; the queries here read better with names.
+const q = (sql, named = {}) => {
+  const values = [];
+  const text = sql.replace(/:([a-z]\w*)/gi, (_, k) => { values.push(named[k]); return `:p${values.length}`; });
+  return db.sqlP(text, values);
+};
+const project = db.createProject({ key: "dw", name: "Drawer", path: repoDir });
+const task = db.createTask({ projectId: project.id, title: "The task with everything", detail: "Read note 1 first.\n\n- one\n- two" });
+db.updateTask(task.id, { status: "doing", priority: "high", ref: "PR-12", due: "2026-12-01" });
+const subA = db.createTask({ projectId: project.id, title: "Sub A", parentId: task.id });
+const subB = db.createTask({ projectId: project.id, title: "Sub B", parentId: task.id });
+db.updateTask(subA.id, { status: "done" });
+const wbTask = db.createTask({ projectId: project.id, title: "Has a Workbench" });
+const note = db.createNote({ projectId: project.id, title: "A gotcha", body: `Seen on #${task.id}.`, kind: "gotcha" });
+const pad = db.createScratchpad
+  ? db.createScratchpad({ projectId: project.id, key: "plan", title: "The plan", body: "- [ ] a line" })
+  : null;
+const say = (kind, body, extra = {}) => q(
+  "INSERT INTO comments (task_id, author, body, kind, meta, promoted, ref_id, author_type) VALUES (:t, :a, :b, :k, :m, :p, :r, :y) RETURNING id",
+  { t: task.id, a: extra.author || "you", b: body, k: kind, m: extra.meta ? JSON.stringify(extra.meta) : null, p: extra.promoted ? 1 : 0, r: extra.ref || null, y: extra.type || "human" });
+const idOf = (r) => (Array.isArray(r) ? r[0].id : r.id);
+say("say", "A plain comment", { promoted: true });
+say("run", "npm test", { meta: { state: "ok", code: 0, lines: 3, dur_ms: 1200 }, author: "claude-code", type: "agent" });
+const asked = idOf(say("ask", "Ship it?", { meta: { options: [{ key: "a", label: "Yes" }, { key: "b", label: "No" }] } }));
+say("decide", "a\nBecause it is ready", { ref: asked, meta: { choice: "a" } });
+say("ask", "Which name?", { meta: { options: [{ key: "a", label: "Drawer" }, { key: "b", label: "Panel" }] } });
+q("INSERT INTO status_events (task_id, status, actor) VALUES (:t, 'doing', 'you')", { t: task.id });
+const repo = q("INSERT INTO repos (project_id, name, path, is_primary, base_branch) VALUES (:p, 'repo', :path, 1, 'main') RETURNING id", { p: project.id, path: repoDir });
+q("INSERT INTO workbenches (task_id, repo_id, path, branch, base, state) VALUES (:t, :r, :path, 'task-wb', 'main', 'active')",
+  { t: wbTask.id, r: idOf(repo), path: wbDir });
+require("../main.js");
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The old panel's features, each with where the drawer keeps it. `where` is
+ * the section to unfold first (or null for the head), and `find` an
+ * expression that is true when the feature is there. `menu` names a menu to
+ * open and the words an item in it must carry.
+ */
+const FEATURES = [
+  // The header row.
+  ["crumb back to the project", null, "!!document.querySelector('.dw .dw-crumb-p')"],
+  ["Hand to agent", null, null, { menu: "more", item: "Hand to agent" }],
+  ["Copy brief", null, "!!document.querySelector('.dw [data-act=share]')"],
+  ["Copy brief, in More too", null, null, { menu: "more", item: "Copy brief" }],
+  ["Item menu: Move", null, null, { menu: "more", item: "Move to" }],
+  ["Item menu: Copy", null, null, { menu: "more", item: "Copy to" }],
+  ["Item menu: Also belongs to", null, null, { menu: "more", item: "Also belongs to" }],
+  ["Item menu: Flag for review", null, null, { menu: "more", item: "Flag for review" }],
+  ["the agent queue", null, null, { menu: "more", item: "agent queue" }],
+  ["colour", null, null, { menu: "more", sel: ".swatch, .swatches, .swatch-row, [data-colour]" }],
+  ["Open full view", null, null, { menu: "more", item: "Open full view" }],
+  ["History", null, null, { menu: "more", item: "History" }],
+  ["Delete", null, "!!document.querySelector('.dw [data-act=delete]')"],
+  ["Close", null, "!!document.querySelector('.dw [data-act=close]')"],
+  // The title and its facts.
+  ["title, editable", null, "!!document.querySelector('.dw textarea.dw-title')"],
+  ["the done ring", null, "!!document.querySelector('.dw [data-act=done]')"],
+  ["status: To do, In progress, Done", null, "['todo','doing','done'].every((s) => document.querySelector(`.dw [data-status=${s}]`))"],
+  ["status: Blocked", null, "!!document.querySelector('.dw [data-status=blocked]')"],
+  ["priority", null, "!!document.querySelector('.dw [data-act=priority]')"],
+  ["due date", null, "!!document.querySelector('.dw [data-act=due]')"],
+  ["reminder", null, "!!document.querySelector('.dw [data-act=remind]')"],
+  ["assignee", null, "!!document.querySelector('.dw [data-act=assign]')"],
+  ["reference", null, "document.querySelector('.dw .dw-prop.ref')?.textContent === 'PR-12'"],
+  ["subtask progress", null, "!!document.querySelector('.dw .dw-progress')"],
+  // The run chip and the Workbench cluster moved into cards and sections.
+  ["the Workbench, at a glance", null, "!!document.querySelector('.dw [data-card=workbench]')"],
+  ["the newest run, at a glance", null, "!!document.querySelector('.dw [data-card=runs]')"],
+  ["the Sheet, at a glance", null, "!!document.querySelector('.dw [data-card=sheet]')"],
+  ["Start Workbench", "workbench", "!!document.querySelector('.dw [data-fold=workbench] [data-act=start]')"],
+  // Details, Reminders and History tabs became sections.
+  ["the description, rendered", "description", "!!document.querySelector('.dw [data-fold=description] .dw-prev .md')"],
+  ["the description, editable", "description", "(document.querySelector('.dw [data-act=mode-write]').click(), !!document.querySelector('.dw [data-fold=description] textarea.dw-raw'))"],
+  ["subtasks, each opens", "subtasks", "document.querySelectorAll('.dw [data-sub] [data-act=open]').length === 2"],
+  ["subtask status", "subtasks", "!!document.querySelector('.dw [data-sub] [data-act=tick]')"],
+  ["subtask menu", "subtasks", "!!document.querySelector('.dw [data-sub] [data-act=menu]')"],
+  ["add a subtask", "subtasks", "!!document.querySelector('.dw .dw-addsub-in')"],
+  ["reminders, listed and added", "reminders", "document.querySelector('.dw [data-fold=reminders] .dw-fold-b').childElementCount > 0"],
+  ["how it got here", "activity", "!!document.querySelector('.dw .dw-timeline li')"],
+  // The Sheet rail.
+  ["Sheet: All and Ledger", "sheet", "!!document.querySelector('.dw [data-act=ledger]') && !!document.querySelector('.dw [data-act=all]')"],
+  ["Sheet: copy it all", "sheet", "!!document.querySelector('.dw [data-act=copy-all]')"],
+  ["Sheet: every entry shown", "sheet", "document.querySelectorAll('.dw [data-entry]').length === 5"],
+  ["Sheet: promote", "sheet", null, { menu: "entry", item: "ledger" }],
+  ["Sheet: file as a note", "sheet", null, { menu: "entry", item: "Decision" }],
+  ["Sheet: copy an entry", "sheet", null, { menu: "entry", item: "Copy" }],
+  ["Sheet: delete an entry", "sheet", null, { menu: "entry", item: "Delete entry" }],
+  ["Sheet: a run's output", "sheet", "!!document.querySelector('.dw [data-act=output]')"],
+  ["Sheet: answer an ask", "sheet", "!!document.querySelector('.dw [data-act=opt-a]:not([disabled])')"],
+  ["Sheet: a decision names its question", "sheet", "!!document.querySelector('.dw [data-act=ref]')"],
+  ["composer: say, run, ask, decide, note", null, "['say','run','ask','decide','note'].every((k) => document.querySelector(`.dw .dw-kinds [data-kind=${k}]`))"],
+  ["composer: pinned at the bottom", null, "!!document.querySelector('.dw > .dw-foot .dw-compose-in')"],
+  // Runs.
+  ["Runs: hand to an agent", "runs", "!!document.querySelector('.dw [data-fold=runs] [data-act=hand]')"],
+  // Memory, new in the drawer.
+  ["Memory: the note that mentions it", "memory", `!!document.querySelector('.dw [data-note="${note.id}"]')`],
+  ["Memory: log a fact", "memory", "!!document.querySelector('.dw [data-act=log-fact]')"],
+];
+
+async function main() {
+  await app.whenReady();
+  if (app.dock) app.dock.hide();
+  for (let i = 0; i < 100 && !win; i++) await wait(100);
+  if (!win) throw new Error("no window");
+  if (win.webContents.isLoading()) await new Promise((r) => win.webContents.once("did-finish-load", r));
+  const js = (code) => win.webContents.executeJavaScript(code, true);
+  const until = async (code, ms = 8000) => {
+    for (let t = 0; t < ms; t += 100) { if (await js(code)) return true; await wait(100); }
+    return false;
+  };
+  await until("typeof DelphiDrawer === 'object' && !!document.querySelector('#switcher .scope')");
+  await js("window.confirm = () => true; window.alert = () => {}; localStorage.clear(); 0");
+  await js(`navigate({ projectId: ${project.id}, view: "tasks", query: "" }).then(() => 1)`);
+  await wait(500);
+
+  const openTask = async (id) => {
+    await js("DelphiDrawer.close(); 1");
+    await wait(200);
+    await js(`openTaskSheet(${id}).then(() => 1)`);
+    return until(`!!document.querySelector('.dw[data-task="${id}"]')`);
+  };
+  const unfold = (key) => js(`(() => { const f = document.querySelector('.dw [data-fold=${key}]'); if (!f.classList.contains('open')) f.querySelector('.dw-fold-h').click(); return 1; })()`);
+  const menuItems = async (which) => {
+    await js("closeRowMenu(); 1");
+    const opened = await js(which === "more"
+      ? "(() => { const b = document.querySelector('.dw .dw-top [data-act=more]'); if (!b) return false; b.click(); return true; })()"
+      : "(() => { const b = document.querySelector('.dw [data-entry] [data-act=entry-menu]'); if (!b) return false; b.click(); return true; })()");
+    if (!opened) return null;
+    await wait(150);
+    return js("(() => { const m = document.querySelector('.ctx'); return m ? { text: [...m.querySelectorAll('.ctx-item')].map((n) => n.textContent), html: m.innerHTML.length, m: true } : null; })()");
+  };
+
+  console.log("\nopening a task opens the drawer");
+  check("openTaskSheet draws the drawer", await openTask(task.id), true);
+  check("and not the old panel", await js("!!document.querySelector('.task-sheet')"), false);
+  check("it is a labelled dialog", await js("(() => { const d = document.querySelector('.dw'); return [d.getAttribute('role'), d.getAttribute('aria-label').startsWith('Task ')]; })()"), ["dialog", true]);
+  check("it is openSheet, so live updates reach it", await js("openSheet && openSheet.drawer === true && openSheet.taskId"), task.id);
+
+  console.log("\nevery feature of the old panel is reachable");
+  for (const [name, where, find, menu] of FEATURES) {
+    if (where) { await unfold(where); await wait(250); }
+    if (menu) {
+      const got = await menuItems(menu.menu);
+      let ok = !!got;
+      if (ok && menu.item) ok = got.text.some((t) => t.includes(menu.item));
+      if (ok && menu.sel) ok = await js(`!!document.querySelector('.ctx') && !!document.querySelector('.ctx').querySelector(${JSON.stringify(menu.sel)})`);
+      await js("closeRowMenu(); 1");
+      check(name, ok, true);
+    } else {
+      check(name, await js(find).catch((e) => String(e)), true);
+    }
+  }
+
+  console.log("\nthe Workbench section, with a Workbench");
+  await openTask(wbTask.id);
+  await unfold("workbench");
+  await until("!!document.querySelector('.dw [data-fold=workbench] .dw-panel')");
+  const acts = await js("[...document.querySelectorAll('.dw [data-fold=workbench] [data-act]')].map((n) => n.dataset.act)");
+  for (const act of ["Open", "open-in", "Park", "Finish", "wb-more", "discard"]) check(`Workbench: ${act}`, acts.includes(act), true);
+  await js("document.querySelector('.dw [data-act=wb-more]').click(); 1");
+  await wait(150);
+  check("Workbench More: Update and Show advanced",
+    await js("[...document.querySelectorAll('.ctx .ctx-item')].map((n) => n.textContent)"), ["Update from main", "Show advanced"]);
+  await js("closeRowMenu(); 1");
+  check("the card names the branch", await js("document.querySelector('.dw [data-card=workbench] .v').textContent"), "task-wb");
+  q("UPDATE workbenches SET state = 'parked' WHERE task_id = :t", { t: wbTask.id });
+  await openTask(wbTask.id);
+  await until("!!document.querySelector('.dw [data-fold=workbench] .dw-panel')");
+  check("Workbench parked: Resume", await js("!!document.querySelector('.dw [data-fold=workbench] [data-act=Resume]')"), true);
+  q("UPDATE workbenches SET state = 'missing' WHERE task_id = :t", { t: wbTask.id });
+  await openTask(wbTask.id);
+  await until("!!document.querySelector('.dw [data-fold=workbench] .dw-panel')");
+  check("Workbench missing: Recreate and Forget",
+    await js("['Recreate','Forget'].map((a) => !!document.querySelector(`.dw [data-fold=workbench] [data-act=${a}]`))"), [true, true]);
+
+  console.log("\nthe keys");
+  await openTask(task.id);
+  await js("document.querySelector('.dw').focus(); 1");
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "4" });
+  win.webContents.sendInputEvent({ type: "char", keyCode: "4" });
+  await until(`openSheet && document.querySelector('.dw [data-status=done]')?.classList.contains('on')`);
+  check("4 marks it done", db.getTask ? db.getTask(task.id).status : q("SELECT status FROM tasks WHERE id = :id", { id: task.id })[0].status, "done");
+  await js("document.querySelector('.dw').focus(); 1");
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "2" });
+  await wait(600);
+  check("2 sets it in progress", q("SELECT status FROM tasks WHERE id = :id", { id: task.id })[0].status, "doing");
+  await js("document.querySelector('.dw').focus(); 1");
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "P" });
+  await wait(200);
+  check("P opens priority", await js("[...document.querySelectorAll('.ctx .ctx-item')].map((n) => n.textContent.trim().split(' ')[0])"), ["High", "Medium", "Low"]);
+  await js("closeRowMenu(); document.querySelector('.dw').focus(); 1");
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "A" });
+  await wait(200);
+  check("A opens the assignee", await js("document.activeElement?.getAttribute('aria-label')"), "Assignee");
+  await js("document.activeElement.blur(); 1");
+  await wait(300);
+  check("digits typed in the composer stay digits", await js(`(() => { const b = document.querySelector('.dw .dw-compose-in'); b.focus(); return 1; })()`), 1);
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "1" });
+  win.webContents.sendInputEvent({ type: "char", keyCode: "1" });
+  await wait(300);
+  check("and do not change the status", q("SELECT status FROM tasks WHERE id = :id", { id: task.id })[0].status, "doing");
+  await js("document.querySelector('.dw .dw-compose-in').value = ''; 1");
+
+  console.log("\nthe title and the subtask box");
+  await js("document.querySelector('.dw .dw-title-btn').click(); 1");
+  check("the title edits on a click", await js("document.activeElement?.tagName === 'TEXTAREA' && document.activeElement.classList.contains('dw-title')"), true);
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Return" });
+  await wait(200);
+  check("and Enter hands focus back to the title, not the page", await js("document.activeElement?.classList.contains('dw-title-btn')"), true);
+  await unfold("subtasks");
+  await js(`(() => { const i = document.querySelector('.dw .dw-addsub-in'); i.focus(); i.value = 'Sub C'; return 1; })()`);
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Return" });
+  check("a subtask added with Enter shows straight away", await until(`[...document.querySelectorAll('.dw [data-sub] [data-act=open]')].some((n) => n.textContent === 'Sub C')`), true);
+  check("with the box still ready for the next", await js("document.activeElement?.classList.contains('dw-addsub-in')"), true);
+  await js("document.activeElement.blur(); 1");
+
+  console.log("\nthe composer");
+  await js(`(() => { const b = document.querySelector('.dw .dw-compose-in'); b.value = 'From the test'; b.dispatchEvent(new Event('input')); document.querySelector('.dw [data-act=send]').click(); return 1; })()`);
+  await until(`[...document.querySelectorAll('.dw [data-entry]')].some((n) => n.textContent.includes('From the test'))`);
+  check("say posts to the Sheet", q("SELECT kind FROM comments WHERE body = 'From the test'").map((r) => r.kind), ["say"]);
+  const C = (raw, mode, ask) => js(`DelphiDrawer.composed(${JSON.stringify(raw)}, ${JSON.stringify(mode)}, { openAsk: ${JSON.stringify(ask)} })`);
+  check("$ runs whatever the mode", (await C("$ ls", "say")).kind, "run");
+  check("/note switches to a note", [(await C("/note hi", "say")).kind, (await C("/note hi", "say")).body], ["note", "hi"]);
+  check("an ask needs 2 to 4 options", [(await C("q | a", "ask")).ok, (await C("q | a | b", "ask")).ok], [false, true]);
+  const open = { id: 9, body: "Which?", meta: { options: [{ key: "a", label: "A" }, { key: "b", label: "B" }] } };
+  check("decide takes the option key and why", await C("b because", "decide", open).then((c) => [c.ok, c.askId, c.choice, c.why]), [true, 9, "b", "because"]);
+  check("decide with nothing open says so", (await C("a", "decide", null)).ok, false);
+
+  console.log("\nfolds, Escape and focus");
+  // Activity was unfolded above; folding it must survive a reopen.
+  const isOpen = () => js("document.querySelector('.dw [data-fold=activity]').classList.contains('open')");
+  if (!(await isOpen())) await unfold("activity");
+  await js("document.querySelector('.dw [data-fold=activity] .dw-fold-h').click(); 1");
+  check("folding is kept per viewer", await js("JSON.parse(localStorage.getItem('delphi.drawer.folds')).activity"), false);
+  await openTask(task.id);
+  check("and a reopened drawer has it folded", await isOpen(), false);
+  await unfold("activity");
+  await openTask(task.id);
+  check("unfolded likewise", await isOpen(), true);
+  await js("DelphiDrawer.close(); 1");
+  await wait(200);
+  await js(`(() => { const b = document.createElement('button'); b.id = 'opener'; b.textContent = 'x'; document.body.append(b); b.focus(); return 1; })()`);
+  await js(`openTaskSheet(${task.id}).then(() => 1)`);
+  await until("!!document.querySelector('.dw')");
+  check("focus moves into the drawer", await js("document.querySelector('.dw').contains(document.activeElement)"), true);
+  await js("(() => { const all = [...document.querySelectorAll('.dw button, .dw textarea, .dw input')].filter((n) => !n.disabled && n.offsetParent); all[all.length - 1].focus(); return 1; })()");
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Tab" });
+  await wait(100);
+  check("Tab from the last control stays inside", await js("document.querySelector('.dw').contains(document.activeElement)"), true);
+  await js("document.querySelector('.dw').focus(); 1");
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+  await until("!document.querySelector('.dw')");
+  check("Escape closes it", await js("!!document.querySelector('.dw') || !!openSheet"), false);
+  check("and focus goes back where it was", await js("document.activeElement?.id"), "opener");
+  await js("document.getElementById('opener').remove(); 1");
+
+  console.log("\nOpen full view keeps the old panel");
+  await openTask(task.id);
+  await js("document.querySelector('.dw .dw-top [data-act=more]').click(); 1");
+  await wait(150);
+  await js("[...document.querySelectorAll('.ctx .ctx-item')].find((n) => n.textContent.includes('Open full view')).click(); 1");
+  check("the full panel opens", await until("!!document.querySelector('.task-sheet')"), true);
+  check("and the drawer is gone", await js("!!document.querySelector('.dw')"), false);
+  await js("openSheet && openSheet.close(); 1");
+  await wait(300);
+
+  console.log("\nthe drawer or the centered view, as the owner chooses");
+  await openTask(task.id);
+  check("the drawer has Open full view in its header", await js("!!document.querySelector('.dw .dw-top [data-act=full]')"), true);
+  await js("document.querySelector('.dw').focus(); 1");
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Return", modifiers: ["shift"] });
+  check("Shift and Enter in the drawer opens the centered view", await until("!!document.querySelector('.task-sheet') && !document.querySelector('.dw')"), true);
+  await js("openSheet && openSheet.close(); 1");
+  await wait(300);
+  await js(`window.delphi.settings.set({ taskOpenMode: "centered" }).then((s) => { state.settings = s; return 1; })`);
+  await js(`openTaskSheet(${task.id}).then(() => 1)`);
+  check("with Open tasks in set to Centered view, a task opens centered", await until("!!document.querySelector('.task-sheet')"), true);
+  check("and not in the drawer", await js("!!document.querySelector('.dw')"), false);
+  await js("openSheet && openSheet.close(); 1");
+  await wait(300);
+  await js(`window.delphi.settings.set({ taskOpenMode: "drawer" }).then((s) => { state.settings = s; return 1; })`);
+  check("set back to Drawer, it opens in the drawer again", await openTask(task.id), true);
+  await js("DelphiDrawer.close(); 1");
+  await wait(200);
+
+  console.log("\nnotes and pads open in the same drawer");
+  await js(`openNoteSheet(${JSON.stringify(note)}); 1`);
+  check("a note opens in the drawer", await until("!!document.querySelector('.dw.dw-note')"), true);
+  check("it lists the task it names", await js(`!!document.querySelector('.dw [data-open="${task.id}"]')`), true);
+  check("with Also belongs to and Flag for review", await js("['also','flag'].map((a) => !!document.querySelector(`.dw [data-act=${a}]`))"), [true, true]);
+  if (pad) {
+    await js(`DelphiDrawer.openPad(${pad.id}).then(() => 1)`);
+    check("a pad opens in the drawer", await until("!!document.querySelector('.dw.dw-pad')"), true);
+    check("with its checkbox switch", await js("document.querySelector('.dw [data-act=derive]')?.getAttribute('role')"), "switch");
+  }
+  await js("DelphiDrawer.close(); 1");
+
+  console.log("\nthe pure rules");
+  const day = 86400000;
+  const at = (ms) => new Date(Date.now() - ms).toISOString().replace("T", " ").slice(0, 19);
+  const S = (status, ms) => js(`DelphiDrawer.stuck({ task: { id: 1, status: ${JSON.stringify(status)}, updated_at: ${JSON.stringify(at(ms))} }, events: [], comments: [] })`);
+  check("to do is never stuck", await S("todo", 30 * day), null);
+  check("doing for 2 days is not", await S("doing", 2 * day), null);
+  check("doing for 4 days is amber", await S("doing", 4 * day).then((s) => [s.level, s.words]), ["amber", "No movement in 4 days"]);
+  check("doing for 8 days is red", await S("doing", 8 * day).then((s) => s.level), "red");
+  check("blocked stays amber", await S("blocked", 20 * day).then((s) => s.level), "amber");
+  check("a note mentioning the task is related", await js(`DelphiDrawer.related({ id: 5, detail: "" }, { id: 2, title: "x", body: "see #5." })`), "Mentions #5");
+  check("but not one mentioning #55", await js(`DelphiDrawer.related({ id: 5, detail: "" }, { id: 2, title: "x", body: "see #55." })`), null);
+  check("a note named in the description", await js(`DelphiDrawer.related({ id: 5, detail: "read note 2" }, { id: 2, title: "x", body: "" })`), "Named in the description");
+  check("subtasks keep a dragged order, new ones last", await js(`DelphiDrawer.ordered([{ id: 1 }, { id: 2 }, { id: 3 }], [3, 1]).map((s) => s.id)`), [3, 1, 2]);
+
+  console.log(`\n${checks - failures}/${checks} passed`);
+}
+
+main()
+  .catch((error) => { failures++; console.error(error); })
+  .finally(() => {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    app.exit(failures ? 1 : 0);
+  });

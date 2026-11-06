@@ -3,9 +3,10 @@
 // G then a letter goes to a place (ui/commands.js says which letter is which):
 // the second key has to come within 1.5 seconds, or the G is forgotten. In a
 // list, J and K move a highlight down and up the tasks, Enter opens the one
-// highlighted, and E opens it to edit its title. There is no F: there is no
-// Focus view yet, and an F that only did what Enter does was a second name
-// for the same key. It comes back with Focus.
+// highlighted (Shift and Enter in the centered view), and E opens it to edit
+// its title. There is no F: there is no Focus view yet, and an F that only
+// did what Enter does was a second name for the same key. It comes back with
+// Focus.
 //
 // No single key fires while the focus is in somewhere to type, or while a
 // panel, a menu or the bar is open over the page: those own the keyboard. The
@@ -84,7 +85,7 @@ globalThis.DelphiKeys = (() => {
       // control's own, whatever row the keyboard last stopped on.
       const focus = document.activeElement;
       if (focus && focus !== document.body && !row.contains(focus)) return;
-      const how = e.key === "Enter" ? "open" : key === "e" ? "edit" : null;
+      const how = e.key === "Enter" ? (e.shiftKey ? "full" : "open") : key === "e" ? "edit" : null;
       if (how) { e.preventDefault(); app.openTask(Number(row.dataset.taskId), how); }
     });
   }
