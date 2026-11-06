@@ -52,6 +52,15 @@ for (const [status, days, want] of [
   ["review", 7, "red"],
 ]) check(`${status} for ${days} days is ${want || "not stuck"}`, brief.levelOf(status, days), want);
 check("the marks are words as well as colour", [brief.markOf("amber", 4), brief.markOf("red", 9)], ["Idle 4d", "9d"]);
+{
+  const at = new Date(2026, 10, 6, 9, 0, 0).getTime();
+  check("due in five hours is Due in 5h, in progress or blocked",
+    [brief.dueSoonHours("doing", "2026-11-06 14:00", at), brief.dueSoonHours("blocked", "2026-11-06 14:00", at)], [5, 5]);
+  check("a bare day is due at its end", brief.dueSoonHours("doing", "2026-11-06", at), 15);
+  check("tomorrow's end is more than a day off", brief.dueSoonHours("doing", "2026-11-07", at), null);
+  check("past due is overdue, not due soon", brief.dueSoonHours("doing", "2026-11-05", at), null);
+  check("to-do and done are never marked", [brief.dueSoonHours("todo", "2026-11-06", at), brief.dueSoonHours("done", "2026-11-06", at)], [null, null]);
+}
 check("the sentence", [brief.movementWords(1), brief.movementWords(12)], ["No movement in 1 day", "No movement in 12 days"]);
 check("stamp reads SQLite text as UTC and ISO as given",
   [brief.stamp("2026-11-06 07:00:00"), brief.stamp("2026-11-06T07:00:00.000Z"), brief.stamp("nonsense")],
@@ -120,6 +129,37 @@ check("exactly these three, loudest first", rows.map((r) => r.id), [red, blocked
 check("the banner names the red one", brief.bannerOf(rows).id, red);
 check("no red, no banner", brief.bannerOf(rows.filter((r) => r.level !== "red")), null);
 check("one project only", brief.stuck(db.sqlP, { projectId: other.id }).length, 0);
+check("every quiet row says why", rows.map((r) => r.reason), ["idle", "idle", "idle"]);
+
+section("due within 24 hours is amber too (plan, slice 7)");
+{
+  const pad = (n) => String(n).padStart(2, "0");
+  const local = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const soon = local(new Date(Date.now() + 5 * 3600 * 1000 - 20 * 60 * 1000));
+  const dueDoing = task("in progress, due in five hours", "doing", 0.1);
+  const dueTodo = task("to do, due in five hours", "todo", 0.1);
+  const dueFar = task("in progress, due next week", "doing", 0.1);
+  q("UPDATE tasks SET due = :p1 WHERE id IN (:p2, :p3)", [soon, dueDoing, dueTodo]);
+  q("UPDATE tasks SET due = date('now', '+7 days') WHERE id = :p1", [dueFar]);
+  q("UPDATE tasks SET due = :p1 WHERE id = :p2", [soon, red]);
+  const due = new Map(brief.stuck(db.sqlP).map((r) => [r.id, r]));
+  const d = due.get(dueDoing);
+  check("in progress and due in five hours: amber, Due in 5h", d && [d.level, d.reason, d.mark, d.words], ["amber", "due", "Due in 5h", "Due in 5 hours"]);
+  check("a to-do due soon is not marked", due.has(dueTodo), false);
+  check("due next week is not marked", due.has(dueFar), false);
+  check("red quiet outranks due soon", [due.get(red).level, due.get(red).reason], ["red", "idle"]);
+  // Quiet for three and a half days and due soon: the row says Due, the brief still says it went quiet.
+  q("UPDATE tasks SET due = :p1 WHERE id = :p2", [soon, amber]);
+  const both = brief.stuck(db.sqlP).find((r) => r.id === amber);
+  check("quiet and due soon: the mark is Due, the quiet rule still holds", [both.reason, both.idle], ["due", "amber"]);
+  check("and the brief still reports it went quiet", brief.brief(db.sqlP, { since: brief.stamp(Date.now() - 86400000) }).groups
+    .flatMap((g) => g.lines).filter((l) => l.kind === "stuck" && l.task_id === amber).map((l) => l.mark), ["Idle 3d"]);
+  q("UPDATE tasks SET due = NULL WHERE id = :p1", [amber]);
+  check("due soon is not newly stuck in the brief", brief.brief(db.sqlP, { since: brief.stamp(Date.now() - 3600000) }).groups
+    .flatMap((g) => g.lines).some((l) => l.kind === "stuck" && l.task_id === dueDoing), false);
+  q("UPDATE tasks SET due = NULL WHERE id IN (:p1, :p2, :p3, :p4)", [dueDoing, dueTodo, dueFar, red]);
+  q("UPDATE tasks SET status = 'done' WHERE id IN (:p1, :p2, :p3)", [dueDoing, dueTodo, dueFar]);
+}
 
 // ---------------------------------------------------------------------------
 // The brief. Since a day ago.
@@ -171,7 +211,10 @@ const small = brief.compact(full, { budget: 200 });
 const roomy = brief.compact(full, { budget: 4000 });
 check("compact: one line per thing, naming its History row", roomy.tasks.flatMap((t) => t.lines).length, 5);
 check("compact lines say History", roomy.tasks.flatMap((t) => t.lines).some((l) => / \(History \d+\)$/.test(l)), true);
-check("compact fits a small budget and says it was trimmed", [JSON.stringify(small).length <= 200 * 4 + 400, small.trimmed, typeof small.more], [true, true, "string"]);
+check("compact fits a small budget, the note included, and says it was trimmed", [JSON.stringify(small).length <= 200 * 4, small.trimmed, typeof small.more], [true, true, "string"]);
+for (const budget of [200, 260, 320, 400]) {
+  check(`never over a budget of ${budget}`, JSON.stringify(brief.compact(full, { budget })).length <= budget * 4, true);
+}
 
 section("Undo from a brief line is History's undo");
 db.undo(lineOf("decision").audit_id);
@@ -199,8 +242,17 @@ section("lastSeen: focused for more than a minute, and away for a while");
   check("back after twenty minutes: since the last look", today.since(), "2026-11-06 09:04:45");
   today.blurred();
   now += 60 * 1000;
-  today.seen();
-  check("Mark as seen starts it from now", today.since(), "2026-11-06 09:25:45");
+  today.seen("2026-11-06 09:20:00");
+  check("Mark as seen starts after the newest thing shown, not the click", today.since(), "2026-11-06 09:20:00");
+  today.seen("2026-11-06 09:10:00");
+  check("and never moves backwards", today.since(), "2026-11-06 09:20:00");
+  today.seen("2030-01-01 00:00:00");
+  check("nor past now", today.since(), "2026-11-06 09:25:45");
+  today.seen("not a time");
+  check("a time that does not parse moves nothing", today.since(), "2026-11-06 09:25:45");
+  check("seenUpTo: the newest line shown", brief.seenUpTo({ until: "2026-11-06 10:00:00",
+    groups: [{ lines: [{ at: "2026-11-06 08:00:00" }, { at: "2026-11-06 09:30:00" }] }, { lines: [{ at: "2026-11-06 09:00:00" }] }] }), "2026-11-06 09:30:00");
+  check("seenUpTo: an empty brief is seen to its end", brief.seenUpTo({ until: "2026-11-06 10:00:00", groups: [] }), "2026-11-06 10:00:00");
   const again = createToday({ sql: db.sqlP, dataDir: data, clock: () => now + 3600 * 1000 });
   check("a relaunch starts from the last look", again.since(), "2026-11-06 09:25:45");
   check("view hands back the stuck list, the banner and the brief", Object.keys(again.view()).sort(), ["banner", "brief", "firstRun", "lastSeen", "since", "stuck"]);
@@ -232,9 +284,48 @@ async function route(name, env) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Speed, with no ANALYZE statistics, as a real database has. The subtask
+// lookups once planned as a walk of every task row in History: 9.4 seconds at
+// 200k rows, synchronously in the main process on every Today paint.
+
+function perf() {
+  section("the stuck query at 200k History rows, without ANALYZE");
+  const h = db.handle();
+  h.exec("DROP TABLE IF EXISTS sqlite_stat1");
+  const busy = [];
+  for (let i = 0; i < 60; i++) {
+    const p = task(`busy parent ${i}`, i % 3 ? "doing" : "blocked", 5);
+    for (let k = 0; k < 3; k++) task(`busy subtask ${i}.${k}`, "todo", 5, { parentId: p });
+    busy.push(p);
+  }
+  const ids = q("SELECT id FROM tasks").map((r) => r.id);
+  h.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200000)
+          INSERT INTO audit (at, action, entity, entity_id, summary, label, before_json)
+          SELECT datetime('now', '-' || (i % 90) || ' days'), 'update', 'task', ${ids[0]} + (i % ${ids.length}), 'moved', 'x', '{}' FROM n`);
+  check("200k History rows", Number(q("SELECT COUNT(*) AS n FROM audit")[0].n) >= 200000, true);
+  const plan = h.prepare(`EXPLAIN QUERY PLAN SELECT ${brief.LAST_ACTIVITY} FROM tasks t`).all().map((r) => r.detail);
+  check("History is only ever searched by its entity index, never scanned",
+    plan.filter((d) => /\ba\b/.test(d)).every((d) => /^SEARCH a USING (COVERING )?INDEX idx_audit_entity/.test(d)), true);
+  check("a parent's subtasks are found by idx_tasks_parent", plan.some((d) => /idx_tasks_parent/.test(d)), true);
+  brief.stuck(db.sqlP);
+  const runs = [];
+  for (let i = 0; i < 3; i++) { const t0 = process.hrtime.bigint(); brief.stuck(db.sqlP); runs.push(Number(process.hrtime.bigint() - t0) / 1e6); }
+  const best = Math.min(...runs);
+  console.log(`       stuck(): ${runs.map((r) => r.toFixed(1)).join(", ")} ms`);
+  check("stuck() under 100ms", best < 100, true);
+  const t0 = process.hrtime.bigint();
+  brief.brief(db.sqlP, { since: brief.stamp(Date.now() - 86400000) });
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  console.log(`       brief(): ${ms.toFixed(1)} ms`);
+  check("the whole brief under 250ms", ms < 250, true);
+}
+
 (async () => {
   await route("node:sqlite", {});
   await route("the sqlite3 binary", { DELPHI_SQLITE_ROUTE: "binary" });
+  process.env.ELECTRON_RUN_AS_NODE = "1";
+  perf();
   console.log(`\n${checks - failures}/${checks} checks passed`);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   process.exit(failures ? 1 : 0);

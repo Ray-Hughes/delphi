@@ -110,9 +110,20 @@ function createToday({ sql, dataDir, clock = () => Date.now() }) {
     };
   }
 
-  /** "Mark as seen": the brief starts again from now. */
-  function seen() {
-    shownSince = brief.stamp(clock());
+  /**
+   * "Mark as seen": the brief starts again from the newest thing the window
+   * showed (brief.seenUpTo), never from the click, so what arrived after the
+   * last repaint is not lost. Clamped to now, and never moved backwards.
+   */
+  function seen(upTo = null) {
+    const now = brief.stamp(clock());
+    // No time given is "now" (nothing was on screen yet). A time that does not
+    // parse moves nothing: falling back to now would lose what it was hiding.
+    let at = upTo == null ? now : brief.stamp(upTo);
+    if (!at) return view();
+    if (at > now) at = now;
+    if (at < shownSince) at = shownSince;
+    shownSince = at;
     saved.lastSeen = shownSince;
     write();
     return view();
@@ -130,7 +141,7 @@ function createToday({ sql, dataDir, clock = () => Date.now() }) {
 
 function register(handle, { today }) {
   handle("today:view", (opts) => today.view(opts || {}));
-  handle("today:seen", () => today.seen());
+  handle("today:seen", (upTo) => today.seen(upTo || null));
 }
 
 module.exports = { createToday, register, LOOKED_MS, AWAY_MS };

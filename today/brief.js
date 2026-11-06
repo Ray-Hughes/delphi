@@ -64,6 +64,34 @@ function levelOf(status, days) {
   return "amber";
 }
 
+const HOUR_MS = 3600000;
+
+/**
+ * When a due date falls due, in ms. A bare day is due at the end of that day
+ * on this machine's clock, which is the day a person meant; a time is read as
+ * local too, the way TIME.dueState reads it in the window.
+ */
+function dueAt(due) {
+  const s = String(due == null ? "" : due).trim();
+  const m = s.match(/^(\d{4})-(\d\d)-(\d\d)(?:[ T](\d\d):(\d\d)(?::(\d\d))?)?/);
+  if (!m) return NaN;
+  const [, y, mo, d, h, mi, se] = m.map((v) => (v == null ? v : Number(v)));
+  return h == null ? new Date(y, mo - 1, d + 1).getTime() : new Date(y, mo - 1, d, h, mi, se || 0).getTime();
+}
+
+/**
+ * Whole hours until a task falls due, when that is within the next day: the
+ * plan's other amber (slice 7). Null when it is further off, already past
+ * (that is overdue, which Today says in its own words), or the task is to-do
+ * or done, which are never marked.
+ */
+function dueSoonHours(status, due, now = Date.now()) {
+  if (NEVER_STUCK.includes(status)) return null;
+  const left = dueAt(due) - (now instanceof Date ? now.getTime() : Number(now));
+  if (!Number.isFinite(left) || left <= 0 || left > DAY_MS) return null;
+  return Math.max(1, Math.ceil(left / HOUR_MS));
+}
+
 /** The words on the mark: amber says what it is, red is already loud. */
 function markOf(level, days) {
   if (level === "amber") return `Idle ${days}d`;
@@ -78,18 +106,33 @@ const movementWords = (days) => `No movement in ${days} ${Number(days) === 1 ? "
 // tasks row aliased t. "Anything" is everything Delphi records about it: the
 // row itself, its Sheet, its jobs, its Workbenches, its status changes and its
 // History, and its subtasks' rows, Sheets, jobs and History, since work on a
-// piece is work on the whole. Each piece is COALESCEd to '' because SQLite's
+// piece is work on the whole.
+//
+// The subtask lookups start from the subtasks (idx_tasks_parent), never from
+// a join to tasks. A join lets the planner, with no ANALYZE statistics, walk
+// every task row in audit and check each one's parent: 9 seconds at 200k
+// History rows, on the main process. tools/today_test.js checks the plan and
+// the time. Each piece is COALESCEd to '' because SQLite's
 // scalar max() is NULL as soon as any argument is.
+// A task's newest History row is its highest id: rows are only ever appended,
+// and neither writer (agent/audit.js, db.js record) sets at, so it is the
+// column's default, datetime('now') at the insert. A clock stepped back would
+// put that out by the step, which is hours against a rule counted in days. So it is one seek down idx_audit_entity
+// (entity, entity_id, id) rather than a max() that has to read and convert
+// every row a busy task has, which at 200k rows was most of the cost.
+const NEWEST_AUDIT = (id) => `(SELECT datetime(a.at) FROM audit a WHERE a.entity = 'task' AND a.entity_id = ${id}
+                ORDER BY a.id DESC LIMIT 1)`;
+
 const LAST_ACTIVITY = `max(
     COALESCE(datetime(t.updated_at), ''),
     COALESCE(datetime(t.created_at), ''),
     COALESCE((SELECT max(max(COALESCE(datetime(s.updated_at), ''), COALESCE(datetime(s.created_at), '')))
                 FROM tasks s WHERE s.parent_id = t.id), ''),
-    COALESCE((SELECT max(datetime(c.created_at)) FROM comments c JOIN tasks s ON s.id = c.task_id WHERE s.parent_id = t.id), ''),
+    COALESCE((SELECT max(datetime(c.created_at)) FROM comments c
+                WHERE c.task_id IN (SELECT s.id FROM tasks s WHERE s.parent_id = t.id)), ''),
     COALESCE((SELECT max(datetime(COALESCE(h.last_activity, h.updated_at, h.created_at))) FROM handoffs h
-                JOIN tasks s ON s.id = h.task_id WHERE s.parent_id = t.id), ''),
-    COALESCE((SELECT max(datetime(a.at)) FROM audit a JOIN tasks s ON s.id = a.entity_id
-                WHERE a.entity = 'task' AND s.parent_id = t.id), ''),
+                WHERE h.task_id IN (SELECT s.id FROM tasks s WHERE s.parent_id = t.id)), ''),
+    COALESCE((SELECT max(${NEWEST_AUDIT("s.id")}) FROM tasks s WHERE s.parent_id = t.id), ''),
     COALESCE((SELECT max(max(COALESCE(datetime(c.created_at), ''), COALESCE(datetime(c.updated_at), '')))
                 FROM comments c WHERE c.task_id = t.id), ''),
     COALESCE((SELECT max(max(COALESCE(datetime(h.created_at), ''), COALESCE(datetime(h.updated_at), ''),
@@ -99,7 +142,7 @@ const LAST_ACTIVITY = `max(
                              COALESCE(datetime(w.closed_at), '')))
                 FROM workbenches w WHERE w.task_id = t.id), ''),
     COALESCE((SELECT max(datetime(e.at)) FROM status_events e WHERE e.task_id = t.id), ''),
-    COALESCE((SELECT max(datetime(a.at)) FROM audit a WHERE a.entity = 'task' AND a.entity_id = t.id), '')
+    COALESCE(${NEWEST_AUDIT("t.id")}, '')
   )`;
 
 // Whether an audit row can be put back, the same rule db.js AUDIT_LIST_COLUMNS
@@ -127,8 +170,15 @@ const LIVE_PROJECT = "(p.id IS NULL OR p.status != 'archived')";
 const inScope = (alias, n) => `(:p${n} IS NULL OR ${alias}.project_id = :p${n})`;
 
 /**
- * Every task that has gone quiet, loudest first: red before amber, then the
- * longest quiet. projectId narrows it to one project.
+ * Every task that has gone quiet or falls due within a day, loudest first:
+ * red before amber, then priority (high first), then the longest quiet, then
+ * the lowest id. projectId narrows it to one project.
+ *
+ * reason says which rule gives the row its mark: "idle" (no movement) or
+ * "due" (due within 24 hours, "Due in Nh"). Red quiet beats due soon;
+ * otherwise due soon is the mark, because it has a clock on it. idle is the
+ * quiet rule's own answer either way, which is what the brief reads. Due rows
+ * sort with the other amber ones, by priority and then quiet, not by how soon.
  */
 function stuck(sql, { now = new Date(), projectId = null } = {}) {
   const at = stamp(now);
@@ -139,22 +189,27 @@ function stuck(sql, { now = new Date(), projectId = null } = {}) {
               ${LAST_ACTIVITY} AS last_at
          FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
         WHERE t.status NOT IN ('todo', 'done') AND ${LIVE_PROJECT} AND ${inScope("t", 2)})
-      WHERE last_at != '' AND julianday(:p1) - julianday(last_at) >= ${AMBER_DAYS}`,
+      WHERE (last_at != '' AND julianday(:p1) - julianday(last_at) >= ${AMBER_DAYS})
+         OR (due IS NOT NULL AND due != '')`,
     [at, projectId == null ? null : Number(projectId)]);
   const nowMs = msOf(at);
   const out = [];
   for (const r of rows) {
     const last = msOf(r.last_at);
-    if (!Number.isFinite(last)) continue;
-    const days = Math.floor((nowMs - last) / DAY_MS);
-    const level = levelOf(r.status, days);
-    if (!level) continue;
+    const days = Number.isFinite(last) ? Math.floor((nowMs - last) / DAY_MS) : 0;
+    const idle = levelOf(r.status, days);
+    const hours = dueSoonHours(r.status, r.due, nowMs);
+    if (!idle && hours == null) continue;
+    const reason = idle === "red" || hours == null ? "idle" : "due";
+    const level = reason === "due" ? "amber" : idle;
     out.push({
       id: Number(r.id), title: r.title, status: r.status, priority: r.priority, due: r.due || null,
       assignee: r.assignee || null, owner: r.owner || null, parent_id: r.parent_id == null ? null : Number(r.parent_id),
       project_id: r.project_id == null ? null : Number(r.project_id), project_name: r.project_name || null,
       project_colour: r.project_colour || null,
-      last_at: stamp(r.last_at), days, level, mark: markOf(level, days), words: movementWords(days),
+      last_at: stamp(r.last_at), days, level, reason, idle, due_in_hours: hours,
+      mark: reason === "due" ? `Due in ${hours}h` : markOf(level, days),
+      words: reason === "due" ? `Due in ${hours} ${hours === 1 ? "hour" : "hours"}` : movementWords(days),
     });
   }
   const PRI = { high: 0, med: 1, low: 2 };
@@ -320,12 +375,15 @@ function brief(sql, { since, now = new Date(), projectId = null, stuckRows = nul
   // Newly stuck: the moment a task crossed 3 or 7 days falls inside the window.
   const fromMs = msOf(from);
   for (const s of stuckRows || stuck(sql, { now: until, projectId: scope })) {
+    // By the quiet rule alone: a task that went quiet and is also due soon
+    // still went quiet, whichever mark its row shows.
+    if (!s.idle) continue;
     const last = msOf(s.last_at);
-    const crossed = last + (s.level === "red" ? RED_DAYS : AMBER_DAYS) * DAY_MS;
+    const crossed = last + (s.idle === "red" ? RED_DAYS : AMBER_DAYS) * DAY_MS;
     if (!(crossed > fromMs)) continue;
     lines.push({
-      kind: "stuck", at: stamp(crossed), who: null, level: s.level, days: s.days, mark: s.mark,
-      text: `${s.level === "red" ? "went red" : "went quiet"}: ${s.words.toLowerCase()}`,
+      kind: "stuck", at: stamp(crossed), who: null, level: s.idle, days: s.days, mark: markOf(s.idle, s.days),
+      text: `${s.idle === "red" ? "went red" : "went quiet"}: ${movementWords(s.days).toLowerCase()}`,
       task_id: s.id, task_title: s.title, task_status: s.status, project_id: s.project_id, project_name: s.project_name,
       audit_id: lastAuditOf(sql, s.id), undoable: false,
     });
@@ -394,13 +452,29 @@ function compact(full, { budget = 1200 } = {}) {
   };
   if (!full.total) out.note = "Nothing happened in this window that needs you.";
   const limit = Math.max(200, Number(budget) || 1200) * CHARS_PER_TOKEN;
-  while (JSON.stringify(out).length > limit && out.tasks.length) {
-    const last = out.tasks[out.tasks.length - 1];
-    if (last.lines.length > 1) last.lines.pop(); else out.tasks.pop();
+  // The note is put on before trimming, so the room it takes is counted: added
+  // after, it pushed a trimmed answer back over the budget it was trimmed to.
+  if (JSON.stringify(out).length > limit) {
     out.trimmed = true;
+    out.more = "Trimmed to the budget. Pass a later since, a project, a larger budget, or detail: \"full\".";
+    while (JSON.stringify(out).length > limit && out.tasks.length) {
+      const last = out.tasks[out.tasks.length - 1];
+      if (last.lines.length > 1) last.lines.pop(); else out.tasks.pop();
+    }
   }
-  if (out.trimmed) out.more = "Trimmed to the budget. Pass a later since, a project, a larger budget, or detail: \"full\".";
   return out;
 }
 
-module.exports = { AMBER_DAYS, RED_DAYS, KINDS, stamp, levelOf, markOf, movementWords, stuck, bannerOf, brief, compact };
+/**
+ * Where "Mark as seen" starts the next brief: the newest line the person was
+ * shown, else the end of the window they were shown. Never the click time, so
+ * anything that arrived after the last repaint is still news next time.
+ */
+function seenUpTo(shown) {
+  if (!shown) return null;
+  let newest = null;
+  for (const g of shown.groups || []) for (const l of g.lines || []) if (!newest || String(l.at) > newest) newest = String(l.at);
+  return stamp(newest || shown.until);
+}
+
+module.exports = { LAST_ACTIVITY, AMBER_DAYS, RED_DAYS, KINDS, stamp, levelOf, markOf, movementWords, dueAt, dueSoonHours, stuck, bannerOf, brief, compact, seenUpTo };
