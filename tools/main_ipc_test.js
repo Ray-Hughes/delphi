@@ -272,21 +272,21 @@ async function main() {
   const refusedSet = async (fields) => { const r = await handlers.get("settings:set")({}, fields); return r.ok ? null : r.error; };
   check("jobConcurrency is a whole number from 1 to 8",
     [await refusedSet({ jobConcurrency: 0 }), await refusedSet({ jobConcurrency: 9 }), await refusedSet({ jobConcurrency: 2.5 }), (await call("settings:set", { jobConcurrency: 8 })).jobConcurrency],
-    ["jobConcurrency must be a whole number from 1 to 8", "jobConcurrency must be a whole number from 1 to 8", "jobConcurrency must be a whole number from 1 to 8", 8]);
+    ["Jobs at once must be a whole number from 1 to 8.", "Jobs at once must be a whole number from 1 to 8.", "Jobs at once must be a whole number from 1 to 8.", 8]);
   check("a harness's limit is a whole number from 0 to 4, and the map is replaced whole",
     [await refusedSet({ jobHarnessLimits: { codex: 5 } }), await refusedSet({ jobHarnessLimits: [1] }), await refusedSet({ jobHarnessLimits: { "no spaces": 1 } }),
      (await call("settings:set", { jobHarnessLimits: { codex: 0, "claude-code": "2" } })).jobHarnessLimits],
-    ["jobHarnessLimits.codex must be a whole number from 0 to 4", "jobHarnessLimits must be an object of harness key to a number", "\"no spaces\" is not a harness key", { codex: 0, "claude-code": 2 }]);
+    ["The limit for codex must be a whole number from 0 to 4.", "Per-agent limits must be an object of agent key to a number.", "\"no spaces\" is not an agent's key.", { codex: 0, "claude-code": 2 }]);
   const pinA = db.createProject({ key: "pin-a", name: "Pin A" });
   const pinB = db.createProject({ key: "pin-b", name: "Pin B" });
   check("pinned projects are existing ids, in order, once each",
     [await refusedSet({ pinnedProjects: [pinA.id, 999999] }), await refusedSet({ pinnedProjects: "1" }),
      (await call("settings:set", { pinnedProjects: [pinB.id, String(pinA.id), pinB.id] })).pinnedProjects],
-    ["No project 999999", "pinnedProjects must be a list of project ids", [pinB.id, pinA.id]]);
+    ["No project 999999.", "Pinned projects must be a list of project ids.", [pinB.id, pinA.id]]);
   check("hidden from Active keeps existing projects with their time, and drops the rest",
     [await refusedSet({ hiddenFromActive: "1" }),
      (await call("settings:set", { hiddenFromActive: [{ id: pinA.id, at: "2026-01-02 03:04:05" }, { id: 999999, at: "2026-01-02 03:04:05" }, { id: pinA.id, at: "nonsense" }] })).hiddenFromActive.map((h) => [h.id, /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(h.at)])],
-    ["hiddenFromActive must be a list of { id, at }", [[pinA.id, true]]]);
+    ["Hidden from Active must be a list of { id, at }.", [[pinA.id, true]]]);
   await call("settings:set", { hiddenFromActive: [] });
   check("a refused field changes nothing", (await call("settings:get")).jobConcurrency, 8);
   {

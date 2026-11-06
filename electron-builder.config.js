@@ -90,6 +90,9 @@ module.exports = {
     // The main process's areas, required from main.js, which the require walk
     // in tools/package_test.js follows into the archive.
     "main/",
+    // The settings schema, required by main/settings.js and loaded by
+    // index.html, so both halves read the one list.
+    "settings/",
   ],
 
   // The MCP server is launched by an editor using its own Node, and a plain Node

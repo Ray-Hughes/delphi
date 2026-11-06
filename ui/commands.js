@@ -115,9 +115,11 @@ globalThis.DelphiCommands = (() => {
    */
   function match(commands, query, state) {
     const words = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
-    const here = commands.filter((c) => !c.when || c.when(state));
+    // A quiet command (each setting is one) is found by typing, never listed
+    // on the empty bar; its keywords count as well as its title.
+    const here = commands.filter((c) => (!c.when || c.when(state)) && (words.length || !c.quiet));
     if (!words.length) return here;
-    const hits = here.filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
+    const hits = here.filter((c) => words.every((w) => `${c.title} ${c.keywords || ""}`.toLowerCase().includes(w)));
     return hits.sort((a, b) => Number(b.title.toLowerCase().startsWith(words[0])) - Number(a.title.toLowerCase().startsWith(words[0])));
   }
 

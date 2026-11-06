@@ -6511,7 +6511,8 @@ async function renderReminders(root) {
   }
 
   root.append(el("p", { className: "hint", style: "margin:var(--s4) 0 0",
-    textContent: `Snooze puts a reminder off for ${plural(reminderPrefs.snoozeMinutes, "minute", "minutes")}. Change that under Settings.` }));
+    textContent: `Snooze puts a reminder off for ${plural(reminderPrefs.snoozeMinutes, "minute", "minutes")}. ` },
+    configureLink("snoozeMinutes")));
 }
 
 // ---------------------------------------------------------------------------
@@ -6521,6 +6522,14 @@ async function renderReminders(root) {
 // the third setting, which has been stored and honoured by nothing since the
 // day it was added.
 // ---------------------------------------------------------------------------
+
+/** "Configure...", opening the Settings panel at one setting's row. */
+function configureLink(key) {
+  if (!window.DelphiSettingsPanel) return null;
+  const a = el("button", { className: "linkish", type: "button", textContent: "Configure..." });
+  a.onclick = () => DelphiSettingsPanel.configure(key);
+  return a;
+}
 
 function remindersSettings(settings) {
   const rem = el("div", { className: "setting" });
@@ -10344,9 +10353,10 @@ async function limitsDialog() {
   const ok = await wbDialog({
     title: "How many agents at once",
     body: [...rows, say],
-    actions: [{ label: "Cancel", value: false }, { label: "Save", kind: "primary", value: true }],
+    actions: [...(window.DelphiSettingsPanel ? [{ label: "Configure...", value: "configure" }] : []), { label: "Cancel", value: false }, { label: "Save", kind: "primary", value: true }],
     cancelValue: false,
   });
+  if (ok === "configure") { if (window.DelphiSettingsPanel) DelphiSettingsPanel.configure("jobConcurrency"); return; }
   if (!ok) return;
   try {
     const saved = await window.delphi.settings.set({ jobConcurrency: global, jobHarnessLimits: per });
@@ -14489,7 +14499,11 @@ const shell = {
     focusComposer();
   },
   newProject: () => createProject(),
+  // The floating panel (ui/settings.js). An anchor means the old page, which
+  // still holds what has not moved yet: archived projects, the AI providers.
+  // It lives in the All view, so getting there leaves whichever project is open.
   openSettings: (anchor) => {
+    if (!anchor && window.DelphiSettingsPanel) return DelphiSettingsPanel.open();
     if (anchor === "archived") revealArchived = true;
     return goTo({ projectId: null, view: "settings", query: "" });
   },
@@ -14527,6 +14541,29 @@ const shell = {
   sessionKids: () => sessionKids(),
 };
 const COMMANDS = DelphiCommands.make(shell);
+// Every setting is a command too, and the panel borrows the harness sheet, the
+// trust row and the theme from here.
+if (window.DelphiSettingsPanel) {
+  COMMANDS.push({ id: "settings-old", group: "Commands", title: "Settings: the old page", place: "settings-old", run: () => shell.openSettings("old") },
+    ...DelphiSettingsPanel.commands());
+  DelphiSettingsPanel.init({
+    state: () => state,
+    saved: (settings, fields) => {
+      state.settings = settings;
+      if ("theme" in fields) applyTheme(settings.theme);
+      if ("animations" in fields) applyMotion(settings.animations !== false);
+      if ("noteView" in fields) state.noteView = settings.noteView;
+      if ("pinnedProjects" in fields) state.pinned = readPins(settings);
+      render();
+    },
+    refresh: () => refresh(),
+    openOld: (anchor) => shell.openSettings(anchor || "old"),
+    openProject: (id) => goTo({ projectId: id || someProjectId(), view: "project", query: "" }),
+    go: (target) => shell.go(target),
+    harnessSheet: (h, done) => openHarnessSheet(h, done),
+    trustRow: (h, repaint) => harnessTrustRow(h, repaint),
+  });
+}
 
 /** The Cmd+K bar, lent what it needs to search, open and run. */
 function openBar(query = "") {
@@ -14572,6 +14609,7 @@ function goTo(next) {
 const someProjectId = () => state.projectId || (state.projects[0] && state.projects[0].id) || null;
 
 window.delphi.onMenu(async ({ action, view, theme }) => {
+  if (window.DelphiSettingsPanel && DelphiSettingsPanel.handleMenu(action)) return;
   switch (action) {
     case "search":
       openBar();
@@ -14587,9 +14625,7 @@ window.delphi.onMenu(async ({ action, view, theme }) => {
       return;
 
     case "settings":
-      // Settings live in the All view, so getting there means leaving whichever
-      // project is open rather than looking for a tab that is not there.
-      await goTo({ projectId: null, view: "settings", query: "" });
+      shell.openSettings();
       return;
 
     case "new-project":
@@ -14690,6 +14726,7 @@ async function boot() {
     migratePins(settings).then(() => { state.pinned = readPins(state.settings); renderSidebar(); });
     applyTheme(settings.theme);
     applyMotion(settings.animations !== false);
+    if (window.DelphiSettingsPanel) DelphiSettingsPanel.applyLook(settings);
     if (["formatted", "raw"].includes(settings.noteView)) state.noteView = settings.noteView;
   } catch {
     applyTheme("system");
