@@ -330,15 +330,18 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
     const stored = storedVectors(q.model);
     if (!stored.length) return { list: null, why: `nothing embedded with ${q.model}` };
     const scored = [];
+    // Cosine beside the ranking dot, so a caller can say "Similar meaning"
+    // only where it is true by the same bar related() uses (SIMILAR_MIN).
+    const scores = new Map();
     for (const [key, vec] of stored) {
       if (vec.length !== q.vector.length) continue;
       let dot = 0;
       for (let i = 0; i < vec.length; i++) dot += vec[i] * q.vector[i];
       const d = c.byKey.get(key);
-      if (d) scored.push([d, dot]);
+      if (d) { scored.push([d, dot]); scores.set(d, cosine(q.vector, vec)); }
     }
     scored.sort((a, b) => b[1] - a[1]);
-    return { list: scored.slice(0, 30).map(([d]) => d), model: q.model };
+    return { list: scored.slice(0, 30).map(([d]) => d), model: q.model, scores };
   }
 
   /** Rows that mention an entity the text names, most entities first. */
@@ -389,7 +392,7 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
     if (graph.list.length) lists.push({ list: graph.list, weight: 0.5 });
     const methods = ["lexical", ...(sem.list ? ["semantic"] : []), ...(graph.list.length ? ["graph"] : [])];
     return {
-      c, queryTerms: new Set(queryTerms), ranked: fuse(lists), graph,
+      c, queryTerms: new Set(queryTerms), ranked: fuse(lists), graph, meaning: sem.scores || new Map(),
       ranking: methods.join("+") + (sem.list ? ` (${sem.model})` : ""),
       semantic_off: sem.list ? undefined : sem.why,
     };
@@ -827,7 +830,8 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
     const named = r.graph.entities.find((e) => d.haystack.includes(String(e.name).toLowerCase()));
     if (named && r.graph.list.includes(d)) return `Names ${named.name}`;
     if ([...r.queryTerms].some((t) => d.tf.has(t))) return "Similar wording";
-    return "Similar meaning";
+    // Ranked in by the vectors alone: said only when near enough to be true.
+    return (r.meaning.get(d) || 0) >= SIMILAR_MIN ? "Similar meaning" : null;
   }
 
   /**
@@ -846,8 +850,10 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
         for (const x of sql(`SELECT entity_id FROM item_projects WHERE entity = 'note' AND project_id = :p1`, [pid])) inScope.add(Number(x.entity_id));
       }
     }
+    // A row in by meaning alone has to clear the same bar related() uses,
+    // or every note in the store would be "Similar meaning" to something.
     const notes = r.ranked.filter(([d]) => d.type === "note" && (!inScope || inScope.has(d.id)) &&
-      (d.haystack.includes(needle) || [...r.queryTerms].some((t) => d.tf.has(t)) || r.ranking.includes("semantic")));
+      searchWhy(d, r, needle) !== null);
     return {
       query,
       total: notes.length,
@@ -858,7 +864,22 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
     };
   }
 
-  return { search, ask, context, load, related, searchNotes };
+  /**
+   * related_notes, compact: one line per card inside a budget, the way the
+   * other memory tools answer. related() is the full answer, for detail full.
+   */
+  function relatedBrief(taskId, { limit = 6, budget = 600 } = {}) {
+    const r = related(taskId, { limit });
+    if (!r) return null;
+    return fit({
+      task: r.task,
+      total: r.total,
+      notes: r.notes.map((c) => `#${c.id} ${c.kind}: ${clip(c.title, 90)} (${c.why})`),
+      more: "get_note {id} to read one; detail: \"full\" for every reason and a snippet.",
+    }, Math.max(100, Number(budget) || 600), ["notes"]);
+  }
+
+  return { search, ask, context, load, related, relatedBrief, searchNotes };
 }
 
 module.exports = { makeRecall, whyRelated, SIGNAL_ORDER, terms, sentences, snippet, clip, fit, plain };

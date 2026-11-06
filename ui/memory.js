@@ -179,15 +179,21 @@ globalThis.DelphiMemory = (() => {
   }
 
   async function runSearch() {
+    // The scope as a value, taken now: app.state() is the live state object,
+    // so reading s.projectId after the await would see the new project.
     const s = app.state();
+    const scope = scopeKey(s);
     const q = query.trim();
     if (!q) { found = null; paintList(); return; }
     try {
       const r = await window.delphi.memory.search(q, s.projectId);
-      if (q !== query.trim()) return;
-      found = { query: q, scope: scopeKey(s), notes: r.notes || [] };
+      // Dropped when the question or the scope moved on while it was asked:
+      // a project's answer painted into another project reads as its notes.
+      if (q !== query.trim() || scopeKey(app.state()) !== scope) return;
+      found = { query: q, scope, notes: r.notes || [] };
     } catch (error) {
-      found = { query: q, scope: scopeKey(s), notes: [], error: error.message || String(error) };
+      if (q !== query.trim() || scopeKey(app.state()) !== scope) return;
+      found = { query: q, scope, notes: [], error: error.message || String(error) };
     }
     paintList();
   }
@@ -330,6 +336,7 @@ globalThis.DelphiMemory = (() => {
   // Log a fact
 
   let fact = null;   // the open dialog: { overlay, field, close }
+  let opening = false;
 
   function onShortcut(e) {
     if (!app || !modKey(e) || e.altKey || String(e.key || "").toLowerCase() !== "l") return;
@@ -344,6 +351,14 @@ globalThis.DelphiMemory = (() => {
 
   async function openLogFact({ taskId = undefined, projectId = undefined } = {}) {
     if (fact) { fact.field.focus(); return; }
+    // Set before the await below: a quick second Cmd+L would otherwise find
+    // no dialog yet and open a second one under the first.
+    if (opening) return;
+    opening = true;
+    try { await buildLogFact({ taskId, projectId }); } finally { opening = false; }
+  }
+
+  async function buildLogFact({ taskId, projectId }) {
     const s = app.state();
     const tid = taskId !== undefined ? taskId : app.openTaskId();
     let task = tid != null ? app.taskById(tid) : null;

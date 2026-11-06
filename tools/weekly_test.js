@@ -165,7 +165,15 @@ const c = weekly.compact(r);
 check("counts and three sections", [c.counts.decisions, c.counts.stale, c.counts.expiring, Array.isArray(c.next_week)], [2, 1, 1, true]);
 check("the restore command is in it", c.tidy.some((l) => l.includes("worktree add")), true);
 const tight = weekly.compact(r, { budget: 200 });
-check("budgeted, and says so", [tight.trimmed, JSON.stringify(tight).length <= 800 || tight.look_back.length <= 2], [true, true]);
+check("budgeted, and says so", [tight.trimmed, typeof tight.more], [true, "string"]);
+// A week too big for any budget still fits it: the totals and notes go last.
+const huge = JSON.parse(JSON.stringify(r));
+huge.tidy.stale = Array.from({ length: 300 }, (_, i) => ({ ...r.tidy.stale[0], id: i, title: "x".repeat(200) }));
+huge.look_back.cost.top_tasks = Array.from({ length: 5 }, (_, i) => ({ ...lb.cost.totals, task_id: i, title: "y".repeat(400) }));
+for (const b of [200, 400, 1200]) {
+  const out = weekly.compact(huge, { budget: b });
+  check(`never over a budget of ${b} tokens`, JSON.stringify(out).length <= b * 4, true);
+}
 
 // ---------------------------------------------------------------------------
 // Park, Drop, Undo and the objectives: the window's half.
@@ -205,6 +213,61 @@ try { w.park(sentBack); } catch (error) { refused = error.message; }
 check("Park on a task already in To do says so", refused, `#${sentBack} is already in To do.`);
 check("every write was followed by the vault export", wrote >= 4, true);
 
+section("Park and Drop hold the write lock, so no other writer can land in between");
+// The MCP server is another process on the same file. If it could write
+// between the mark and the end of a Park, its row would be counted as the
+// Park's and taken back by Undo. Both of its routes are tried mid-write: a
+// second node:sqlite connection and the sqlite3 binary, neither waiting.
+const { DatabaseSync } = require("node:sqlite");
+const { spawnSync } = require("child_process");
+const probes = [];
+const probing = { ...db, updateTask: (id, fields) => {
+  const other = new DatabaseSync(process.env.DELPHI_DB);
+  other.exec("PRAGMA busy_timeout = 0");
+  try { other.exec("INSERT INTO meta (key, value) VALUES ('wk-probe-node', '1')"); probes.push("node wrote"); }
+  catch (error) { probes.push(/locked|busy/i.test(error.message) ? "node locked out" : error.message); }
+  finally { other.close(); }
+  const bin = spawnSync("sqlite3", ["-cmd", ".timeout 0", process.env.DELPHI_DB, "INSERT INTO meta (key, value) VALUES ('wk-probe-bin', '1');"], { encoding: "utf8" });
+  probes.push(bin.status === 0 ? "binary wrote" : /locked|busy/i.test(bin.stderr) ? "binary locked out" : bin.stderr.trim());
+  return db.updateTask(id, fields);
+} };
+const lockedW = createWeekly({ db: probing, sheets, after: () => {} });
+const probeParked = lockedW.park(stale);
+check("both routes are locked out while a Park writes", probes, ["node locked out", "binary locked out"]);
+check("and the Park's rows are only its own", q("SELECT COUNT(*) AS n FROM meta WHERE key LIKE 'wk-probe-%'", [])[0].n, 0);
+lockedW.undo(probeParked);
+check("its Undo puts it back", statusOf(stale), "doing");
+
+section("a task written in a pad: Drop ticks its line, and Undo puts the task back");
+const pad = db.createScratchpad({ projectId: project.id, title: "wk pad", body: "- [ ] a pad task\n" });
+const padTask = q("SELECT id FROM tasks WHERE pad_id = :p1", [pad.id])[0].id;
+db.updateTask(padTask, { status: "doing" });
+const padLine = () => (q("SELECT body FROM scratchpads WHERE id = :p1", [pad.id])[0].body.match(/^- \[(.)\] a pad task/m) || [])[1];
+const padDrop = w.drop(padTask, "covered elsewhere");
+check("dropped, its line is ticked", [statusOf(padTask), padLine()], ["done", "x"]);
+w.undo(padDrop);
+check("undone, the task is as it was", statusOf(padTask), "doing");
+// The line stays ticked: db.undo restores the task row and does not write the
+// board back to the pad, the same as an undo from History. That is db.js's to
+// change, for every undo at once, not this module's.
+
+section("a Drop that cannot finish leaves nothing behind");
+const failing = { ...db, updateTask: () => { throw new Error("refused for the test"); } };
+const failW = createWeekly({ db: failing, sheets, after: () => {} });
+const countOf = (sqlText, params) => q(sqlText, params)[0].n;
+const before = [countOf("SELECT COUNT(*) AS n FROM comments WHERE task_id = :p1", [stale]), countOf("SELECT COUNT(*) AS n FROM audit", [])];
+let failed = null;
+try { failW.drop(stale, "never lands"); } catch (error) { failed = error.message; }
+check("the error is said, not swallowed", failed, "refused for the test");
+check("no note and no History row stay", [countOf("SELECT COUNT(*) AS n FROM comments WHERE task_id = :p1", [stale]), countOf("SELECT COUNT(*) AS n FROM audit", [])], before);
+check("and the task is as it was", statusOf(stale), "doing");
+
+section("dropped is the Drop's mark, not words that look like it");
+const lookalike = task("finished, with a note that only sounds like a Drop", "doing", 1);
+agentStore.append({ taskId: lookalike, kind: "note", body: "Dropped in the weekly review: no, this one was finished" });
+q(`UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = :p1`, [lookalike]);
+check("a note in the same words without the mark counts as done", weekly.review(db.sqlP).look_back.done.tasks.some((x) => x.id === lookalike), true);
+
 section("next week's objectives");
 let few = null;
 try { w.save({ projectId: project.id, objectives: [{ text: "one" }, { text: "two" }] }); } catch (error) { few = error.message; }
@@ -217,13 +280,16 @@ const after = weekly.review(db.sqlP).next_week;
 check("next week's review reads them back with how each went",
   after.last.objectives.map((o) => [o.task_id, o.status]), [[reopened, "doing"], [dueSoon, "done"], [null, null]]);
 check("and knows they were saved this week", after.saved_this_week, true);
+const again = w.save({ projectId: other.id, objectives: [{ text: "First" }, { text: "Second" }, { text: "Third" }, { text: "Fourth" }] });
+check("saving the same week again rewrites its note, in the project it is kept in",
+  [again.id, again.updated, again.project_id, q("SELECT COUNT(*) AS n FROM notes WHERE title = :p1", [saved.title])[0].n], [saved.id, true, project.id, 1]);
+check("and the review reads the second list", weekly.review(db.sqlP).next_week.last.objectives.map((o) => o.text), ["First", "Second", "Third", "Fourth"]);
 
 // ---------------------------------------------------------------------------
 // The same review from the MCP server, on both routes.
 
 db.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
 delete process.env.ELECTRON_RUN_AS_NODE;
-const here = weekly.review(db.sqlP);
 // What a second's difference in "now" cannot move.
 const shape = (x) => ({
   decisions: x.look_back.decisions.map((d) => [d.entry_id, d.choice, d.question]),
@@ -243,12 +309,51 @@ async function route(name, env) {
     check("weekly_review is listed", Boolean(listed), true);
     const before = q("SELECT COUNT(*) AS n FROM audit", [])[0].n;
     const got = await client.call("weekly_review", { detail: "full" });
-    check("the same review as db.js's route", shape(got), shape(here));
+    check("the same review as db.js's route", shape(got), shape(weekly.review(db.sqlP)));
     const one = await client.call("weekly_review", { project: "wk2" });
     check("compact by default, one project", [Array.isArray(one.look_back), one.counts.done], [true, 1]);
     const small = await client.call("weekly_review", { budget: 200 });
     check("budgeted", small.trimmed, true);
     check("read only: nothing written", q("SELECT COUNT(*) AS n FROM audit", [])[0].n, before);
+
+    // An agent writing on this route to a task the window Parked: Undo takes
+    // back the Park and nothing of the agent's.
+    const mine = task(`parked while an agent talks, ${name}`, "doing", 5);
+    const p1 = w.park(mine);
+    await client.call("sheet_append", { task_id: mine, kind: "say", body: `still on it over ${name}` });
+    const agentRows = () => q("SELECT id, undone FROM audit WHERE entity = 'task' AND entity_id = :p1 AND actor = 'claude-code:9'", [mine]);
+    check("the Park's rows are none of the agent's", p1.audit.some((id) => agentRows().some((r) => r.id === id)), false);
+    w.undo(p1);
+    check("Undo puts the Park back and leaves the agent's entry",
+      [statusOf(mine), q("SELECT COUNT(*) AS n FROM comments WHERE task_id = :p1 AND body LIKE 'still on it%'", [mine])[0].n,
+       agentRows().every((r) => Number(r.undone) === 0)], ["doing", 1, true]);
+
+    // An agent that changed the task itself since: Undo refuses as a whole,
+    // and nothing of either is undone.
+    const theirs = task(`parked, then changed by an agent, ${name}`, "doing", 5);
+    const p2 = w.park(theirs);
+    await client.call("update_task", { id: theirs, priority: "high" });
+    let no = null;
+    try { w.undo(p2); } catch (error) { no = error.message; }
+    check("Undo refuses, saying who changed it", /claude-code:9 changed/i.test(String(no)), true);
+    check("and changes nothing: still parked, the agent's priority kept, no row undone",
+      [statusOf(theirs), q("SELECT priority FROM tasks WHERE id = :p1", [theirs])[0].priority,
+       q(`SELECT COUNT(*) AS n FROM audit WHERE entity = 'task' AND entity_id = :p1 AND undone = 1`, [theirs])[0].n], ["todo", "high", 0]);
+
+    // Drop then Undo, read back through this route.
+    const gone = task(`dropped and brought back, ${name}`, "doing", 5);
+    const d1 = w.drop(gone, "testing");
+    const dropped1 = (await client.call("weekly_review", { detail: "full" })).look_back.done;
+    w.undo(d1);
+    const dropped2 = (await client.call("weekly_review", { detail: "full" })).look_back.done;
+    check("a Drop counts as dropped on this route, and its Undo takes the note and the count away",
+      [dropped1.dropped - dropped2.dropped, q("SELECT COUNT(*) AS n FROM comments WHERE task_id = :p1", [gone])[0].n, statusOf(gone)], [1, 0, "doing"]);
+
+    // One note per week, read on this route.
+    const w2 = w.save({ projectId: project.id, objectives: [{ text: `A ${name}` }, { text: "B" }, { text: "C" }] });
+    const last = (await client.call("weekly_review", { detail: "full" })).next_week.last;
+    check("a re-save is still one note for the week, and the server reads the latest list",
+      [last.note_id, last.objectives[0].text, q("SELECT COUNT(*) AS n FROM notes WHERE title = :p1", [w2.title])[0].n], [w2.id, `A ${name}`, 1]);
   } finally {
     client.close();
   }
