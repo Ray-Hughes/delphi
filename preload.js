@@ -319,6 +319,8 @@ contextBridge.exposeInMainWorld("delphi", {
     doctor: () => call("settings:doctor"),
     export: () => call("settings:export"),
     importRead: () => call("settings:importRead"),
+    brokenNotice: () => call("settings:brokenNotice"),
+    brokenSeen: () => call("settings:brokenSeen"),
   },
   app: {
     // Where your data lives: { path, dbId, createdAt, dataDir, resolvedBy,

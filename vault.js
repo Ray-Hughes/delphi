@@ -80,6 +80,14 @@ function noteFile(vault, projectName, title) {
 function exportAll(db, vaultPath = DEFAULT_VAULT) {
   const vault = vaultPath.replace(/^~(?=$|\/)/, os.homedir());
   fs.mkdirSync(vault, { recursive: true });
+  // The mark that this folder is Delphi's mirror. Settings will point the
+  // vault at a folder that holds markdown only when it carries this, because
+  // the sweep below deletes markdown this pass did not write
+  // (main/settings.js vaultFolderProblem, VAULT_MARKER).
+  try {
+    const marker = path.join(vault, ".delphi-vault");
+    if (!fs.existsSync(marker)) fs.writeFileSync(marker, "This folder is Delphi's markdown mirror. Delphi rewrites it after every change and removes markdown it did not write.\n");
+  } catch {}
 
   // Archived projects are written too. listProjects hides them, and the sweep at
   // the end removes every .md this pass did not write, so leaving them out meant

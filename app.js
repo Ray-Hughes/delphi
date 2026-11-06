@@ -14573,10 +14573,12 @@ if (window.DelphiSettingsPanel) {
     openOld: (anchor) => shell.openSettings(anchor || "old"),
     openProject: (id) => goTo({ projectId: id || someProjectId(), view: "project", query: "" }),
     addFolder: () => shell.addFolder(),
+    notify: (text) => notify(text, { error: true }),
     go: (target) => shell.go(target),
     harnessSheet: (h, done) => openHarnessSheet(h, done),
     trustRow: (h, repaint) => harnessTrustRow(h, repaint),
   });
+  DelphiSettingsPanel.checkBroken();
 }
 
 /** The Cmd+K bar, lent what it needs to search, open and run. */

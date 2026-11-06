@@ -126,36 +126,28 @@ function scheduleVaultExport() {
   }, 1500);
 }
 
+// Where a settings.json that was not valid JSON was kept at launch, or null.
+// The window is told once (settings:brokenNotice).
+let brokenSettingsFile = null;
+// True when settings.json is there but could not be read or set aside, so
+// nothing may write over it.
+let settingsProtected = false;
+
+/** The rules are main/settings.js readSettingsFile's. */
 function loadSettings() {
-  let existing = null;
-  try {
-    existing = fs.readFileSync(SETTINGS_PATH, "utf8");
-    settings = { ...settings, ...JSON.parse(existing) };
-  } catch (error) {
-    if (existing !== null) {
-      // The file is there but is not valid JSON, which means it was hand edited
-      // into something broken. Keep it and run on defaults rather than
-      // overwriting whatever was being typed.
-      console.error(`settings.json is not valid JSON (${error.message}), using defaults`);
-      return;
-    }
-  }
-  // Write the file on first run so it exists to be edited. A setting you are
-  // told to change in a file that was never created is not a setting.
-  //
-  // A new install starts dark, which is the look v2 was designed in. Only here,
-  // not in the defaults above: every older install wrote "system" into its file
-  // on its own first run, and an older file without the key predates the
-  // setting, so neither is moved off what it has been showing.
-  if (existing === null) {
-    settings.theme = "dark";
-    saveSettings();
-  }
+  const got = settingsMain.readSettingsFile(SETTINGS_PATH, settingsSchema.defaults());
+  settings = got.settings;
+  brokenSettingsFile = got.broken;
+  settingsProtected = got.protect;
+  if (got.protect) console.error("settings.json could not be read or set aside; running on defaults and leaving the file alone");
+  if (got.broken) console.error(`settings.json was not valid JSON; kept as ${got.broken}, starting on defaults`);
+  if (got.write) saveSettings();
 }
 
 function saveSettings() {
+  if (settingsProtected) throw new Error(`Delphi could not read ${SETTINGS_PATH} at launch, so it will not write over it. Check the file's permissions, then restart Delphi.`);
   paths.ensureDataDir();
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  settingsMain.writeSettingsFile(SETTINGS_PATH, settings);
 }
 
 /** Whether dark tokens are the ones currently in force. */
@@ -308,7 +300,8 @@ function toggle() {
 
 function registerHotkey(accelerator) {
   globalShortcut.unregisterAll();
-  const ok = globalShortcut.register(accelerator, toggle);
+  let ok = false;
+  try { ok = globalShortcut.register(accelerator, toggle); } catch { ok = false; }
   if (!ok) {
     // Another app owns it. Say so rather than failing silently, which would look
     // like the app is broken.
@@ -2241,8 +2234,8 @@ function setSettings(fields) {
     let ok = false;
     try { ok = registerHotkey(values.hotkey); } catch { ok = false; }
     if (!ok) {
-      registerHotkey(previousHotkey);
-      throw new Error(`${values.hotkey} is already taken by another application, or is not a key this computer can bind`);
+      const back = registerHotkey(previousHotkey);
+      throw new Error(`${values.hotkey} is already taken by another application, or is not a key this computer can bind${back ? "" : `, and ${previousHotkey} could not be taken back either, so no shortcut shows Delphi until one is set`}`);
     }
   }
   const before = { ...settings };
@@ -2253,7 +2246,9 @@ function setSettings(fields) {
     // Not written, so not kept: the window would show a value the next launch
     // does not have.
     for (const key of Object.keys(values)) settings[key] = before[key];
-    if (changed.includes("hotkey")) registerHotkey(previousHotkey);
+    if (changed.includes("hotkey") && !registerHotkey(previousHotkey)) {
+      throw new Error(`${error.message}. ${previousHotkey} could not be taken back either, so no shortcut shows Delphi until one is set`);
+    }
     throw error;
   }
   const effects = [...new Set(changed.map((key) => settingsSchema.BY_KEY[key].effect).filter(Boolean))];
@@ -2268,6 +2263,7 @@ settingsMain.register(handle, {
   version: app.getVersion(),
   documents: app.getPath("documents"),
   parent: () => (win && !win.isDestroyed() ? win : null),
+  broken: () => brokenSettingsFile,
   info: () => {
     const id = db.identity();
     const list = backups.list();
@@ -2280,6 +2276,7 @@ settingsMain.register(handle, {
       resolvedBy: paths.RESOLVED.source,
       checkoutDbIgnored: paths.RESOLVED.checkoutDbIgnored,
       settingsPath: SETTINGS_PATH,
+      brokenSettings: brokenSettingsFile,
       vaultPath: settings.vaultPath || vault.DEFAULT_VAULT,
       guard: launch.guardStatus(require("os").homedir()),
       guardPath: launch.guardPath(),

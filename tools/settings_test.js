@@ -191,8 +191,8 @@ check("and the panel's stylesheet", html.includes('href="styles/settings.css"'),
 console.log("\nwrites");
 const current = schema.defaults();
 {
-  const { values, changed } = schema.apply(current, { panelMode: true, theme: "dark", snoozeMinutes: 15 }, ctxAll);
-  check("panel mode no longer discards the rest of its call", values, { panelMode: true, theme: "dark", snoozeMinutes: 15 });
+  const { values, changed } = schema.apply(current, { panelMode: true, theme: "light", snoozeMinutes: 15 }, ctxAll);
+  check("panel mode no longer discards the rest of its call", values, { panelMode: true, theme: "light", snoozeMinutes: 15 });
   check("and the window rebuild comes last", changed[changed.length - 1], "panelMode");
 }
 check("the vault can be switched off and moved from the window",
@@ -213,15 +213,83 @@ check("Shift and a letter would take over typing, so it is refused; a name that 
   [throws(() => schema.check("hotkey", "Shift+T")) !== null, throws(() => schema.check("hotkey", "Control+Banana")) !== null, schema.check("hotkey", "Control+Shift+Space")], [true, true, "Control+Shift+Space"]);
 check("text settings take text, not an object", throws(() => schema.check("workbenchEditor", { a: 1 })), "Open a Workbench with must be text.");
 check("a project that does not exist is refused", throws(() => schema.check("scratchpadProjectId", 99, { projectExists: () => false })), "No project 99.");
-check("a value that is the same is not a change", schema.apply(current, { theme: "system" }, ctxAll).changed, []);
+check("a value that is the same is not a change", schema.apply(current, { theme: "dark" }, ctxAll).changed, []);
 check("a call that is not an object is refused", throws(() => schema.apply(current, null, ctxAll)) !== null, true);
 check("the checkout notice takes only the path the window was shown",
   [throws(() => schema.check("checkoutNoticeSeen", "/x.db", { checkoutDbIgnored: "/y.db" })) !== null, schema.check("checkoutNoticeSeen", "/y.db", { checkoutDbIgnored: "/y.db" })], [true, "/y.db"]);
 
-check("modified means not the default", [schema.isModified("theme", "dark"), schema.isModified("theme", "system"), schema.isModified("workbenchEditor", ""), schema.isModified("jobHarnessLimits", {})], [true, false, false, false]);
+check("modified means not the default", [schema.isModified("theme", "system"), schema.isModified("theme", "dark"), schema.isModified("workbenchEditor", ""), schema.isModified("jobHarnessLimits", {})], [true, false, false, false]);
 check("turning a dangerous switch on needs a yes, turning it off does not",
   [schema.needsConfirm("scratchpadMode", true), schema.needsConfirm("scratchpadMode", false), schema.needsConfirm("vaultPath", "/a"), schema.needsConfirm("vaultPath", null), schema.needsConfirm("theme", "dark")],
   [true, false, true, false, false]);
+
+check("__proto__ and constructor are no setting, refused by name",
+  [throws(() => schema.apply(current, JSON.parse('{"__proto__":{"x":1}}'), ctxAll)), throws(() => schema.apply(current, { constructor: 1 }, ctxAll)), throws(() => schema.apply(current, { toString: 1 }, ctxAll))],
+  ['Delphi has no setting called "__proto__".', 'Delphi has no setting called "constructor".', 'Delphi has no setting called "toString".']);
+check("NaN is no number", throws(() => schema.apply(current, { fontSize: NaN }, ctxAll)) !== null, true);
+
+// --- settings.json, read and written ------------------------------------------
+console.log("\nsettings.json");
+{
+  const tmpS = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "delphi-settings-file-")));
+  const file = path.join(tmpS, "settings.json");
+  const d = schema.defaults();
+  check("a new install's theme is dark, and is not counted as changed", [d.theme, schema.isModified("theme", d.theme)], ["dark", false]);
+  const fresh = settingsMain.readSettingsFile(file, d);
+  check("a missing file is a new install: defaults, and written", [fresh.settings.theme, fresh.write, fresh.broken], ["dark", true, null]);
+  settingsMain.writeSettingsFile(file, { ...fresh.settings, snoozeMinutes: 15 });
+  check("a write leaves the whole file and no temporary beside it",
+    [JSON.parse(fs.readFileSync(file, "utf8")).snoozeMinutes, fs.readdirSync(tmpS)], [15, ["settings.json"]]);
+  fs.writeFileSync(file, JSON.stringify({ snoozeMinutes: 20 }));
+  const old = settingsMain.readSettingsFile(file, d);
+  check("an existing file without a theme predates it, and keeps following the system", [old.settings.theme, old.settings.snoozeMinutes, old.write], ["system", 20, false]);
+  fs.writeFileSync(file, JSON.stringify({ theme: "light" }));
+  check("a theme someone chose is kept", settingsMain.readSettingsFile(file, d).settings.theme, "light");
+  fs.writeFileSync(file, "{ \"theme\": \"light\", oops");
+  const bad = settingsMain.readSettingsFile(file, d, { now: () => new Date("2026-11-06T10:00:00Z") });
+  check("a file that is not JSON is kept aside, and defaults are written", [path.basename(bad.broken || ""), bad.write, bad.settings.theme, fs.existsSync(file)],
+    ["settings.json.broken-2026-11-06T10-00-00-000Z", true, "dark", false]);
+  check("with what was being typed still in it", fs.readFileSync(bad.broken, "utf8"), "{ \"theme\": \"light\", oops");
+  fs.rmSync(file, { force: true }); fs.mkdirSync(file);
+  const unreadable = settingsMain.readSettingsFile(file, d);
+  check("a settings.json that is there but cannot be read is never written over", [unreadable.write, unreadable.protect], [false, true]);
+  fs.rmSync(tmpS, { recursive: true, force: true });
+}
+{
+  const handlers = new Map();
+  settingsMain.register((ch, fn) => handlers.set(ch, fn), { settings: () => ({}), context: () => ({}), dialog: {}, info: () => ({}), version: "x", documents: os.tmpdir(), broken: () => "/data/settings.json.broken-1" });
+  check("the person is told about a broken settings.json until the window says it has told them",
+    [handlers.get("settings:brokenNotice")(), handlers.get("settings:brokenNotice")(), handlers.get("settings:brokenSeen")(), handlers.get("settings:brokenNotice")()], ["/data/settings.json.broken-1", "/data/settings.json.broken-1", null, null]);
+}
+const mainText = read("main.js");
+check("main.js reads and writes the file through those two", /settingsMain\.readSettingsFile\(SETTINGS_PATH/.test(mainText) && /settingsMain\.writeSettingsFile\(SETTINGS_PATH, settings\)/.test(mainText) && !/writeFileSync\(SETTINGS_PATH/.test(mainText), true);
+check("loadSettings no longer sets a first-run theme of its own", /settings\.theme = "dark"/.test(mainText), false);
+check("a failed hotkey rollback is reported, not ignored", /const back = registerHotkey\(previousHotkey\)/.test(mainText), true);
+
+// --- the panel's own rows, in search and Cmd+K -----------------------------------
+console.log("\nthe panel's rows");
+{
+  globalThis.DelphiSettingsSchema = schema;
+  globalThis.isMac = () => true; globalThis.modLabel = () => "⌘"; globalThis.tilde = (p) => p; globalThis.modKey = () => false;
+  globalThis.navigator = globalThis.navigator || { platform: "MacIntel" };
+  require("../ui/settings.js");
+  const P = globalThis.DelphiSettingsPanel;
+  const find = (q) => P.EXTRAS.filter((x) => [x.label, x.desc, ...x.synonyms].join(" ").toLowerCase().includes(q)).map((x) => x.id);
+  const missing = ["backup", "restore", "import", "export", "api key", "trust", "approve", "unguarded", "guard", "reset", "database", "folder", "history", "keychain"].filter((q) => !find(q).length);
+  check("every action people search for has a row: backup, restore, import, api key, trust, approve, unguarded, guard, reset...", missing, []);
+  check("every one names a section the panel has", P.EXTRAS.filter((x) => !sections.has(x.section)).map((x) => x.id), []);
+  const cmds = P.commands();
+  check("and each is a Cmd+K command too", P.EXTRAS.every((x) => cmds.some((c) => c.id === `settings-row-${x.id}`)), true);
+  const panelText = read("ui/settings.js");
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, (m) => "\\" + m);
+  const drawn = (x) => {
+    if (x.target) return P.EXTRAS.some((y) => y.id === x.target);
+    if (x.row) return new RegExp(`infoRow\\(\\s*"${esc(x.row)}"`).test(panelText);
+    if (x.group) return new RegExp(`(group\\(\\s*|textContent: )"${esc(x.group)}"`).test(panelText);
+    return new RegExp(`(dataset\\.row = |perProject\\()"${esc(x.id)}"`).test(panelText);
+  };
+  check("every row an entry names is a row the panel draws", P.EXTRAS.filter((x) => !drawn(x)).map((x) => x.id), []);
+}
 
 // --- export and import ----------------------------------------------------------
 console.log("\nexport and import");
@@ -254,6 +322,12 @@ fs.writeFileSync(path.join(hidden, ".trash", "old.md"), "x");
 check("markdown in a hidden folder counts too, since the vault's sweep walks those", /already holds markdown/.test(settingsMain.vaultFolderProblem(hidden) || ""), true);
 const ctx = settingsMain.makeContext({ projectExists: () => true, checkoutDbIgnored: null, vaults: () => [] });
 check("a path this platform does not call absolute is refused", throws(() => schema.check("vaultPath", process.platform === "win32" ? "notes" : "C:/vault", ctx)), "Vault folder must be a full path to a folder.");
+const mine2 = path.join(tmp, "was-mine"); fs.mkdirSync(mine2);
+fs.writeFileSync(path.join(mine2, "Project.md"), "# x"); fs.writeFileSync(path.join(mine2, settingsMain.VAULT_MARKER), "x");
+check("a folder Delphi mirrored into before, with its marker, is allowed back", settingsMain.vaultFolderProblem(mine2), null);
+fs.rmSync(path.join(mine2, settingsMain.VAULT_MARKER)); fs.mkdirSync(path.join(mine2, settingsMain.VAULT_MARKER));
+check("a folder merely named like the marker does not count", /already holds markdown/.test(settingsMain.vaultFolderProblem(mine2) || ""), true);
+check("the marker is the one vault.js writes", read("vault.js").includes(`"${settingsMain.VAULT_MARKER}"`), true);
 check("and settings:set's own check says so", /already holds markdown/.test(throws(() => schema.apply(current, { vaultPath: own }, ctx)) || ""), true);
 fs.rmSync(tmp, { recursive: true, force: true });
 
