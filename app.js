@@ -156,6 +156,16 @@ const safeColour = (value, fallback = "var(--ink-faint)") => {
 const TIME = window.delphiTime;
 const today = () => TIME.localDay();
 const isOverdue = (t) => t.status !== "done" && TIME.dueState(t.due) === "overdue";
+
+/**
+ * The status this version knows how to draw. A newer Delphi adds statuses
+ * (In review), and a person who downgrades keeps that database; a task this
+ * version cannot name is shown as in progress, because that is what it most
+ * nearly is, and it then still appears in a column instead of in none. Only
+ * what is drawn changes: the stored value is never rewritten from here.
+ */
+const KNOWN_STATUSES = new Set(["todo", "doing", "blocked", "done"]);
+const statusOf = (t) => (KNOWN_STATUSES.has(t && t.status) ? t.status : "doing");
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 // The system half of the motion question, read once and then kept current by a
@@ -1313,7 +1323,7 @@ function renderMetrics() {
   const open = state.allTasks.filter((t) => t.status !== "done");
   const figures = [
     ["Open", open.length, null],
-    ["Doing", open.filter((t) => t.status === "doing").length, "good"],
+    ["Doing", open.filter((t) => statusOf(t) === "doing").length, "good"],
     ["Blocked", open.filter((t) => t.status === "blocked").length, "warn"],
     ["Overdue", open.filter(isOverdue).length, "crit"],
   ];
@@ -1364,7 +1374,7 @@ async function renderOverview(root) {
   const done = all.length - open.length;
   const overdue = open.filter(isOverdue).length;
   const blocked = open.filter((t) => t.status === "blocked").length;
-  const doing = open.filter((t) => t.status === "doing").length;
+  const doing = open.filter((t) => statusOf(t) === "doing").length;
 
   // Summary first: what needs attention before what merely exists.
   const stats = el("div", { className: "stats" });
@@ -1407,7 +1417,7 @@ async function renderOverview(root) {
 
   // --- what to do next -----------------------------------------------------
   const priority = [...open].sort((a, b) => {
-    const rank = (t) => (isOverdue(t) ? 0 : t.status === "doing" ? 1 : t.status === "blocked" ? 2 : 3);
+    const rank = (t) => (isOverdue(t) ? 0 : statusOf(t) === "doing" ? 1 : t.status === "blocked" ? 2 : 3);
     return rank(a) - rank(b) || (a.priority === "high" ? -1 : 1);
   }).slice(0, 6);
 
@@ -3737,7 +3747,7 @@ function groupByStatus(tasks) {
   return BOARD_COLUMNS.map(([status, label]) => ({
     status,
     label,
-    tasks: tasks.filter((t) => t.status === status),
+    tasks: tasks.filter((t) => statusOf(t) === status),
   }));
 }
 
@@ -4360,9 +4370,9 @@ function taskTableRow(t) {
   // Status is a control here rather than a label: in a table the whole point is
   // changing one field across many rows without opening any of them.
   const statusCell = el("div", { className: "tcell" });
-  const status = el("select", { className: `cell-select st-${t.status}` });
+  const status = el("select", { className: `cell-select st-${statusOf(t)}` });
   for (const [value, label] of BOARD_COLUMNS) {
-    status.append(el("option", { value, textContent: label, selected: t.status === value }));
+    status.append(el("option", { value, textContent: label, selected: statusOf(t) === value }));
   }
   status.onclick = (e) => e.stopPropagation();
   status.onchange = async (e) => {
@@ -4468,7 +4478,7 @@ function renderTasks(root) {
   // Applied here rather than in refresh so the tab count keeps reporting the
   // whole list, and clearing the filter is a render away rather than a reload.
   const filters = {
-    doing: [(t) => t.status === "doing", "in progress"],
+    doing: [(t) => statusOf(t) === "doing", "in progress"],
     blocked: [(t) => t.status === "blocked", "blocked"],
     overdue: [isOverdue, "overdue"],
     done: [(t) => t.status === "done", "done"],
@@ -4633,11 +4643,11 @@ async function quickLook(taskId) {
   card.setAttribute("aria-label", "Quick look");
 
   card.append(el("div", { className: "qlook-head" },
-    el("span", { className: `dot-status st-${t.status}` }),
+    el("span", { className: `dot-status st-${statusOf(t)}` }),
     el("h3", { textContent: t.title })));
 
   const rows = [
-    ["Status", STATUS_WORD[t.status] || t.status],
+    ["Status", STATUS_WORD[statusOf(t)]],
     ["Priority", t.priority],
     ["Assignee", t.assignee || "unassigned"],
     ["Due", t.due || "no due date"],
@@ -4700,7 +4710,7 @@ function taskMenu(t, x, y, { after = null } = {}) {
     ...(t.status === "done"
       ? [{ label: "Reopen", run: () => set({ status: "todo" }) }]
       : [{ label: "Mark done", run: () => set({ status: "done" }) }]),
-    ...(t.status === "doing" ? [] : [{ label: "Start", run: () => set({ status: "doing" }) }]),
+    ...(statusOf(t) === "doing" ? [] : [{ label: "Start", run: () => set({ status: "doing" }) }]),
     ...(t.status === "blocked"
       ? [{ label: "Unblock", run: () => set({ status: "todo" }) }]
       : [{ label: "Block", run: () => set({ status: "blocked" }) }]),
@@ -5044,7 +5054,7 @@ function taskRow(t) {
 
   const right = el("div", { className: "t-right" });
   if (t.priority === "high") right.append(el("span", { className: "pill high", textContent: "high" }));
-  if (t.status === "doing") right.append(el("span", { className: "pill doing", textContent: "In progress" }));
+  if (statusOf(t) === "doing") right.append(el("span", { className: "pill doing", textContent: "In progress" }));
   if (t.status === "blocked") right.append(el("span", { className: "pill blocked", textContent: "Blocked" }));
   if (isOverdue(t)) right.append(el("span", { className: "pill overdue", textContent: t.due }));
   else if (t.due) right.append(el("span", { className: "t-due", textContent: t.due }));
@@ -9002,11 +9012,11 @@ async function openTaskSheet(taskId) {
     const t = detail.task;
 
     meta.append(chip({
-      icon: "◍", value: STATUS_LABEL[t.status], tone: `tone-${t.status}`,
+      icon: "◍", value: STATUS_LABEL[statusOf(t)], tone: `tone-${statusOf(t)}`,
       build: (done) => {
         const s = el("select", { className: "ts-inline" });
         for (const [v, label] of Object.entries(STATUS_LABEL)) {
-          s.append(el("option", { value: v, textContent: label, selected: t.status === v }));
+          s.append(el("option", { value: v, textContent: label, selected: statusOf(t) === v }));
         }
         s.onchange = () => write({ status: s.value }, "status saved").then(done);
         s.onblur = done;
@@ -9225,10 +9235,10 @@ async function openTaskSheet(taskId) {
 
     const foot = el("div", { className: "subcard-foot" });
 
-    const status = el("select", { className: `cell-select st-${s.status}`, title: "Status" });
+    const status = el("select", { className: `cell-select st-${statusOf(s)}`, title: "Status" });
     status.setAttribute("aria-label", "Subtask status");
     for (const [value, label] of BOARD_COLUMNS) {
-      status.append(el("option", { value, textContent: label, selected: s.status === value }));
+      status.append(el("option", { value, textContent: label, selected: statusOf(s) === value }));
     }
     status.onchange = () => save({ status: status.value });
     foot.append(status);

@@ -549,9 +549,11 @@ function makeRecall({ sql, hasTable = () => true, embedQuery = async () => null 
       (b.title.toLowerCase().includes(lname) - a.title.toLowerCase().includes(lname)) ||
       ((kindRank[a.kind] ?? 3) - (kindRank[b.kind] ?? 3)) ||
       String(b.updated_at).localeCompare(String(a.updated_at)));
-    const statusRank = { doing: 0, blocked: 1, todo: 2, done: 3 };
+    // A status missing here is one a newer Delphi wrote (In review). It reads
+    // as in progress, so it ranks just after doing rather than with todo.
+    const statusRank = { doing: 0, blocked: 2, todo: 3, done: 4 };
     const taskList = [...tasks.values()].sort((a, b) =>
-      ((statusRank[a.status] ?? 2) - (statusRank[b.status] ?? 2)) ||
+      ((statusRank[a.status] ?? 1) - (statusRank[b.status] ?? 1)) ||
       String(b.updated_at).localeCompare(String(a.updated_at)));
 
     const spans = entity.id != null ? sql(`

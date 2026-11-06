@@ -47,6 +47,9 @@ const TAIL_KEEP = 400;
 const LIVE_TAIL_ROWS = 3;
 const OUTPUT_ROWS = 200;
 const STATUSES = ["todo", "doing", "blocked", "done"];
+// A status a newer Delphi wrote (In review) is shown as the one it most nearly
+// is, the way the app shows it, so the two never name the same task differently.
+const statusOf = (s) => (STATUSES.includes(s) ? s : "doing");
 const FILE_KINDS = { d: "decision", g: "gotcha", r: "reference", n: "note" };
 const HINT = "y copies clean";
 
@@ -1184,7 +1187,7 @@ function createSheetApp({ client, resolved, io = {}, paint = null, size = () => 
     const chip = workbenchChip(state.workbench);
     const parts = [];
     if (t.project) parts.push({ text: scr.sanitize(t.project), role: "dim", weight: 0 });
-    if (t.status) parts.push({ text: scr.sanitize(t.status), role: "dim", weight: 2 });
+    if (t.status) parts.push({ text: scr.sanitize(statusOf(t.status)), role: "dim", weight: 2 });
     parts.push({ text: `ledger ${ledgerIds(state.entries).size}`, role: "dim", weight: 1 });
     if (chip) parts.push({ ...chip, weight: 3 });
     const left = ` ${t.id}  `;
