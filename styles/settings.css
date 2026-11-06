@@ -110,8 +110,8 @@
 .sp-btn { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); font-size: 12.5px; white-space: nowrap; box-shadow: var(--shadow-1); }
 .sp-btn:hover { background: var(--raised); }
 .sp-btn.sm { height: 24px; padding: 0 8px; font-size: 12px; border-radius: 6px; }
-.sp-btn.primary { background: var(--accent); border-color: transparent; color: #fff; }
-.sp-btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
+.sp-btn.primary { background: var(--btn-primary, var(--accent)); border-color: transparent; color: #fff; }
+.sp-btn.primary:hover { background: color-mix(in srgb, var(--btn-primary, var(--accent)) 88%, #000); }
 .sp-btn.danger { color: var(--crit-ink); border-color: color-mix(in srgb, var(--crit) 35%, transparent); }
 .sp-btn.danger:hover { background: var(--crit-soft); }
 .sp-btn.danger.solid { background: var(--crit); color: #fff; border-color: transparent; }

@@ -773,7 +773,7 @@ globalThis.DelphiSettingsPanel = (() => {
         r.dataset.key = `folder-${p.id}`;
         const change = btn(p.path ? "Change..." : "Choose...", async () => {
           let chosen = null;
-          try { chosen = await window.delphi.dialog.pickFolder(`The folder for ${p.name}`, { buttonLabel: "Use this folder", defaultPath: p.path || undefined }); } catch {}
+          try { chosen = await window.delphi.dialog.pickFolder(`The folder for ${p.name}`, { buttonLabel: "Use this folder", defaultPath: p.path || undefined }); } catch (error) { status(String(error.message || error), "crit"); }
           if (!chosen) return;
           try { await window.delphi.folders.set(p.id, chosen); p.path = chosen; status(`${p.name} now uses ${homeShort(chosen)}.`, "good"); }
           catch (error) { status(String(error.message || error), "crit"); }
@@ -782,7 +782,7 @@ globalThis.DelphiSettingsPanel = (() => {
         });
         r.append(
           el("span", { className: "sq", style: `background:${safeColour(p.colour, "var(--ink-faint)")}`, textContent: (p.name || "?")[0] }),
-          el("span", { className: "pn", textContent: p.name, style: "flex:0 0 230px" }),
+          el("span", { className: "pn", textContent: p.name, title: p.name, style: "flex:0 0 230px" }),
           el("span", { className: `pn mono${p.path ? "" : " hint"}`, textContent: p.path ? homeShort(p.path) : "No folder", title: p.path || "" }),
           change);
         if (p.path) {
