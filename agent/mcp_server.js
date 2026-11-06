@@ -2438,10 +2438,18 @@ const TOOLS = {
     schema: {
       type: "object",
       required: ["task_id"],
-      properties: { task_id: { type: "number" }, limit: { type: "number", description: "Default 6" } },
+      properties: {
+        task_id: { type: "number" },
+        limit: { type: "number", description: "Default 6" },
+        budget: { type: "number", description: "Max tokens, default 600" },
+        detail: { type: "string", enum: ["brief", "full"] },
+      },
     },
     run: (a) => {
-      const r = recall.related(a.task_id, { limit: Math.max(1, Math.min(Number(a.limit) || 6, 30)) });
+      const limit = Math.max(1, Math.min(Number(a.limit) || 6, 30));
+      const r = a.detail === "full"
+        ? recall.related(a.task_id, { limit })
+        : recall.relatedBrief(a.task_id, { limit, budget: a.budget });
       if (!r) throw new Error(`No task ${a.task_id}`);
       return r;
     },

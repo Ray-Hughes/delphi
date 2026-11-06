@@ -27,7 +27,7 @@ const db = require("../db");
 const oracle = require("../oracle");
 const { makeSheetStore } = require("../sheet/store");
 const { createMemory, register } = require("../main/memory");
-const { whyRelated, SIGNAL_ORDER } = require("../agent/recall");
+const { whyRelated, SIGNAL_ORDER, makeRecall } = require("../agent/recall");
 const { openServer } = require("../sheet/client");
 
 let failures = 0;
@@ -56,7 +56,7 @@ function pure() {
   check("filler says it is filler", whyRelated({ kind: "project", noteKind: "gotcha" }), "Same project, gotcha");
   check("a long name is cut short", whyRelated({ kind: "entity", name: "x".repeat(80) }).length <= 52, true);
   check("every signal has its words", SIGNAL_ORDER.every((k) => whyRelated({ kind: k }) !== "Related"), true);
-  check("no dashes in any of them", SIGNAL_ORDER.map((k) => whyRelated({ kind: k, name: "n", task: 1 })).some((w) => /[–—−]/.test(w)), false);
+  check("no dashes in any of them", SIGNAL_ORDER.map((k) => whyRelated({ kind: k, name: "n", task: 1 })).some((w) => /[\u2013\u2014\u2212]/.test(w)), false);
 }
 
 function vector(values) {
@@ -152,6 +152,14 @@ function app(f) {
     const body = await memory.search("double charge", null);
     check("found in the body", body.notes.find((x) => x.id === f.n.words.id).why, "In the text");
 
+    // A fake model that answers, so rows come in by meaning alone.
+    const byMeaning = makeRecall({ sql: db.sqlP, embedQuery: async () => ({ model: "fake", vector: [1, 0, 0] }) });
+    const meant = await byMeaning.searchNotes("zqxv", { projectId: null });
+    const meantWhy = Object.fromEntries(meant.notes.map((x) => [x.id, x.why]));
+    check("a note near in meaning says so", meantWhy[f.n.meaning.id], "Similar meaning");
+    check("one the vectors ranked but far away is left out, not called similar", f.n.unrelated.id in meantWhy, false);
+    check("no row without a reason", meant.notes.every((x) => typeof x.why === "string"), true);
+
     section("why it's related, in the app");
     const r = memory.relatedFor(f.task.id, { limit: 12 });
     const why = Object.fromEntries(r.notes.map((c) => [c.id, c.why]));
@@ -199,8 +207,15 @@ async function route(name, env, f, inApp) {
   try {
     const tool = (await agent.request("tools/list", {})).tools.find((t) => t.name === "related_notes");
     check("listed, with a short description", Boolean(tool) && tool.description.length < 200, true);
-    const got = await agent.call("related_notes", { task_id: f.task.id, limit: 12 });
-    check("the same cards and reasons as the window", got.notes.map((c) => [c.id, c.why]), inApp.notes.map((c) => [c.id, c.why]));
+    const brief = await agent.call("related_notes", { task_id: f.task.id, limit: 12 });
+    check("brief by default: one line per card, with its reason",
+      brief.notes, inApp.notes.map((c) => `#${c.id} ${c.kind}: ${c.title} (${c.why})`));
+    check("and says how to get more", typeof brief.more === "string", true);
+    const tight = await agent.call("related_notes", { task_id: f.task.id, limit: 12, budget: 100 });
+    check("inside its budget, and says it trimmed", [JSON.stringify(tight).length <= 100 * 4, tight.trimmed], [true, true]);
+    const got = await agent.call("related_notes", { task_id: f.task.id, limit: 12, detail: "full" });
+    check("detail full: the same cards and reasons as the window", got.notes.map((c) => [c.id, c.why]), inApp.notes.map((c) => [c.id, c.why]));
+    check("with every reason", got.notes.every((c) => Array.isArray(c.reasons) && c.reasons.length > 0), true);
     check("unknown task", (await refuses(() => agent.call("related_notes", { task_id: 99999 }))) || "", "No task 99999");
   } finally {
     agent.close();
