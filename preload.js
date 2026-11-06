@@ -307,6 +307,11 @@ contextBridge.exposeInMainWorld("delphi", {
     get: () => call("settings:get"),
     set: (fields) => call("settings:set", fields),
     setHotkey: (accelerator) => call("settings:setHotkey", accelerator),
+    // The floating Settings panel: what the Overview shows, and export and
+    // import as JSON. Import only reads; settings:set applies what was chosen.
+    doctor: () => call("settings:doctor"),
+    export: () => call("settings:export"),
+    importRead: () => call("settings:importRead"),
   },
   app: {
     // Where your data lives: { path, dbId, createdAt, dataDir, resolvedBy,

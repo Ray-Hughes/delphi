@@ -57,9 +57,12 @@ loads all of them at startup, so a renderer change needs a restart, not a reload
 
 ## Things that will catch you out
 
-**`settings:set` uses an allowlist.** A field that is not named in the handler is
-silently dropped, so adding a setting means editing `main.js` as well as the
-renderer. Add it to the defaults object too, or the first read returns undefined.
+**A setting is one entry in `settings/schema.js`.** The defaults, `settings:set`'s
+checks, the Settings panel's form, its search and the Cmd+K entries are all built
+from it, and a field it does not name is refused by name rather than dropped.
+A write is all or nothing. An entry's `effect` is what `main.js` runs after a
+change (`SETTING_EFFECTS`), and `tools/settings_test.js` checks that every key
+the renderer saves is in the schema.
 
 **The MCP server has two routes to the database.** It runs under whatever Node
 an MCP client launches it with, so it uses `node:sqlite` when that Node has it

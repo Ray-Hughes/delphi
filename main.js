@@ -75,75 +75,15 @@ const isMac = process.platform === "darwin";
 const SETTINGS_PATH = paths.SETTINGS_PATH;
 const DEFAULT_HOTKEY = "Control+T";
 const REPO = "https://github.com/Ray-Hughes/delphi";
+const settingsSchema = require("./settings/schema");
+const settingsMain = require("./main/settings");
 
 let win = null;
 let tray = null;
-let settings = {
-  hotkey: DEFAULT_HOTKEY,
-  snoozeMinutes: 10,
-  // Off by default: a window you can full screen and switch to like any other
-  // app is the better default. Panel mode is for people who want it to appear
-  // over their work and vanish again.
-  panelMode: false,
-  vaultEnabled: true,
-  vaultPath: null,   // null means the default folder beside the app
-  // How often the scheduler looks for due reminders. A minute is frequent enough
-  // for reminders measured in minutes and cheap enough to ignore.
-  checkIntervalSeconds: 60,
-  autoRemindBeforeDueHours: 24,
-  // Follow the system unless told otherwise, which is how the window behaved
-  // before the setting existed.
-  theme: "system",
-  // Memory notes are markdown written by agents and read by people, so reading
-  // is the default and the source is a switch away.
-  noteView: "formatted",
-  // Whether connected agents are told to use this tracker as their scratchpad
-  // instead of writing drafts to temporary files. Off by default: it changes how
-  // every agent sharing this database behaves, which is not something to turn on
-  // for someone without asking. See agent/directives.js for how it reaches them.
-  scratchpadMode: false,
-  scratchpadProjectId: null,   // null means "no default, pick a project"
-  // Whether connected agents are told to ask another agent for a second opinion
-  // (the second_opinion tool) before a commit and when they reach a root cause.
-  // Off by default for the same reason as the scratchpad: it changes how every
-  // agent sharing this database works, and spends the other agent's quota.
-  secondOpinionMode: false,
-  secondOpinionAgent: "copilot",
-  // How many second opinions may start in an hour, across every agent on this
-  // database. Each one spends the other agent's quota. See
-  // harness.SECOND_OPINION_HOURLY.
-  secondOpinionHourlyLimit: harness.SECOND_OPINION_HOURLY.default,
-  // On by default because the celebration is the confirmation that a task was
-  // completed, and the row leaves straight afterwards. The system reduced motion
-  // preference already suppresses all of it for the people who need that, so
-  // this is a second, independent off switch rather than the only one.
-  animations: true,
-  // The command that opens a Workbench folder in an editor, split like a shell
-  // would split it, with the folder appended. null means VS Code's `code` when
-  // it is installed, else the system's default for a folder.
-  workbenchEditor: null,
-  // What Workbench branches start with. null means the OS username, which is
-  // what shows whose branch is whose on a shared remote.
-  workbenchBranchPrefix: null,
-  // The checkout database the person has already been told is ignored, so the
-  // notice in Settings is shown once per file rather than on every visit.
-  // null means not yet acknowledged. See app:dataInfo.
-  checkoutNoticeSeen: null,
-  // The dispatcher (agent/dispatch.js): how many jobs run at once in all, how
-  // many per harness (a key missing here means 1, because subscriptions
-  // throttle), and how long one may run before it is stopped. Bounded by
-  // dispatch.BOUNDS, here and again where the dispatcher reads them.
-  jobConcurrency: 3,
-  jobHarnessLimits: {},
-  jobTimeoutMinutes: 60,
-  // Projects kept at the top of the sidebar, in the person's order. Ids, so a
-  // renamed project stays pinned; settings:set drops any that do not exist.
-  pinnedProjects: [],
-  // Projects taken out of the sidebar's Active group, each with when, as
-  // [{ id, at }]. Touching the project after `at` brings it back on its own,
-  // so hiding is "not now" rather than a second archive nobody remembers.
-  hiddenFromActive: [],
-};
+// Every setting's default, and why it is that, is in settings/schema.js: the
+// one list the defaults, settings:set's checks and the Settings panel are all
+// built from. Nothing here names a setting it does not also find there.
+let settings = settingsSchema.defaults();
 let schedulerTimer = null;
 let vaultTimer = null;
 // The last value of PRAGMA data_version, not a timestamp. 0 means "not looked
@@ -2258,173 +2198,94 @@ handle("app:dataInfo", () => {
   };
 });
 handle("settings:get", () => ({ ...settings, workbenchBranchPrefixDefault: require("./workbench/naming").defaultPrefix() }));
-handle("settings:set", (fields) => {
-  if (fields.panelMode !== undefined) {
-    const next = fields.panelMode === true;
-    if (next !== (settings.panelMode === true)) {
-      settings.panelMode = next;
-      saveSettings();
-      rebuildWindow();
-      refreshMenu();
-      return settings;
-    }
-  }
-  // Presentation preferences. Validated against their allowed values rather
-  // than stored as given, so a bad write cannot leave the renderer applying an
-  // attribute no stylesheet answers to.
-  const choices = {
-    theme: ["system", "light", "dark"],
-    noteView: ["formatted", "raw"],
-  };
-  for (const [key, allowed] of Object.entries(choices)) {
-    if (fields[key] !== undefined) {
-      if (!allowed.includes(fields[key])) throw new Error(`${key} must be one of ${allowed.join(", ")}`);
-      settings[key] = fields[key];
-    }
-  }
-
-  if (fields.scratchpadMode !== undefined) settings.scratchpadMode = fields.scratchpadMode === true;
-
-  if (fields.secondOpinionMode !== undefined) settings.secondOpinionMode = fields.secondOpinionMode === true;
-  if (fields.secondOpinionAgent !== undefined) {
-    // A harness key, not a command: the server looks the row up by it, so
-    // anything that could not be one is refused here rather than there.
-    const key = String(fields.secondOpinionAgent || "");
-    if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(key)) throw new Error("secondOpinionAgent must be an agent's key, such as copilot");
-    settings.secondOpinionAgent = key;
-  }
-
-  if (fields.animations !== undefined) settings.animations = fields.animations !== false;
-
-  // A path, and only ever the one app:dataInfo reported: anything else would
-  // acknowledge a notice nobody was shown.
-  if (fields.checkoutNoticeSeen !== undefined) {
-    const value = fields.checkoutNoticeSeen;
-    if (value !== null && value !== paths.RESOLVED.checkoutDbIgnored) {
-      throw new Error("checkoutNoticeSeen must be the ignored checkout database app:dataInfo reported, or null");
-    }
-    settings.checkoutNoticeSeen = value;
-  }
-
-  if (fields.workbenchEditor !== undefined) {
-    const value = fields.workbenchEditor == null ? "" : String(fields.workbenchEditor).trim();
-    if (value.length > 200) throw new Error("The editor command must be 200 characters or fewer");
-    settings.workbenchEditor = value || null;
-  }
-  // Checked against what git accepts in a ref, because a prefix git refuses
-  // would make every Start fail with git's message instead of this one.
-  if (fields.workbenchBranchPrefix !== undefined) {
-    const value = fields.workbenchBranchPrefix == null ? "" : String(fields.workbenchBranchPrefix).trim();
-    if (value && (!/^[A-Za-z0-9._-]{1,40}$/.test(value) || /^[.-]|\.\.|\.lock$|\.$/.test(value))) {
-      throw new Error("The branch prefix may use letters, digits, dots, hyphens and underscores, up to 40, and cannot start with a dot or hyphen");
-    }
-    settings.workbenchBranchPrefix = value || null;
-  }
-
-  // Checked against the projects that exist, because this id is handed to agents
-  // as the place to write. A stale id would send them at a project that is not
-  // there and turn every draft into a failed call.
-  if (fields.scratchpadProjectId !== undefined) {
-    const value = fields.scratchpadProjectId;
-    if (value === null || value === "") {
-      settings.scratchpadProjectId = null;
-    } else {
-      const id = Number(value);
-      if (!Number.isInteger(id) || !db.getProject(id)) throw new Error(`No project ${value}`);
-      settings.scratchpadProjectId = id;
-    }
-  }
-
-  // The dispatcher's limits. Whole numbers inside dispatch.BOUNDS, refused
-  // rather than clamped, so Settings shows the sentence instead of a number
-  // that quietly became another one. Read on every pass, and a pass is run
-  // below, so a raised limit starts what was waiting at once.
-  const { BOUNDS } = require("./agent/dispatch");
-  const whole = (key, value, [min, max]) => {
-    const n = Number(value);
-    if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${key} must be a whole number from ${min} to ${max}`);
-    return n;
-  };
-  if (fields.jobConcurrency !== undefined) settings.jobConcurrency = whole("jobConcurrency", fields.jobConcurrency, BOUNDS.jobConcurrency);
-  if (fields.jobTimeoutMinutes !== undefined) settings.jobTimeoutMinutes = whole("jobTimeoutMinutes", fields.jobTimeoutMinutes, BOUNDS.jobTimeoutMinutes);
-  if (fields.secondOpinionHourlyLimit !== undefined) {
-    settings.secondOpinionHourlyLimit = whole("secondOpinionHourlyLimit", fields.secondOpinionHourlyLimit, harness.SECOND_OPINION_HOURLY.bounds);
-  }
-  // The whole map, as the window shows it: a harness left out goes back to 1.
-  // Keys are harness keys, which is what a job's to_harness holds.
-  if (fields.jobHarnessLimits !== undefined) {
-    const value = fields.jobHarnessLimits;
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("jobHarnessLimits must be an object of harness key to a number");
-    const next = {};
-    for (const [key, limit] of Object.entries(value)) {
-      if (!/^[A-Za-z0-9._:-]{1,64}$/.test(key)) throw new Error(`"${key}" is not a harness key`);
-      next[key] = whole(`jobHarnessLimits.${key}`, limit, BOUNDS.jobHarnessLimit);
-    }
-    settings.jobHarnessLimits = next;
-  }
-  // Checked against the projects that exist, like scratchpadProjectId, and
-  // kept in the order given with repeats dropped.
-  if (fields.pinnedProjects !== undefined) {
-    const value = fields.pinnedProjects == null ? [] : fields.pinnedProjects;
-    if (!Array.isArray(value)) throw new Error("pinnedProjects must be a list of project ids");
-    const ids = [];
-    for (const raw of value) {
-      const id = Number(raw);
-      if (!Number.isInteger(id) || !db.getProject(id)) throw new Error(`No project ${raw}`);
-      if (!ids.includes(id)) ids.push(id);
-    }
-    settings.pinnedProjects = ids;
-  }
-  // Unlike pins, a project that no longer exists is dropped rather than
-  // refused: the list is rewritten whole on every hide, and one deleted
-  // project should not make every later hide fail.
-  if (fields.hiddenFromActive !== undefined) {
-    const value = fields.hiddenFromActive == null ? [] : fields.hiddenFromActive;
-    if (!Array.isArray(value)) throw new Error("hiddenFromActive must be a list of { id, at }");
-    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
-    const kept = new Map();
-    for (const raw of value) {
-      const id = Number(raw && typeof raw === "object" ? raw.id : raw);
-      if (!Number.isInteger(id) || !db.getProject(id)) continue;
-      const at = raw && typeof raw === "object" && /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(String(raw.at)) ? String(raw.at) : now;
-      kept.set(id, { id, at });
-    }
-    settings.hiddenFromActive = [...kept.values()];
-  }
-
-  const numeric = ["snoozeMinutes", "checkIntervalSeconds", "autoRemindBeforeDueHours"];
-  for (const key of numeric) {
-    if (fields[key] !== undefined) {
-      const value = Number(fields[key]);
-      if (!Number.isFinite(value) || value <= 0) throw new Error(`${key} must be a positive number`);
-      settings[key] = value;
-    }
-  }
-  saveSettings();
-  if (fields.checkIntervalSeconds !== undefined) startScheduler();
-  if (fields.jobConcurrency !== undefined || fields.jobHarnessLimits !== undefined) dispatcher.tick();
-  // The Appearance menu carries a radio mark, and the Windows control overlay is
-  // painted by the system rather than by the stylesheet. Both are stale the moment
-  // the theme is changed from inside the window instead of from the menu.
-  if (fields.theme !== undefined) {
+// Every field checked against settings/schema.js before any is kept, so a bad
+// one changes nothing and a name the schema does not know is refused by name
+// rather than dropped. Then each change's effect, from the entry's `effect`,
+// with a window rebuild last: it replaces the renderer that is waiting on this
+// reply, so it runs after the reply has gone and after everything is saved.
+const settingsContext = () => settingsMain.makeContext({
+  projectExists: (id) => Boolean(db.getProject(id)),
+  checkoutDbIgnored: paths.RESOLVED.checkoutDbIgnored,
+  vaults: () => [settings.vaultPath, vault.DEFAULT_VAULT],
+});
+const SETTING_EFFECTS = {
+  scheduler: () => startScheduler(),
+  // Read on every pass, and a pass is run here, so a raised limit starts what
+  // was waiting at once.
+  dispatcher: () => dispatcher.tick(),
+  vault: () => scheduleVaultExport(),
+  // The Appearance menu carries a radio mark, and the Windows control overlay
+  // is painted by the system rather than by the stylesheet. Both are stale the
+  // moment the theme is changed from inside the window instead of the menu.
+  theme: () => {
     refreshMenu();
     if (win && !win.isDestroyed() && !isMac && settings.panelMode !== true && win.setTitleBarOverlay) {
       win.setTitleBarOverlay(overlay());
     }
+  },
+  window: () => setTimeout(() => { rebuildWindow(); refreshMenu(); }, 50),
+  hotkey: () => {},
+};
+function setSettings(fields) {
+  const { values, changed } = settingsSchema.apply(settings, fields, settingsContext());
+  // The one change another application can refuse. Tried before anything is
+  // kept, and the old one put back, so a taken shortcut changes nothing.
+  const previousHotkey = settings.hotkey;
+  if (changed.includes("hotkey")) {
+    let ok = false;
+    try { ok = registerHotkey(values.hotkey); } catch { ok = false; }
+    if (!ok) {
+      registerHotkey(previousHotkey);
+      throw new Error(`${values.hotkey} is already taken by another application, or is not a key this computer can bind`);
+    }
   }
+  const before = { ...settings };
+  Object.assign(settings, values);
+  try {
+    saveSettings();
+  } catch (error) {
+    // Not written, so not kept: the window would show a value the next launch
+    // does not have.
+    for (const key of Object.keys(values)) settings[key] = before[key];
+    if (changed.includes("hotkey")) registerHotkey(previousHotkey);
+    throw error;
+  }
+  const effects = [...new Set(changed.map((key) => settingsSchema.BY_KEY[key].effect).filter(Boolean))];
+  for (const effect of effects) SETTING_EFFECTS[effect]();
   return settings;
+}
+handle("settings:set", setSettings);
+settingsMain.register(handle, {
+  settings: () => settings,
+  context: settingsContext,
+  dialog,
+  version: app.getVersion(),
+  documents: app.getPath("documents"),
+  parent: () => (win && !win.isDestroyed() ? win : null),
+  info: () => {
+    const id = db.identity();
+    const list = backups.list();
+    return {
+      version: app.getVersion(),
+      dbPath: db.DB_PATH,
+      dbId: id.db_id,
+      createdAt: id.created_at,
+      dataDir: paths.DATA_DIR,
+      resolvedBy: paths.RESOLVED.source,
+      checkoutDbIgnored: paths.RESOLVED.checkoutDbIgnored,
+      settingsPath: SETTINGS_PATH,
+      vaultPath: settings.vaultPath || vault.DEFAULT_VAULT,
+      guard: launch.guardStatus(require("os").homedir()),
+      guardPath: launch.guardPath(),
+      lastBackup: list[0] || null,
+      backupCount: list.length,
+    };
+  },
 });
 
-handle("settings:setHotkey", (accelerator) => {
-  const previous = settings.hotkey;
-  if (!registerHotkey(accelerator)) {
-    registerHotkey(previous);
-    throw new Error(`${accelerator} is already taken by another application`);
-  }
-  settings.hotkey = accelerator;
-  saveSettings();
-  return settings;
-});
+// The older call, kept for the old Settings page: the same checks as any other
+// field, through the one path.
+handle("settings:setHotkey", (accelerator) => setSettings({ hotkey: accelerator }));
 
 ipcMain.on("hide", hide);
 ipcMain.on("open-external", (_e, url) => {
