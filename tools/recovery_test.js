@@ -18,6 +18,17 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
+// The child half of the kill test below: a restore that dies, with no catch or
+// finally run, at the step it was told. Before anything else, so it touches
+// only the folder it was handed.
+if (process.argv[2] === "--kill-at") {
+  const [, , , at, dataDir, dbPath] = process.argv;
+  const { createBackups } = require("../main/backups");
+  createBackups({ dataDir, dbPath, source: () => null, sqlite: null })
+    .applyPending({ step: (name) => { if (name === at) process.kill(process.pid, "SIGKILL"); } });
+  process.exit(0);
+}
+
 const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "delphi-recovery-")));
 process.env.DELPHI_DATA_DIR = path.join(dir, "data");
 delete process.env.DELPHI_DB_ID;
@@ -53,10 +64,23 @@ function heartbeat() {
     { unclean: true, lastSeen: "2026-11-06T05:00:00Z", version: null });
   check("a live pid: another app on this database, not a crash", lastExit({ pid: 4242, host }, { host, isAlive: alive }).unclean, false);
   check("another machine's heartbeat says nothing about this one", lastExit({ pid: 4242, host: "other" }, { host, isAlive: dead }).unclean, false);
+  // A pid reused by something else: alive, but not the app that wrote the beat.
+  const beat = { pid: 4242, host, started: "2026-11-06T04:00:00Z", last_seen: "2026-11-06T05:00:00Z" };
+  const at = (iso) => () => Date.parse(iso);
+  check("a beat from before this machine booted is a crash, whatever holds the pid now",
+    lastExit(beat, { host, isAlive: alive, booted: at("2026-11-06T06:00:00Z"), startedAt: () => null }).unclean, true);
+  check("so is a pid whose process started after the beat's writer did",
+    lastExit(beat, { host, isAlive: alive, booted: at("2026-11-01T00:00:00Z"), startedAt: at("2026-11-06T05:30:00Z") }).unclean, true);
+  check("the writer itself, still running, is not",
+    lastExit(beat, { host, isAlive: alive, booted: at("2026-11-01T00:00:00Z"), startedAt: at("2026-11-06T04:00:00Z") }).unclean, false);
+  if (process.platform !== "win32") {
+    const mine = require("../main/recovery").processStart(process.pid);
+    check("this process's own start time can be read", Number.isFinite(mine) && mine <= Date.now() && mine > Date.now() - 3600 * 1000, true);
+  }
 
   const rows = {
-    7: { id: 7, state: "failed", task_id: 3, to_harness: "claude-code", agent_pid: 999, request: "Work task 3", task_title: "Fix the thing" },
-    8: { id: 8, state: "failed", task_id: null, to_harness: "codex", agent_pid: null, request: "Look at the logs\nand more", task_title: null },
+    7: { id: 7, state: "failed", kind: "do", task_id: 3, to_harness: "claude-code", agent_pid: 999, native_session: "sess-7", request: "Work task 3", task_title: "Fix the thing" },
+    8: { id: 8, state: "failed", kind: "do", task_id: null, to_harness: "codex", agent_pid: null, native_session: null, request: "Look at the logs\nand more", task_title: null },
   };
   const sql = (_q, [id]) => (rows[id] ? [rows[id]] : []);
   const pidsAlive = new Set([999]);
@@ -65,6 +89,18 @@ function heartbeat() {
   check("the interrupted runs are listed, with their titles", seen.runs.map((x) => [x.id, x.title, x.harness]),
     [[7, "Fix the thing", "claude-code"], [8, "Look at the logs", "codex"]]);
   check("a run whose agent still lives says so", seen.runs.map((x) => x.agentAlive), [true, false]);
+  check("and whether there is a session to resume, or only starting again", seen.runs.map((x) => x.canResume), [true, false]);
+  const replies = [];
+  const handlers = {};
+  require("../main/recovery").register((name, fn) => { handlers[name] = fn; },
+    { recovery: r, dispatcher: { reply: (id, text) => { replies.push([id, text]); return { id }; } } });
+  pidsAlive.clear();
+  handlers["recovery:resume"](7);
+  handlers["recovery:resume"](8);
+  check("Resume with a session asks the agent to carry on", /^Carry on from where you stopped/.test(replies[0][1]), true);
+  check("without one, it says it is starting over, and that the Workbench keeps its changes", [/starts it again from its request/.test(replies[1][1]), /Workbench still holds/.test(replies[1][1])], [true, true]);
+  r.start({ pid: 1, host }, [7, 8], { host });
+  pidsAlive.add(999);
   pidsAlive.clear();
   check("and stops saying so once it has exited", r.view().runs[0].agentAlive, false);
   r.done(7);
@@ -173,6 +209,119 @@ async function snapshots() {
   check("no database yet: nothing", await fresh.beforeOpen("2.0.0"), null);
 }
 
+/**
+ * Rows in a database as SQLite would see it, its -wal included, read from a
+ * copy so the reading neither checkpoints nor removes anything under test.
+ */
+function rowsIn(file) {
+  const tmp = fs.mkdtempSync(path.join(dir, "count-"));
+  const copy = path.join(tmp, "c.db");
+  try {
+    fs.copyFileSync(file, copy);
+    if (fs.existsSync(`${file}-wal`)) fs.copyFileSync(`${file}-wal`, `${copy}-wal`);
+    const h = new sqlite.DatabaseSync(copy);
+    try { return Number(h.prepare("SELECT COUNT(*) AS n FROM tasks").get().n); } finally { h.close(); }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A live file the way a crash leaves it: three rows in the file and five more
+ * only in its -wal, with a -shm beside them, and a two-row snapshot to restore.
+ */
+function crashedLive(where) {
+  const dataDir = path.join(where, "data");
+  const dbPath = path.join(dataDir, "delphi.db");
+  fs.mkdirSync(path.join(dataDir, "backups"), { recursive: true });
+  const snap = path.join(dataDir, "backups", "delphi-2026-10-01.db");
+  makeDb(snap, 2).close();
+  makeDb(dbPath, 3).close();
+  const h = new sqlite.DatabaseSync(dbPath);
+  h.exec("PRAGMA wal_autocheckpoint = 0");
+  addTasks(h, 5);
+  const frozen = path.join(where, "frozen");
+  fs.mkdirSync(frozen);
+  for (const s of ["", "-wal", "-shm"]) fs.copyFileSync(dbPath + s, path.join(frozen, `delphi.db${s}`));
+  h.close();
+  for (const s of ["", "-wal", "-shm"]) { fs.rmSync(dbPath + s, { force: true }); fs.copyFileSync(path.join(frozen, `delphi.db${s}`), dbPath + s); }
+  fs.writeFileSync(path.join(dataDir, "restore.pending.json"), JSON.stringify({ from: snap, pre: null, asked: "2026-10-01T09:00:00Z", phase: "asked" }));
+  return { dataDir, dbPath, snap };
+}
+
+async function killed() {
+  section("main/backups.js: a restore killed at every step, then the next launch");
+  const { spawnSync } = require("child_process");
+  const steps = ["partial", "copied", "noted-copied", "moved-wal", "moved-shm", "linked", "noted-aside", "swapped", "done"];
+  for (const at of steps) {
+    const { dataDir, dbPath } = crashedLive(path.join(dir, `kill-${at}`));
+    check(`${at}: the live file holds eight rows before`, rowsIn(dbPath), 8);
+    const child = spawnSync(process.execPath, [__filename, "--kill-at", at, dataDir, dbPath], { env: process.env, encoding: "utf8" });
+    check(`${at}: the restore was killed there`, child.signal, "SIGKILL");
+    // The point of the order: whatever step it died at, there is a database
+    // at the live path, and it is either the old one or the new one.
+    check(`${at}: the live path is never empty`, fs.existsSync(dbPath), true);
+    const seen = rowsIn(dbPath);
+    check(`${at}: and holds the old file or the new one, never a mix`, [3, 8, 2].includes(seen), true);
+    const after = createBackups({ dataDir, dbPath, source: () => null, sqlite }).applyPending();
+    if (at === "done") {
+      check(`${at}: the next launch finds nothing left to do`, after, null);
+    } else {
+      check(`${at}: the next launch finishes it`, after && after.ok, true);
+    }
+    check(`${at}: no -wal beside the restored file for SQLite to replay`, fs.existsSync(`${dbPath}-wal`), false);
+    check(`${at}: the restored file is the snapshot`, rowsIn(dbPath), 2);
+    check(`${at}: nothing half done is left`, [fs.existsSync(path.join(dataDir, "restore.pending.json")), fs.existsSync(`${dbPath}.restoring`), fs.existsSync(`${dbPath}.restoring.partial`)], [false, false, false]);
+    const asides = fs.readdirSync(path.join(dataDir, "backups")).filter((f) => /^replaced-/.test(f));
+    check(`${at}: one folder holds the old file`, asides.length, 1);
+    check(`${at}: with its -wal, so all eight rows are kept`, rowsIn(path.join(dataDir, "backups", asides[0], "delphi.db")), 8);
+  }
+
+  section("main/backups.js: a restore that cannot finish puts back what it moved");
+  const { dataDir, dbPath, snap } = crashedLive(path.join(dir, "undo"));
+  // Killed with the -wal moved aside, then the backup goes before the relaunch
+  // and the copy beside the live file is lost too: nothing can finish it.
+  spawnSync(process.execPath, [__filename, "--kill-at", "noted-aside", dataDir, dbPath], { env: process.env });
+  fs.rmSync(snap);
+  fs.rmSync(`${dbPath}.restoring`);
+  const undone = createBackups({ dataDir, dbPath, source: () => null, sqlite }).applyPending();
+  check("it says why", [undone.ok, /no longer there/.test(undone.error)], [false, true]);
+  check("the -wal an earlier launch moved is back, with its rows", [fs.existsSync(`${dbPath}-wal`), rowsIn(dbPath)], [true, 8]);
+  check("and the note is gone, since nothing changed", fs.existsSync(path.join(dataDir, "restore.pending.json")), false);
+}
+
+function orphans() {
+  section("main/backups.js: no database, and a restore's folder holding one");
+  const dataDir = path.join(dir, "orphan", "data");
+  const dbPath = path.join(dataDir, "delphi.db");
+  const folder = path.join(dataDir, "backups", "replaced-2026-10-01T09-00-00");
+  fs.mkdirSync(folder, { recursive: true });
+  const b = createBackups({ dataDir, dbPath, source: () => null, sqlite });
+  check("with nothing set aside there is nothing to say", b.orphaned(), null);
+  // What an older Delphi left when killed between moving the live file out and
+  // renaming the new one in: the old file and its -wal in the folder, and a
+  // -wal at the live path that belongs to no file there.
+  const { dbPath: made } = crashedLive(path.join(dir, "orphan-src"));
+  fs.copyFileSync(made, path.join(folder, "delphi.db"));
+  fs.copyFileSync(`${made}-wal`, path.join(folder, "delphi.db-wal"));
+  fs.writeFileSync(`${dbPath}-wal`, "not this file's");
+  fs.writeFileSync(`${dbPath}.restoring`, "half");
+  check("a launch with no note leaves a stray .restoring while the live file is missing", [b.applyPending(), fs.existsSync(`${dbPath}.restoring`)], [null, true]);
+  const found = b.orphaned();
+  check("it is found, loudly, rather than opened as a new empty database", [found.replaced.length, found.replaced[0].wal, found.strayWal], [1, true, true]);
+  let refused = null;
+  try { b.putBack(path.join(dataDir, "elsewhere")); } catch (error) { refused = error.message; }
+  check("only a restore's own folder can be put back", refused, "That is not a folder a restore set aside.");
+  b.putBack(found.replaced[0].folder);
+  check("put back, it holds all eight rows", rowsIn(dbPath), 8);
+  check("the stray -wal was moved into the folder, not replayed", fs.existsSync(path.join(folder, "stray-wal")), true);
+  check("the folder keeps its own copy", fs.existsSync(path.join(folder, "delphi.db")), true);
+  check("and once there is a database, there is nothing to say", b.orphaned(), null);
+  fs.writeFileSync(`${dbPath}.restoring`, "stale");
+  fs.writeFileSync(`${dbPath}.restoring.partial`, "half");
+  check("with the live file there, strays from a dead restore go", [b.applyPending(), fs.existsSync(`${dbPath}.restoring`), fs.existsSync(`${dbPath}.restoring.partial`)], [null, false, false]);
+}
+
 async function server() {
   section("agent/mcp_server.js: a file replaced under a running server");
   const { openServer } = require("../sheet/client");
@@ -233,6 +382,21 @@ function renderer() {
   check("the drafts of one kind can be listed", R.draftsOf("flag").map((d) => d.id).sort(), ["10", "9"]);
   data.set("delphi.draft.desc.3", JSON.stringify({ text: "stale", at: Date.now() - 31 * 24 * 3600 * 1000 }));
   check("a draft untouched for 30 days is dropped at launch", [R.pruneDrafts(), R.draft("desc", 3), R.draft("flag", 9)], [1, null, "a reply"]);
+  const t42 = { id: 42, created_at: "2026-11-01 09:00:00" };
+  const reused = { id: 42, created_at: "2026-11-05 10:00:00" };
+  check("a task's drafts are keyed by its id and when it was made", R.taskDraftId(t42), "42-20261101090000");
+  R.saveDraft("sheet", R.taskDraftId(t42), "for the first task 42");
+  check("a new task given a deleted one's id does not get its draft", R.draft("sheet", R.taskDraftId(reused)), null);
+  R.saveDraft("desc", R.taskDraftId(t42), "a description");
+  R.saveDraft("sheet", R.taskDraftId({ id: 4, created_at: "2026-01-01" }), "task 4's");
+  R.saveDraft("flag", 42, "a reply to flag 42");
+  check("deleting a task clears every draft it had, and only its own", [R.clearTaskDrafts(42), R.draft("sheet", R.taskDraftId(t42)), R.draft("desc", R.taskDraftId(t42)), R.draft("sheet", R.taskDraftId({ id: 4, created_at: "2026-01-01" }))], [2, null, null, "task 4's"]);
+  check("a flag with the same number keeps its draft", R.draft("flag", 42), "a reply to flag 42");
+  const restoredAt = Date.now();
+  data.set("delphi.draft.sheet.7-1", JSON.stringify({ text: "typed before the restore", at: restoredAt - 1000 }));
+  data.set("delphi.draft.sheet.8-1", JSON.stringify({ text: "typed after it", at: restoredAt + 1000 }));
+  R.dropDraftsBefore(restoredAt);
+  check("after a restore, drafts typed against the replaced file go, and later ones stay", [R.draft("sheet", "7-1"), R.draft("sheet", "8-1")], [null, "typed after it"]);
   R.taskClosed();
   R.remember({ projectId: 2, view: "notes" });
   check("moving on forgets the task and the scroll", [R.lastPlace().taskId, R.lastPlace().scroll], [null, 0]);
@@ -244,6 +408,8 @@ function renderer() {
 async function main() {
   heartbeat();
   await snapshots();
+  await killed();
+  orphans();
   await server();
   renderer();
   console.log(`\n${checks - failures}/${checks} checks passed`);

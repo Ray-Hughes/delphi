@@ -903,6 +903,12 @@ function createDispatcher({
       },
       onAction: (action) => {
         if (action.type === "error") errorSeen = action.message;
+        // Kept the moment the harness names it, not when the turn ends: a
+        // turn cut off by a crash never ends, and a job with no session to
+        // resume can only be started again from the top.
+        if (action.type === "session" && !entry.abandoned && chat.SESSION_ID.test(String(action.id || "")) && action.id !== job.native_session) {
+          try { job = jobs.update(sql, job.id, { native_session: String(action.id) }); } catch (error) { log(`job ${job.id} session`, error.message); }
+        }
         activity(entry, action);
       },
       onError: (error) => log(`job ${job.id} sheet`, error.message),

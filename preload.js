@@ -21,6 +21,9 @@ const call = async (channel, ...args) => {
 };
 
 contextBridge.exposeInMainWorld("delphi", {
+  // Read synchronously by ui/core.js before the first paint, so a shortcut is
+  // labelled and bound for this platform from the start.
+  platform: process.platform,
   projects: {
     list: () => call("projects:list"),
     archived: () => call("projects:archived"),
