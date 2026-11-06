@@ -119,7 +119,15 @@ globalThis.DelphiSettingsPanel = (() => {
     return String(accel || "").split("+").filter(Boolean).map((p) => map[p] || p);
   }
   /** A value as the panel shows it: a shortcut as its keycaps, the rest as the schema says. */
-  const shown = (key, v) => (SS.BY_KEY[key] && SS.BY_KEY[key].type === "shortcut" ? capsOf(v).join(" ") : SS.describe(key, v));
+  const shown = (key, v) => {
+    const s = SS.BY_KEY[key];
+    if (s && s.type === "shortcut") return capsOf(v).join(" ");
+    if (s && s.type === "projectId" && v != null) {
+      const p = ((lent.state && lent.state().projects) || []).find((x) => x.id === Number(v));
+      return p ? p.name : `project ${v}, which is gone`;
+    }
+    return SS.describe(key, v);
+  };
   const keysEl = (accel) => el("span", { className: "sp-caps" }, ...capsOf(accel).map(kbd));
 
   /** Words from what was typed, and whether it asked for changed settings only. */
@@ -127,6 +135,39 @@ globalThis.DelphiSettingsPanel = (() => {
     const words = String(q || "").toLowerCase().split(/\s+/).filter(Boolean);
     return { mod: words.includes("@modified"), words: words.filter((w) => w !== "@modified") };
   }
+
+  // --- the rows that are not settings --------------------------------------
+
+  // Every row and action in the panel that is not a schema setting, so search
+  // and Cmd+K find "backup", "api key" or "trust" as readily as a setting. Each
+  // is matched to its row by `row` (the infoRow label), `group` (a group's
+  // heading) or `id` (a data-key a section sets itself), and the row is given
+  // data-row=id so a jump lands on it.
+  const EXTRAS = [
+    { id: "doctor", section: "overview", label: "Database, agents, guard and last backup", desc: "The same checks as delphi doctor.", synonyms: ["doctor", "health", "status", "guard", "db_id", "database id", "whoami", "check"], group: "This Delphi" },
+    { id: "agents-list", section: "agents", label: "Agents on this machine", desc: "Turn an agent on or off, see where its command resolves, and edit it.", synonyms: ["harness", "harnesses", "claude code", "codex", "copilot", "enable", "disable", "turn off"], group: "Agents on this machine" },
+    { id: "trust", section: "agents", label: "Trust this command", desc: "Let jobs run an agent whose command is a wrapper rather than the agent's own program. Under Details.", synonyms: ["trust", "untrust", "wrapper", "shim", "trusted command"], target: "agents-list" },
+    { id: "add-agent", section: "agents", label: "Add an agent", desc: "Any agent command line that speaks MCP.", synonyms: ["custom agent", "new agent", "mcp", "aider"], target: "agents-list" },
+    { id: "auto_approve", section: "jobs", label: "Start agent jobs without asking", desc: "Per project: an agent's job starts without waiting for your approval.", synonyms: ["approve", "approval", "auto approve", "auto-approve", "without asking", "needs you"] },
+    { id: "allow_unguarded", section: "jobs", label: "Allow unguarded runs", desc: "Per project: let Copilot and Codex run in auto mode without the guard.", synonyms: ["unguarded", "guard", "auto mode", "unsafe", "allow-unguarded"] },
+    { id: "folders", section: "workbenches", label: "Projects and their folders", desc: "Each project's folder: change it, clear it, or add a folder as a project.", synonyms: ["folder", "path", "repository", "repo", "add folder", "clear folder", "directory"], group: "Projects and their folders" },
+    { id: "per-repo", section: "workbenches", label: "Base branch, setup command and files to copy", desc: "Per repository, on the project's own settings.", synonyms: ["base branch", "setup", "copy files", "env"], row: "Base branch, setup command and files to copy" },
+    { id: "vault-now", section: "memory", label: "Rebuild or open the vault", desc: "Export the mirror now, or open its folder.", synonyms: ["export vault", "obsidian", "open folder", "rebuild"], row: "Rebuild or open it" },
+    { id: "data-where", section: "data", label: "Where your data lives", desc: "The database's path, its id, and how it was found.", synonyms: ["database", "db", "path", "location", "data folder", "db_id", "copy path"], group: "Where your data lives" },
+    { id: "backups", section: "data", label: "Backups", desc: "Daily snapshots of the whole database, and restoring one.", synonyms: ["backup", "backups", "snapshot", "restore", "roll back", "daily", "recover"], group: "Backups" },
+    { id: "settings-file", section: "data", label: "Export and import settings", desc: "Every setting as JSON, without secrets.", synonyms: ["export", "import", "json", "another computer", "transfer", "move settings"], row: "Export and import settings" },
+    { id: "elsewhere", section: "data", label: "History, undo and archived projects", desc: "On the old Settings page and the History tab.", synonyms: ["history", "undo", "archived", "archive", "restore project"], row: "History, undo and archived projects" },
+    { id: "privacy-leaves", section: "privacy", label: "What leaves this computer", desc: "Agents, second opinions, Delphi's own chat, update checks.", synonyms: ["privacy", "network", "sharing", "telemetry", "what is sent"], group: "What leaves this computer" },
+    { id: "api-key", section: "privacy", label: "Anthropic API key", desc: "Kept in the operating system's keychain; remove it here.", synonyms: ["api key", "anthropic", "keychain", "token", "secret", "credential", "remove key"], row: "Anthropic API key" },
+    { id: "never-sent", section: "privacy", label: "Delphi itself sends nothing else", desc: "No analytics, no crash reports, no account.", synonyms: ["analytics", "tracking", "crash reports", "ollama", "local"], row: "Delphi itself sends nothing else" },
+    { id: "settings-json", section: "advanced", label: "settings.json", desc: "The file behind these pages, and what happens when it is broken.", synonyms: ["file", "json", "broken", "reveal", "settings file"], row: "settings.json" },
+    { id: "agent-cmds", section: "advanced", label: "Agent command lines", desc: "Each agent's command, arguments, output parser and MCP style.", synonyms: ["argv", "args", "arguments", "parser", "mcp", "flags"], row: "Agent command lines" },
+    { id: "old-page", section: "advanced", label: "The old Settings page", desc: "AI providers, the mouse button and Hand to an agent, until they move here.", synonyms: ["legacy", "providers", "mouse button", "hand to an agent", "old settings"], row: "The old Settings page" },
+    { id: "reset-all", section: "advanced", label: "Reset every setting to its default", desc: "Settings only; projects, tasks and notes are kept.", synonyms: ["reset", "reset all", "defaults", "factory", "start over"], row: "Reset every setting to its default" },
+    { id: "about", section: "about", label: "Version and source", desc: "Which Delphi this is, and where it comes from.", synonyms: ["version", "release", "github", "about", "update"], group: "This Delphi" },
+  ];
+  const extraFor = (field, value) => EXTRAS.find((x) => x[field] === value && !x.target);
+  const extraText = (x) => [x.label, x.desc, ...x.synonyms, (SS.SECTIONS.find((y) => y.id === x.section) || {}).label].join(" \n ").toLowerCase();
 
   // --- the shortcuts inside the window -------------------------------------
 
@@ -312,10 +353,14 @@ globalThis.DelphiSettingsPanel = (() => {
   function seg(s, value, onPick) {
     const g = el("div", { className: "sp-seg", role: "radiogroup" });
     g.setAttribute("aria-label", s.label);
-    for (const [v, label] of s.choices) {
+    // A stored value that is none of the choices still leaves one in the Tab
+    // order, the first, so the group can be reached to put it right.
+    const any = s.choices.some(([v]) => v === value);
+    for (const [i, [v, label]] of s.choices.entries()) {
       const b = el("button", { type: "button", role: "radio", textContent: label });
+      b.dataset.v = String(v);
       b.setAttribute("aria-checked", String(v === value));
-      b.tabIndex = v === value ? 0 : -1;
+      b.tabIndex = v === value || (!any && i === 0) ? 0 : -1;
       b.onclick = () => onPick(v);
       g.append(b);
     }
@@ -323,8 +368,9 @@ globalThis.DelphiSettingsPanel = (() => {
     g.onkeydown = (e) => {
       if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
       e.preventDefault();
-      const at = s.choices.findIndex(([v]) => v === value);
+      const at = Math.max(0, s.choices.findIndex(([v]) => v === value));
       const next = s.choices[(at + (e.key === "ArrowRight" ? 1 : -1) + s.choices.length) % s.choices.length][0];
+      P.focusNext = { key: s.key, fid: `radio:${next}` };
       onPick(next);
     };
     return g;
@@ -340,13 +386,23 @@ globalThis.DelphiSettingsPanel = (() => {
     return wrap;
   }
 
+  /**
+   * Saves a field on Enter, keeping the focus in it (the repaint puts it back
+   * by identity), and on leaving it, once per value either way.
+   */
+  function commitOn(input, onSet) {
+    let sent = input.value;
+    const commit = () => { if (input.value === sent) return; sent = input.value; onSet(input.value); };
+    input.onchange = commit;
+    input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } };
+  }
+
   function number(s, value, onSet, { label = null, min = s.min, max = s.max, unit = s.unit } = {}) {
     const wrap = el("label", { className: `sp-field${P.errors[s.key] ? " bad" : ""}` });
     if (label) wrap.append(el("span", { className: "lab", textContent: label }));
     const input = el("input", { type: "number", min: String(min), max: String(max), step: "1", value: String(value ?? "") });
     input.setAttribute("aria-label", label ? `${s.label}: ${label}` : s.label);
-    input.onchange = () => onSet(input.value);
-    input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); input.blur(); } };
+    commitOn(input, onSet);
     wrap.append(input);
     if (unit) wrap.append(el("span", { className: "u", textContent: unit }));
     return wrap;
@@ -356,8 +412,7 @@ globalThis.DelphiSettingsPanel = (() => {
     const wrap = el("label", { className: `sp-field${P.errors[s.key] ? " bad" : ""}` });
     const input = el("input", { type: "text", value: value || "", placeholder, spellcheck: false, autocomplete: "off" });
     input.setAttribute("aria-label", s.label);
-    input.onchange = () => onSet(input.value);
-    input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); input.blur(); } };
+    commitOn(input, onSet);
     wrap.append(input);
     return wrap;
   }
@@ -429,6 +484,7 @@ globalThis.DelphiSettingsPanel = (() => {
       live.setAttribute("aria-live", "polite");
       if (P.rec.accel) live.append(keysEl(P.rec.accel)); else live.append("Press the keys...");
       const cancel = el("button", { className: "sp-x sm", type: "button", title: "Cancel (Esc)" }, I("x", "sm"));
+      cancel.dataset.fid = "rec-cancel";
       cancel.setAttribute("aria-label", "Cancel recording");
       cancel.onclick = () => { P.rec = null; repaint(); };
       box.append(live, cancel);
@@ -450,6 +506,16 @@ globalThis.DelphiSettingsPanel = (() => {
   }
 
   // --- rows and groups -----------------------------------------------------
+
+  /** Why a stored value fails its own check now, and what Fix would save, or null. */
+  function legacyProblem(s, v) {
+    if (v === undefined) return null;
+    try { SS.check(s.key, v, {}); return null; } catch (error) {
+      let fix = SS.BY_KEY[s.key].default;
+      if (s.type === "int" && typeof v === "number" && Number.isFinite(v)) fix = Math.min(s.max, Math.max(s.min, Math.round(v)));
+      return { why: String(error.message || error), fix };
+    }
+  }
 
   function resetButton(s) {
     const b = el("button", { className: "sp-rst", type: "button", title: `Back to ${shown(s.key, s.default)}` }, I("reset", "xs"), "Reset");
@@ -475,9 +541,18 @@ globalThis.DelphiSettingsPanel = (() => {
     l.append(el("div", { className: "d", textContent: s.desc + range(s) }));
     if (s.notChanged) l.append(el("div", { className: "nc", textContent: `Does not change: ${s.notChanged}` }));
     if (P.errors[s.key]) l.append(el("div", { className: "err", role: "alert", textContent: P.errors[s.key] }));
+    else {
+      // A value saved by an older version, or by hand, that this one would
+      // refuse: said gently, with the nearest value that is allowed.
+      const bad = legacyProblem(s, v);
+      if (bad) l.append(el("div", { className: "warn", role: "status" }, I("alert", "xs"), `Saved as ${shown(s.key, v)}, which this version does not accept. ${bad.why} `,
+        btn("Fix", () => save({ [s.key]: bad.fix }))));
+    }
+    // The control first and Reset after it, in the order Tab reaches them, so
+    // a row that grows a Reset keeps the control where the keyboard left it.
     const c = el("div", { className: "c" });
-    if (SS.isModified(s.key, v)) c.append(resetButton(s));
     if (!block) c.append(controlEl || control(s));
+    if (SS.isModified(s.key, v)) c.append(resetButton(s));
     if (block) {
       const top = el("div", { style: "display:flex;align-items:flex-start;gap:16px" }, l, c);
       r.append(top, ...(controlEl ? [controlEl] : []));
@@ -490,6 +565,8 @@ globalThis.DelphiSettingsPanel = (() => {
 
   function group(label, rows, { care = false } = {}) {
     const g = el("div", { className: "sp-group" });
+    const x = extraFor("group", label);
+    if (x && !(x.section === "overview" || x.section === "about")) g.dataset.row = x.id;
     g.append(el("div", { className: `gl${care ? " care" : ""}` }, care ? I("alert", "xs") : null, label));
     const card = el("div", { className: `sp-card${care ? " care" : ""}` });
     for (const r of rows.flat()) if (r) card.append(r);
@@ -511,6 +588,8 @@ globalThis.DelphiSettingsPanel = (() => {
   /** A row that is not a setting: a fact, an action, a link. */
   function infoRow(label, desc, ...controls) {
     const r = el("div", { className: "sp-row" });
+    const x = extraFor("row", label);
+    r.dataset.row = x ? x.id : `info:${label}`;
     const l = el("div", { className: "l" }, el("div", { className: "n" }, label));
     if (desc) l.append(el("div", { className: "d" }, desc));
     r.append(l, el("div", { className: "c" }, ...controls));
@@ -562,6 +641,7 @@ globalThis.DelphiSettingsPanel = (() => {
             ? tile("alert", "Checkout database", "warn", "Ignored", `${homeShort(d.checkoutDbIgnored)} exists and is never opened.`)
             : tile("file", "Found by", true, d.resolvedBy === "default" ? "The per-user folder" : String(d.resolvedBy || ""), homeShort(d.dataDir), { smono: true }));
       }
+      tiles.dataset.row = "doctor";
       root.append(tiles);
       const mods = modified();
       const g = el("div", { className: "sp-group" }, el("div", { className: "gl" }, "Changed from default"));
@@ -595,14 +675,15 @@ globalThis.DelphiSettingsPanel = (() => {
         const on = val("theme") === v;
         const b = el("button", { className: "sp-thm", type: "button", role: "radio" });
         b.setAttribute("aria-checked", String(on));
-        b.tabIndex = on ? 0 : -1;
+        b.dataset.v = v;
+        b.tabIndex = on || (!theme.choices.some(([c]) => c === val("theme")) && v === theme.choices[0][0]) ? 0 : -1;
         b.append(
           el("div", { className: `shot${v === "system" ? " half" : ""}` }, ...(v === "system" ? [pane("light"), pane("dark")] : [pane(v)])),
           el("div", { className: "cap" }, el("span", { className: "sp-radio" }), label, v === "system" ? el("span", { className: "hint", textContent: `Now ${dark ? "dark" : "light"}` }) : null));
         b.onclick = () => save({ theme: v });
         cards.append(b);
       }
-      cards.onkeydown = (e) => arrowRadio(e, theme.choices.map(([c]) => c), val("theme"), (x) => save({ theme: x }));
+      cards.onkeydown = (e) => arrowRadio(e, theme.choices.map(([c]) => c), val("theme"), (x) => save({ theme: x }), "theme");
       const swatches = el("div", { className: "sp-swatches", role: "radiogroup" });
       swatches.setAttribute("aria-label", "Accent colour");
       const ids = SS.ACCENTS.map((a) => a.id);
@@ -612,12 +693,13 @@ globalThis.DelphiSettingsPanel = (() => {
         const aa = Math.min(ratioOnWhite(a.light[0]), ratioOnWhite(a.dark[0]));
         const b = el("button", { className: "sp-sw", type: "button", role: "radio", title: `${a.label}: white text on it is ${aa.toFixed(1)} to 1 or better in both themes` });
         b.setAttribute("aria-checked", String(on));
-        b.tabIndex = on ? 0 : -1;
+        b.dataset.v = a.id;
+        b.tabIndex = on || (!ids.includes(val("accent")) && a.id === ids[0]) ? 0 : -1;
         b.append(el("span", { className: "sw-dot", style: `background:${fill}` }, on ? I("check", "sm") : null), a.label, el("span", { className: "aa", textContent: `AA ${aa.toFixed(1)}` }));
         b.onclick = () => save({ accent: a.id });
         swatches.append(b);
       }
-      swatches.onkeydown = (e) => arrowRadio(e, ids, val("accent"), (x) => save({ accent: x }));
+      swatches.onkeydown = (e) => arrowRadio(e, ids, val("accent"), (x) => save({ accent: x }), "accent");
       const size = SS.BY_KEY.fontSize;
       const slider = el("div", { className: "sp-range" });
       const input = el("input", { type: "range", min: String(size.min), max: String(size.max), step: "1", value: String(val("fontSize")) });
@@ -683,16 +765,18 @@ globalThis.DelphiSettingsPanel = (() => {
         if (h.command) p.append(el("span", { className: "mono", textContent: h.command }), h.path && h.path !== h.command ? ` resolves to ${homeShort(h.path)}` : "", h.ready ? "" : `. ${h.detail}`);
         else p.append("Any agent command line that speaks MCP. Set one up to use it.");
         const details = btn(open ? "Close" : "Details", () => { P.expanded = open ? null : h.id; repaint(); });
+        details.dataset.fid = `details-${h.id}`;
         details.setAttribute("aria-expanded", String(open));
         const on = toggle({ label: `${h.label} on`, danger: null }, Boolean(h.enabled), async (next) => {
           try { await window.delphi.harnesses.update(h.id, { enabled: next ? 1 : 0 }); } catch (error) { status(String(error.message || error), "crit"); }
           await loadHarnesses(true);
         });
-        on.setAttribute("aria-label", `${h.label}: ${h.enabled ? "on" : "off"}`);
+        on.setAttribute("aria-label", `${h.label} on`);
         card.append(el("div", { className: "sp-agent" },
           el("span", { className: `sp-logo ${harnessClass(h)}`, textContent: harnessInitials(h) }),
           el("div", { className: "who" }, el("b", {}, h.label, state), p),
           details, on));
+        card.lastChild.dataset.row = `agent-${h.id}`;
         if (open) {
           let args = "";
           try { args = JSON.parse(h.args_json || "[]").map((a) => (Array.isArray(a) ? `[${a.join(" ")}]` : a)).join(" "); } catch { args = h.args_json || ""; }
@@ -717,6 +801,7 @@ globalThis.DelphiSettingsPanel = (() => {
           btn("Check again", () => loadHarnesses(true))));
       }
       root.append(el("div", { className: "sp-group" }, el("div", { className: "gl", textContent: "Agents on this machine" }), card));
+      root.lastChild.dataset.row = "agents-list";
       root.append(...schemaGroups("agents"));
     },
 
@@ -733,6 +818,7 @@ globalThis.DelphiSettingsPanel = (() => {
           el("div", { className: "c" },
             el("span", { className: "hint", textContent: onIn.length ? `On in ${onIn.map((p) => p.name).join(", ")}` : `Off in all ${projects.length} projects` }),
             btn(open ? "Done" : "Choose projects", () => { P.expanded = open ? null : field; repaint(); }, "danger"))));
+        r.querySelector(".sp-btn").dataset.fid = `choose-${field}`;
         if (open) {
           const list = el("div", { className: "sp-plist", style: "margin-top:10px" });
           for (const p of projects) {
@@ -836,11 +922,13 @@ globalThis.DelphiSettingsPanel = (() => {
           btn("Got it", () => save({ checkoutNoticeSeen: P.data.checkoutDbIgnored }).then(() => loadData()))));
       }
       root.append(el("div", { className: "sp-group" }, el("div", { className: "gl", textContent: "Where your data lives" }), card));
+      root.lastChild.dataset.row = "data-where";
 
       const bk = el("div", { className: "sp-card sp-backups" });
       if (globalThis.DelphiBackups) DelphiBackups.paint(bk);
-      root.append(el("div", { className: "sp-group" }, el("div", { className: "gl", textContent: "Backups" }),
+      root.append(el("div", { className: "sp-group", tabIndex: -1 }, el("div", { className: "gl", textContent: "Backups" }),
         el("p", { className: "lede", style: "margin:0 0 8px", textContent: "A copy of the whole database every day, the last seven kept, and one before anything big such as an update. Restoring one keeps a copy of what is here now first." }), bk));
+      root.lastChild.dataset.row = "backups";
 
       root.append(group("Settings file", [infoRow("Export and import settings",
         "Every setting on these pages as JSON, without secrets: the API key stays in the keychain and trusted agent commands stay in the database. Import shows what will change first.",
@@ -883,8 +971,9 @@ globalThis.DelphiSettingsPanel = (() => {
       root.append(...schemaGroups("advanced"));
       const d = P.doctor;
       root.append(group("Files", [
-        infoRow("settings.json", el("span", {}, "Everything on these pages is stored here. A file that is not valid JSON is kept, and Delphi runs on defaults. ", d ? el("span", { className: "mono", textContent: homeShort(d.settingsPath) }) : ""),
-          d ? btn([I("ext", "xs"), "Reveal"], () => window.delphi.fs.reveal(d.settingsPath)) : null),
+        infoRow("settings.json", el("span", {}, "Everything on these pages is stored here, written whole or not at all. A file that is not valid JSON is kept beside it as settings.json.broken-<time>, and Delphi starts on defaults. ", d ? el("span", { className: "mono", textContent: homeShort(d.settingsPath) }) : ""),
+          d && d.brokenSettings ? el("span", { className: "sp-tag warn", title: d.brokenSettings, textContent: "A broken copy is kept" }) : null,
+          d ? btn([I("ext", "xs"), "Reveal"], () => window.delphi.fs.reveal(d.brokenSettings || d.settingsPath)) : null),
         infoRow("Agent command lines", "Each agent's command, arguments, output parser and how it is handed Delphi's MCP server.", btn(["Agents", I("right", "xs")], () => show("agents"))),
         infoRow("The old Settings page", "Delphi's own AI providers, the mouse button and Hand to an agent are still there, until they move here.", btn([I("ext", "xs"), "Open it"], () => { close(); if (lent.openOld) lent.openOld(); })),
       ]));
@@ -906,6 +995,7 @@ globalThis.DelphiSettingsPanel = (() => {
       line("Database id", d ? d.dbId : "...", d ? copyBtn(d.dbId) : null);
       line("Data folder", d ? homeShort(d.dataDir) : "...", d ? btn([I("ext", "xs"), "Reveal"], () => window.delphi.fs.reveal(d.dataDir)) : null);
       root.append(el("div", { className: "sp-group" }, el("div", { className: "gl", textContent: "This Delphi" }), el("div", { className: "sp-card" }, kv)));
+      root.lastChild.dataset.row = "about";
       root.append(group("More", [
         infoRow("What's new", "What changed across every project since you last looked.", btn(["Open", I("right", "xs")], () => { close(); if (lent.go) lent.go({ projectId: null, view: "new" }); })),
         infoRow("Source and releases", "github.com/Ray-Hughes/delphi", btn([I("ext", "xs"), "Open"], () => window.delphi.openExternal("https://github.com/Ray-Hughes/delphi"))),
@@ -913,12 +1003,15 @@ globalThis.DelphiSettingsPanel = (() => {
     },
   };
 
-  function arrowRadio(e, values, current, pick) {
+  /** Arrow keys in a radio group: the next choice, and the focus goes with it. */
+  function arrowRadio(e, values, current, pick, key) {
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
     e.preventDefault();
-    const at = values.indexOf(current);
+    const at = Math.max(0, values.indexOf(current));
     const step = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : -1;
-    pick(values[(at + step + values.length) % values.length]);
+    const next = values[(at + step + values.length) % values.length];
+    P.focusNext = { key, fid: `radio:${next}` };
+    pick(next);
   }
 
   /** A strip of the window in miniature, drawn with the live tokens, so every change shows here as it does everywhere. */
@@ -990,6 +1083,9 @@ globalThis.DelphiSettingsPanel = (() => {
       if (words.every((w) => hay.includes(w))) out.push({ kind: "setting", s, section: s.section, label: s.label, desc: s.desc, value: shown(s.key, val(s.key)) });
     }
     if (!mod && words.length) {
+      for (const x of EXTRAS) {
+        if (words.every((w) => extraText(x).includes(w))) out.push({ kind: "extra", x, section: x.section, label: x.label, desc: x.desc, value: "" });
+      }
       for (const k of shortcuts()) {
         const hay = `${k.label} ${k.group} shortcut keyboard ${capsOf(k.keys || "").join(" ")} ${(k.plain || []).join(" ")} ${k.chord ? `g ${k.chord}` : ""}`.toLowerCase();
         if (words.every((w) => hay.includes(w))) out.push({ kind: "shortcut", k, section: "shortcuts", label: k.label, desc: k.group, value: k.keys ? capsOf(k.keys).join("") : k.chord ? `G then ${k.chord.toUpperCase()}` : (k.plain || []).join(" ") });
@@ -1012,8 +1108,26 @@ globalThis.DelphiSettingsPanel = (() => {
     return out;
   }
 
+  /**
+   * How well a result's name answers what was typed: a name that starts with
+   * it, then a word in the name that does, then a match anywhere.
+   */
+  function score(r, words) {
+    const name = String(r.label || "").toLowerCase();
+    const w = words[0] || "";
+    if (!w) return 0;
+    if (name.startsWith(w)) return 2;
+    return name.split(/[^a-z0-9]+/).some((x) => x.startsWith(w)) ? 1 : 0;
+  }
+
   function paintResults(root) {
-    const { out, words, mod } = results();
+    const { out: found, words, mod } = results();
+    // In the order they are drawn: the best match's section first, each
+    // section's best first, so the lit row, the arrow keys and Enter agree.
+    const best = new Map();
+    for (const r of found) best.set(r.section, Math.max(best.get(r.section) ?? -1, score(r, words)));
+    const order = [...new Set(found.map((r) => r.section))].sort((a, b) => best.get(b) - best.get(a));
+    const out = order.flatMap((sec) => found.filter((r) => r.section === sec).map((r, i) => [r, i]).sort((a, b) => score(b[0], words) - score(a[0], words) || a[1] - b[1]).map(([r]) => r));
     P.found = out;
     if (P.hot >= out.length) P.hot = Math.max(0, out.length - 1);
     const title = mod && !words.length
@@ -1026,7 +1140,7 @@ globalThis.DelphiSettingsPanel = (() => {
       root.append(el("div", { className: "sp-card" }, el("div", { className: "sp-empty", textContent: mod ? "Nothing is changed from its default." : "Nothing matches. Try another word, or @modified for what you have changed." })));
       return;
     }
-    const sections = [...new Set(out.map((r) => r.section))];
+    const sections = order;
     let i = 0;
     const list = el("div", { className: "sp-results", role: "listbox", id: "sp-results" });
     list.setAttribute("aria-label", "Matching settings");
@@ -1038,9 +1152,9 @@ globalThis.DelphiSettingsPanel = (() => {
         b.setAttribute("aria-selected", String(at === P.hot));
         b.append(
           el("div", { className: "l" },
-            el("div", { className: "sp-crumb" }, sectionOf(sec).label, I("right", "xs"), r.kind === "setting" ? r.s.group : r.desc),
+            el("div", { className: "sp-crumb" }, sectionOf(sec).label, I("right", "xs"), r.kind === "setting" ? r.s.group : r.kind === "extra" ? "Panel" : r.desc),
             el("div", { className: "n" }, ...marked(r.label, words)),
-            r.kind === "setting" ? el("div", { className: "d" }, ...marked(r.desc + range(r.s), words)) : null),
+            r.kind === "setting" ? el("div", { className: "d" }, ...marked(r.desc + range(r.s), words)) : r.kind === "extra" ? el("div", { className: "d" }, ...marked(r.desc, words)) : null),
           r.value ? el("span", { className: "val", textContent: r.value }) : null,
           at === P.hot ? el("span", { className: "go" }, kbd("↵"), "Jump") : I("right", "sm"));
         b.onclick = () => choose(at);
@@ -1067,6 +1181,7 @@ globalThis.DelphiSettingsPanel = (() => {
     const r = P.found && P.found[i];
     if (!r) return;
     if (r.kind === "setting") jump(r.s.key);
+    else if (r.kind === "extra") jumpRow(r.x.target || r.x.id, r.x.section);
     else { setQuery(""); show("shortcuts"); }
   }
 
@@ -1083,6 +1198,16 @@ globalThis.DelphiSettingsPanel = (() => {
   function paintNav() {
     const nav = P.nav;
     nav.textContent = "";
+    // Below 860px wide the list gives way to this menu, which is the same
+    // sections in the same order. Navigation is never just hidden.
+    const sel = P.navsel;
+    sel.textContent = "";
+    let og = null;
+    for (const sec of SS.SECTIONS) {
+      if (!og && P.query.trim()) sel.append(el("option", { value: "", textContent: "Search results", selected: true, disabled: true }));
+      if (!og || og.label !== (sec.group || "Settings")) { og = el("optgroup", { label: sec.group || "Settings" }); sel.append(og); }
+      og.append(el("option", { value: sec.id, textContent: sec.label, selected: sec.id === P.section && !P.query.trim() }));
+    }
     const searching = Boolean(P.query.trim());
     const counts = searching ? results().out.reduce((m, r) => ((m[r.section] = (m[r.section] || 0) + 1), m), {}) : {};
     const mods = modified();
@@ -1122,24 +1247,52 @@ globalThis.DelphiSettingsPanel = (() => {
     P.lastPainted = `${P.section}|${P.query}`;
     root.scrollTop = keepScroll;
     if (focusKey) restoreFocus(focusKey);
+    // An arrow's "focus the next choice" is for the paint it asked for only.
+    P.focusNext = null;
   }
 
-  /** Where the focus was, as something that survives a repaint: the row and the control's place in it. */
+  /**
+   * What a control is, as something that survives a repaint: a radio by its
+   * value, anything else by its tag, role, name and words. Not its place in
+   * the row, because the row changes shape (Reset appears the moment a value
+   * stops being the default) and a place would land on the wrong control.
+   */
+  function controlId(node) {
+    if (node.dataset.fid) return node.dataset.fid;
+    if (node.getAttribute("role") === "radio" && node.dataset.v != null) return `radio:${node.dataset.v}`;
+    return [node.tagName, node.getAttribute("role") || "", node.getAttribute("aria-label") || "", (node.textContent || "").trim().slice(0, 60), node.type || ""].join("|");
+  }
+  const rowOf = (node) => node.closest("[data-key], [data-row]");
+  const rowSel = (r) => (r.dataset.key ? `[data-key="${CSS.escape(r.dataset.key)}"]` : `[data-row="${CSS.escape(r.dataset.row)}"]`);
+  /** Where the focus was: the search, a section, or a row and the control in it. */
   function focusToken(node) {
     if (node === P.input) return { input: true };
-    const r = node.closest("[data-key]");
-    if (!r) { const nv = node.closest("[data-sec]"); return nv ? { sec: nv.dataset.sec } : null; }
-    const all = [...r.querySelectorAll("button, input, select")];
-    return { key: r.dataset.key, at: all.indexOf(node) };
+    if (node.matches && node.matches(".sp-navsel select")) return { navsel: true };
+    const nv = node.closest("[data-sec]");
+    if (nv) return { sec: nv.dataset.sec };
+    const r = rowOf(node);
+    if (!r) return { content: true };
+    return { row: rowSel(r), id: controlId(node) };
   }
   function restoreFocus(t) {
+    const next = P.focusNext;
+    P.focusNext = null;
+    if (next) {
+      const r = P.content.querySelector(`[data-key="${CSS.escape(next.key)}"]`);
+      const n = r && [...r.querySelectorAll("button, input, select")].find((x) => controlId(x) === next.fid);
+      if (n) { n.focus({ preventScroll: true }); return; }
+    }
     if (t.input) { P.input.focus({ preventScroll: true }); return; }
-    if (t.sec) { const b = P.nav.querySelector(`[data-sec="${t.sec}"]`); if (b) b.focus({ preventScroll: true }); return; }
-    const r = P.content.querySelector(`[data-key="${t.key}"]`);
-    if (!r) return;
-    const all = [...r.querySelectorAll("button, input, select")];
-    const n = all[Math.min(Math.max(t.at, 0), all.length - 1)];
-    if (n) n.focus({ preventScroll: true });
+    if (t.navsel) { const s = P.box.querySelector(".sp-navsel select"); if (s) { s.focus({ preventScroll: true }); return; } }
+    if (t.sec) { const b = P.nav.querySelector(`[data-sec="${t.sec}"]`); if (b) { b.focus({ preventScroll: true }); return; } }
+    const r = t.row ? P.content.querySelector(t.row) : null;
+    if (r) {
+      const all = [...r.querySelectorAll("button, input, select")].filter((n) => !n.disabled);
+      const n = all.find((x) => controlId(x) === t.id) || all.find((x) => x.tabIndex >= 0);
+      if (n) { n.focus({ preventScroll: true }); return; }
+    }
+    // Never to the page behind: the section itself holds the focus.
+    P.content.focus({ preventScroll: true });
   }
 
   function repaint() {
@@ -1157,6 +1310,22 @@ globalThis.DelphiSettingsPanel = (() => {
     P.content.scrollTop = 0;
   }
 
+  /** A panel row that is not a setting, the same way: its section, lit, focused. */
+  function jumpRow(id, section) {
+    if (!P) return;
+    if (P.query) { P.query = ""; P.input.value = ""; P.find.classList.remove("on"); }
+    show(section);
+    const r = P.content.querySelector(`[data-row="${CSS.escape(id)}"], [data-key="${CSS.escape(id)}"]`);
+    if (!r) return;
+    r.scrollIntoView({ block: "center" });
+    r.classList.remove("flash");
+    void r.offsetWidth;
+    r.classList.add("flash");
+    const c = r.querySelector("button, input, select");
+    if (c) c.focus({ preventScroll: true });
+    else { if (r.tabIndex < 0 && !r.hasAttribute("tabindex")) r.tabIndex = -1; r.focus({ preventScroll: true }); }
+  }
+
   /** A setting's own row, scrolled to and lit, with the focus on its control. */
   function jump(key) {
     const s = SS.BY_KEY[key];
@@ -1169,7 +1338,8 @@ globalThis.DelphiSettingsPanel = (() => {
     r.classList.remove("flash");
     void r.offsetWidth;
     r.classList.add("flash");
-    const c = r.querySelector("button:not(.sp-rst), input, select");
+    // The chosen radio when there is one, as Tab would reach the group.
+    const c = r.querySelector('[role="radio"][tabindex="0"]') || r.querySelector("button:not(.sp-rst), input, select");
     if (c) c.focus({ preventScroll: true });
   }
 
@@ -1198,15 +1368,21 @@ globalThis.DelphiSettingsPanel = (() => {
     if (P.rec) {
       if (e.key === "Escape") { own(); P.rec = null; repaint(); return; }
       if (["Shift", "Meta", "Control", "Alt"].includes(e.key)) { own(); return; }
-      if (e.key === "Tab") return;
-      own();
-      if (P.rec.conflict) return;
-      const got = accelOf(e);
-      if (!got) return;
-      if (!got.accel) { P.rec = { ...P.rec, why: got.why }; repaint(); return; }
-      P.rec = { ...P.rec, accel: got.accel, why: null };
-      recorded(got.accel);
-      return;
+      if (e.key === "Tab") {
+        // Leaving the recorder by Tab ends the recording, and the trap below
+        // still keeps the focus inside the panel.
+        P.rec = null;
+        repaint();
+      } else {
+        own();
+        if (P.rec.conflict) return;
+        const got = accelOf(e);
+        if (!got) return;
+        if (!got.accel) { P.rec = { ...P.rec, why: got.why }; repaint(); return; }
+        P.rec = { ...P.rec, accel: got.accel, why: null };
+        recorded(got.accel);
+        return;
+      }
     }
     if (e.key === "Escape") {
       own();
@@ -1265,9 +1441,12 @@ globalThis.DelphiSettingsPanel = (() => {
    * Opens the panel: at a section, at one setting's row (key), or searching.
    * Opening it again while it is open moves it there.
    */
-  async function open({ section = null, key = null, query = "" } = {}) {
+  async function open({ section = null, key = null, query = "", row = null } = {}) {
+    const extra = row ? EXTRAS.find((x) => x.id === row) : null;
+    if (extra && !section) section = extra.section;
     if (P) {
-      if (key) jump(key);
+      if (extra) jumpRow(extra.target || extra.id, extra.section);
+      else if (key) jump(key);
       else if (query) { setQuery(query); focusSearch(); }
       else if (section) show(section);
       else focusSearch();
@@ -1287,7 +1466,11 @@ globalThis.DelphiSettingsPanel = (() => {
     const closeBtn = el("button", { className: "sp-x", type: "button", title: "Close (Esc)" }, I("x"));
     closeBtn.setAttribute("aria-label", "Close settings");
     closeBtn.onclick = () => close();
-    const head = el("header", { className: "sp-head" }, el("h2", { id: "sp-title", textContent: "Settings" }), el("span", { className: "vr" }), find,
+    const navsel = el("select", {});
+    navsel.setAttribute("aria-label", "Settings section");
+    navsel.onchange = () => { if (P.query) setQuery(""); show(navsel.value); navsel.focus(); };
+    const navselWrap = el("label", { className: "sp-field sp-navsel" }, I("right", "xs"), navsel);
+    const head = el("header", { className: "sp-head" }, el("h2", { id: "sp-title", textContent: "Settings" }), navselWrap, el("span", { className: "vr" }), find,
       el("span", { className: "sp-caps", title: "Settings opens with" }, kbd(modLabel()), kbd(",")), closeBtn);
     const nav = el("nav", { className: "sp-nav" });
     nav.setAttribute("aria-label", "Settings sections");
@@ -1295,7 +1478,7 @@ globalThis.DelphiSettingsPanel = (() => {
     const saved = el("span", { className: "saved", role: "status" });
     saved.setAttribute("aria-live", "polite");
     const foot = el("footer", { className: "sp-foot" },
-      el("span", {}, kbd("↑"), kbd("↓"), "sections"), el("span", {}, kbd("Tab"), "into settings"),
+      el("span", { className: "wide" }, kbd("↑"), kbd("↓"), "sections"), el("span", { className: "narrow" }, "Sections in the menu beside the title"), el("span", {}, kbd("Tab"), "into settings"),
       el("span", {}, kbd(modLabel()), kbd("F"), "search"), el("span", {}, kbd("Esc"), "close"), saved);
     box.append(head, el("div", { className: "sp-body" }, nav, content), foot);
     scrim.append(box);
@@ -1303,7 +1486,7 @@ globalThis.DelphiSettingsPanel = (() => {
     scrim.addEventListener("keydown", stopBehind);
 
     P = {
-      scrim, box, nav, content, input, find, count, saved, returnTo,
+      scrim, box, nav, navsel, content, input, find, count, saved, returnTo, focusNext: null,
       section: section || (key && SS.BY_KEY[key] ? SS.BY_KEY[key].section : "overview"),
       query: "", hot: 0, found: [], errors: {}, expanded: null, rec: null, dialog: false,
       settings: (lent.state && lent.state().settings) || {}, harnesses: (lent.state && lent.state().harnesses) || null, doctor: null, data: null,
@@ -1324,7 +1507,8 @@ globalThis.DelphiSettingsPanel = (() => {
     try { const got = await window.delphi.settings.get(); if (P) P.settings = got; } catch {}
     if (!P) return;
     if (query) setQuery(query);
-    if (key) jump(key); else { repaint(); focusSearch(); }
+    if (extra) jumpRow(extra.target || extra.id, extra.section);
+    else if (key) jump(key); else { repaint(); focusSearch(); }
     loadDoctor();
     loadData();
     loadHarnesses(false);
@@ -1367,8 +1551,22 @@ globalThis.DelphiSettingsPanel = (() => {
       keywords: [s.desc, ...(s.synonyms || []), sectionOf(s.section).label, "setting"].join(" "),
       get keys() { const st = lent.state && lent.state().settings; return shown(s.key, st && s.key in st ? st[s.key] : s.default); },
       run: () => open({ key: s.key }),
-    }));
+    })).concat(EXTRAS.map((x) => ({
+      id: `settings-row-${x.id}`, group: "Settings", quiet: true, place: "setting",
+      title: x.label,
+      keywords: [x.desc, ...x.synonyms, sectionOf(x.section).label, "settings"].join(" "),
+      run: () => open({ row: x.id }),
+    })));
   }
 
-  return { init: (app) => { lent = app || {}; }, open, close, isOpen: () => Boolean(P), configure: (key) => open({ key }), applyLook, handleMenu, commands, accelOf, conflictOf };
+  /** Once per launch: settings.json was not valid JSON and was kept aside. */
+  async function checkBroken() {
+    let at = null;
+    try { at = await window.delphi.settings.brokenNotice(); } catch { return; }
+    if (!at || !lent.notify) return;
+    lent.notify(`settings.json was not valid JSON, so Delphi started on its defaults. Your file is kept as ${tilde(at)}.`);
+    try { await window.delphi.settings.brokenSeen(); } catch {}
+  }
+
+  return { checkBroken, EXTRAS, init: (app) => { lent = app || {}; }, open, close, isOpen: () => Boolean(P), configure: (key) => open({ key }), applyLook, handleMenu, commands, accelOf, conflictOf };
 })();

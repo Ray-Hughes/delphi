@@ -17,6 +17,9 @@ const schema = require("../settings/schema");
 // been walked. A folder too big to look through is refused rather than
 // guessed at, because the guess is about deleting someone's files.
 const VAULT_SCAN_LIMIT = 4000;
+// What vault.exportAll leaves in a folder it mirrors into. Named here and
+// there by the same string; tools/settings_test.js checks they agree.
+const VAULT_MARKER = ".delphi-vault";
 
 /**
  * Why a folder is not safe to mirror the vault into, or null.
@@ -36,6 +39,9 @@ function vaultFolderProblem(target, { known = [] } = {}) {
     return error && error.code === "ENOENT" ? null : "Delphi cannot look inside that folder, so it cannot tell whether the vault would delete anything there.";
   }
   if (!st.isDirectory()) return "That is a file, not a folder.";
+  // A folder Delphi has mirrored into before carries its marker
+  // (vault.exportAll writes it), and is Delphi's own to rewrite.
+  try { if (fs.statSync(path.join(resolved, VAULT_MARKER)).isFile()) return null; } catch {}
   let seen = 0;
   const stack = [resolved];
   while (stack.length) {
@@ -84,8 +90,13 @@ function makeContext({ projectExists, checkoutDbIgnored, vaults = () => [] }) {
  * @param version  the app's version
  * @param documents  the folder a save dialog starts in
  */
-function register(handle, { settings, context, dialog, info, version, documents, parent = () => null }) {
+function register(handle, { settings, context, dialog, info, version, documents, parent = () => null, broken = null }) {
   handle("settings:doctor", () => info());
+  // The bad settings.json kept aside at launch, until the window says it has
+  // told the person (settings:brokenSeen), so a reload before then still tells.
+  let brokenTold = false;
+  handle("settings:brokenNotice", () => (brokenTold ? null : (broken ? broken() : null)));
+  handle("settings:brokenSeen", () => { brokenTold = true; return null; });
 
   // JSON with every setting a person sets, and a line saying what is left out
   // and why, so nobody opens it looking for the API key.
@@ -129,4 +140,64 @@ function register(handle, { settings, context, dialog, info, version, documents,
   });
 }
 
-module.exports = { vaultFolderProblem, makeContext, register, VAULT_SCAN_LIMIT };
+/**
+ * settings.json, written so a crash or a full disk mid-write never leaves half
+ * a file: a temporary file beside it, flushed to the disk, then renamed over
+ * the old one, which the filesystem does in one step.
+ */
+function writeSettingsFile(file, settings) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.${process.pid}.tmp`;
+  try {
+    const fd = fs.openSync(temp, "w");
+    try {
+      fs.writeFileSync(fd, JSON.stringify(settings, null, 2) + "\n");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(temp, file);
+  } catch (error) {
+    try { fs.rmSync(temp, { force: true }); } catch {}
+    throw error;
+  }
+}
+
+/**
+ * settings.json as found, over the schema's defaults.
+ *
+ * A missing file is a new install: it gets the defaults, and the file is
+ * written so it exists to be edited. A file that is not valid JSON was hand
+ * edited into something broken; it is kept, renamed settings.json.broken-<time>
+ * beside the new one, so whatever was being typed is not lost, and the caller
+ * tells the person once. A theme missing from a file that exists predates the
+ * setting, when every window followed the system, so it stays "system" rather
+ * than taking the new installs' dark.
+ *
+ * A file that is there but cannot be read, or cannot be set aside, is never
+ * written over: protect says so, and saveSettings refuses until it is fixed.
+ *
+ * Returns { settings, write, broken, protect }: write says the file should be
+ * written now, broken is where the bad file went, or null.
+ */
+function readSettingsFile(file, defaults, { now = () => new Date() } = {}) {
+  let text = null;
+  try { text = fs.readFileSync(file, "utf8"); } catch (error) {
+    if (error && error.code === "ENOENT") return { settings: { ...defaults }, write: true, broken: null, protect: false };
+    return { settings: { ...defaults }, write: false, broken: null, protect: true };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+  } catch {
+    const broken = `${file}.broken-${now().toISOString().replace(/[:.]/g, "-")}`;
+    try { fs.renameSync(file, broken); } catch { return { settings: { ...defaults }, write: false, broken: null, protect: true }; }
+    return { settings: { ...defaults }, write: true, broken, protect: false };
+  }
+  const settings = { ...defaults, ...parsed };
+  if (!("theme" in parsed)) settings.theme = "system";
+  return { settings, write: false, broken: null, protect: false };
+}
+
+module.exports = { vaultFolderProblem, makeContext, register, writeSettingsFile, readSettingsFile, VAULT_SCAN_LIMIT, VAULT_MARKER };

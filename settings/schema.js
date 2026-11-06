@@ -92,7 +92,10 @@
 
     // --- Appearance --------------------------------------------------------
     {
-      key: "theme", section: "appearance", group: "Theme", type: "enum", default: "system",
+      // Dark for a new install, the look v2 was designed in (owner decision).
+      // An install whose file predates the setting keeps "system":
+      // main/settings.js readSettingsFile.
+      key: "theme", section: "appearance", group: "Theme", type: "enum", default: "dark",
       choices: [["system", "System"], ["light", "Light"], ["dark", "Dark"]],
       label: "Theme",
       desc: "System follows the computer's setting and changes with it. Light and Dark pin the window whatever the computer says.",
@@ -311,7 +314,10 @@
     },
   ];
 
-  const BY_KEY = Object.fromEntries(SETTINGS.map((s) => [s.key, s]));
+  // No prototype, so "__proto__" or "constructor" is no setting rather than
+  // Object's own machinery.
+  const BY_KEY = Object.assign(Object.create(null), Object.fromEntries(SETTINGS.map((s) => [s.key, s])));
+  const has = (key) => typeof key === "string" && Object.prototype.hasOwnProperty.call(BY_KEY, key);
   const TIME = /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/;
   const MODIFIER = /^(Command|Cmd|Control|Ctrl|CommandOrControl|CmdOrCtrl|Alt|Option|AltGr|Shift|Super|Meta)$/;
 
@@ -455,7 +461,7 @@
 
   /** One value, checked and put in the shape it is stored in. */
   function check(key, value, ctx = {}) {
-    const s = BY_KEY[key];
+    const s = has(key) ? BY_KEY[key] : null;
     if (!s) {
       const e = new Error(`Delphi has no setting called "${key}".`);
       e.key = key;

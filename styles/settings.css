@@ -295,9 +295,19 @@
 .sp-dlg ul code, .sp-dlg p code { font-family: var(--mono); font-size: 11.5px; color: var(--ink); }
 .sp-dlg .df { display: flex; gap: 8px; justify-content: flex-end; padding: 14px 18px; margin-top: 16px; border-top: 1px solid var(--line); background: var(--chrome); }
 
+/* The section menu that takes the list's place in a narrow window. */
+.sp-navsel { display: none; }
+.sp-foot .narrow { display: none; }
 @media (max-width: 860px) {
   .sp-body { grid-template-columns: 1fr; }
   .sp-nav { display: none; }
+  .sp-navsel { display: inline-flex; }
+  .sp-navsel select { font-weight: 600; max-width: 180px; }
+  .sp-foot .wide { display: none; }
+  .sp-foot .narrow { display: inline-flex; }
+  .sp-content { padding: 18px 18px 32px; }
+  .sp-row { flex-wrap: wrap; }
+  .sp-row .c { max-width: none; }
   .sp-tiles, .sp-themes { grid-template-columns: 1fr; }
   .sp-live .lb { grid-template-columns: 1fr; }
 }
