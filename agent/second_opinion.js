@@ -62,7 +62,7 @@ const READ_ONLY_TOOLS = [
   "sheet_read", "sheet_get", "workbench_status", "workbench_list",
   "list_scratchpads", "read_scratchpad", "handoff_status", "run_status", "run_list",
   "list_agents", "lock_status", "search", "get_note", "oracle_context", "oracle_entities",
-  "oracle_ask", "list_flags", "recent_activity", "cost_ledger", "daily_brief",
+  "oracle_ask", "list_flags", "recent_activity", "cost_ledger", "daily_brief", "related_notes",
 ];
 
 // Copilot's built-in tools that only read files: view reads one, glob finds

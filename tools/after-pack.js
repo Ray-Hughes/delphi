@@ -56,6 +56,9 @@ const OUTSIDE_TOO = [
   "agent/binaries.js",
   // Attribution and the undo rule: the shared stores require it.
   "agent/audit.js",
+  // Recall, and the reasons on memory cards: the window's Memory and the
+  // server's search, oracle tools and related_notes.
+  "agent/recall.js",
   "sheet",
   "workbench",
   // Move, copy, associate and flag: the server's tools and the app's IPC use

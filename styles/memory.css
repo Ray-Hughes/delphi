@@ -1,0 +1,124 @@
+/* Memory (ui/memory.js): the tab's list, the cards that say why they are
+   there, and the Log a fact line.
+
+   The list is the mockup's memlist: 38px rows in a white box on the page's
+   grey, kind first, then the number, the title, and on the right where it
+   lives and its age. Kinds are told apart by colour and by their word, never
+   colour alone. A reason is a quiet outlined chip, so it reads as an
+   explanation beside the note rather than a label on it. Tokens only. */
+
+.mm-page { max-width: 980px; margin: 0 auto; padding-bottom: var(--s7); }
+
+.mm-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 12px; }
+.mm-bar .grow { flex: 1; }
+.mm-bar .btn.sm { height: 28px; display: inline-flex; align-items: center; gap: 6px; }
+.mm-bar .btn.ghost { border-color: transparent; background: transparent; color: var(--ink-dim); }
+.mm-bar .btn.ghost:hover { background: var(--raised); color: var(--ink); }
+
+.mm-seg { display: inline-flex; padding: 2px; gap: 2px; background: var(--raised); border: 1px solid var(--line-soft); border-radius: var(--r-sm); }
+.mm-seg button { height: 24px; padding: 0 9px; border: 0; border-radius: 5px; background: transparent; color: var(--ink-dim); font: inherit; font-size: 12px; }
+.mm-seg button:hover { color: var(--ink); }
+.mm-seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-1); }
+
+.mm-search { display: inline-flex; flex: 0 1 280px; width: 280px; margin: 0; align-items: center; gap: 6px; height: 28px; padding: 0 9px; min-width: 180px; box-sizing: border-box;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--ink-faint); }
+.mm-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.mm-search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 12.5px; }
+.mm-search input::placeholder { color: var(--ink-faint); }
+
+.mm-count { margin: 0 2px 8px; font-size: 12px; color: var(--ink-faint); }
+.mm-list-wrap .mm-list + .mm-count { margin-top: 8px; }
+
+.mm-list { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-1); overflow: hidden; }
+.mm-row { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 38px; padding: 0 14px;
+  border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: var(--ink);
+  font: inherit; font-size: 13px; text-align: left; }
+.mm-row:last-child { border-bottom: 0; }
+.mm-row:hover { background: var(--raised); }
+.mm-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mm-row .grow { flex: 1 1 0; min-width: 8px; }
+.mm-id { flex: none; width: 40px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); }
+.mm-title { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mm-pin { flex: none; display: inline-flex; color: var(--ink-faint); }
+.mm-meta { flex: none; display: flex; align-items: center; gap: 8px; color: var(--ink-faint); font-size: 12px; }
+.mm-age { min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Kind: its word on a soft ground of its colour. */
+.mm-kind { flex: none; display: inline-flex; align-items: center; height: 20px; padding: 0 6px; border-radius: 5px;
+  font-size: 11px; font-weight: 500; text-transform: none; letter-spacing: 0; background: var(--raised); color: var(--ink-dim); width: 70px; justify-content: center; }
+.mm-kind.k-gotcha { background: var(--warn-soft); color: var(--warn-ink); }
+.mm-kind.k-decision { background: var(--accent-soft); color: var(--accent-ink); }
+.mm-kind.k-reference { background: color-mix(in srgb, var(--tag) 12%, transparent); color: var(--tag); }
+
+/* Where it lives. */
+.mm-proj, .mm-from { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 7px; max-width: 180px;
+  border-radius: 5px; font-size: 11.5px; color: var(--ink-dim); background: var(--raised); }
+.mm-proj span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mm-from { background: transparent; border: 1px solid var(--line); }
+.mm-from b { font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mm-sw { flex: none; width: 7px; height: 7px; border-radius: 2px; }
+
+/* Why it is here. */
+.mm-why { flex: none; display: inline-flex; align-items: center; height: 18px; padding: 0 6px; max-width: 240px;
+  border: 1px solid var(--line); border-radius: 4px; font-size: 11px; color: var(--ink-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.mm-empty { padding: 26px 18px 24px; border: 1px dashed var(--line); border-radius: var(--r-lg); text-align: center; color: var(--ink-dim); }
+.mm-empty b { display: block; font-size: 13px; color: var(--ink); margin-bottom: 4px; }
+.mm-empty p { margin: 0 auto 12px; max-width: 360px; font-size: 12px; line-height: 1.55; color: var(--ink-faint); }
+.mm-empty.sm { padding: 14px; }
+.mm-empty.sm p { margin-bottom: 0; }
+.mm-empty .btn { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Cards beside a task: the mockup's .mem, icon, title, two lines, then the
+   kind, the reason and the age. */
+.mm-sec-h { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; min-height: 26px; }
+.mm-sec-h b { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.mm-sec-h .grow { flex: 1; }
+.mm-sec-h .btn { display: inline-flex; align-items: center; gap: 6px; }
+.mm-sec-h .btn.ghost { border-color: transparent; background: transparent; }
+.mm-cards { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); overflow: hidden; }
+.mm-card { display: grid; grid-template-columns: 26px 1fr; gap: 10px; width: 100%; padding: 10px 12px; text-align: left;
+  border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: var(--ink); font: inherit; }
+.mm-card:last-child { border-bottom: 0; }
+.mm-card:hover { background: var(--raised); }
+.mm-card:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mm-ico { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center;
+  background: var(--raised); color: var(--ink-dim); border: 1px solid var(--line-soft); }
+.mm-ico.k-gotcha { color: var(--warn-ink); }
+.mm-ico.k-decision { color: var(--accent-ink); }
+.mm-ico.k-reference { color: var(--tag); }
+.mm-card-body { display: flex; flex-direction: column; min-width: 0; }
+.mm-card-t { font-size: 12.5px; font-weight: 600; line-height: 1.35; }
+.mm-card-s { margin-top: 2px; font-size: 12px; color: var(--ink-faint); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.mm-card-m { margin-top: 5px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 11px; color: var(--ink-faint); }
+.mm-card-m .mm-kind { width: auto; }
+.mm-card-p { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Log a fact: one line near the top, the way the bar opens, not a form in
+   the middle of the window. */
+.overlay.mm-fact-overlay { place-items: start center; padding-top: 14vh; background: var(--scrim); }
+.mm-fact { width: min(620px, 100%); border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface);
+  box-shadow: var(--shadow-3); overflow: hidden; }
+.mm-fact-line { display: flex; align-items: center; gap: 10px; height: 52px; padding: 0 14px; border-bottom: 1px solid var(--line-soft); color: var(--ink-faint); }
+.mm-fact-in { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 15px; }
+.mm-fact-in::placeholder { color: var(--ink-faint); }
+.mm-key { flex: none; font: 500 10.5px/1 var(--mono); color: var(--ink-faint); border: 1px solid var(--line); border-bottom-width: 2px;
+  border-radius: 4px; padding: 2px 4px; background: var(--surface); }
+.mm-fact-kinds { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 14px 0; }
+.mm-fact-kind { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px 0 9px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: var(--surface); color: var(--ink-dim); font: inherit; font-size: 12.5px; }
+.mm-fact-kind:hover { border-color: var(--ink-faint); color: var(--ink); }
+.mm-fact-kind[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); }
+.mm-fact-kind.k-gotcha[aria-checked="true"] { border-color: var(--warn); background: var(--warn-soft); color: var(--warn-ink); }
+.mm-fact-kind.k-reference[aria-checked="true"] { border-color: var(--tag); background: color-mix(in srgb, var(--tag) 12%, transparent); color: var(--tag); }
+.mm-fact-kind[aria-checked="true"] .mm-key { color: inherit; border-color: currentColor; background: transparent; }
+.mm-fact-where { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 14px 0; font-size: 12.5px; color: var(--ink-dim); }
+.mm-fact-link { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+.mm-fact-link b { color: var(--ink); font-weight: 600; font-family: var(--mono); font-size: 12px; }
+.mm-fact-task { min-width: 0; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.mm-fact-to { display: inline-flex; align-items: center; gap: 6px; }
+.mm-fact-pick { height: 26px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--ink); font: inherit; font-size: 12.5px; padding: 0 6px; }
+.mm-fact-msg { min-height: 18px; padding: 6px 14px 0; font-size: 12px; color: var(--ink-faint); }
+.mm-fact-msg.err { color: var(--crit-ink); }
+.mm-fact-hint { padding: 6px 14px 10px; font-size: 11.5px; color: var(--ink-faint); border-top: 1px solid var(--line-soft); margin-top: 8px; background: var(--raised); }

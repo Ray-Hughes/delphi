@@ -2429,6 +2429,22 @@ const TOOLS = {
     },
   },
 
+  // The window's memory cards for a task, with the same reasons, so an agent
+  // starting on a task sees what a person sees beside it.
+  related_notes: {
+    description: "Notes related to a task, each with why (from its Sheet, same file, both name X, similar wording). No model call.",
+    schema: {
+      type: "object",
+      required: ["task_id"],
+      properties: { task_id: { type: "number" }, limit: { type: "number", description: "Default 6" } },
+    },
+    run: (a) => {
+      const r = recall.related(a.task_id, { limit: Math.max(1, Math.min(Number(a.limit) || 6, 30)) });
+      if (!r) throw new Error(`No task ${a.task_id}`);
+      return r;
+    },
+  },
+
   get_note: {
     description: "Notes in full by id, after search, oracle_ask or oracle_context.",
     schema: {
