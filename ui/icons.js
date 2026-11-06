@@ -36,6 +36,10 @@ globalThis.DelphiIcons = (() => {
     eye: [["path",{"d":"M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"}],["circle",{"cx":"12","cy":"12","r":"2.5"}]],
     alert: [["path",{"d":"M10.3 4.2 2.6 17.5A2 2 0 0 0 4.3 20.5h15.4a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0z"}],["path",{"d":"M12 9.5v4M12 17h.01"}]],
     clock: [["circle",{"cx":"12","cy":"12","r":"8.5"}],["path",{"d":"M12 7.5V12l3 2"}]],
+    pencil: [["path",{"d":"M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z"}],["path",{"d":"m13.5 6.5 4 4"}]],
+    sliders: [["path",{"d":"M4 7h10M18 7h2M4 17h4M12 17h8"}],["circle",{"cx":"16","cy":"7","r":"2"}],["circle",{"cx":"10","cy":"17","r":"2"}]],
+    list: [["path",{"d":"M9 6h11M9 12h11M9 18h11"}],["circle",{"cx":"4.5","cy":"6","r":".6","fill":"currentColor"}],["circle",{"cx":"4.5","cy":"12","r":".6","fill":"currentColor"}],["circle",{"cx":"4.5","cy":"18","r":".6","fill":"currentColor"}]],
+    kanban: [["rect",{"x":"3.5","y":"4","width":"5","height":"15","rx":"1.5"}],["rect",{"x":"10.5","y":"4","width":"5","height":"10","rx":"1.5"}],["rect",{"x":"17.5","y":"4","width":"3","height":"6","rx":"1"}]],
   };
 
   /** One icon as an <svg>, or an empty span for a name that is not here. */
