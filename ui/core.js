@@ -62,4 +62,25 @@ const shortcut = (key, mac = isMac()) => (mac ? `\u2318${key}` : `Ctrl+${key}`);
  */
 const tilde = (path) => String(path || "").replace(/^(?:\/Users\/[^/]+|\/home\/[^/]+|\/root|[A-Za-z]:[\\/]Users[\\/][^\\/]+)(?=[\\/]|$)/i, "~");
 
+/**
+ * The pointing hand on rows and chips that only have an onclick assigned after
+ * they were made, which no stylesheet selector can see. On the way up from
+ * whatever the pointer is over, the first element with an onclick gets
+ * .has-click, once; styles/pointer.css turns that into the hand, and gives the
+ * arrow back while it is disabled or busy. Only in a window: this file is also
+ * loaded by tests under plain Node.
+ */
+if (typeof document !== "undefined") {
+  document.addEventListener("mouseover", (e) => {
+    for (let node = e.target; node && node !== document.body && node.nodeType === 1; node = node.parentElement) {
+      if (node.dataset.pointerChecked) return;
+      if (typeof node.onclick === "function") {
+        node.dataset.pointerChecked = "1";
+        node.classList.add("has-click");
+        return;
+      }
+    }
+  }, { passive: true });
+}
+
 if (typeof module !== "undefined" && module.exports) module.exports = { $, el, safeColour, PLATFORM, isMac, modKey, modLabel, shortcut, tilde };
