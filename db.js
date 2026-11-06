@@ -153,6 +153,9 @@ function pruneReviewSnapshots(query) {
     for (const name of fs.readdirSync(dir)) {
       const full = path.join(dir, name);
       if (!/^before-review-.*\.db$/.test(name) || full === file || named.has(full)) continue;
+      // Only one some time old: a younger one may be another process's, taken
+      // a moment ago, whose rebuild has not written its restore point yet.
+      if (Date.now() - fs.statSync(full).mtimeMs < 15 * 60 * 1000) continue;
       fs.rmSync(full, { force: true });
     }
   } catch (error) { console.error("tidying the before-review snapshots", error); }

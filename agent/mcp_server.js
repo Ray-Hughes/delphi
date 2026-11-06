@@ -600,10 +600,13 @@ function assertReviewReady() {
  * outside takes the work out of its hands mid-run. An expired claim holds
  * nothing, which is how a dead agent's task comes back.
  */
+function heldByAnother(task) {
+  return !BY_PERSON && Boolean(task.claimed_by) && task.claimed_by !== ACTOR && Boolean(task.claim_expires) &&
+    task.claim_expires >= sql("SELECT datetime('now') AS n")[0].n;
+}
 function assertReviewMove(task, to) {
   if (!to || to === task.status) return;
-  if (!BY_PERSON && task.claimed_by && task.claimed_by !== ACTOR && task.claim_expires &&
-      task.claim_expires >= sql("SELECT datetime('now') AS n")[0].n) {
+  if (heldByAnother(task)) {
     throw new Error(`Task ${task.id} is held by ${task.claimed_by} until ${task.claim_expires}, so its status is theirs to change. ` +
       "Add a Sheet entry (add_comment) if they should know something.");
   }
@@ -876,7 +879,11 @@ function derivePad(padId) {
       // A ticked line moves a task on to done, and only a person moves one on
       // from review: for an agent the task stays in review and its line is
       // unticked again below, so the pad never says done when the board does not.
-      const status = pads.statusFor(current.done, task.status, { finishReview: BY_PERSON });
+      let status = pads.statusFor(current.done, task.status, { finishReview: BY_PERSON });
+      // The claim rule holds here too: a tick in a shared pad is a status
+      // change, and another agent's live claim makes it theirs to make. The
+      // line is put back below so the pad says what the board does.
+      if (status !== task.status && heldByAnother(task)) status = task.status;
       if (status !== task.status) {
         set("status", status);
         sets.push(status === "done" ? "completed_at = datetime('now')" : "completed_at = NULL");
@@ -918,15 +925,17 @@ function derivePad(padId) {
     }
 
     idByEntry.set(current.at, task.id);
-    const now = pads.statusFor(current.done, task.status, { finishReview: BY_PERSON });
+    const wanted = pads.statusFor(current.done, task.status, { finishReview: BY_PERSON });
+    const now = wanted !== task.status && heldByAnother(task) ? task.status : wanted;
     // Said back to the agent, so an untick it did not ask for is not a surprise.
     filed.push({ id: task.id, title: current.title, status: now,
-      ...(current.done && now === "review" ? { note: "In review, waiting on a person, so its line was left unticked" } : {}) });
+      ...(current.done && now === "review" ? { note: "In review, waiting on a person, so its line was left unticked" }
+        : wanted !== now ? { note: `Held by ${task.claimed_by}, so its status is theirs to change and its line was put back` } : {}) });
 
     if (current.taskId !== task.id) body = pads.anchorLine(body, current, task.id);
-    if (current.done && now === "review") {
+    if (current.done !== (now === "done")) {
       const line = pads.parse(body)[current.at];
-      if (line) body = pads.writeLine(body, line, { done: false });
+      if (line) body = pads.writeLine(body, line, { done: now === "done" });
     }
   }
 

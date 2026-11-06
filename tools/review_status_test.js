@@ -249,6 +249,12 @@ function bare(pristine) {
   // One a failed launch left behind: no restore point names it.
   const stale = path.join(home, "backups", "before-review-2026-01-01T00-00-00-1-aaaaaa.db");
   fs.copyFileSync(pristine, stale);
+  // Old enough to be nobody's work in progress.
+  const old = new Date(Date.now() - 3600 * 1000);
+  fs.utimesSync(stale, old, old);
+  // And one a moment old, which may be another process's: left alone.
+  const young = path.join(home, "backups", "before-review-2026-01-01T00-00-01-2-bbbbbb.db");
+  fs.copyFileSync(pristine, young);
   const out = spawnSync(process.execPath, [__filename], {
     env: { ...process.env, REVIEW_TEST_CHILD: "bare", DELPHI_DB: file, DELPHI_DATA_DIR: data },
     encoding: "utf8",
@@ -258,7 +264,7 @@ function bare(pristine) {
   check("the rebuild ran", got && got.rebuild && got.rebuild.ran, true);
   ok("after a snapshot beside the file it opened, not in a data folder that is not its own", got && got.exists && got.backup.startsWith(path.join(home, "backups")));
   check("a before-review snapshot no restore point names is tidied away", fs.existsSync(stale), false);
-  check("and only the one the rebuild came after is kept", fs.readdirSync(path.join(home, "backups")).filter((f) => /^before-review-/.test(f)).length, 1);
+  check("one only a moment old is left, in case it is another process's", fs.existsSync(young), true);
   check("which holds the database from before it", got && got.snapshotOld, "old");
 }
 
@@ -419,6 +425,15 @@ async function server(db, name, routeEnv, padFixture) {
     await agent.call("write_scratchpad", { project_id: pad.project_id, key: pad.key, title: pad.title, body: ticked });
     check("an agent's tick on a review line leaves the task in review", db.handle().prepare("SELECT status FROM tasks WHERE id = ?").get(reviewId).status, "review");
     ok("and the line is unticked again", /^- \[ \] write it/m.test(db.getScratchpad(pad.id).body));
+
+    // A tick on a line whose task another agent holds by live claim.
+    const shipId = ids[1];
+    db.handle().prepare("UPDATE tasks SET status = 'doing', claimed_by = 'codex:b', claim_expires = datetime('now', '+30 minutes') WHERE id = ?").run(shipId);
+    const tickedShip = db.getScratchpad(pad.id).body.replace(/^- \[ \] ship it/m, "- [x] ship it");
+    await agent.call("write_scratchpad", { project_id: pad.project_id, key: pad.key, title: pad.title, body: tickedShip });
+    check("an agent's tick on another agent's held task changes nothing", { ...db.handle().prepare("SELECT status, claimed_by FROM tasks WHERE id = ?").get(shipId) }, { status: "doing", claimed_by: "codex:b" });
+    ok("and its line is put back", /^- \[ \] ship it/m.test(db.getScratchpad(pad.id).body));
+    db.handle().prepare("UPDATE tasks SET status = 'todo', claimed_by = NULL, claim_expires = NULL WHERE id = ?").run(shipId);
   } finally {
     agent.close(); other.close(); person.close();
   }
