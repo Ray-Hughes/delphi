@@ -87,6 +87,20 @@ function binarySql(query, params = []) {
   }
 }
 
+// A batch as the server runs one on this route: one script, one process,
+// between BEGIN and COMMIT, so an entry and its History row land together.
+function binaryBatch(statements) {
+  const render = (query, params = []) => String(query).replace(/:p(\d+)/g, (m, n) => (Number(n) - 1 < params.length ? literal(params[Number(n) - 1]) : m));
+  const file = path.join(dir, `b-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.sql`);
+  fs.writeFileSync(file, [".timeout 5000", ".bail on", "BEGIN IMMEDIATE;",
+    ...statements.map(([q, p]) => { const s = render(q, p); return s.trim().endsWith(";") ? s : `${s};`; }), "COMMIT;"].join("\n"));
+  try {
+    execFileSync(SQLITE, [process.env.DELPHI_DB], { input: `.read ${file}\n`, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 const project = db.createProject({ key: "store-test", name: "Store test" });
@@ -103,8 +117,8 @@ check("sqlP binds a repeated placeholder", db.sqlP("SELECT :p1 AS a, :p1 AS b", 
 
 const shapes = {};
 
-for (const [route, sql] of [["sqlP", db.sqlP], ["sqlite3 binary", binarySql]]) {
-  const store = makeSheetStore({ sql, actor: "claude-code:7" });
+for (const [route, sql, batch] of [["sqlP", db.sqlP, db.batchP], ["sqlite3 binary", binarySql, binaryBatch]]) {
+  const store = makeSheetStore({ sql, batch, actor: "claude-code:7" });
   const task = db.createTask({ projectId: project.id, title: `sheet on ${route}` });
   const auditFrom = Number(db.sqlP("SELECT COALESCE(MAX(id), 0) AS n FROM audit")[0].n);
 
@@ -120,7 +134,7 @@ for (const [route, sql] of [["sqlP", db.sqlP], ["sqlite3 binary", binarySql]]) {
         "quotes ' and \" and :p1 :p2 :p10 and $& $` $' $$ and `$ ` too\n\n```\n$ rm -rf /\n```");
   check("an author can be named", [kept.author, kept.author_type], ["ray", "human"]);
 
-  const human = makeSheetStore({ sql, actor: "you", authorType: "human" });
+  const human = makeSheetStore({ sql, batch, actor: "you", authorType: "human" });
   const typed = human.append({ taskId: task.id, kind: "say", body: "  indented first line\nsecond" });
   check("authorType is stored when the writer knows it", [typed.author, typed.author_type], ["you", "human"]);
   check("leading spaces on the first line are content", typed.body, "  indented first line\nsecond");

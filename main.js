@@ -1111,7 +1111,9 @@ handle("tasks:uncomment", (id) => {
 const { makeSheetStore } = require("./sheet/store");
 const sheetFormat = require("./sheet/format");
 const sheetRun = require("./sheet/run");
-const sheets = makeSheetStore({ sql: db.sqlP, actor: "you", authorType: "human" });
+// batch and step so an entry and its History row land together and share the
+// click's step id with whatever else that click wrote. See agent/audit.js.
+const sheets = makeSheetStore({ sql: db.sqlP, batch: db.batchP, actor: "you", authorType: "human", step: db.currentStep });
 const SHEET_LOG_DIR = path.join(paths.DATA_DIR, "sheets");
 // The tail of a log the rail will show. A build log can be hundreds of
 // megabytes, and the end is where the error is.
@@ -1306,7 +1308,7 @@ handle("sheet:copyAll", (taskId, opts = {}) => {
 const { makeWorkbenchStore } = require("./workbench/store");
 const { createWorkbench } = require("./workbench/workbench");
 const launch = require("./agent/launch");
-const benchStore = makeWorkbenchStore({ sql: db.sqlP, actor: "you" });
+const benchStore = makeWorkbenchStore({ sql: db.sqlP, actor: "you", who: { actor: "you", actor_type: "human" }, step: db.currentStep });
 const benches = createWorkbench({
   store: benchStore,
   sheet: sheets,
@@ -1501,7 +1503,7 @@ handle("organizers:delete", (id) => { const r = db.deleteOrganizer(id); schedule
 const { makeItemStore } = require("./items/store");
 const itemStore = makeItemStore({
   sql: db.sqlP, batch: db.batchP, actor: "you", authorType: "human",
-  settings: () => settings, derive: (padId) => db.derive(padId),
+  settings: () => settings, derive: (padId) => db.derive(padId), step: db.currentStep,
 });
 let lastFlagSignature = null;
 function flagSignature() {
@@ -1858,8 +1860,8 @@ const { makeWorkbenchStore: makeJobBenchStore } = require("./workbench/store");
 // Its own Workbench verbs, attributed to Delphi rather than to "you": a
 // Workbench a job started was started by the dispatcher, on a person's say-so.
 const jobBenches = createWorkbench({
-  store: makeJobBenchStore({ sql: db.sqlP, actor: "delphi" }),
-  sheet: makeSheetStore({ sql: db.sqlP, actor: "delphi", authorType: "tool" }),
+  store: makeJobBenchStore({ sql: db.sqlP, actor: "delphi", who: { actor: "delphi", actor_type: "tool" } }),
+  sheet: makeSheetStore({ sql: db.sqlP, batch: db.batchP, actor: "delphi", authorType: "tool" }),
   runEntry: sheetRun.runEntry,
   logDir: SHEET_LOG_DIR,
   settings: () => settings,
@@ -1869,6 +1871,7 @@ const jobBenches = createWorkbench({
 });
 const dispatcher = createDispatcher({
   sql: db.sqlP,
+  batch: db.batchP,
   benches: jobBenches,
   logDir: SHEET_LOG_DIR,
   dbPath: db.DB_PATH,

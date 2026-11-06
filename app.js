@@ -5741,6 +5741,38 @@ function renderLinks(root) {
  * because a task deleted inside a project could previously only be recovered from
  * the All view, which is not where anyone looks after deleting something.
  */
+/**
+ * Who made a History row, and its summary without the " (by X)" the writers
+ * still append. From the actor and session columns where the row has them;
+ * older rows have only the suffix, which is read as the fallback.
+ */
+function auditWho(e) {
+  const m = / \(by ([^()]+)\)$/.exec(String(e.summary || ""));
+  const actor = e.actor || (m ? m[1] : null);
+  const summary = m && (!e.actor || m[1] === e.actor) ? e.summary.slice(0, m.index) : e.summary;
+  const parts = [];
+  if (actor && actor !== "you") parts.push(`by ${actor}`);
+  if (e.session_id) parts.push(`session ${e.session_id}`);
+  if (e.job_id) parts.push(`job ${e.job_id}`);
+  return { summary, by: parts.join(", ") };
+}
+
+/** The undo control for a row that is not a delete: a button, or why there is none. */
+function auditAction(e, label = "undo") {
+  if (e.legacy) {
+    return el("span", { className: "chip", textContent: "not recorded",
+      title: "Recorded before Delphi kept the previous state, so it cannot be undone automatically." });
+  }
+  // A flag, a job's own row, a Workbench's note: nothing changed to put back.
+  if (!e.restorable) return null;
+  const b = el("button", { className: "btn sm", textContent: label });
+  b.onclick = async () => {
+    try { await window.delphi.audit.undo(e.id); } catch (err) { alert(err.message); }
+    refresh();
+  };
+  return b;
+}
+
 async function renderActivity(root) {
   const entries = await window.delphi.audit.project(state.projectId, 200);
 
@@ -5776,9 +5808,11 @@ async function renderActivity(root) {
     });
     row.append(el("span", { className: "audit-when", textContent: ago(e.at) }));
 
+    const who = auditWho(e);
     const what = el("div", { className: "audit-what" },
       el("div", {}, el("span", { className: `act act-${e.action}`, textContent: e.action }),
-                    el("span", { textContent: ` ${e.entity} ${e.summary}` })));
+                    el("span", { textContent: ` ${e.entity} ${who.summary}` }),
+                    ...(who.by ? [el("span", { className: "audit-by", textContent: who.by })] : [])));
     if (e.label) what.append(el("div", { className: "lbl", textContent: e.label.slice(0, 140) }));
     row.append(what);
 
@@ -5788,16 +5822,16 @@ async function renderActivity(root) {
       // Honest rather than hopeful: with no stored copy there is nothing to put
       // back, and a button that cannot work is worse than no button.
       row.append(el("span", { className: "chip", textContent: "not recoverable" }));
-    } else {
-      const b = el("button", {
-        className: "btn sm" + (e.action === "delete" ? " primary" : ""),
-        textContent: e.action === "delete" ? "restore" : "undo",
-      });
+    } else if (e.action === "delete") {
+      const b = el("button", { className: "btn sm primary", textContent: "restore" });
       b.onclick = async () => {
         try { await window.delphi.audit.undo(e.id); } catch (err) { alert(err.message); }
         refresh();
       };
       row.append(b);
+    } else {
+      const control = auditAction(e);
+      if (control) row.append(control);
     }
     list.append(row);
   }
@@ -5841,8 +5875,10 @@ async function renderHistory(root) {
   entries.forEach((e) => {
     const row = el("div", { className: "audit-row" + (e.undone ? " undone" : "") });
     row.append(el("span", { className: "audit-when", textContent: ago(e.at) }));
+    const who = auditWho(e);
     const what = el("div", { className: "audit-what" },
-      el("div", { textContent: `${e.entity} ${e.summary}` }));
+      el("div", {}, el("span", { textContent: `${e.entity} ${who.summary}` }),
+                    ...(who.by ? [el("span", { className: "audit-by", textContent: who.by })] : [])));
     if (e.label) what.append(el("div", { className: "lbl", textContent: e.label.slice(0, 120) }));
     row.append(what);
     if (e.undone) {
@@ -5853,12 +5889,8 @@ async function renderHistory(root) {
       // copy, where pressing it can only produce an error.
       row.append(el("span", { className: "chip", textContent: "not recoverable" }));
     } else {
-      const b = el("button", { className: "btn sm", textContent: "undo" });
-      b.onclick = async () => {
-        try { await window.delphi.audit.undo(e.id); } catch (err) { alert(err.message); }
-        refresh();
-      };
-      row.append(b);
+      const control = auditAction(e);
+      if (control) row.append(control);
     }
     list.append(row);
   });

@@ -134,6 +134,14 @@ const LATER_COLUMNS = [
   // Who queued a task, so a job an agent queued waits for a person.
   ["tasks", "queued_by", "TEXT"],
   ["tasks", "queued_by_type", "TEXT"],
+  // Who made each change, as columns. Older rows keep only the suffix on their
+  // summary and are left as they are (owner decision S6). See agent/audit.js.
+  ["audit", "actor", "TEXT"],
+  ["audit", "actor_type", "TEXT"],
+  ["audit", "session_id", "INTEGER"],
+  ["audit", "job_id", "INTEGER"],
+  ["audit", "step", "TEXT"],
+  ["comments", "session_id", "INTEGER"],
 ];
 
 // The same text as schema.sql. A table is created here too, rather than left to
@@ -236,6 +244,10 @@ const LATER_TABLES = [
 // because an index on a column that does not exist yet is an error, and a table
 // this file could not widen (a failed ALTER) should cost one index, not the run.
 const LATER_INDEXES = [
+  ["idx_audit_entity", "audit", ["entity", "entity_id"],
+   "CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit(entity, entity_id, id)"],
+  ["idx_audit_session", "audit", ["session_id"],
+   "CREATE INDEX IF NOT EXISTS idx_audit_session ON audit(session_id, id)"],
   ["idx_comments_ledger", "comments", ["task_id", "promoted"],
    "CREATE INDEX IF NOT EXISTS idx_comments_ledger ON comments(task_id, promoted)"],
   ["idx_handoffs_state", "handoffs", ["state"],

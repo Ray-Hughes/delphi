@@ -13,6 +13,7 @@ const paths = require("./paths");
 const pads = require("./pads");
 const schemaLater = require("./agent/schema_later");
 const identity = require("./agent/identity");
+const auditLib = require("./agent/audit");
 
 // Decided by agent/locate.js, the same rule the MCP server and the command line
 // use, so the window and every agent are looking at one file. See paths.js.
@@ -102,15 +103,27 @@ function widenAuditEntities(db) {
       before_json TEXT,
       after_json  TEXT,
       undone      INTEGER NOT NULL DEFAULT 0,
-      undone_at   TEXT
+      undone_at   TEXT,
+      actor       TEXT,
+      actor_type  TEXT,
+      session_id  INTEGER,
+      job_id      INTEGER,
+      step        TEXT
     );
+    -- The attribution columns are copied too. schema_later has added them to
+    -- the old table by the time this runs, and leaving them out here would
+    -- drop them from a database old enough to need the rebuild.
     INSERT INTO audit_rebuilt
-      (id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at)
-      SELECT id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at
+      (id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at,
+       actor, actor_type, session_id, job_id, step)
+      SELECT id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at,
+             actor, actor_type, session_id, job_id, step
       FROM audit;
     DROP TABLE audit;
     ALTER TABLE audit_rebuilt RENAME TO audit;
     CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit(entity, entity_id, id);
+    CREATE INDEX IF NOT EXISTS idx_audit_session ON audit(session_id, id);
     COMMIT;
   `);
   db.exec("PRAGMA foreign_keys = ON");
@@ -186,7 +199,7 @@ let itemStore = null;
 function items() {
   if (!itemStore) {
     const { makeItemStore } = require("./items/store");
-    itemStore = makeItemStore({ sql: sqlP, batch: batchP, actor: "you", authorType: "human", derive: (id) => deriveInPlace(id) });
+    itemStore = makeItemStore({ sql: sqlP, batch: batchP, actor: "you", authorType: "human", derive: (id) => deriveInPlace(id), step: currentStep });
   }
   return itemStore;
 }
@@ -217,10 +230,31 @@ const TABLES = {
 const rowOf = (entity, id) =>
   id == null ? null : one(`SELECT * FROM ${TABLES[entity]} WHERE id = :id`, { id });
 
+// The window's writes are the person's: no session, no job.
+const WINDOW = { actor: "you", actor_type: "human", session_id: null, job_id: null };
+
+/**
+ * The step a window write belongs to: one per synchronous turn of the main
+ * process. Every IPC handler runs its writes without yielding (node:sqlite is
+ * synchronous), so the rows one click makes, a pad write and the tasks derived
+ * from it, share an id, and the next click gets a fresh one once the current
+ * turn has finished.
+ */
+let windowStep = null;
+function currentStep() {
+  if (!windowStep) {
+    windowStep = auditLib.newStep("w");
+    queueMicrotask(() => { windowStep = null; });
+  }
+  return windowStep;
+}
+
 function record({ action, entity, entityId, summary, label, before, after }) {
   run(
-    `INSERT INTO audit (action, entity, entity_id, summary, label, before_json, after_json)
-     VALUES (:action, :entity, :entityId, :summary, :label, :before, :after)`,
+    `INSERT INTO audit (action, entity, entity_id, summary, label, before_json, after_json,
+                        actor, actor_type, session_id, job_id, step)
+     VALUES (:action, :entity, :entityId, :summary, :label, :before, :after,
+             :actor, :actorType, NULL, NULL, :step)`,
     {
       action,
       entity,
@@ -229,8 +263,32 @@ function record({ action, entity, entityId, summary, label, before, after }) {
       label: label ?? null,
       before: before ? JSON.stringify(before) : null,
       after: after ? JSON.stringify(after) : null,
+      actor: WINDOW.actor,
+      actorType: WINDOW.actor_type,
+      step: currentStep(),
     }
   );
+}
+
+/**
+ * Runs fn as one unit: its writes and the audit rows describing them land
+ * together or not at all. A savepoint, so it nests inside undo's and inside
+ * another of these, which BEGIN cannot.
+ */
+function atomic(fn) {
+  return function atomically(...args) {
+    const conn = open();
+    conn.exec("SAVEPOINT delphi_atomic");
+    try {
+      const result = fn.apply(this, args);
+      conn.exec("RELEASE delphi_atomic");
+      return result;
+    } catch (error) {
+      conn.exec("ROLLBACK TO delphi_atomic");
+      conn.exec("RELEASE delphi_atomic");
+      throw error;
+    }
+  };
 }
 
 // Describes an update in words, so the audit list is readable without diffing
@@ -266,6 +324,20 @@ function describeUpdate(entity, before, after) {
   return changes.length ? changes.join(", ") : "no visible change";
 }
 
+// What History lists for a row. restorable says whether an Undo button makes
+// sense at all: a create always has something to take away, a change needs its
+// previous state, and a flag, a job's or session's own row, or a Workbench's or
+// job's note changed nothing to put back. Whether it may go ahead now is the
+// conflict rule's question, asked when someone presses it.
+const AUDIT_LIST_COLUMNS = `id, at, action, entity, entity_id, summary, label, undone, undone_at,
+            actor, actor_type, session_id, job_id, step,
+            CASE WHEN action = 'update' AND before_json IS NULL AND entity NOT IN ('handoff', 'session')
+                 THEN 1 ELSE 0 END AS legacy,
+            CASE WHEN entity IN ('handoff', 'session') THEN 0
+                 WHEN action = 'create' THEN 1
+                 WHEN before_json IS NULL OR before_json LIKE '{"__flag":%' OR before_json LIKE '{"__note":%' THEN 0
+                 ELSE 1 END AS restorable`;
+
 /**
  * Everything that has happened inside one project.
  *
@@ -277,8 +349,7 @@ function describeUpdate(entity, before, after) {
  */
 function projectActivity(projectId, limit = 200) {
   return all(
-    `SELECT id, at, action, entity, entity_id, summary, label, undone, undone_at,
-            CASE WHEN before_json IS NULL OR before_json LIKE '{"__flag":%' THEN 0 ELSE 1 END AS restorable
+    `SELECT ${AUDIT_LIST_COLUMNS}
      FROM audit
      WHERE (entity = 'project' AND entity_id = :projectId)
         OR (entity = 'task'  AND entity_id IN (SELECT id FROM tasks  WHERE project_id = :projectId))
@@ -301,8 +372,7 @@ function listAudit(limit = 100) {
     // restorable is the same column projectActivity computes, and for the same
     // reason: a delete with no stored copy cannot be put back, and the global
     // list used to offer an undo button on those rows anyway.
-    `SELECT id, at, action, entity, entity_id, summary, label, undone, undone_at,
-            CASE WHEN before_json IS NULL OR before_json LIKE '{"__flag":%' THEN 0 ELSE 1 END AS restorable
+    `SELECT ${AUDIT_LIST_COLUMNS}
      FROM audit ORDER BY id DESC LIMIT :limit`,
     { limit }
   );
@@ -410,12 +480,16 @@ function undo(auditId) {
   if (!entry) throw new Error("No such audit entry");
   if (entry.undone) throw new Error("That change has already been undone");
 
-  // One transaction over the whole reversal. A restore is many statements and a
-  // failure part way through used to leave a project back but empty, which is
-  // worse than the delete it was trying to reverse and reported as success.
-  const conn = open();
-  conn.exec("BEGIN");
-  try {
+  // One transaction over the whole reversal, the check included, so nothing can
+  // change the row between the check passing and the restore. A restore is many
+  // statements and a failure part way through used to leave a project back but
+  // empty, which is worse than the delete it was trying to reverse and reported
+  // as success. A savepoint, because undoLast and atomic() may hold one already.
+  atomic(() => {
+    // The conflict rule: refuse, by name, rather than put back a row over a
+    // change made since. See agent/audit.js makeUndoRules.
+    const refused = undoRules().refusal(entry);
+    if (refused) throw new Error(refused);
     applyUndo(entry);
     // Putting a pad body back leaves the board reading from text that is no
     // longer there, so the projection is taken again from the restored body.
@@ -423,17 +497,59 @@ function undo(auditId) {
     // gives: half a sync is worse than none.
     if (entry.entity === "scratchpad" && entry.action !== "delete") deriveInPlace(entry.entity_id);
     run("UPDATE audit SET undone = 1, undone_at = datetime('now') WHERE id = :id", { id: auditId });
-    conn.exec("COMMIT");
-  } catch (error) {
-    conn.exec("ROLLBACK");
-    throw error;
-  }
+  })();
   return listAudit(100);
+}
+
+let rules = null;
+const undoRules = () => rules || (rules = auditLib.makeUndoRules({ sql: sqlP }));
+
+// What of a comment an undo compares and puts back. The same four fields the
+// shared stores write into their __op, in the same shape, so either side's
+// entry reverses here.
+const sheetSide = (c) => ({ body: c.body, meta: c.meta ?? null, promoted: Number(c.promoted || 0), note_id: c.note_id ?? null });
+const sameSide = (a, b) => Boolean(a && b) && ["body", "meta", "promoted", "note_id"].every((k) => String(a[k] ?? "") === String(b[k] ?? ""));
+
+/**
+ * Reverses a Sheet entry's write: an entry added is taken away, an entry edited
+ * goes back to its words. Refused when the entry is not as that write left it,
+ * or an answer now hangs off it, for the reason the shared rule refuses.
+ */
+function undoSheetOp(entry, op) {
+  const after = (() => { try { return (JSON.parse(entry.after_json || "{}").__op || {}).after || null; } catch { return null; } })();
+  const id = Number(op.comment_id);
+  const now = one("SELECT * FROM comments WHERE id = :id", { id });
+  if (op.kind === "sheet_append") {
+    if (!now) return;
+    if (after && !sameSide(sheetSide(now), after)) throw new Error(`Entry ${id} has been changed since it was written. Undo that first, or remove it by hand.`);
+    const answer = one("SELECT id, author FROM comments WHERE ref_id = :id ORDER BY id LIMIT 1", { id });
+    if (answer) throw new Error(`Entry ${answer.id}, by ${answer.author}, answers entry ${id}, so it cannot be taken away on its own.`);
+    run("DELETE FROM comments WHERE id = :id", { id });
+    return;
+  }
+  if (!now) throw new Error(`Entry ${id} has been deleted since.`);
+  const was = op.before || {};
+  // A filing made a note. While the note is there, taking the filing back
+  // alone would leave it orphaned and the next filing would make a second copy,
+  // so the note goes first; once it has, the entry's note_id is null by the
+  // foreign key, which is the filing's own state, not a later change.
+  const filed = after && after.note_id != null && was.note_id == null ? Number(after.note_id) : null;
+  if (filed && one("SELECT id FROM notes WHERE id = :id", { id: filed })) {
+    throw new Error(`That filing made note ${filed}. Undo the note's creation first, then this.`);
+  }
+  const expected = filed && now.note_id == null ? { ...after, note_id: null } : after;
+  if (expected && !sameSide(sheetSide(now), expected)) throw new Error(`Entry ${id} has been changed again since. Undo that first.`);
+  run("UPDATE comments SET body = :body, meta = :meta, promoted = :promoted, note_id = :noteId, updated_at = datetime('now') WHERE id = :id",
+      { body: was.body, meta: was.meta ?? null, promoted: Number(was.promoted || 0), noteId: was.note_id ?? null, id });
 }
 
 function applyUndo(entry) {
   const table = TABLES[entry.entity];
   const before = entry.before_json ? JSON.parse(entry.before_json) : null;
+
+  // A job's or a session's own row has no table to replay into. Refused in
+  // words here too, for a caller that skipped undo()'s check.
+  if (!table) throw new Error(undoRules().refusal(entry) || `Nothing can be put back for a ${entry.entity}.`);
 
   // A move, an association or its removal carries exactly what it changed in
   // __op, and is reversed from that alone. Replaying the stored row instead
@@ -444,8 +560,14 @@ function applyUndo(entry) {
     throw new Error("That is a flag, which changed nothing. Withdraw or reject the flag instead.");
   }
   if (entry.action === "update" && before && before.__op) {
+    if (before.__op.kind === "sheet_append" || before.__op.kind === "sheet_edit") return undoSheetOp(entry, before.__op);
     items().undo(entry);
     return;
+  }
+  // A Workbench or a job's account of itself on the task: nothing in the row
+  // changed, so there is nothing to put back.
+  if (before && before.__note !== undefined) {
+    throw new Error("That records what a Workbench or a job did, which changed nothing in the task. There is nothing to undo.");
   }
 
   if (entry.action === "create") {
@@ -479,9 +601,14 @@ function applyUndo(entry) {
     run(`DELETE FROM ${table} WHERE id = :id`, { id: entry.entity_id });
   } else if (entry.action === "update") {
     if (!before) throw new Error("That change has no recorded previous state");
-    const cols = Object.keys(before).filter((c) => c !== "id");
+    // Only the fields this change changed, when both sides were kept. Replaying
+    // the whole stored row put back every other field as it was then, which
+    // quietly reverted whatever anyone had changed since in the rest of the row.
+    const cols = undoRules().restoreSet(entry).filter((c) => c in before);
+    if (!cols.length) return;
     const sets = cols.map((c) => `${c} = :${c}`).join(", ");
-    run(`UPDATE ${table} SET ${sets} WHERE id = :id`, { ...before, id: entry.entity_id });
+    run(`UPDATE ${table} SET ${sets} WHERE id = :id`,
+        { ...Object.fromEntries(cols.map((c) => [c, before[c]])), id: entry.entity_id });
   } else if (entry.action === "delete") {
     if (!before) throw new Error("That deletion has no recorded contents");
     // Keys beginning with two underscores are the subtree the cascade took, not
@@ -521,7 +648,12 @@ function undoLast(count = 1) {
   const pending = all(
     // Flag bookkeeping is stepped over rather than stopped at: an agent's
     // flag_item landing after a person's edit must not block undoing the edit.
-    `SELECT id FROM audit WHERE undone = 0 AND (before_json IS NULL OR before_json NOT LIKE '{"__flag":%')
+    //
+    // So are a job's and a session's own rows, and a Workbench's or a job's
+    // note on a task, which changed nothing that could be put back. Stopping
+    // at one used to block every older change beneath it.
+    `SELECT id FROM audit WHERE undone = 0 AND entity NOT IN ('handoff', 'session')
+        AND (before_json IS NULL OR (before_json NOT LIKE '{"__flag":%' AND before_json NOT LIKE '{"__note":%'))
       ORDER BY id DESC LIMIT :count`,
     { count }
   );
@@ -776,21 +908,11 @@ function projectContents(id) {
  * that cannot be recovered from.
  */
 function deleteProject(id, options = {}) {
-  const conn = open();
-  conn.exec("BEGIN");
-  try {
-    const result = deleteProjectRows(id, options);
-    conn.exec("COMMIT");
-    return result;
-  } catch (error) {
-    conn.exec("ROLLBACK");
-    throw error;
-  }
+  return atomic(deleteProjectRows)(id, options);
 }
 
-// The body of the above, without the transaction. undo() already holds one when
-// it reverses a project creation, and SQLite has no nested BEGIN, so that path
-// calls this directly rather than opening a second one.
+// The body of the above, without its own savepoint. undo() already holds one
+// when it reverses a project creation, so that path calls this directly.
 function deleteProjectRows(id, { tasks = "keep" } = {}) {
   if (tasks !== "keep" && tasks !== "delete") {
     throw new Error('tasks must be either "keep" or "delete"');
@@ -1406,10 +1528,16 @@ function createComment({ taskId, body, author = "you" }) {
   // Comments are not in the audit table's entity list, so the task carries the
   // trail. That keeps the History tab readable: "commented on X" belongs against
   // the task, not against a row nobody can navigate to.
+  //
+  // The row it added rides in __op, as the Sheet store's entries do, so the
+  // comment is one undo away like everything else in History.
   const task = one("SELECT * FROM tasks WHERE id = :id", { id: taskId });
+  const comment = one("SELECT * FROM comments WHERE id = :id", { id: Number(r.lastInsertRowid) });
   record({ action: "update", entity: "task", entityId: taskId,
-           summary: `commented (by ${author})`, label: task ? task.title : null });
-  return one("SELECT * FROM comments WHERE id = :id", { id: Number(r.lastInsertRowid) });
+           summary: `commented (by ${author})`, label: task ? task.title : null,
+           before: { __op: { kind: "sheet_append", comment_id: comment.id } },
+           after: { __op: { kind: "sheet_append", comment_id: comment.id, after: sheetSide(comment) } } });
+  return comment;
 }
 
 function deleteComment(id) {
@@ -1632,26 +1760,21 @@ function writeScratchpad(id, fields = {}) {
   const before = rowOf("scratchpad", id);
   if (!before) throw new Error("No such scratchpad");
 
-  const conn = open();
-  conn.exec("BEGIN");
-  try {
+  // The audit row is inside the unit too, after the derive, so its after is
+  // the body with the derive's anchors in it: the state undo compares against.
+  return atomic(() => {
     run(
       `UPDATE scratchpads SET ${sets.map((k) => `${k} = :${k}`).join(", ")},
        updated_at = datetime('now') WHERE id = :id`,
       { ...Object.fromEntries(sets.map((k) => [k, fields[k]])), id }
     );
     deriveInPlace(id);
-    conn.exec("COMMIT");
-  } catch (error) {
-    conn.exec("ROLLBACK");
-    throw error;
-  }
-
-  const after = getScratchpad(id);
-  record({ action: "update", entity: "scratchpad", entityId: id,
-           summary: describeUpdate("scratchpad", before, after), label: after.title,
-           before, after });
-  return after;
+    const after = getScratchpad(id);
+    record({ action: "update", entity: "scratchpad", entityId: id,
+             summary: describeUpdate("scratchpad", before, after), label: after.title,
+             before, after });
+    return after;
+  })();
 }
 
 /** Adds to the end of a pad. The common agent write, and it cannot lose anything. */
@@ -2783,7 +2906,20 @@ function adoptProjectPaths() {
 // deliberately not here: see agent/identity.js for why it is a file.
 const dbIdentity = () => identity.current((statement) => open().prepare(statement).all());
 
+// Every export that writes a row and its History, so the two land together.
+// Wrapped here, once, rather than in each body: the internal calls between
+// them (a derive creating tasks, a claim updating one) then run inside the
+// caller's unit instead of each opening its own.
+const ATOMIC = [
+  "createProject", "updateProject", "createTask", "updateTask", "deleteTask", "createComment",
+  "setQueue", "claimNext", "releaseClaim", "completeClaim", "extendClaim", "reclaimExpired",
+  "createNote", "updateNote", "deleteNote", "createScratchpad", "appendScratchpad", "patchScratchpad",
+  "deleteScratchpad", "derive", "createLink", "deleteLink", "createAlert", "createHandoff", "updateHandoff",
+  "createExternalTask",
+];
+
 module.exports = {
+  currentStep,
   batchP,
   items,
   DB_PATH,
@@ -2824,3 +2960,7 @@ module.exports = {
   acquireLock, releaseLock, listLocks,
   listMessages, appendMessage, updateMessage, addSessionUsage,
 };
+for (const name of ATOMIC) {
+  if (typeof module.exports[name] !== "function") throw new Error(`db.js: ${name} is not an export`);
+  module.exports[name] = atomic(module.exports[name]);
+}

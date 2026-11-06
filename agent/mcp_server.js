@@ -511,7 +511,19 @@ const { makeSheetStore, pidAlive } = require("../sheet/store");
 const sheetFormat = require("../sheet/format");
 const AUTHOR_TYPE = ["human", "agent", "tool"].includes(process.env.DELPHI_AUTHOR_TYPE)
   ? process.env.DELPHI_AUTHOR_TYPE : null;
-const sheets = makeSheetStore({ sql, actor: ACTOR, authorType: AUTHOR_TYPE });
+// Who this process writes as, and the step each tool call's rows share. See
+// agent/audit.js. The step lives in AsyncLocalStorage rather than a variable,
+// because an async tool (second_opinion, a Workbench's setup) can still be
+// running when the next call arrives, and two calls must not trade step ids.
+const auditLib = require("./audit");
+const { AsyncLocalStorage } = require("async_hooks");
+const STEP = new AsyncLocalStorage();
+const WHO = auditLib.identity(process.env, { inferType: sheetFormat.inferAuthorType });
+// A job writes for the session that asked for it, when one did.
+if (WHO.session_id == null && WHO.job_id != null) WHO.session_id = auditLib.sessionOfJob(sql, WHO.job_id);
+const currentStep = () => STEP.getStore() || null;
+const auditor = auditLib.makeAuditor({ sql, batch, who: WHO, step: currentStep });
+const sheets = makeSheetStore({ sql, batch, actor: ACTOR, authorType: AUTHOR_TYPE, who: WHO, step: currentStep });
 // Run logs live in the data folder, DATA_DIR in the app's terms, so they
 // inherit its "never in git" rule.
 const SHEET_LOG_DIR = path.join(RESOLVED.dataDir, "sheets");
@@ -522,7 +534,7 @@ const SHEET_LOG_DIR = path.join(RESOLVED.dataDir, "sheets");
 const { makeWorkbenchStore } = require("../workbench/store");
 const { createWorkbench } = require("../workbench/workbench");
 const { runEntry } = require("../sheet/run");
-const benchStore = makeWorkbenchStore({ sql, actor: ACTOR });
+const benchStore = makeWorkbenchStore({ sql, actor: ACTOR, who: WHO, step: currentStep });
 const benches = createWorkbench({
   store: benchStore, sheet: sheets, runEntry, logDir: SHEET_LOG_DIR,
   settings: () => readSettings(),
@@ -537,7 +549,7 @@ const { makeItemStore, inProject } = require("../items/store");
 const ITEM_AUTHOR_TYPE = AUTHOR_TYPE || sheetFormat.inferAuthorType(ACTOR);
 const itemStore = makeItemStore({
   sql, batch, actor: ACTOR, authorType: ITEM_AUTHOR_TYPE, settings: () => readSettings(),
-  derive: (padId) => derivePad(padId),
+  derive: (padId) => derivePad(padId), who: WHO, step: currentStep,
 });
 
 // When sheet_read last swept a task for lost runs. See sheet_read.
@@ -682,13 +694,6 @@ const PROMOTE_DIRECTIVE =
   "Promote (promote: true) anything that changes what the next agent should do: a finding, a dead end, a decision. " +
   "If it would matter on a different task too, call sheet_file on it as well, so it becomes a project note the graph and search can find.";
 
-const audit = (action, entity, entityId, summary, label) =>
-  sql(
-    `INSERT INTO audit (action, entity, entity_id, summary, label)
-     VALUES (:p1, :p2, :p3, :p4, :p5)`,
-    [action, entity, entityId, `${summary} (by ${ACTOR})`, label]
-  );
-
 // --- scratchpads -------------------------------------------------------------
 //
 // The row half of the pad tools. Twins of db.js the same way add_project is, and
@@ -764,6 +769,7 @@ function derivePad(padId) {
   let entries = pads.parse(body);
   const idByEntry = new Map();
   const filed = [];
+  const stepId = auditor.step();
 
   for (const entry of entries.slice()) {
     // Re-read each pass, because anchoring a line shifts nothing but rewrites it,
@@ -795,54 +801,69 @@ function derivePad(padId) {
       // Values go through sql()'s placeholders, never spliced into the text
       // first. A title spliced in as a literal is still query text when sql()
       // runs, so a line that happened to mention a placeholder was rewritten.
+      //
+      // Every change is recorded with the row before and after, in one batch
+      // with the write. Only status flips and creates used to be, so a title
+      // or a parent the sync rewrote could not be undone or even seen.
       const sets = [];
       const values = [];
+      const said = [];
       const set = (column, value) => { values.push(value); sets.push(`${column} = :p${values.length}`); };
-      if (current.title && current.title !== task.title) set("title", current.title);
+      if (current.title && current.title !== task.title) { set("title", current.title); said.push("title changed"); }
       const status = pads.statusFor(current.done, task.status);
       if (status !== task.status) {
         set("status", status);
         sets.push(status === "done" ? "completed_at = datetime('now')" : "completed_at = NULL");
+        said.push(`status ${task.status} to ${status}`);
       }
-      if (current.assignee && current.assignee !== task.assignee) set("assignee", current.assignee);
-      if (current.priority && current.priority !== task.priority) set("priority", current.priority);
-      if (parentId !== (task.parent_id ?? null)) set("parent_id", parentId);
+      if (current.assignee && current.assignee !== task.assignee) { set("assignee", current.assignee); said.push("assignee changed"); }
+      if (current.priority && current.priority !== task.priority) { set("priority", current.priority); said.push("priority changed"); }
+      if (parentId !== (task.parent_id ?? null)) { set("parent_id", parentId); said.push(parentId == null ? "taken out from under its parent" : "moved under another task"); }
+      const anchorKey = `pad:${pad.id}:${task.id}`;
+      if (task.external_key !== anchorKey) set("external_key", anchorKey);
       if (sets.length) {
         values.push(task.id);
-        sql(`UPDATE tasks SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = :p${values.length}`, values);
+        const writes = [[`UPDATE tasks SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = :p${values.length}`, values]];
         if (status !== task.status) {
-          sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
-              [task.id, status, ACTOR]);
-          audit("update", "task", task.id, `status ${task.status} to ${status}`, task.title);
+          writes.push(["INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)", [task.id, status, ACTOR]]);
         }
+        auditor.run(auditor.update("task", task.id, { summary: said.length ? said.join(", ") : "anchored to its pad line",
+                                                      label: current.title || task.title, stepId }, writes));
       }
     } else {
       // RETURNING rather than a second SELECT on last_insert_rowid(). On the
       // sqlite3 binary route every sql() call is its own process, and a new
       // connection's last_insert_rowid() is always 0, so every pad task filed
       // that way came back as undefined.
-      task = sql(
-        `INSERT INTO tasks (project_id, title, status, priority, assignee, parent_id, pad_id, source, completed_at)
-         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, 'pad',
-                 CASE WHEN :p3 = 'done' THEN datetime('now') END)
-         RETURNING *`,
-        [pad.project_id, current.title || "Untitled", current.done ? "done" : "todo",
-         current.priority || "med", current.assignee || null, parentId, pad.id]
-      )[0];
-      sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
-          [task.id, task.status, ACTOR]);
-      audit("create", "task", task.id, "read out of a pad", task.title);
+      // One batch for the task, its anchor key, its opening status and its
+      // History row, with the id taken inside it (agent/audit.js create). The
+      // key goes in before the row is recorded, so the recorded after is the
+      // task as the sync left it.
+      const title = current.title || "Untitled";
+      auditor.run(auditor.create("task", { summary: "read out of a pad", label: title, stepId },
+        [`INSERT INTO tasks (project_id, title, status, priority, assignee, parent_id, pad_id, source, completed_at)
+          VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, 'pad',
+                  CASE WHEN :p3 = 'done' THEN datetime('now') END)`,
+         [pad.project_id, title, current.done ? "done" : "todo",
+          current.priority || "med", current.assignee || null, parentId, pad.id]],
+        [[`INSERT INTO status_events (task_id, status, actor) SELECT id, status, :p1 FROM tasks WHERE id = ${auditor.createdId("task", stepId)}`, [ACTOR]]],
+        [["UPDATE tasks SET external_key = 'pad:' || pad_id || ':' || id WHERE id = last_insert_rowid()", []]]));
+      task = sql("SELECT * FROM tasks WHERE id = :p1", [auditor.created("task", stepId)])[0];
     }
 
-    sql("UPDATE tasks SET pad_id = :p1, external_key = :p2 WHERE id = :p3",
-        [pad.id, `pad:${pad.id}:${task.id}`, task.id]);
     idByEntry.set(current.at, task.id);
     filed.push({ id: task.id, title: current.title, status: pads.statusFor(current.done, task.status) });
 
     if (current.taskId !== task.id) body = pads.anchorLine(body, current, task.id);
   }
 
-  if (body !== pad.body) sql("UPDATE scratchpads SET body = :p1 WHERE id = :p2", [body, pad.id]);
+  // The anchors are part of the write that made them: the step's own row for
+  // the pad is given the body with them in, or undo would read the pad as
+  // edited since by the time anyone pressed it.
+  if (body !== pad.body) {
+    auditor.run(auditor.refreshAfter("scratchpad", pad.id, { summary: "anchored its lines to their tasks", label: pad.title, stepId },
+      [["UPDATE scratchpads SET body = :p1 WHERE id = :p2", [body, pad.id]]]));
+  }
   return { ...sql("SELECT * FROM scratchpads WHERE id = :p1", [pad.id])[0], tasks: filed };
 }
 
@@ -928,16 +949,27 @@ function secondOpinionScope(a) {
   return { task, projectId: Number(projectId), roots, cwd };
 }
 
+/**
+ * A say entry and its History row, as statements for a batch. The queue's
+ * release and complete write theirs beside the task's own change, so the entry
+ * can be undone on its own and the change without it.
+ */
+function sheetEntry(task, summary, body, { promoted = false, stepId = null } = {}) {
+  return auditor.sheetAppend(task, { summary, stepId }, [
+    `INSERT INTO comments (task_id, author, body, kind, author_type, promoted, session_id)
+     VALUES (:p1, :p2, :p3, 'say', :p4, :p5, :p6)`,
+    [task.id, ACTOR, body, AUTHOR_TYPE, promoted ? 1 : 0, WHO.session_id],
+  ]);
+}
+
 /** A plain comment on a task, as add_comment and second_opinion both write it. */
 function addComment(taskId, body) {
   const task = sql("SELECT id, title FROM tasks WHERE id = :p1", [taskId])[0];
   if (!task) throw new Error(`No task ${taskId}`);
   if (!body || !String(body).trim()) throw new Error("A comment needs something in it");
-  const row = sql(`INSERT INTO comments (task_id, author, body, kind, author_type)
-                   VALUES (:p1, :p2, :p3, 'say', :p4) RETURNING *`,
-                  [taskId, ACTOR, String(body).trim(), AUTHOR_TYPE])[0];
-  audit("update", "task", taskId, "commented", task.title);
-  return row;
+  const stepId = auditor.step();
+  auditor.run(sheetEntry(task, "commented", String(body).trim(), { stepId }));
+  return sql("SELECT * FROM comments WHERE id = :p1", [auditor.appendedId(task.id, stepId)])[0];
 }
 
 const TOOLS = {
@@ -955,6 +987,8 @@ const TOOLS = {
         resolved_by: RESOLVED.source,
         actor: ACTOR,
         author_type: AUTHOR_TYPE || "agent",
+        session_id: WHO.session_id,
+        ...(WHO.job_id ? { job_id: WHO.job_id } : {}),
         project_scope: projectScope(),
         app_running: app.running,
         app,
@@ -1006,14 +1040,11 @@ const TOOLS = {
       // Sit above General, which is pinned at 99 as the catch-all. New projects
       // slot in behind the last real one so the sidebar keeps its order.
       const below = sql("SELECT COALESCE(MAX(sort_order), 0) + 10 AS next FROM projects WHERE sort_order < 99")[0];
-      sql(
-        `INSERT INTO projects (key, name, summary, colour, sort_order)
-         VALUES (:p1, :p2, :p3, :p4, :p5)`,
-        [key, a.name, a.summary ?? null, a.colour ?? null, below.next]
-      );
-      const row = sql("SELECT id, key, name, summary, status, sort_order FROM projects WHERE key = :p1", [key])[0];
-      audit("create", "project", row.id, "created", row.name);
-      return row;
+      auditor.run(auditor.create("project", { summary: "created", label: a.name },
+        [`INSERT INTO projects (key, name, summary, colour, sort_order)
+          VALUES (:p1, :p2, :p3, :p4, :p5)`,
+         [key, a.name, a.summary ?? null, a.colour ?? null, below.next]]));
+      return sql("SELECT id, key, name, summary, status, sort_order FROM projects WHERE key = :p1", [key])[0];
     },
   },
 
@@ -1077,15 +1108,17 @@ const TOOLS = {
       }
       // RETURNING, not "the newest row": with two agents filing at once the
       // newest row can be the other agent's.
-      const row = sql(
-        `INSERT INTO tasks (project_id, title, detail, priority, due, ref, parent_id, source)
-         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8)
-         RETURNING id, title`,
-        [projectId, a.title, a.detail ?? null, a.priority || "med", a.due ?? null, a.ref ?? null, a.parent_id ?? null, ACTOR]
-      )[0];
-      sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'todo', :p2)", [row.id, ACTOR]);
-      audit("create", "task", row.id, "created", row.title);
-      return row;
+      //
+      // The task, its opening status and its History row are one batch, with
+      // the id read back from this call's own row, which no other agent's
+      // write can be.
+      const stepId = auditor.step();
+      auditor.run(auditor.create("task", { summary: "created", label: a.title, stepId },
+        [`INSERT INTO tasks (project_id, title, detail, priority, due, ref, parent_id, source)
+          VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8)`,
+         [projectId, a.title, a.detail ?? null, a.priority || "med", a.due ?? null, a.ref ?? null, a.parent_id ?? null, ACTOR]],
+        [[`INSERT INTO status_events (task_id, status, actor) VALUES (${auditor.createdId("task", stepId)}, 'todo', :p1)`, [ACTOR]]]));
+      return sql("SELECT id, title FROM tasks WHERE id = :p1", [auditor.created("task", stepId)])[0];
     },
   },
 
@@ -1120,10 +1153,13 @@ const TOOLS = {
         // Only for a named writer: with no DELPHI_ACTOR every agent is
         // "agent", and "you filed it" would let one move another's work.
         const named = Boolean(process.env.DELPHI_ACTOR) && ACTOR !== "agent";
+        // The actor column says who filed it; the suffix is all a row from
+        // before that column has, so it is the fallback.
         const suffix = `(by ${ACTOR})`;
         const mine = named && sql(`SELECT id FROM audit WHERE action = 'create' AND entity = 'task' AND entity_id = :p1
-                            AND substr(summary, -length(:p2)) = :p2 AND at >= datetime('now', '-24 hours') LIMIT 1`,
-                         [before.id, suffix])[0];
+                            AND (actor = :p2 OR (actor IS NULL AND substr(summary, -length(:p3)) = :p3))
+                            AND at >= datetime('now', '-24 hours') LIMIT 1`,
+                         [before.id, ACTOR, suffix])[0];
         if (!mine) {
           throw new Error(`Task ${before.id} was not filed by you in the last 24 hours, so moving it is a person's call. ` +
             `Flag it instead: flag_item with entity "task", id ${before.id}, and a note saying where it belongs and why.`);
@@ -1137,16 +1173,17 @@ const TOOLS = {
       const sets = fields.map((f, i) => `${f} = :p${i + 1}`).join(", ");
       params.push(a.id);
       const done = a.status === "done" ? ", completed_at = datetime('now')" : a.status ? ", completed_at = NULL" : "";
-      sql(`UPDATE tasks SET ${sets}, updated_at = datetime('now')${done} WHERE id = :p${params.length}`, params);
-      const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
       // The timeline should not be able to tell whether a person or an agent
       // moved a task, only who it was. Recorded here for the same reason the app
-      // records it: so the history cannot disagree with the column.
-      if (after.status !== before.status) {
-        sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
-            [a.id, after.status, ACTOR]);
-      }
-      audit("update", "task", a.id, a.status ? `status to ${a.status}` : "updated", after.title);
+      // records it: so the history cannot disagree with the column. In the same
+      // batch as the write and its History row, compared in SQL against the
+      // status the row had when the batch began.
+      auditor.run(auditor.update("task", a.id, { summary: a.status ? `status to ${a.status}` : "updated", label: a.title ?? before.title }, [
+        [`UPDATE tasks SET ${sets}, updated_at = datetime('now')${done} WHERE id = :p${params.length}`, params],
+        ["INSERT INTO status_events (task_id, status, actor) SELECT id, status, :p1 FROM tasks WHERE id = :p2 AND status IS NOT :p3",
+         [ACTOR, a.id, before.status]],
+      ]));
+      const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
       const notice = a.status === "done" ? workbenchNotice(a.id) : null;
       return notice ? { ...after, workbench: notice } : after;
     },
@@ -1177,25 +1214,37 @@ const TOOLS = {
       // Node with no better-sqlite3 and cannot read inside app.asar, so any
       // change to how a task is chosen has to be made in both or the app and the
       // agents will disagree about what is claimable.
-      const claimed = sql(
-        `UPDATE tasks
+      //
+      // Now one batch rather than one statement, so the History row records
+      // the task before and after: the row is written first, choosing the task,
+      // and the claim takes whichever task it chose. Both routes run a batch as
+      // one write transaction, so two agents still cannot both win.
+      //
+      // Blocked work is not available work: something outside the task is
+      // being waited on, and an agent given it can only hand it back. Values
+      // are literals here because this text is spliced into several statements.
+      const stepId = auditor.step();
+      const chosen = `SELECT id FROM tasks
+             WHERE queue = ${literal(queue)}
+               AND status NOT IN ('done', 'blocked')
+               AND (claimed_by IS NULL OR claim_expires < datetime('now'))
+               ${projectId == null ? "" : `AND project_id = ${literal(Number(projectId))}`}
+             ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
+             LIMIT 1`;
+      const took = auditor.stepRowId("task", stepId);
+      auditor.run(auditor.update("task", { sql: chosen }, { summary: `claimed by ${ACTOR}`, stepId }, [
+        [`UPDATE tasks
             SET claimed_by = :p1,
                 claim_expires = datetime('now', '+' || :p2 || ' minutes'),
                 status = CASE WHEN status = 'todo' THEN 'doing' ELSE status END,
                 updated_at = datetime('now')
-          WHERE id = (
-            SELECT id FROM tasks
-             WHERE queue = :p3
-               -- Blocked work is not available work: something outside the task
-               -- is being waited on, and an agent given it can only hand it back.
-               AND status NOT IN ('done', 'blocked')
-               AND (claimed_by IS NULL OR claim_expires < datetime('now'))
-               ${projectId == null ? "" : "AND project_id = :p4"}
-             ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
-             LIMIT 1)
-          RETURNING *`,
-        projectId == null ? [ACTOR, minutes, queue] : [ACTOR, minutes, queue, projectId]
-      )[0];
+          WHERE id = ${took}`, [ACTOR, minutes]],
+        // Only when the claim moved it. Nothing but todo is claimable, so this
+        // is always a real transition rather than a repeat of the current status.
+        [`INSERT INTO status_events (task_id, status, actor) SELECT id, status, :p1 FROM tasks WHERE id = ${took} AND status = 'doing'`, [ACTOR]],
+      ]));
+      const claimedId = sql(`SELECT ${took} AS id`, [])[0];
+      const claimed = claimedId && claimedId.id != null ? sql("SELECT * FROM tasks WHERE id = :p1", [claimedId.id])[0] : null;
 
       if (!claimed) {
         return {
@@ -1206,13 +1255,6 @@ const TOOLS = {
         };
       }
 
-      // Only when the claim moved it. Nothing but todo is claimable, so this is
-      // always a real transition rather than a repeat of the current status.
-      if (claimed.status === "doing") {
-        sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
-            [claimed.id, claimed.status, ACTOR]);
-      }
-      audit("update", "task", claimed.id, `claimed by ${ACTOR}`, claimed.title);
 
       return {
         claimed: claimed.id,
@@ -1244,21 +1286,20 @@ const TOOLS = {
     run: (a) => {
       const before = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
       if (!before) throw new Error(`No task ${a.task_id}`);
-      sql(`UPDATE tasks SET claimed_by = NULL, claim_expires = NULL,
-             status = CASE WHEN status = 'doing' THEN 'todo' ELSE status END,
-             updated_at = datetime('now') WHERE id = :p1`, [a.task_id]);
       // Promoted, because why the last agent gave up is the first thing the
       // next one needs, and the ledger is what it reads first.
-      sql(`INSERT INTO comments (task_id, author, body, kind, author_type, promoted)
-           VALUES (:p1, :p2, :p3, 'say', :p4, 1)`,
-          [a.task_id, ACTOR, `Released: ${a.reason}`, AUTHOR_TYPE]);
-      const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
-      if (after.status !== before.status) {
-        sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)",
-            [a.task_id, after.status, ACTOR]);
-      }
-      audit("update", "task", a.task_id, `released by ${ACTOR}`, after.title);
-      return after;
+      const stepId = auditor.step();
+      auditor.run([
+        ...auditor.update("task", a.task_id, { summary: `released by ${ACTOR}`, label: before.title, stepId }, [
+          [`UPDATE tasks SET claimed_by = NULL, claim_expires = NULL,
+               status = CASE WHEN status = 'doing' THEN 'todo' ELSE status END,
+               updated_at = datetime('now') WHERE id = :p1`, [a.task_id]],
+          ["INSERT INTO status_events (task_id, status, actor) SELECT id, status, :p1 FROM tasks WHERE id = :p2 AND status IS NOT :p3",
+           [ACTOR, a.task_id, before.status]],
+        ]),
+        ...sheetEntry(before, "commented", `Released: ${a.reason}`, { promoted: true, stepId }),
+      ]);
+      return sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
     },
   },
 
@@ -1286,11 +1327,11 @@ const TOOLS = {
       if (task.claim_expires && task.claim_expires < stale) {
         throw new Error("That claim has already expired. Call queue_next again rather than extending it.");
       }
-      sql(`UPDATE tasks SET claim_expires = datetime('now', '+' || :p2 || ' minutes'),
-             updated_at = datetime('now') WHERE id = :p1`, [a.task_id, minutes]);
-      const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
-      audit("update", "task", a.task_id, `claim extended by ${ACTOR} to ${after.claim_expires}`, after.title);
-      return after;
+      const until = sql("SELECT datetime('now', '+' || :p1 || ' minutes') AS t", [minutes])[0].t;
+      auditor.run(auditor.update("task", a.task_id, { summary: `claim extended by ${ACTOR} to ${until}`, label: task.title }, [
+        [`UPDATE tasks SET claim_expires = :p2, updated_at = datetime('now') WHERE id = :p1`, [a.task_id, until]],
+      ]));
+      return sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
     },
   },
 
@@ -1310,16 +1351,17 @@ const TOOLS = {
       if (!before) throw new Error(`No task ${a.task_id}`);
       // Promoted, so every finished run lands in the ledger: it is the one
       // entry the next person or agent always wants.
-      sql(`INSERT INTO comments (task_id, author, body, kind, author_type, promoted)
-           VALUES (:p1, :p2, :p3, 'say', :p4, 1)`,
-          [a.task_id, ACTOR, a.summary, AUTHOR_TYPE]);
-      sql(`UPDATE tasks SET status = 'done', completed_at = datetime('now'),
-             claimed_by = NULL, claim_expires = NULL, queue = NULL,
-             updated_at = datetime('now') WHERE id = :p1`, [a.task_id]);
-      if (before.status !== "done") {
-        sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'done', :p2)", [a.task_id, ACTOR]);
-      }
-      audit("update", "task", a.task_id, "status to done", before.title);
+      const stepId = auditor.step();
+      auditor.run([
+        ...sheetEntry(before, "commented", a.summary, { promoted: true, stepId }),
+        ...auditor.update("task", a.task_id, { summary: "status to done", label: before.title, stepId }, [
+          [`UPDATE tasks SET status = 'done', completed_at = datetime('now'),
+               claimed_by = NULL, claim_expires = NULL, queue = NULL,
+               updated_at = datetime('now') WHERE id = :p1`, [a.task_id]],
+          ...(before.status !== "done"
+            ? [["INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'done', :p2)", [a.task_id, ACTOR]]] : []),
+        ]),
+      ]);
       const after = sql("SELECT * FROM tasks WHERE id = :p1", [a.task_id])[0];
       const notice = workbenchNotice(a.task_id);
       return notice ? { ...after, workbench: notice } : after;
@@ -1779,11 +1821,11 @@ const TOOLS = {
       },
     },
     run: (a) => {
-      const row = sql(`INSERT INTO notes (project_id, title, body, kind) VALUES (:p1, :p2, :p3, :p4)
-                       RETURNING id, title`,
-                      [a.project_id, a.title, a.body, a.kind || "note"])[0];
-      audit("create", "note", row.id, "created", row.title);
-      return row;
+      const stepId = auditor.step();
+      auditor.run(auditor.create("note", { summary: "created", label: a.title, stepId },
+        [`INSERT INTO notes (project_id, title, body, kind) VALUES (:p1, :p2, :p3, :p4)`,
+         [a.project_id, a.title, a.body, a.kind || "note"]]));
+      return sql("SELECT id, title FROM notes WHERE id = :p1", [auditor.created("note", stepId)])[0];
     },
   },
 
@@ -1858,20 +1900,23 @@ const TOOLS = {
       const key = padKeyFor(projectId, a.key || a.title);
       const existing = sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
                            [projectId, key])[0];
+      // Recorded with the pad before and after, so an agent's rewrite of a plan
+      // is one undo away; it used to be recorded with neither, and every one of
+      // them refused to undo.
       if (existing) {
-        sql(`UPDATE scratchpads SET title = :p1, body = :p2, author = :p3,
-             derives_tasks = :p4, updated_at = datetime('now') WHERE id = :p5`,
-            [a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : existing.derives_tasks, existing.id]);
-        audit("update", "scratchpad", existing.id, "wrote to the pad", a.title);
+        auditor.run(auditor.update("scratchpad", existing.id, { summary: "wrote to the pad", label: a.title }, [
+          [`UPDATE scratchpads SET title = :p1, body = :p2, author = :p3,
+               derives_tasks = :p4, updated_at = datetime('now') WHERE id = :p5`,
+           [a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : existing.derives_tasks, existing.id]],
+        ]));
         return derivePad(existing.id);
       }
-      sql(`INSERT INTO scratchpads (project_id, key, title, body, author, derives_tasks)
-           VALUES (:p1, :p2, :p3, :p4, :p5, :p6)`,
-          [projectId, key, a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : 1]);
-      const row = sql("SELECT id FROM scratchpads WHERE project_id = :p1 AND key = :p2",
-                      [projectId, key])[0];
-      audit("create", "scratchpad", row.id, "created", a.title);
-      return derivePad(row.id);
+      const stepId = auditor.step();
+      auditor.run(auditor.create("scratchpad", { summary: "created", label: a.title, stepId },
+        [`INSERT INTO scratchpads (project_id, key, title, body, author, derives_tasks)
+          VALUES (:p1, :p2, :p3, :p4, :p5, :p6)`,
+         [projectId, key, a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : 1]]));
+      return derivePad(auditor.created("scratchpad", stepId));
     },
   },
 
@@ -1892,9 +1937,12 @@ const TOOLS = {
       const pad = findPad(a);
       if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
       const joiner = !pad.body || pad.body.endsWith("\n") ? "" : "\n";
-      sql("UPDATE scratchpads SET body = :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3",
-          [`${pad.body}${joiner}${a.text}`, ACTOR, pad.id]);
-      audit("update", "scratchpad", pad.id, "added to the pad", pad.title);
+      // The text is appended in SQL rather than from the body read above, so a
+      // write landing between the read and this batch is not overwritten.
+      const tail = `${joiner}${a.text}`;
+      auditor.run(auditor.update("scratchpad", pad.id, { summary: "added to the pad", label: pad.title }, [
+        ["UPDATE scratchpads SET body = body || :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3", [tail, ACTOR, pad.id]],
+      ]));
       return derivePad(pad.id);
     },
   },
@@ -1916,9 +1964,10 @@ const TOOLS = {
     run: (a) => {
       const pad = findPad(a);
       if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
-      sql("UPDATE scratchpads SET body = :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3",
-          [patchSection(pad.body, a.heading, a.text), ACTOR, pad.id]);
-      audit("update", "scratchpad", pad.id, `rewrote "${a.heading}"`, pad.title);
+      auditor.run(auditor.update("scratchpad", pad.id, { summary: `rewrote "${a.heading}"`, label: pad.title }, [
+        ["UPDATE scratchpads SET body = :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3",
+         [patchSection(pad.body, a.heading, a.text), ACTOR, pad.id]],
+      ]));
       return derivePad(pad.id);
     },
   },
@@ -1974,7 +2023,9 @@ const TOOLS = {
         context: a.context ?? null, wake: a.wake !== false, kind, source: "handoff",
         requestedBy: ACTOR, requesterType: AUTHOR_TYPE || "agent", state, approval,
       });
-      audit("create", "handoff", run.id, `asked ${run.harness} (${kind})`, run.request.slice(0, 80));
+      // The job's own record: attributed like every row, never undone.
+      auditor.run([auditor.statement({ action: "create", entity: "handoff", id: run.id, summary: `asked ${run.harness} (${kind})`,
+                                       label: run.request.slice(0, 80) })]);
       // Told honestly. Only a Delphi app's dispatcher ever runs a job, and
       // only a session the app launched has a turn to be woken into, so an
       // agent promised both when neither holds stops and waits for nothing.
@@ -2681,7 +2732,9 @@ async function handle(req) {
     if (READ_ONLY && !READ_ONLY_TOOLS.has(params.name)) {
       throw new Error(`${params.name} is not available here: this Delphi server was started read only, for a second opinion. Say what you would do instead.`);
     }
-    const result = await tool.run(params.arguments || {});
+    // One step per call: every row it writes shares the id, which is what a
+    // rollback takes whole. See agent/audit.js.
+    const result = await STEP.run(auditLib.newStep("m"), () => tool.run(params.arguments || {}));
     // Compact JSON. Indentation is a fifth of a pretty-printed answer and an
     // agent reads the structure without it, so every call paid for whitespace.
     const content = [{ type: "text", text: JSON.stringify(result) }];
