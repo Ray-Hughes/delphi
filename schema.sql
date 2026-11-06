@@ -826,3 +826,20 @@ CREATE TRIGGER IF NOT EXISTS items_link_ad AFTER DELETE ON links BEGIN
   UPDATE item_flags SET status = 'stale', updated_at = datetime('now')
    WHERE entity = 'link' AND entity_id = old.id AND status IN ('open', 'evaluating', 'proposed');
 END;
+
+-- One row per second_opinion started, kept a day. What the hourly limit counts,
+-- across every server on this database: each one spends another agent's quota,
+-- and only the ones asked with a task leave a Sheet entry to count instead.
+-- No foreign keys, because a row outlives the task it was about and is only
+-- ever counted. agent/schema_later.js holds the same text.
+CREATE TABLE IF NOT EXISTS second_opinions (
+  id          INTEGER PRIMARY KEY,
+  actor       TEXT,
+  agent       TEXT NOT NULL,
+  project_id  INTEGER,
+  task_id     INTEGER,
+  started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT,
+  outcome     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_second_opinions_started ON second_opinions(started_at);

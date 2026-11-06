@@ -102,6 +102,16 @@ let settings = {
   // for someone without asking. See agent/directives.js for how it reaches them.
   scratchpadMode: false,
   scratchpadProjectId: null,   // null means "no default, pick a project"
+  // Whether connected agents are told to ask another agent for a second opinion
+  // (the second_opinion tool) before a commit and when they reach a root cause.
+  // Off by default for the same reason as the scratchpad: it changes how every
+  // agent sharing this database works, and spends the other agent's quota.
+  secondOpinionMode: false,
+  secondOpinionAgent: "copilot",
+  // How many second opinions may start in an hour, across every agent on this
+  // database. Each one spends the other agent's quota. See
+  // harness.SECOND_OPINION_HOURLY.
+  secondOpinionHourlyLimit: harness.SECOND_OPINION_HOURLY.default,
   // On by default because the celebration is the confirmation that a task was
   // completed, and the row leaves straight afterwards. The system reduced motion
   // preference already suppresses all of it for the people who need that, so
@@ -2120,6 +2130,15 @@ handle("settings:set", (fields) => {
 
   if (fields.scratchpadMode !== undefined) settings.scratchpadMode = fields.scratchpadMode === true;
 
+  if (fields.secondOpinionMode !== undefined) settings.secondOpinionMode = fields.secondOpinionMode === true;
+  if (fields.secondOpinionAgent !== undefined) {
+    // A harness key, not a command: the server looks the row up by it, so
+    // anything that could not be one is refused here rather than there.
+    const key = String(fields.secondOpinionAgent || "");
+    if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(key)) throw new Error("secondOpinionAgent must be an agent's key, such as copilot");
+    settings.secondOpinionAgent = key;
+  }
+
   if (fields.animations !== undefined) settings.animations = fields.animations !== false;
 
   // A path, and only ever the one app:dataInfo reported: anything else would
@@ -2173,6 +2192,9 @@ handle("settings:set", (fields) => {
   };
   if (fields.jobConcurrency !== undefined) settings.jobConcurrency = whole("jobConcurrency", fields.jobConcurrency, BOUNDS.jobConcurrency);
   if (fields.jobTimeoutMinutes !== undefined) settings.jobTimeoutMinutes = whole("jobTimeoutMinutes", fields.jobTimeoutMinutes, BOUNDS.jobTimeoutMinutes);
+  if (fields.secondOpinionHourlyLimit !== undefined) {
+    settings.secondOpinionHourlyLimit = whole("secondOpinionHourlyLimit", fields.secondOpinionHourlyLimit, harness.SECOND_OPINION_HOURLY.bounds);
+  }
   // The whole map, as the window shows it: a harness left out goes back to 1.
   // Keys are harness keys, which is what a job's to_harness holds.
   if (fields.jobHarnessLimits !== undefined) {

@@ -46,6 +46,7 @@ loads all of them at startup, so a renderer change needs a restart, not a reload
 | `harness.js` | Running somebody else's agent CLI as a session. Templates, parsers, MCP wiring |
 | `agent/mcp_server.js` | JSON-RPC 2.0 MCP server over stdio, no dependencies |
 | `agent/schema_later.js` | Columns and tables added after a database was made. Run by the app and the server alike |
+| `agent/second_opinion.js` | Running another agent's CLI read only and waiting for its answer, for the `second_opinion` tool. Copilot only for now |
 | `agent/launch.js` | Splitting a command line, finding a binary, and whether the guard is wired in. Shared by the runner, `delphi chat` and `sheet/run.js` |
 | `sheet/` | Sheets: the text format, the shared store, the MCP client, `run.js`, `decide.js` and `chat.js` |
 | `sheet/tui/` | The Sheet in a terminal (`delphi open`): keys, screen, clipboard and the view itself |

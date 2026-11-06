@@ -325,6 +325,65 @@ Delphi stops running handoffs by itself after twelve finish in one project in an
 hour. Two agents that each wake the other are a loop that spends money at machine
 speed with nobody watching, and the limit is the thing that notices.
 
+## Second opinions
+
+`second_opinion` asks another agent, Copilot by default, and waits for the answer.
+It is not a job: there is no approval, no app needs to be running, and the answer
+comes back in the same call, usually within a minute. That is what it is for: the
+question you are blocked on right now.
+
+```
+second_opinion(request, files?, cwd?, task_id?, project?, timeout_seconds?)
+```
+
+Copilot runs read only. Its command line may carry only a short list of flags, and a
+Copilot command line in Settings that passes anything else is refused rather than
+trimmed. The tools it can see are an allowlist (view and glob, not grep, and
+Delphi's read tools), its built-in and your own MCP servers are switched off, and
+write, shell and web fetches are denied by name, because Copilot's saved approvals
+apply in this mode too. It is the same binary check jobs use: Copilot as an
+installer put it, or a command a person trusted in Settings. It does get Delphi's
+own tools, from a server named `delphi_readonly` and started with
+`DELPHI_READ_ONLY=1`, that offers only the tools that read, carries no directives,
+and writes under its own name in History (`copilot:second-opinion`). So it can read
+the same notes and pads you can, and cannot file work, change a pad, hand off a job
+or ask for a second opinion of its own.
+
+It reads only inside the project's folders (its path, repositories and workspaces)
+and the task's Workbench. It runs in `cwd`, or the task's Workbench, or the
+project's folder; with no project or task given it uses the session's project, then
+the project whose folder holds `cwd`. Relative paths in `files` are taken from
+that folder, followed through links, and refused when they land outside those
+folders. A cwd or file in a key folder or named like a key file is refused
+(`.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.netrc`, `.env*`, `*.pem`, `*.key`,
+`id_*`, Keychains, `~/.copilot`, `~/.claude`, Delphi's data folder and its
+database), and so are the filesystem root, a home folder and anything above one.
+Inside a folder it was let into, Copilot is told to deny reading `.env*`,
+`.netrc`, `*.pem`, `*.key` and `id_*`. Write a diff to a file inside the
+project and pass the path, because the request is a prompt and Copilot reads
+nothing from stdin. A `task_id` and a `project` that disagree are refused.
+
+One runs at a time per session, and a limited number start in an hour across every
+agent on the database (Settings, `secondOpinionHourlyLimit`, default 12, 0 turns it
+off). The timeout is five minutes by default and ten at most. An answer longer than
+about 64 KB is cut and says so. With `task_id` the answer is also kept on the task's
+Sheet, so the next session has it, with anything shaped like a token or private key
+replaced by `[redacted]` first and the entry saying how many were.
+
+**Second opinion mode** (Settings, Second opinion) tells every connected agent when to
+use it: on a diff before a commit or pull request, on a root cause, reached
+independently, and on large unfamiliar code. Verify what it says before acting on
+it, say what it found and which findings held up, skip trivial work, and never send
+it secrets or personal data. The rule reaches an agent three ways, as the
+scratchpad's does: the server's instructions, a note on `second_opinion`,
+`queue_complete`, `add_comment`, `sheet_append` and `list_projects`, and a reminder
+on a tool result. The reminder comes on `list_projects` and on the first result an
+hour, which is how a session that was already running when the mode was turned on
+hears about it.
+
+Only Copilot can be the second opinion for now. Each CLI says "read only" in its own
+flags, and a second one should arrive with its own.
+
 ## Taking work from the queue
 
 Tasks placed in the queue are work someone has decided is ready for an agent. Nobody

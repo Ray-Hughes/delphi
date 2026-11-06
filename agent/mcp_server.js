@@ -69,6 +69,41 @@ function scratchpadState() {
 // is the mistake this is guarding against, and the description is the last place
 // to catch it.
 const SCRATCHPAD_TOOLS = new Set(["write_scratchpad", "list_scratchpads", "add_note", "list_projects"]);
+
+/**
+ * The second opinion setting, and the agent it names.
+ *
+ * The row is read from harnesses so a model or flag set in Settings applies, and
+ * falls back to the built-in definition because a database the app has never
+ * opened since an upgrade has no row yet, and the tool has to work without the
+ * app running. A row someone turned off stays off.
+ */
+function secondOpinionAgent() {
+  const key = String(readSettings().secondOpinionAgent || "copilot");
+  let row = null;
+  try { row = sql("SELECT * FROM harnesses WHERE key = :p1", [key])[0] || null; } catch { row = null; }
+  if (!row) {
+    const builtin = harness.BUILTINS.find((h) => h.key === key);
+    if (builtin) row = { ...builtin, args_json: JSON.stringify(builtin.args), enabled: 1 };
+  }
+  return row;
+}
+
+function secondOpinionState() {
+  if (readSettings().secondOpinionMode !== true) return { on: false, label: null };
+  const row = secondOpinionAgent();
+  return { on: true, label: (row && row.label) || "the second opinion agent" };
+}
+
+// Which tools carry the second opinion note. second_opinion itself, and the
+// moments the rule is about: finishing a queued task, writing up what was found,
+// and the orienting call.
+const SECOND_OPINION_TOOLS = new Set(["second_opinion", "queue_complete", "add_comment", "sheet_append", "list_projects"]);
+// How often a running session is reminded through tool results. Once an hour is
+// enough to reach a session that started before the mode was turned on, without
+// repeating itself so often that the model learns to skip it.
+const SECOND_OPINION_REMIND_MS = 60 * 60 * 1000;
+let secondOpinionRemindedAt = 0;
 const ACTOR = process.env.DELPHI_ACTOR || "agent";
 
 /**
@@ -298,6 +333,9 @@ const identity = require("./identity");
 // Jobs (handoffs, queued work, a person's own requests): rows and rules shared
 // with the app's dispatcher. See agent/jobs.js.
 const jobs = require("./jobs");
+// Second opinions: another agent's CLI, run read only and waited for.
+const secondOpinion = require("./second_opinion");
+const harness = require("../harness");
 let IDENTITY = { db_id: null, created_at: null };
 try {
   IDENTITY = identity.ensure((statement) => DATABASE.query(statement));
@@ -794,6 +832,76 @@ function projectScope() {
   }
 }
 
+const isDirectory = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+const holds = (root, p) => {
+  const a = (() => { try { return fs.realpathSync(root); } catch { return null; } })();
+  const b = (() => { try { return fs.realpathSync(p); } catch { return null; } })();
+  if (!a || !b) return false;
+  const rel = path.relative(a, b);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+};
+
+/**
+ * Which task and project a second opinion is about, the folders it may read,
+ * and where it runs.
+ *
+ * The folders are the project's own (repositories, workspaces, its path) and the
+ * task's live Workbench, and nothing else: the reviewer is let into every folder
+ * here, and an agent that could name any folder could hand it a home directory.
+ * With no project named, the session's own scope is used, then the project
+ * whose folder holds cwd.
+ */
+function secondOpinionScope(a) {
+  let task = null;
+  if (a.task_id != null) {
+    task = sql("SELECT id, title, project_id FROM tasks WHERE id = :p1", [a.task_id])[0];
+    if (!task) throw new Error(`No task ${a.task_id}`);
+  }
+  let projectId = resolveProjectId(a);
+  if (projectId != null && task && Number(task.project_id) !== Number(projectId)) {
+    throw new Error(`Task ${task.id} is not in the project you named (it is in project ${task.project_id}). Pass the task alone, or the project it belongs to.`);
+  }
+  if (projectId == null && task) projectId = task.project_id;
+  if (projectId == null) {
+    const scope = projectScope();
+    if (scope && scope.id) projectId = scope.id;
+  }
+  const benches = (where, params) => sql(`SELECT w.path, w.task_id, t.project_id FROM workbenches w JOIN tasks t ON t.id = w.task_id
+                                           WHERE w.state IN ('active', 'parked') ${where} ORDER BY w.id DESC`, params);
+  // A Workbench cwd belongs to a task; without one named, it is the folder that
+  // says which, and it is let in as that task's.
+  let inferredBench = null;
+  if (projectId == null) {
+    const here = a.cwd || process.cwd();
+    const bench = benches("", []).find((b) => holds(b.path, here));
+    if (bench) { projectId = bench.project_id; inferredBench = bench.path; }
+    else {
+      const found = sql("SELECT id FROM projects ORDER BY id", []).find((p) => jobs.folders(sql, p.id).some((f) => holds(f, here)));
+      if (found) projectId = found.id;
+    }
+  }
+  if (projectId == null) {
+    throw new Error("A second opinion reads only inside a project's folders or a task's Workbench, and none was given. Pass project or task_id, or a cwd inside a project's folder.");
+  }
+  const own = task ? benches("AND w.task_id = :p1", [task.id]).map((b) => b.path) : (inferredBench ? [inferredBench] : []);
+  const roots = [...own, ...jobs.folders(sql, projectId)];
+  const cwd = a.cwd || own.find(isDirectory) || jobs.readFolder(sql, projectId);
+  if (!cwd) throw new Error(jobs.folderProblem(sql, projectId) || "The project has no folder for a second opinion to read.");
+  return { task, projectId: Number(projectId), roots, cwd };
+}
+
+/** A plain comment on a task, as add_comment and second_opinion both write it. */
+function addComment(taskId, body) {
+  const task = sql("SELECT id, title FROM tasks WHERE id = :p1", [taskId])[0];
+  if (!task) throw new Error(`No task ${taskId}`);
+  if (!body || !String(body).trim()) throw new Error("A comment needs something in it");
+  const row = sql(`INSERT INTO comments (task_id, author, body, kind, author_type)
+                   VALUES (:p1, :p2, :p3, 'say', :p4) RETURNING *`,
+                  [taskId, ACTOR, String(body).trim(), AUTHOR_TYPE])[0];
+  audit("update", "task", taskId, "commented", task.title);
+  return row;
+}
+
 const TOOLS = {
   whoami: {
     description:
@@ -1257,16 +1365,7 @@ const TOOLS = {
         body: { type: "string", description: "Markdown. Be specific." },
       },
     },
-    run: (a) => {
-      const task = sql("SELECT id, title FROM tasks WHERE id = :p1", [a.task_id])[0];
-      if (!task) throw new Error(`No task ${a.task_id}`);
-      if (!a.body || !String(a.body).trim()) throw new Error("A comment needs something in it");
-      const row = sql(`INSERT INTO comments (task_id, author, body, kind, author_type)
-                       VALUES (:p1, :p2, :p3, 'say', :p4) RETURNING *`,
-                      [a.task_id, ACTOR, String(a.body).trim(), AUTHOR_TYPE])[0];
-      audit("update", "task", a.task_id, "commented", task.title);
-      return row;
-    },
+    run: (a) => addComment(a.task_id, a.body),
   },
 
   // --- the Sheet ---------------------------------------------------------------
@@ -1937,6 +2036,86 @@ const TOOLS = {
     },
   },
 
+  second_opinion: {
+    description:
+      "Ask another agent (Copilot by default) for a second opinion and wait for its answer. It runs read only, with Delphi's tools, in the task's Workbench or the project's folder, and returns what it said. " +
+      "It reads only inside the project's folders and the task's Workbench, never key files, one at a time, and a limited number an hour. " +
+      "Use it to review a diff before a commit or pull request (write the diff to a file inside the project and pass it in files), to diagnose a bug independently (give it the symptom, not your conclusion), or to summarise unfamiliar code. " +
+      "Verify what it says before acting on it. Never send secrets or real personal data. With task_id the answer is also kept on the task's Sheet.",
+    schema: {
+      type: "object",
+      required: ["request"],
+      properties: {
+        request: { type: "string", description: "What to look at and what you want to know, written for them" },
+        files: { type: "array", items: { type: "string" }, description: "Paths it should read: a diff, the files in question" },
+        cwd: { type: "string", description: "Folder to run in. Default: the project's folder" },
+        task_id: { type: "number", description: "Keep the answer on this task's Sheet" },
+        project_id: { type: "number" },
+        project: { type: "string", description: "Key, instead of project_id" },
+        timeout_seconds: { type: "number", description: "Default 300, at most 600" },
+      },
+    },
+    run: async (a) => {
+      const row = secondOpinionAgent();
+      const key = String(readSettings().secondOpinionAgent || "copilot");
+      if (!row) throw new Error(`There is no agent called "${key}" to ask. Set the second opinion agent in Delphi's Settings.`);
+      if (!Number(row.enabled)) throw new Error(`${row.label} is turned off in Delphi's Settings, under Agents. Turn it on to ask it for a second opinion.`);
+
+      const { task, projectId, roots, cwd } = secondOpinionScope(a);
+
+      // Claimed only once everything else has been checked, immediately before
+      // the agent starts, so a call that was refused for a missing file or a
+      // folder outside the project does not count against the hour.
+      let claim = null;
+      const beforeStart = () => {
+        const limit = secondOpinion.hourlyLimit(readSettings());
+        if (limit === 0) return "Second opinions are turned off: the hourly limit in Delphi's Settings is 0.";
+        claim = secondOpinion.claimHourly(sql, { limit, actor: ACTOR, agent: row.key, projectId, taskId: task ? task.id : null });
+        return claim ? null : `${limit} second opinions have been asked for on this database in the last hour, which is the limit in Delphi's Settings. Carry on without one and say so, or ask again later.`;
+      };
+
+      let result;
+      try {
+        result = await secondOpinion.run({
+          row,
+          request: a.request,
+          files: a.files || [],
+          cwd,
+          roots,
+          dataDir: RESOLVED.dataDir,
+          dbPath: DB,
+          beforeStart,
+          timeoutMs: a.timeout_seconds ? Number(a.timeout_seconds) * 1000 : undefined,
+          // Its own name in History, so a note it writes is never mistaken for
+          // the caller's.
+          mcp: { dbPath: DB, dbId: IDENTITY.db_id, projectId, sessionId: null, actor: `${row.key}:second-opinion`, tag: "second-opinion", readOnly: true },
+        });
+      } catch (error) {
+        secondOpinion.finishHourly(sql, claim, "failed");
+        throw error;
+      }
+      secondOpinion.finishHourly(sql, claim, "answered");
+
+      // Kept on the task after the answer is in hand, and a failure to keep it
+      // is reported beside the answer rather than instead of it: the task may
+      // have gone while the agent was thinking, and the answer is still good.
+      if (!task) return result;
+      const first = secondOpinion.redact(String(a.request).trim().split("\n")[0].slice(0, 200)).text;
+      // A Sheet is read by every later session and mirrored into the vault, so
+      // a key the reviewer quoted back from a file it read is taken out first,
+      // and the entry says so rather than leaving a gap nobody can explain.
+      const clean = secondOpinion.redact(result.answer);
+      const said = clean.count
+        ? `\n\n_${clean.count} ${clean.count === 1 ? "thing" : "things"} shaped like a token or private key ${clean.count === 1 ? "was" : "were"} replaced with [redacted] before this was kept._`
+        : "";
+      try {
+        return { ...result, redacted: clean.count, comment_id: addComment(task.id, `**Second opinion from ${result.label}** (asked: ${first})\n\n${clean.text}${said}`).id };
+      } catch (error) {
+        return { ...result, comment_error: `The answer could not be kept on task ${task.id}: ${error.message}` };
+      }
+    },
+  },
+
   list_agents: {
     description:
       "The other agents Delphi can hand work to on this machine, and whether each is turned on. Call this before handoff_send if you are guessing at a name.",
@@ -2390,6 +2569,17 @@ const INTERNAL_TOOLS = new Set([
 ]);
 const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";
 
+// A server started for a second opinion offers only what reads. The reviewer is
+// handed whatever it is reviewing, and a diff can carry instructions; read only
+// has to mean it cannot file work, change a pad, hand a job to an agent that
+// writes, or ask for a second opinion of its own and start a chain. Listed by
+// what is allowed rather than what is not, so a tool added later is closed to it
+// until someone decides otherwise.
+const READ_ONLY = process.env.DELPHI_READ_ONLY === "1";
+// The list lives in agent/second_opinion.js, which hands the same names to
+// Copilot as --available-tools.
+const READ_ONLY_TOOLS = new Set(secondOpinion.READ_ONLY_TOOLS);
+
 // --- JSON-RPC ---------------------------------------------------------------
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
@@ -2407,7 +2597,14 @@ async function handle(req) {
   const { id, method, params } = req;
 
   if (method === "initialize") {
-    const scratchpad = scratchpadState();
+    const scratchpad = READ_ONLY ? { on: false } : scratchpadState();
+    const second = READ_ONLY ? { on: false } : secondOpinionState();
+    // Both directives, when both are on, as separate sections of one text.
+    const instructions = [
+      scratchpad.on ? directives.scratchpadInstructions(scratchpad.project) : null,
+      second.on ? directives.secondOpinionInstructions(second.label) : null,
+    ].filter(Boolean).join("\n\n");
+    if (second.on) secondOpinionRemindedAt = Date.now();
     return {
       protocolVersion: "2024-11-05",
       // listChanged, because the scratchpad setting rewrites tool descriptions.
@@ -2415,19 +2612,26 @@ async function handle(req) {
       // nothing until the agent is restarted.
       capabilities: { tools: { listChanged: true } },
       serverInfo: { name: "brain", version: "1.0.0" },
-      ...(scratchpad.on
-        ? { instructions: directives.scratchpadInstructions(scratchpad.project) }
-        : {}),
+      ...(instructions ? { instructions } : {}),
     };
   }
 
   if (method === "tools/list") {
-    const scratchpad = scratchpadState();
+    // A server started read only carries none of the directives: they tell the
+    // reviewer to write pads and ask for second opinions, which it cannot, and
+    // each one is tokens on someone else's quota spent on an instruction it has
+    // to ignore.
+    const scratchpad = READ_ONLY ? { on: false } : scratchpadState();
     const suffix = scratchpad.on ? directives.scratchpadToolNote(scratchpad.project) : "";
+    const second = READ_ONLY ? { on: false } : secondOpinionState();
+    const secondNote = second.on ? directives.secondOpinionToolNote(second.label) : "";
     return {
-      tools: Object.entries(TOOLS).filter(([name]) => !INTERNAL_TOOLS.has(name) && !UNLISTED_TOOLS.has(name)).map(([name, t]) => ({
+      tools: Object.entries(TOOLS).filter(([name]) => !INTERNAL_TOOLS.has(name) && !UNLISTED_TOOLS.has(name) &&
+                                                      (!READ_ONLY || READ_ONLY_TOOLS.has(name))).map(([name, t]) => ({
         name,
-        description: t.description + (suffix && SCRATCHPAD_TOOLS.has(name) ? suffix : ""),
+        description: t.description +
+          (suffix && SCRATCHPAD_TOOLS.has(name) ? suffix : "") +
+          (secondNote && SECOND_OPINION_TOOLS.has(name) ? secondNote : ""),
         inputSchema: t.schema,
       })),
     };
@@ -2436,6 +2640,9 @@ async function handle(req) {
   if (method === "tools/call") {
     const tool = TOOLS[params.name];
     if (!tool || (INTERNAL_TOOLS.has(params.name) && !CLI_CLIENT)) throw new Error(`Unknown tool ${params.name}`);
+    if (READ_ONLY && !READ_ONLY_TOOLS.has(params.name)) {
+      throw new Error(`${params.name} is not available here: this Delphi server was started read only, for a second opinion. Say what you would do instead.`);
+    }
     const result = await tool.run(params.arguments || {});
     // Compact JSON. Indentation is a fifth of a pretty-printed answer and an
     // agent reads the structure without it, so every call paid for whitespace.
@@ -2445,9 +2652,20 @@ async function handle(req) {
     // arrives while it is already working rather than at startup. Only on
     // list_projects: that is the orienting call, and repeating this on every
     // result would train the model to skip it.
-    const scratchpad = scratchpadState();
+    // None of this on a read-only server; see tools/list.
+    const scratchpad = READ_ONLY ? { on: false } : scratchpadState();
     if (scratchpad.on && params.name === "list_projects") {
       content.push({ type: "text", text: directives.scratchpadReminder(scratchpad.project) });
+    }
+    // On the orienting call, and on any call when this session has not been
+    // told for an hour. The second half is what reaches a session that was
+    // already running when the mode was turned on: it read its instructions
+    // before the mode existed and will not read them again.
+    const second = READ_ONLY ? { on: false } : secondOpinionState();
+    if (second.on && params.name !== "second_opinion" &&
+        (params.name === "list_projects" || Date.now() - secondOpinionRemindedAt >= SECOND_OPINION_REMIND_MS)) {
+      secondOpinionRemindedAt = Date.now();
+      content.push({ type: "text", text: directives.secondOpinionReminder(second.label) });
     }
     return { content };
   }
@@ -2471,7 +2689,8 @@ async function handle(req) {
  */
 function watchSettings() {
   const settingsPath = SETTINGS_FILE;
-  let previous = JSON.stringify(scratchpadState());
+  const effective = () => JSON.stringify([scratchpadState(), secondOpinionState()]);
+  let previous = effective();
   let timer = null;
 
   try {
@@ -2479,7 +2698,7 @@ function watchSettings() {
       if (filename && String(filename) !== path.basename(settingsPath)) return;
       clearTimeout(timer);
       timer = setTimeout(() => {
-        const next = JSON.stringify(scratchpadState());
+        const next = effective();
         if (next === previous) return;
         previous = next;
         send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });

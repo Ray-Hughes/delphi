@@ -219,6 +219,17 @@ const LATER_TABLES = [
   flag_id           INTEGER REFERENCES item_flags(id) ON DELETE SET NULL,
   PRIMARY KEY (entity, entity_id)
 )`],
+  // What the second_opinion hourly limit counts. See schema.sql.
+  ["second_opinions", `CREATE TABLE IF NOT EXISTS second_opinions (
+  id          INTEGER PRIMARY KEY,
+  actor       TEXT,
+  agent       TEXT NOT NULL,
+  project_id  INTEGER,
+  task_id     INTEGER,
+  started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT,
+  outcome     TEXT
+)`],
 ];
 
 // [name, table, columns the index needs, statement]. The columns are checked
@@ -258,6 +269,8 @@ const LATER_INDEXES = [
    "CREATE INDEX IF NOT EXISTS idx_item_projects_project ON item_projects(project_id, entity, entity_id)"],
   ["idx_item_copies_source", "item_copies", ["entity", "source_id"],
    "CREATE INDEX IF NOT EXISTS idx_item_copies_source ON item_copies(entity, source_id)"],
+  ["idx_second_opinions_started", "second_opinions", ["started_at"],
+   "CREATE INDEX IF NOT EXISTS idx_second_opinions_started ON second_opinions(started_at)"],
 ];
 
 /**
