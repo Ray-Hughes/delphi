@@ -902,6 +902,7 @@ globalThis.DelphiSettingsPanel = (() => {
     },
 
     focus(root) { root.append(...schemaGroups("focus")); },
+    brief(root) { root.append(...schemaGroups("brief")); },
 
     data(root) {
       const d = P.doctor;

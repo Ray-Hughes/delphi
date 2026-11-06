@@ -568,6 +568,8 @@ const benches = createWorkbench({
 const { makeItemStore, inProject } = require("../items/store");
 // Stuck tasks and the daily brief, shared with the window's Today (main/today.js).
 const todayBrief = require("../today/brief");
+// The weekly review, shared with the window's (main/weekly.js). Read only here.
+const weeklyReview = require("../today/weekly");
 const ITEM_AUTHOR_TYPE = AUTHOR_TYPE || sheetFormat.inferAuthorType(ACTOR);
 const itemStore = makeItemStore({
   sql, batch, actor: ACTOR, authorType: ITEM_AUTHOR_TYPE, settings: () => readSettings(),
@@ -2703,6 +2705,26 @@ const TOOLS = {
     run: (a) => {
       const full = todayBrief.brief(sql, { since: a.since || null, projectId: resolveProjectId(a) });
       return a.detail === "full" ? full : todayBrief.compact(full, { budget: a.budget || 1200 });
+    },
+  },
+
+  // The weekly review (today/weekly.js), the rows the window's review shows.
+  // Read only: Park, Drop and saving objectives are a person's, in the window.
+  weekly_review: {
+    description: "The last 7 days, read only: decisions with their questions, agent cost and time, tasks that went backwards, done count; stale tasks, Workbenches idle 7 days, kept copies expiring within 7 days with the restore command; candidates and last objectives.",
+    schema: {
+      type: "object",
+      properties: {
+        days: { type: "number", description: "Default 7, at most 31" },
+        project_id: { type: "number" },
+        project: { type: "string" },
+        budget: { type: "number" },
+        detail: { type: "string", enum: ["brief", "full"] },
+      },
+    },
+    run: (a) => {
+      const full = weeklyReview.review(sql, { projectId: resolveProjectId(a), days: a.days || 7 });
+      return a.detail === "full" ? full : weeklyReview.compact(full, { budget: a.budget || 1200 });
     },
   },
 };

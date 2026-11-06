@@ -257,7 +257,26 @@
       return out;
     }
 
-    return { forTask, rollup };
+    /**
+     * Totals over jobs whose last moment falls in (since, until], for the
+     * weekly review's rolling seven days, which a calendar week from Monday
+     * does not match on any day but Sunday. Per agent, project and task.
+     */
+    function between({ since, until, projectId = null }) {
+      const params = [String(since), String(until)];
+      let where = `datetime(${AT}) > datetime(:p1) AND datetime(${AT}) <= datetime(:p2)`;
+      if (projectId != null) { params.push(Number(projectId)); where += ` AND h.project_id = :p${params.length}`; }
+      const rows = sql(`SELECT ${JOB_COLUMNS} WHERE ${where} ORDER BY h.id`, params);
+      return {
+        since, until, project_id: projectId == null ? null : Number(projectId), cost_label: COST_LABEL,
+        totals: total(rows),
+        by_harness: groupBy(rows, "harness", "harness_label"),
+        by_project: groupBy(rows, "project_id", "project_name"),
+        by_task: groupBy(rows.filter((r) => r.task_id != null), "task_id"),
+      };
+    }
+
+    return { forTask, rollup, between };
   }
 
   // ---------------------------------------------------------------------------

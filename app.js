@@ -14664,6 +14664,13 @@ DelphiMemory.init({
   },
 });
 COMMANDS.push(...DelphiMemory.commands());
+// The weekly review (ui/weekly.js), lent Finish so an idle Workbench is put away the one careful way.
+if (window.DelphiWeekly) {
+  DelphiWeekly.init({ ...shell, refresh: () => refresh(), repaint: () => { if (onHomeView()) repaintKeepingFocus(); },
+    notify: (text) => notify(text), openTask: (id) => openTaskSheet(id), isAgent, projectName: (id) => (projectById(id) || {}).name || "",
+    finishWorkbench: (wbId, taskId, opts) => finishWorkbench(wbId, taskId, opts) });
+  COMMANDS.push(...DelphiWeekly.commands());
+}
 DelphiKeys.install({
   commands: () => COMMANDS,
   // A panel, a menu, a dialog or a popover owns the keyboard while it is open.

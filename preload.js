@@ -252,6 +252,8 @@ contextBridge.exposeInMainWorld("delphi", {
   dialog: {
     pickFolder: (title, options) => call("dialog:pickFolder", title, options),
   },
+  // The weekly review: the review, the Today card's question, Park, Drop, Undo (by receipt) and the objectives.
+  weekly: { view: (opts) => call("weekly:view", opts || {}), status: () => call("weekly:status"), park: (id) => call("weekly:park", id), drop: (id, why) => call("weekly:drop", id, why), undo: (what) => call("weekly:undo", what), save: (payload) => call("weekly:save", payload) },
   // The cost and time ledger (main/ledger.js). Read only.
   ledger: {
     forTask: (taskId) => call("ledger:forTask", taskId),

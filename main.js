@@ -2015,6 +2015,9 @@ require("./main/memory").register(handle, { memory: require("./main/memory").cre
 const today = require("./main/today").createToday({ sql: db.sqlP, dataDir: paths.DATA_DIR });
 require("./main/today").register(handle, { today });
 today.watch(app);
+// The weekly review (today/weekly.js), and its Park, Drop and objectives.
+const weeklyMain = require("./main/weekly");
+weeklyMain.register(handle, { weekly: weeklyMain.createWeekly({ db, sheets, after: () => scheduleVaultExport() }) });
 
 handle("backups:list", () => ({ dir: backups.dir, backups: backups.list(), lastRestore }));
 handle("backups:preview", (name) => backups.preview(name));
