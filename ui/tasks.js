@@ -48,27 +48,34 @@ globalThis.DelphiTasks = (() => {
     let s = String(text == null ? "" : text).trim();
     let priority = "med";
     let assignee = null;
-    if (s.startsWith("!") && !/^!(high|med|medium|low)\b/i.test(s)) { priority = "high"; s = s.slice(1).trim(); }
-    s = s.replace(/(^|\s)!(high|medium|med|low)\b/gi, (m, sp, p) => { const v = p.toLowerCase(); priority = v === "medium" ? "med" : v; return sp; })
+    if (s.startsWith("!") && !/^!(high|med|medium|low)(?=\s|$)/i.test(s)) { priority = "high"; s = s.slice(1).trim(); }
+    // Followed by a space or the end, so "!low-level bug" is a title, not a priority.
+    s = s.replace(/(^|\s)!(high|medium|med|low)(?=\s|$)/gi, (m, sp, p) => { const v = p.toLowerCase(); priority = v === "medium" ? "med" : v; return sp; })
       .replace(/(^|\s)@([\w:.-]+)/g, (m, sp, who) => { assignee = who; return sp; })
       .replace(/\s+/g, " ").trim();
     const ref = (s.match(/\b([A-Z][A-Z0-9]+-\d+)\b/) || [])[1] || null;
     return { title: s, priority, assignee, ref };
   }
 
+  /** The three fields the editor holds, as the editor would show them for a task. */
+  const baseOf = (t) => ({ title: String((t && t.title) || ""), status: statusOf(t), priority: priOf(t) });
+
   /**
    * What an inline edit changes, as the fields to send, or null for nothing.
-   * Only what moved is sent: a status this version shows as In progress (In
-   * review, written by a newer Delphi) is never rewritten as doing because the
-   * row was opened and saved, and an untouched title is never re-trimmed.
+   * Compared with `base`, the task as it was when the editor opened, never
+   * with the row as it is now: an agent that retitled the task or moved its
+   * status meanwhile keeps its change unless this edit touched that same
+   * field. So a status this version shows as In progress (In review, written
+   * by a newer Delphi) is never rewritten as doing because the row was opened
+   * and saved, and an untouched title is never re-trimmed.
    */
-  function editPatch(task, draft) {
+  function editPatch(task, draft, base = baseOf(task)) {
     const out = {};
-    const title = String(draft.title == null ? task.title : draft.title).trim();
+    const title = String(draft.title == null ? base.title : draft.title).trim();
     if (!title) return { error: "A task needs a title." };
-    if (title !== String(task.title || "").trim()) out.title = title;
-    if (draft.status && KNOWN.has(draft.status) && draft.status !== statusOf(task)) out.status = draft.status;
-    if (draft.priority && PRI[draft.priority] != null && draft.priority !== priOf(task)) out.priority = draft.priority;
+    if (title !== String(base.title || "").trim()) out.title = title;
+    if (draft.status && KNOWN.has(draft.status) && draft.status !== base.status) out.status = draft.status;
+    if (draft.priority && PRI[draft.priority] != null && draft.priority !== base.priority) out.priority = draft.priority;
     return { patch: Object.keys(out).length ? out : null };
   }
 
@@ -164,7 +171,8 @@ globalThis.DelphiTasks = (() => {
     const q = String(query || "").trim().toLowerCase();
     if (!q) return true;
     const hay = `#${t.id} ${t.title || ""} ${t.ref || ""} ${t.assignee || ""}`.toLowerCase();
-    return q.split(/\s+/).every((w) => hay.includes(w));
+    // "#6" is task 6, not the start of #60.
+    return q.split(/\s+/).every((w) => (/^#\d+$/.test(w) ? w === `#${t.id}` : hay.includes(w)));
   }
 
   // The four filters the metrics strip sets (state.taskFilter), as app.js reads them.
@@ -245,7 +253,7 @@ globalThis.DelphiTasks = (() => {
     return parts[0].slice(0, 1).toUpperCase() + parts[0].slice(1, 2).toLowerCase();
   }
 
-  const pure = { STATUSES, PRIORITIES, PROPS, GROUPS, ORDERS, DEFAULTS, statusOf, parseQuick, editPatch, pillOf,
+  const pure = { STATUSES, PRIORITIES, PROPS, GROUPS, ORDERS, DEFAULTS, statusOf, parseQuick, baseOf, editPatch, pillOf,
     toggleSub, dropPatch, normalise, arrange, columns, matches, ageDays, initials };
   if (typeof document === "undefined") return { pure };
 
@@ -266,6 +274,8 @@ globalThis.DelphiTasks = (() => {
   let editing = null;       // { id, title, status, priority } while a row is its own editor
   let quickBusy = false;
   let quickMsg = null;
+  let quickLive = null;     // { id, value }: what is in quick entry now, carried into a rebuilt field
+  let adding = null;        // { status, text }: an open "add to this status" line, redrawn by a repaint
   let lastAdded = null;
   let doneOpen = false;
   let pop = null;           // the open Display popover
@@ -600,12 +610,13 @@ globalThis.DelphiTasks = (() => {
       if (other) saveEdit(other, prev, { focus: false });
       else editing = null;
     }
-    editing = { id: t.id, title: t.title, status: statusOf(t), priority: priOf(t) };
+    editing = { id: t.id, ...baseOf(t), base: baseOf(t) };
     const ed = editor(t, ctxNow.opts, ctxNow);
     node.replaceWith(ed);
     const field = ed.querySelector(".tk-edit-title");
     field.focus();
     field.select();
+    focusWas = "edit";
     return true;
   }
 
@@ -633,7 +644,7 @@ globalThis.DelphiTasks = (() => {
   const saving = new Set();
   async function saveEdit(t, draft, { field = null, focus = false } = {}) {
     if (!draft || saving.has(draft)) return;
-    const { patch, error } = editPatch(t, draft);
+    const { patch, error } = editPatch(t, draft, draft.base);
     if (error) {
       // An emptied title is refused on Enter; walking away from one puts the
       // old title back rather than holding the focus hostage.
@@ -643,10 +654,25 @@ globalThis.DelphiTasks = (() => {
     }
     if (!patch) { if (editing === draft) { editing = null; focusWas = null; swapRow(t.id, focus); } return; }
     saving.add(draft);
+    const sent = { title: draft.title, status: draft.status, priority: draft.priority };
     try {
       await window.delphi.tasks.update(t.id, patch);
       const keyBefore = groupKey(t, ctxNow.opts);
       Object.assign(t, patch);
+      // Typed into while it was being written: the editor stays open on what
+      // is there now, and the next save sends only what changed since.
+      const typedOn = editing === draft && ["title", "status", "priority"].some((k) => draft[k] !== sent[k]);
+      if (typedOn) {
+        draft.base = { ...draft.base, ...sent, title: String(sent.title).trim() };
+        if (patch.status || groupKey(t, ctxNow.opts) !== keyBefore) await app.refresh();
+        // A focusout while this was written was turned away by `saving`; if
+        // the person has left the row, what they typed since is saved now.
+        setTimeout(() => {
+          const node = document.querySelector(`#content .tk-row.editing[data-task-id="${t.id}"]`);
+          if (editing === draft && (!node || !node.contains(document.activeElement))) saveEdit(ctxNow.byId.get(t.id) || t, draft, { focus: false });
+        }, 0);
+        return;
+      }
       if (editing === draft) { editing = null; focusWas = null; }
       // A change that moves the task to another group, or changes what the
       // tab counts, is a repaint; a new title or priority is just this row.
@@ -680,7 +706,7 @@ globalThis.DelphiTasks = (() => {
     if (!focusWas) return;
     const a = document.activeElement;
     if (a && a !== document.body && document.contains(a)) return;
-    const sel = { quick: ".tk-quick-in", filter: ".tk-filter-in", edit: ".tk-edit-title" }[focusWas];
+    const sel = { quick: ".tk-quick-in", filter: ".tk-filter-in", edit: ".tk-edit-title", add: ".tk-add-in" }[focusWas];
     const node = sel && root.querySelector(sel);
     if (!node) return;
     node.focus({ preventScroll: true });
@@ -734,6 +760,9 @@ globalThis.DelphiTasks = (() => {
     const field = el("input", { className: "field tk-quick-in", type: "text", placeholder: "Quick task entry. Enter adds it; !high and @who work too" });
     field.setAttribute("aria-label", "Quick task entry");
     const draftId = s.projectId || "all";
+    // A repaint builds a new field while the old one may hold text typed a
+    // moment ago, newer than the saved draft; that text comes across.
+    if (quickLive && quickLive.id === draftId) field.value = quickLive.value;
     if (window.DelphiRecovery) DelphiRecovery.bindDraft(field, "quick", draftId);
     track(field, "quick");
     const chips = el("span", { className: "tk-quick-chips" });
@@ -748,7 +777,7 @@ globalThis.DelphiTasks = (() => {
       if (target != null) chips.append(el("span", { className: "tk-chip", textContent: app.projectName(target) || "Project" }));
       chips.append(el("span", { className: "tk-hint" }, kbd("Enter"), " add"));
     };
-    field.addEventListener("input", () => { quickMsg = null; paintChips(); const m = wrap.parentNode && wrap.parentNode.querySelector(".tk-msg"); if (m) m.remove(); });
+    field.addEventListener("input", () => { quickLive = { id: draftId, value: field.value }; quickMsg = null; paintChips(); const m = wrap.parentNode && wrap.parentNode.querySelector(".tk-msg"); if (m) m.remove(); });
     field.onkeydown = async (e) => {
       if (e.isComposing) return;
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); field.blur(); return; }
@@ -764,6 +793,7 @@ globalThis.DelphiTasks = (() => {
       // if the write fails.
       const sent = field.value;
       field.value = "";
+      quickLive = { id: draftId, value: "" };
       paintChips();
       try {
         const created = await window.delphi.tasks.create({ projectId: target, title: v.title, priority: v.priority, assignee: v.assignee, ref: v.ref });
@@ -779,6 +809,17 @@ globalThis.DelphiTasks = (() => {
         await app.refresh();
       } catch (error) {
         if (field.isConnected) { field.value = field.value ? `${sent} ${field.value}` : sent; field.dispatchEvent(new Event("input")); }
+        else {
+          // A repaint built a new field while this was being written: the text goes back into that one.
+          // Only into this project's field: after a switch, it is kept as this project's draft instead.
+          const since = quickLive && quickLive.id === draftId ? quickLive.value : "";
+          const value = since ? `${sent} ${since}` : sent;
+          const here = (app.state().projectId || "all") === draftId && owns(app.state());
+          const live = here ? document.querySelector("#content .tk-quick-in") : null;
+          if (live) { live.value = value; live.dispatchEvent(new Event("input")); }
+          else if (window.DelphiRecovery) DelphiRecovery.saveDraft("quick", draftId, value);
+          if (!live && quickLive && quickLive.id === draftId) quickLive = { id: draftId, value };
+        }
         quickMsg = { error: true, text: errOf(error) };
         const boxNow = wrap.parentNode;
         if (boxNow) { boxNow.querySelector(".tk-msg")?.remove(); boxNow.append(el("div", { className: "tk-msg err", role: "status", textContent: quickMsg.text })); }
@@ -930,16 +971,35 @@ globalThis.DelphiTasks = (() => {
     return head;
   }
 
-  /** An entry line under a status heading: what is typed there starts in that status. */
+  /** Opens an entry line under a status heading: what is typed there starts in that status. */
   function addInto(after, status, ctx) {
     const existing = after.nextElementSibling;
     if (existing && existing.classList.contains("tk-add")) { existing.querySelector("input").focus(); return; }
+    // One entry line at a time: a second one replaces the first.
+    for (const old of document.querySelectorAll("#content .tk-add")) old.remove();
+    if (!adding || adding.status !== status) adding = { status, text: "" };
+    const line = addLine(ctx, adding);
+    after.after(line);
+    line.querySelector("input").focus();
+    // Said here as well as by the focus event, which a window in the
+    // background does not fire.
+    focusWas = "add";
+  }
+
+  /**
+   * The entry line for `adding`. Its text lives at module level, so a repaint
+   * (an agent's write, a refresh) draws the line again with what was typed.
+   */
+  function addLine(ctx, mine) {
+    const status = mine.status;
     const line = el("div", { className: "tk-add" });
-    const input = el("input", { type: "text", placeholder: `New task in ${STATUS_LABEL.get(status)}, then Enter` });
+    const input = el("input", { className: "tk-add-in", type: "text", value: mine.text, placeholder: `New task in ${STATUS_LABEL.get(status)}, then Enter` });
     input.setAttribute("aria-label", `New task in ${STATUS_LABEL.get(status)}`);
+    track(input, "add");
+    input.oninput = () => { mine.text = input.value; };
     input.onkeydown = async (e) => {
       if (e.isComposing) return;
-      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); line.remove(); return; }
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); if (adding === mine) adding = null; focusWas = null; line.remove(); return; }
       if (e.key !== "Enter") return;
       e.preventDefault();
       const v = parseQuick(input.value);
@@ -949,12 +1009,14 @@ globalThis.DelphiTasks = (() => {
       try {
         const created = await window.delphi.tasks.create({ projectId: target, title: v.title, priority: v.priority, assignee: v.assignee, ref: v.ref, status });
         lastAdded = created && created.id;
+        // Left open for the next one, empty unless more was typed meanwhile.
+        if (adding === mine) mine.text = "";
+        focusWas = "add";
         await app.refresh();
       } catch (error) { app.notify(errOf(error)); input.readOnly = false; }
     };
     line.append(I("plus", "sm"), input);
-    after.after(line);
-    input.focus();
+    return line;
   }
 
   /**
@@ -970,6 +1032,7 @@ globalThis.DelphiTasks = (() => {
     for (const g of groups) {
       const isDone = g.kind === "status" && g.status === "done";
       if (g.label != null) queue.push(() => groupHead(g, ctx));
+      if (adding && g.kind === "status" && adding.status === g.status) { const mine = adding; queue.push(() => addLine(ctx, mine)); }
       if (isDone && !doneOpen && ctx.taskFilter !== "done") continue;
       let list = g.tasks;
       let more = 0;
@@ -1043,10 +1106,13 @@ globalThis.DelphiTasks = (() => {
       if (e.key === "Enter") { e.preventDefault(); app.openTask(t.id); }
       else if (e.key === " ") { e.preventDefault(); app.quickLook(t.id); }
     };
-    c.ondragstart = (e) => { e.dataTransfer.setData("text/plain", String(t.id)); e.dataTransfer.effectAllowed = "move"; c.classList.add("dragging"); };
+    c.ondragstart = (e) => { e.dataTransfer.setData(DRAG_TYPE, String(t.id)); e.dataTransfer.effectAllowed = "move"; c.classList.add("dragging"); };
     c.ondragend = () => c.classList.remove("dragging");
     return c;
   }
+
+  // A type of our own: dropping plain text such as "12" on Done must not close #12.
+  const DRAG_TYPE = "application/x-delphi-task";
 
   const EMPTY = { todo: "Nothing to do.", doing: "Nothing in progress. Drag a card here.", blocked: "Nothing blocked.", done: "Nothing done yet." };
 
@@ -1084,15 +1150,19 @@ globalThis.DelphiTasks = (() => {
       };
       if (list.length) more();
       else body.append(el("div", { className: "tk-col-empty", textContent: EMPTY[col.status] }));
-      column.append(head, body);
-      const land = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; column.classList.add("over"); };
+      column.append(head);
+      if (adding && adding.status === col.status) column.append(addLine(ctx, adding));
+      column.append(body);
+      // Only a card is something to land: other dragged text gets no target.
+      const land = (e) => { if (!e.dataTransfer || !e.dataTransfer.types.includes(DRAG_TYPE)) return; e.preventDefault(); e.dataTransfer.dropEffect = "move"; column.classList.add("over"); };
       column.ondragover = land;
       column.ondragenter = land;
       column.ondragleave = (e) => { if (!column.contains(e.relatedTarget)) column.classList.remove("over"); };
       column.ondrop = async (e) => {
         e.preventDefault();
         column.classList.remove("over");
-        const t = ctx.byId.get(Number(e.dataTransfer.getData("text/plain")));
+        const raw = e.dataTransfer.getData(DRAG_TYPE);
+        const t = raw ? ctx.byId.get(Number(raw)) : null;
         const patch = dropPatch(t, col.status);
         if (!patch) return;
         try { await window.delphi.tasks.update(t.id, patch); await app.refresh(); } catch (error) { app.notify(errOf(error)); }
@@ -1163,6 +1233,7 @@ globalThis.DelphiTasks = (() => {
     placeWas = place;
     focusWas = null;
     filterText = "";
+    adding = null;
     opened.clear();
     doneOpen = false;
     if (pop) closePop();
