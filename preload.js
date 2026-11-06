@@ -34,6 +34,8 @@ contextBridge.exposeInMainWorld("delphi", {
   },
   tasks: {
     list: (opts) => call("tasks:list", opts),
+    reviewReady: () => call("tasks:reviewReady"),
+    inReview: () => call("tasks:inReview"),
     create: (payload) => call("tasks:create", payload),
     update: (id, fields) => call("tasks:update", id, fields),
     remove: (id) => call("tasks:delete", id),

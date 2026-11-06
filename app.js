@@ -584,6 +584,10 @@ async function refresh() {
     ? state.allTasks
     : await window.delphi.tasks.list({ projectId: null, includeDone: true });
   try { state.runs = await window.delphi.runs.list({ limit: 300 }); } catch { state.runs = []; }
+  // Asked each refresh, never assumed: the rebuild that allows In review may
+  // have been held back at launch, and then nothing should offer it.
+  try { state.reviewReady = await window.delphi.tasks.reviewReady(); } catch { state.reviewReady = true; }
+  try { state.inReview = await window.delphi.tasks.inReview(); } catch { state.inReview = []; }
   if (window.DelphiNeeds) await DelphiNeeds.load();
   render();
   reloadFlags();
@@ -4385,6 +4389,7 @@ function taskTableRow(t) {
   const statusCell = el("div", { className: "tcell" });
   const status = el("select", { className: `cell-select st-${statusOf(t)}` });
   for (const [value, label] of BOARD_COLUMNS) {
+    if (value === "review" && state.reviewReady === false && t.status !== "review") continue;
     status.append(el("option", { value, textContent: label, selected: statusOf(t) === value }));
   }
   status.onclick = (e) => e.stopPropagation();
@@ -4725,7 +4730,7 @@ function taskMenu(t, x, y, { after = null } = {}) {
       ? [{ label: "Reopen", run: () => set({ status: "todo" }) }]
       : [{ label: "Mark done", run: () => set({ status: "done" }) }]),
     ...(statusOf(t) === "doing" ? [] : [{ label: t.status === "review" ? "Back to in progress" : "Start", run: () => set({ status: "doing" }) }]),
-    ...(t.status === "review" || t.status === "done" ? [] : [{ label: "Put up for review", run: () => set({ status: "review" }) }]),
+    ...(t.status === "review" || t.status === "done" || state.reviewReady === false ? [] : [{ label: "Put up for review", run: () => set({ status: "review" }) }]),
     ...(t.status === "blocked"
       ? [{ label: "Unblock", run: () => set({ status: "todo" }) }]
       : [{ label: "Block", run: () => set({ status: "blocked" }) }]),
@@ -9062,6 +9067,7 @@ async function openTaskSheet(taskId) {
       build: (done) => {
         const s = el("select", { className: "ts-inline" });
         for (const [v, label] of Object.entries(STATUS_LABEL)) {
+          if (v === "review" && state.reviewReady === false && t.status !== "review") continue;
           s.append(el("option", { value: v, textContent: label, selected: statusOf(t) === v }));
         }
         s.onchange = () => write({ status: s.value }, "status saved").then(done);
@@ -10029,9 +10035,10 @@ const needsYouCount = () => waitingRuns().filter((r) => !isAnswered(r)).length;
 const needsYouTotal = () => needsYouCount() + reviewRuns().length + reviewTasks().length + (state.flagRows || []).length + (window.DelphiNeeds ? DelphiNeeds.count() : 0);
 // Tasks in review: finished work that waits on a person to move it on, so it
 // is Needs you's by definition. Parents only; a subtask shows by its parent.
-// Not an archived project's, as today/brief.js inReview leaves them out.
-const reviewTasks = () => (state.everyTask || []).filter((t) => t.status === "review" && !t.parent_id && (t.project_id == null || projectById(t.project_id)))
-  .sort((a, b) => String(a.updated_at).localeCompare(String(b.updated_at)) || a.id - b.id);
+// today/brief.js inReview: subtasks too (unless their parent is in review as
+// well), never an archived project's, oldest wait first, each with since, the
+// last time it entered review.
+const reviewTasks = () => state.inReview || [];
 const onHomeView = () => !state.query && !state.projectId && HOME_VIEWS.includes(state.view);
 
 /**
@@ -12624,7 +12631,8 @@ function reviewTaskRow(t) {
   row.dataset.row = `review-task-${t.id}`;
   const title = el("div", { className: "t" }, el("b", { textContent: `#${t.id}` }), ` ${t.title || ""}`);
   const s = el("div", { className: "s" }, projectDot(t.project_id), el("span", { textContent: t.project_name || "" }));
-  if (t.assignee) s.append(el("span", { className: "who", textContent: t.assignee }));
+  if (t.moved_by) s.append(el("span", { className: "who", textContent: `put up by ${t.moved_by}` }));
+  else if (t.assignee) s.append(el("span", { className: "who", textContent: t.assignee }));
   const main = el("div", { style: "min-width:0" }, el("span", { className: "k", textContent: "In review" }), title, s);
   const move = (status, words) => async () => {
     try { await window.delphi.tasks.update(t.id, { status }); notify(`#${t.id} ${words}.`); refresh(); } catch (error) { notify(String(error.message || error)); }
@@ -12635,7 +12643,7 @@ function reviewTaskRow(t) {
   back.onclick = move("doing", "is back in progress");
   const open = el("button", { className: "btn", type: "button", textContent: "Open" });
   open.onclick = () => openTaskSheet(t.id);
-  const since = t.updated_at;
+  const since = t.since || t.updated_at;
   const ring = el("span", { className: "tk-st-ring st-review rv-ring" });
   ring.setAttribute("aria-hidden", "true");
   row.append(ring, main, el("div", { className: "side" },

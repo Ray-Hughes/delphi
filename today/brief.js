@@ -226,7 +226,8 @@ function stuck(sql, { now = new Date(), projectId = null } = {}) {
  * Every task in review, for Needs you: oldest wait first. since is when it
  * last entered review (its newest status event saying so, else the row's
  * updated_at for a task with no such event), and days is whole days since.
- * Subtasks are left out: a subtask in review is shown by its parent's row.
+ * A subtask in review is listed too, unless its parent is in review as well,
+ * which then stands for both.
  */
 function inReview(sql, { now = new Date(), projectId = null } = {}) {
   const at = stamp(now);
@@ -236,7 +237,8 @@ function inReview(sql, { now = new Date(), projectId = null } = {}) {
                      datetime(t.updated_at)) AS since,
             (SELECT e.actor FROM status_events e WHERE e.task_id = t.id AND e.status = 'review' ORDER BY e.at DESC, e.id DESC LIMIT 1) AS moved_by
        FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
-      WHERE t.status = 'review' AND t.parent_id IS NULL AND ${LIVE_PROJECT} AND ${inScope("t", 1)}
+      WHERE t.status = 'review' AND ${LIVE_PROJECT} AND ${inScope("t", 1)}
+        AND NOT EXISTS (SELECT 1 FROM tasks pt WHERE pt.id = t.parent_id AND pt.status = 'review')
       ORDER BY since, t.id`,
     [projectId == null ? null : Number(projectId)]);
   const nowMs = msOf(at);

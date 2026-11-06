@@ -626,7 +626,13 @@ function rebuildStatuses(query, { point = null } = {}) {
   const legacyWas = Number(((query("PRAGMA legacy_alter_table") || [])[0] || {}).legacy_alter_table) === 1;
   const done = { ran: false, tables: [], rows: {} };
   try {
-    if (fkWas) { query("PRAGMA foreign_keys = OFF"); fkOff = true; }
+    if (fkWas) {
+      query("PRAGMA foreign_keys = OFF");
+      fkOff = true;
+      // Read back, because it is silently ignored inside a transaction, and a
+      // drop with foreign keys still on cascades into every Sheet entry.
+      if (Number(((query("PRAGMA foreign_keys") || [])[0] || {}).foreign_keys) !== 0) throw new Error("foreign keys could not be turned off for the rebuild");
+    }
     if (!legacyWas) { query("PRAGMA legacy_alter_table = ON"); legacyOn = true; }
     query("BEGIN IMMEDIATE");
     try {

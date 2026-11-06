@@ -80,7 +80,9 @@ function open() {
       const home = path.resolve(path.dirname(DB_PATH)) === path.resolve(paths.DATA_DIR) ? paths.DATA_DIR : path.dirname(DB_PATH);
       const dir = path.join(home, "backups");
       fs.mkdirSync(dir, { recursive: true });
-      const file = path.join(dir, `before-review-${new Date().toISOString().replace(/\.\d+Z$/, "").replace(/:/g, "-")}.db`);
+      // The pid and a random tail as well as the time: main.js names its own
+      // snapshot to the second, and VACUUM INTO refuses a file that exists.
+      const file = path.join(dir, `before-review-${new Date().toISOString().replace(/\.\d+Z$/, "").replace(/:/g, "-")}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.db`);
       db.prepare("VACUUM INTO ?").run(file);
       statusGate = { hold: false, point: { file, label: "Before adding In review" } };
     } catch (error) {
@@ -97,6 +99,7 @@ function open() {
       statusRebuild = { ran: false, error: String(error.message || error) };
       console.error("could not rebuild the task tables for In review; nothing was changed", error);
     }
+    pruneReviewSnapshots(statusQuery);
   }
   // One folder, one project (workbench/folders.js). After the schema, so the
   // tables it writes exist, and before anything reads a project. main.js takes
@@ -133,6 +136,27 @@ function prepareStatusRebuild({ hold = false, file = null } = {}) {
   statusGate = { hold: Boolean(hold), point: file ? { file, label: "Before adding In review" } : null };
 }
 const statusRebuildResult = () => statusRebuild;
+
+/**
+ * A rebuild that keeps failing would otherwise leave a new before-review copy
+ * of the whole database behind at every launch. A before-review snapshot no
+ * restore point names is one whose rebuild never happened, so nothing can need
+ * it once a newer one exists: all but the newest such go. One a restore point
+ * names is the way back from the rebuild and is left for slice 1's 30 days.
+ */
+function pruneReviewSnapshots(query) {
+  const file = statusGate.point && statusGate.point.file;
+  if (!file) return;
+  try {
+    const dir = path.dirname(file);
+    const named = new Set(query("SELECT backup_path FROM restore_points WHERE backup_path IS NOT NULL").map((r) => r.backup_path));
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      if (!/^before-review-.*\.db$/.test(name) || full === file || named.has(full)) continue;
+      fs.rmSync(full, { force: true });
+    }
+  } catch (error) { console.error("tidying the before-review snapshots", error); }
+}
 
 /** Throws a sentence saying why when this database cannot store review yet. */
 function assertReviewReady(status) {

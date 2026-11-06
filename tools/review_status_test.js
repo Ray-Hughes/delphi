@@ -239,9 +239,16 @@ function rollback(pristine) {
 
 function bare(pristine) {
   section("opened without main.js: db.js takes its own snapshot first");
-  const file = path.join(dir, "bare.db");
+  // A folder of its own, so its snapshot never shares a name or a folder with
+  // the ones the rest of this test takes.
+  const home = path.join(dir, "bare");
+  fs.mkdirSync(path.join(home, "backups"), { recursive: true });
+  const file = path.join(home, "bare.db");
   fs.copyFileSync(pristine, file);
   const data = path.join(dir, "bare-data");
+  // One a failed launch left behind: no restore point names it.
+  const stale = path.join(home, "backups", "before-review-2026-01-01T00-00-00-1-aaaaaa.db");
+  fs.copyFileSync(pristine, stale);
   const out = spawnSync(process.execPath, [__filename], {
     env: { ...process.env, REVIEW_TEST_CHILD: "bare", DELPHI_DB: file, DELPHI_DATA_DIR: data },
     encoding: "utf8",
@@ -249,7 +256,9 @@ function bare(pristine) {
   let got = null;
   try { got = JSON.parse(out.stdout); } catch { console.error(out.stderr); }
   check("the rebuild ran", got && got.rebuild && got.rebuild.ran, true);
-  ok("after a snapshot beside the file it opened, not in a data folder that is not its own", got && got.exists && got.backup.startsWith(path.join(dir, "backups")));
+  ok("after a snapshot beside the file it opened, not in a data folder that is not its own", got && got.exists && got.backup.startsWith(path.join(home, "backups")));
+  check("a before-review snapshot no restore point names is tidied away", fs.existsSync(stale), false);
+  check("and only the one the rebuild came after is kept", fs.readdirSync(path.join(home, "backups")).filter((f) => /^before-review-/.test(f)).length, 1);
   check("which holds the database from before it", got && got.snapshotOld, "old");
 }
 
@@ -326,6 +335,12 @@ function appRules(db) {
   ok("it is listed for Needs you", mine);
   check("with how long it has waited", mine && [mine.days, mine.words], [10, "Waiting on your review for 10 days"]);
   check("oldest wait first", waiting[0].id, quiet.id);
+  const parent = db.createTask({ projectId: p.id, title: "a parent still in progress", status: "doing" });
+  const sub = db.createTask({ projectId: p.id, title: "a piece up for review", parentId: parent.id, status: "review" });
+  check("a subtask in review is listed when its parent is not", brief.inReview(db.sqlP, { projectId: p.id }).some((w) => w.id === sub.id), true);
+  db.updateTask(parent.id, { status: "review" });
+  const both = brief.inReview(db.sqlP, { projectId: p.id }).map((w) => w.id);
+  check("and stood for by its parent when both are", [both.includes(parent.id), both.includes(sub.id)], [true, false]);
 }
 
 function padRoundTrip(db) {
@@ -375,6 +390,14 @@ async function server(db, name, routeEnv, padFixture) {
     ok("nor send it back to doing", /waiting on a person/.test(await refused(agent, "update_task", { id: ownId, status: "doing" }) || ""));
     ok("nor queue_complete it to done", /waiting on a person/.test(await refused(other, "queue_complete", { task_id: ownId, summary: "done" }) || ""));
     ok("nor put another agent's held task up for review", /held by codex:b/.test(await refused(agent, "update_task", { id: theirId, status: "review" }) || ""));
+    ok("nor mark another agent's held task done", /held by codex:b/.test(await refused(agent, "update_task", { id: theirId, status: "done" }) || ""));
+    ok("nor blocked", /held by codex:b/.test(await refused(agent, "update_task", { id: theirId, status: "blocked" }) || ""));
+    ok("nor queue_complete it", /held by codex:b/.test(await refused(agent, "queue_complete", { task_id: theirId, summary: "mine now" }) || ""));
+    check("and it is still theirs, in progress", { ...db.handle().prepare("SELECT status, claimed_by FROM tasks WHERE id = ?").get(theirId) }, { status: "doing", claimed_by: "codex:b" });
+    const brief = await agent.call("daily_brief", { project_id: p.id });
+    ok("daily_brief lists the task in review", (brief.in_review || []).some((l) => l.startsWith(`#${ownId} `)));
+    const fullBrief = await agent.call("daily_brief", { project_id: p.id, detail: "full" });
+    check("and in full", (fullBrief.in_review || []).map((r) => r.id), [ownId]);
     const elsewhere = db.createProject({ key: `${p.key}-x`, name: `${p.name} elsewhere` });
     ok("a refused status change in the same call as a move moves nothing",
       /waiting on a person/.test(await refused(agent, "update_task", { id: ownId, status: "done", project_id: elsewhere.id }) || "")

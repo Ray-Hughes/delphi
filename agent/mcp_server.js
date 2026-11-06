@@ -593,15 +593,23 @@ function assertReviewReady() {
   throw new Error("This database has not been upgraded for In review yet. Open the Delphi app once and it will upgrade it " +
     "(after taking a backup), then try again. Nothing was changed.");
 }
-/** Refuses an agent's status change that In review does not allow, with the sentence that says why. */
+/**
+ * Refuses an agent's status change that is not its to make, with the sentence
+ * that says why. Any change, not only into review: a live claim is another
+ * agent's hold on the work, and finishing, blocking or reviewing it from
+ * outside takes the work out of its hands mid-run. An expired claim holds
+ * nothing, which is how a dead agent's task comes back.
+ */
 function assertReviewMove(task, to) {
   if (!to || to === task.status) return;
+  if (!BY_PERSON && task.claimed_by && task.claimed_by !== ACTOR && task.claim_expires &&
+      task.claim_expires >= sql("SELECT datetime('now') AS n")[0].n) {
+    throw new Error(`Task ${task.id} is held by ${task.claimed_by} until ${task.claim_expires}, so its status is theirs to change. ` +
+      "Add a Sheet entry (add_comment) if they should know something.");
+  }
   if (to === "review") {
     assertReviewReady();
     if (task.status === "done" && !BY_PERSON) throw new Error(`Task ${task.id} is done already. Reopen it first if it needs another look.`);
-    if (!BY_PERSON && task.claimed_by && task.claimed_by !== ACTOR && task.claim_expires && task.claim_expires >= sql("SELECT datetime('now') AS n")[0].n) {
-      throw new Error(`Task ${task.id} is held by ${task.claimed_by}, so it is theirs to put up for review.`);
-    }
     return;
   }
   if (task.status === "review" && !BY_PERSON) {
@@ -2756,7 +2764,7 @@ const TOOLS = {
   // "While you were away". Deterministic SQL, no model. Brief by default, one
   // line per thing inside a budget, the way recall answers.
   daily_brief: {
-    description: "What happened since a time, grouped by task: decisions agents made on a Sheet, open asks, finished runs nobody reviewed, Workbenches with work not seen pushed, tasks that went quiet. Each line names its History row.",
+    description: "What happened since a time, grouped by task: decisions agents made on a Sheet, open asks, finished runs nobody reviewed, Workbenches with work not seen pushed, tasks that went quiet. Each line names its History row. in_review lists tasks waiting on a person's review.",
     schema: {
       type: "object",
       properties: {
@@ -2768,8 +2776,19 @@ const TOOLS = {
       },
     },
     run: (a) => {
-      const full = todayBrief.brief(sql, { since: a.since || null, projectId: resolveProjectId(a) });
-      return a.detail === "full" ? full : todayBrief.compact(full, { budget: a.budget || 1200 });
+      const projectId = resolveProjectId(a);
+      const full = todayBrief.brief(sql, { since: a.since || null, projectId });
+      // Tasks in review are not something that happened in the window but
+      // something still waiting on a person, so they ride alongside the
+      // brief rather than inside its groups, oldest wait first.
+      const inReview = todayBrief.inReview(sql, { projectId });
+      if (a.detail === "full") return { ...full, in_review: inReview };
+      const out = todayBrief.compact(full, { budget: a.budget || 1200 });
+      if (inReview.length) {
+        out.in_review = inReview.slice(0, 10).map((r) => `#${r.id} ${r.title}${r.project_name ? ` (${r.project_name})` : ""}: ${r.words}`);
+        if (inReview.length > 10) out.in_review.push(`and ${inReview.length - 10} more`);
+      }
+      return out;
     },
   },
 

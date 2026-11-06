@@ -177,7 +177,8 @@ choose Delphi. **Windows**: press <kbd>Win</kbd>+<kbd>R</kbd>, run
 | High priority | Start the task with `!` |
 | Link a ticket | Include a reference like `ABC-1234`; it is picked up automatically |
 | Search everything | Type in the top box, or press <kbd>Cmd</kbd>+<kbd>F</kbd> |
-| Change status | Hover a task and click **status** to cycle todo, doing, blocked, done |
+| Change status | Pick To do, In progress, Blocked, In review or Done on the task, or drag its card between Kanban columns |
+| Review an agent's work | **In review** tasks wait under **Needs you**: mark them Done, or send them back to In progress. Agents can put work up for review but never move it on |
 | Move between projects | Hover a task and use the **move to** menu |
 | Store a finding | The **Memory** tab, per project |
 | Read what an agent is working on | The **Pads** tab, per project |

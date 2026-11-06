@@ -1051,6 +1051,11 @@ handle("projects:delete", (id, opts) => {
 });
 
 handle("tasks:list", (opts) => db.listTasks(opts));
+// In review: whether this database can store it yet (the rebuild may have been
+// held back), so the window offers it only when a write would land, and the
+// tasks waiting on a review with how long each has waited, the rows Today uses.
+handle("tasks:reviewReady", () => db.reviewReady());
+handle("tasks:inReview", () => require("./today/brief").inReview(db.sqlP));
 handle("tasks:create", (payload) => { const r = db.createTask(payload); scheduleVaultExport(); return r; });
 handle("tasks:update", (id, fields) => {
   const before = db.handle().prepare("SELECT status FROM tasks WHERE id = ?").get(Number(id));

@@ -255,11 +255,18 @@ globalThis.DelphiTasks = (() => {
     return groups;
   }
 
-  /** The Kanban columns: always every status, in board order, empty ones kept. */
+  /**
+   * The statuses offered: every one, except In review while the database
+   * cannot store it yet (its one-time rebuild was held back), when a column or
+   * an option for it would only lead to a refusal. Nothing can be in review then.
+   */
+  const offered = (ctx = {}) => (ctx.reviewReady === false ? STATUSES.filter(([s]) => s !== "review") : STATUSES);
+
+  /** The Kanban columns: every offered status, in board order, empty ones kept. */
   function columns(tasks, opts, ctx = {}) {
     const groups = arrange(tasks, { ...opts, group: "status" }, ctx);
     const by = new Map(groups.map((g) => [g.key, g.tasks]));
-    return STATUSES.map(([status, label]) => ({ key: status, status, label, tasks: by.get(status) || [] }));
+    return offered(ctx).map(([status, label]) => ({ key: status, status, label, tasks: by.get(status) || [] }));
   }
 
   /** Two letters for an avatar: "Raymond Hughes" is RH, "claude-code" is CC, "codex" is Co. */
@@ -589,7 +596,7 @@ globalThis.DelphiTasks = (() => {
     title.setAttribute("aria-label", `Title of #${t.id}`);
     title.dataset.keep = "tasks-edit";
     title.oninput = () => { draft.title = title.value; title.removeAttribute("aria-invalid"); };
-    const status = select("tk-edit-sel", STATUSES, draft.status, "Status");
+    const status = select("tk-edit-sel", offered({ reviewReady: app.state().reviewReady }), draft.status, "Status");
     status.onchange = () => { draft.status = status.value; };
     const priority = select("tk-edit-sel", PRIORITIES, draft.priority, "Priority");
     priority.onchange = () => { draft.priority = priority.value; };
@@ -1195,7 +1202,7 @@ globalThis.DelphiTasks = (() => {
   function context(s) {
     const opts = displayOf(s);
     const tasks = s.allTasks || [];
-    const base = { state: s, opts, query: filterText, taskFilter: s.taskFilter || null, isOverdue: app.isOverdue };
+    const base = { state: s, opts, query: filterText, taskFilter: s.taskFilter || null, isOverdue: app.isOverdue, reviewReady: s.reviewReady };
     const hasEpics = Boolean(s.projectId && (s.organizers || []).length);
     if (opts.group === "epic" && !hasEpics) opts.group = DEFAULTS[scopeOf(s)].group;
     const mode = modeOf(s);
