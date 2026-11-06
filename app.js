@@ -3391,6 +3391,18 @@ function paintPanel(panel, select) {
     if (project) navigate({ projectId: project.id, view });
   };
 
+  const openItem = async (r, view) => {
+    if (!r.id) return openIn(r.project, view);
+    if (view === "tasks") return openTaskSheet(r.id);
+    const project = state.projects.find((p) => p.name === r.project);
+    try {
+      const notes = project ? await window.delphi.notes.list(project.id) : [];
+      const note = (notes || []).find((n) => n.id === r.id);
+      if (note) return openNoteSheet(note);
+    } catch {}
+    openIn(r.project, view);
+  };
+
   const section = (label, rows, view) => {
     if (!rows || !rows.length) return;
     panel.append(el("div", { className: "side-label", textContent: label }));
@@ -3410,8 +3422,10 @@ function paintPanel(panel, select) {
         row.classList.add("clickable");
         row.tabIndex = 0;
         row.setAttribute("role", "link");
-        row.title = `Open in ${r.project}`;
-        const go = () => openIn(r.project, view);
+        row.title = r.id ? `Open ${view === "tasks" ? "this task" : "this note"}` : `Open in ${r.project}`;
+        // Open the very item that was clicked. Landing on the project's whole
+        // list left the person searching for the thing they had just picked.
+        const go = () => openItem(r, view);
         row.onclick = go;
         row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
       }
