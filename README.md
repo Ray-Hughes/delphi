@@ -28,6 +28,8 @@
 
 <br><br>
 
+<h2>Delphi is not resdy for production as of 11/5/26</h2>
+
 Projects hold tasks, memory notes and links. Press a key, it appears. Press it again, it is gone.
 Claude Code and GitHub Copilot can both read and write it through MCP, so what one of them
 learns is still there for the next session.
