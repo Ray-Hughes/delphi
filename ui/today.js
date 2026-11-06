@@ -54,6 +54,19 @@ globalThis.DelphiToday = (() => {
   // differs every time: compared with it, every fetch would repaint.
   const sigOf = (d) => JSON.stringify({ ...d, brief: d && d.brief ? { ...d.brief, until: null } : null });
 
+  /**
+   * The newest line on screen, else the end of the window shown: where Mark
+   * as seen starts the next brief. Mirrors today/brief.js seenUpTo, which the
+   * window cannot require.
+   */
+  function shownUpTo() {
+    const b = data && data.brief;
+    if (!b) return null;
+    let newest = null;
+    for (const g of b.groups || []) for (const l of g.lines || []) if (!newest || String(l.at) > newest) newest = String(l.at);
+    return newest || b.until || null;
+  }
+
   /** Asks main for the stuck tasks and the brief; repaints only when they changed. */
   function load({ force = false } = {}) {
     if (loading) return loading;
@@ -377,9 +390,9 @@ globalThis.DelphiToday = (() => {
       head.append(toggle);
     }
     const seen = button("Mark as seen", "btn sm ghost");
-    seen.title = "Start the brief again from now";
+    seen.title = "Start the brief again after the newest thing shown here";
     seen.onclick = async () => {
-      try { data = await window.delphi.today.seen(); sig = sigOf(data); loadedAt = Date.now(); } catch (error) { app.notify(errOf(error)); }
+      try { data = await window.delphi.today.seen(shownUpTo()); sig = sigOf(data); loadedAt = Date.now(); } catch (error) { app.notify(errOf(error)); }
       app.repaint();
     };
     head.append(seen);
@@ -619,7 +632,7 @@ globalThis.DelphiToday = (() => {
     page.append(day);
 
     if (stuckList.length) {
-      const quiet = section("Gone quiet", stuckList.length, "No movement in 3 days or more. Blocked work stays amber; to-do is never counted.");
+      const quiet = section("Gone quiet", stuckList.length, "No movement in 3 days or more, or due within a day. Blocked work stays amber; to-do is never counted.");
       quiet.id = "today-quiet";
       const box = el("div", { className: "td-box" });
       for (const st of stuckList) box.append(taskRow(st, { stuck: st }));
@@ -651,7 +664,7 @@ globalThis.DelphiToday = (() => {
     return [
       { id: "start-focus", group: "Commands", title: "Start focus", place: "focus", run: () => startFocus() },
       { id: "brief-seen", group: "Commands", title: "Mark the daily brief as seen",
-        run: async () => { try { data = await window.delphi.today.seen(); sig = sigOf(data); } catch {} if (onToday()) app.repaint(); } },
+        run: async () => { try { data = await window.delphi.today.seen(shownUpTo()); sig = sigOf(data); } catch {} if (onToday()) app.repaint(); } },
     ];
   }
 
