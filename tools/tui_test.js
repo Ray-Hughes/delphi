@@ -276,8 +276,8 @@ async function main() {
   check("NO_COLOR paints no colour", scr.makePainter({ depth: "none" })("agent", "@"), "@");
   check("palettes have the same roles", Object.keys(scr.PALETTE.light), Object.keys(scr.PALETTE.dark));
   {
-    // The palette is copied from index.html; this keeps the copy honest.
-    const html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
+    // The palette is copied from the app's tokens; this keeps the copy honest.
+    const html = fs.readFileSync(path.join(ROOT, "styles", "tokens.css"), "utf8");
     const light = scr.PALETTE.light;
     check("light agent matches --tc-purple", html.includes(`--tc-purple: ${light.agent}`), true);
     check("light run matches --tc-teal", html.includes(`--tc-teal:   ${light.run}`), true);

@@ -128,27 +128,8 @@ const state = {
   lastHandKind: "ask",
 };
 
-const $ = (id) => document.getElementById(id);
-const el = (tag, props = {}, ...kids) => {
-  const node = Object.assign(document.createElement(tag), props);
-  for (const k of kids.flat()) {
-    if (k == null) continue;
-    node.append(k.nodeType ? k : document.createTextNode(String(k)));
-  }
-  return node;
-};
-
-/**
- * A colour from the database, fit to put in a style attribute, or the
- * fallback. Project and epic colours are written by agents over MCP, and a
- * value such as "red; background-image: url(...)" would otherwise carry CSS of
- * its choosing into the window. Only a hex value, a var() token, or a bare
- * colour name gets through.
- */
-const safeColour = (value, fallback = "var(--ink-faint)") => {
-  const v = String(value == null ? "" : value).trim();
-  return /^#[0-9a-f]{3,8}$/i.test(v) || /^var\(--[a-z0-9-]+\)$/i.test(v) || /^[a-z]{3,20}$/i.test(v) ? v : fallback;
-};
+// $, el and safeColour live in ui/core.js, loaded before this file, so the
+// modules under ui/ build DOM the same way this file does.
 
 // Every stamp and day in this file goes through timefmt.js: stamps from the
 // store are UTC, a due date is a day on the local calendar, and parsing either
@@ -1197,6 +1178,12 @@ function render() {
   renderMetrics();
   renderTabs();
   paintTitleLive();
+
+  // --- MOUNTS ---
+  // Where render() hands a part of the window to its module under ui/. One
+  // line per module, added by the slice that builds it, so two slices working
+  // at once collide on a line rather than on a function.
+  // --- end MOUNTS ---
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
   // pane that has moved on. Several views await an IPC call before appending,
@@ -14435,6 +14422,14 @@ function focusComposer() {
     if (!document.contains(field)) place();
   });
 }
+
+// --- COMMANDS ---
+// Every place and action the Cmd+K bar and the G-then-letter keys can reach,
+// one row each: { id, title, keys, run }. The bar and the keys read this list
+// rather than keeping their own, so a place cannot be reachable from one and
+// missing from the other. Empty until the slice that builds the bar.
+const COMMANDS = [];
+// --- end COMMANDS ---
 
 /** Navigating from the menu empties the search box with the query, so the field
  *  cannot sit there showing a search the view no longer reflects. */

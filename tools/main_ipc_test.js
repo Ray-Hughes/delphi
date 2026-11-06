@@ -107,6 +107,11 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 async function main() {
   await wait(300);
 
+  section("a new install starts dark");
+  // This data folder had no settings.json, which is what a new install is. An
+  // older install has "system" written in its file, and keeps it.
+  check("the file it wrote says dark", JSON.parse(fs.readFileSync(path.join(process.env.DELPHI_DATA_DIR, "settings.json"), "utf8")).theme, "dark");
+
   section("every channel preload.js calls is handled");
   const preload = fs.readFileSync(path.join(__dirname, "..", "preload.js"), "utf8");
   const called = [...preload.matchAll(/call\("([^"]+)"/g)].map((m) => m[1]);

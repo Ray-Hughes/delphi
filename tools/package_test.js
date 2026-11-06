@@ -330,11 +330,30 @@ function inSimulatedAsar(config, rel) {
  * and a renderer file left out of `files` is a window that opens blank.
  */
 const SCRIPT_SRC = /<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi;
+const localPaths = (srcs) => srcs
+  .filter((src) => !/^[a-z]+:|^\/\//i.test(src))
+  .map((src) => path.posix.normalize(src.replace(/^\.\//, "")));
 function rendererScripts(html) {
-  return [...String(html).replace(/<!--[\s\S]*?-->/g, "").matchAll(SCRIPT_SRC)]
-    .map((m) => m[1])
-    .filter((src) => !/^[a-z]+:|^\/\//i.test(src))
-    .map((src) => path.posix.normalize(src.replace(/^\.\//, "")));
+  return localPaths([...String(html).replace(/<!--[\s\S]*?-->/g, "").matchAll(SCRIPT_SRC)].map((m) => m[1]));
+}
+
+/**
+ * The stylesheets index.html links, and every file those stylesheets name in
+ * url(), as paths relative to the project. A stylesheet left out of the archive
+ * is not an error anywhere: the window opens unstyled, or with the fallback
+ * font, and nobody is told. So they are checked the way scripts are.
+ */
+const LINK_TAG = /<link\b[^>]*>/gi;
+function rendererStylesheets(html) {
+  const tags = [...String(html).replace(/<!--[\s\S]*?-->/g, "").matchAll(LINK_TAG)].map((m) => m[0]);
+  return localPaths(tags.filter((t) => /\brel\s*=\s*["']?stylesheet\b/i.test(t))
+    .map((t) => (t.match(/\bhref\s*=\s*["']([^"']+)["']/i) || [])[1]).filter(Boolean));
+}
+const CSS_URL = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
+function stylesheetFiles(rel, css) {
+  const base = path.posix.dirname(rel);
+  return localPaths([...String(css).replace(/\/\*[\s\S]*?\*\//g, "").matchAll(CSS_URL)].map((m) => m[2]).filter((u) => !/^data:/i.test(u)))
+    .map((u) => path.posix.normalize(path.posix.join(base, u)));
 }
 
 /**
@@ -375,6 +394,12 @@ function checkAsar(asarPath, label) {
     const scripts = rendererScripts(asar.extractFile(asarPath, "index.html").toString("utf8"));
     for (const src of scripts) {
       check(`${label}: index.html loads ${src}, and app.asar has it`, isFile(src), "the window would open without it");
+    }
+    for (const href of rendererStylesheets(asar.extractFile(asarPath, "index.html").toString("utf8"))) {
+      if (!check(`${label}: index.html links ${href}, and app.asar has it`, isFile(href), "the window would open unstyled")) continue;
+      for (const file of stylesheetFiles(href, asar.extractFile(asarPath, href).toString("utf8"))) {
+        check(`${label}: ${href} names ${file}, and app.asar has it`, isFile(file), "the stylesheet would fall back without it");
+      }
     }
   }
 }
@@ -525,6 +550,19 @@ async function main() {
       else check(`${rel} is in app.asar`, inSimulatedAsar(config, rel), "it is in extraResources too, which takes it out of the archive");
     }
     console.log(`  ok   ${scripts.length} renderer scripts index.html loads checked the same way`);
+    const sheets = rendererStylesheets(fs.readFileSync(path.join(ROOT, "index.html"), "utf8"));
+    check("index.html links at least styles/app.css", sheets.includes("styles/app.css"), sheets.join(", "));
+    const styled = [];
+    for (const rel of sheets) {
+      if (!exists(rel)) { check(`index.html links ${rel}, which exists`, false); continue; }
+      styled.push(rel, ...stylesheetFiles(rel, fs.readFileSync(path.join(ROOT, rel), "utf8")));
+    }
+    for (const rel of styled) {
+      if (!exists(rel)) { check(`${rel}, named by a stylesheet, exists`, false); continue; }
+      if (!inFiles(config, rel)) check(`files covers ${rel}`, false, "index.html's stylesheets need it, and it would not be in app.asar");
+      else check(`${rel} is in app.asar`, inSimulatedAsar(config, rel), "it is in extraResources too, which takes it out of the archive");
+    }
+    console.log(`  ok   ${sheets.length} stylesheets and the ${styled.length - sheets.length} files they name checked the same way`);
     for (const rel of OUTSIDE_TOO) {
       check(`OUTSIDE_TOO ${rel} exists`, exists(rel));
       check(`OUTSIDE_TOO ${rel} is in files, so the app has it too`, inFiles(config, rel) || inFiles(config, `${rel}/`) || config.files.includes(`${rel}/`));

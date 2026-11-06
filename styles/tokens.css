@@ -1,0 +1,223 @@
+/* Tokens ---------------------------------------------------------------
+   Light is the base set; dark redefines the same names. Components only ever
+   reference tokens, so neither theme can end up with one theme's ink on the
+   other's ground. The values are Direction B's (the v2 design), exactly, plus
+   the -ink variants it needs to pass 4.5:1 as text; tools/contrast_test.js
+   reads this file and checks every ink against every ground. */
+:root {
+    /* Grounds. The page is the faintest grey, and what holds the work (a card,
+       a panel, a menu) is white on it, which is what separates them; borders
+       are hairlines rather than the main way to tell one thing from another. */
+    --bg:          #FAFAFA;
+    --surface:     #FFFFFF;
+    /* Under the pointer, and anything pressed into the page. */
+    --raised:      #F4F4F6;
+    --line:        #E5E7EB;
+    --line-soft:   #EFF0F3;
+    /* The window's own frame, a step behind the work: the sidebar and the bar. */
+    --chrome:      #F4F5F7;
+    --chrome-deep: #EFF0F3;
+
+    --ink:       #0F1523;
+    --ink-dim:   #4B5563;
+    /* Counts, hints and stamps. Below 4.5:1, on purpose: it is for what you
+       read second, and anything a person has to read uses --ink-dim. */
+    --ink-faint: #8A93A3;
+
+    /* Indigo. Each colour comes as a fill and an ink. The fill is the design's
+       own value, for buttons, dots and rules; the ink is the darker one for
+       text, because the fills fail 4.5:1 as text on these grounds
+       (#6366F1 on white is 4.47, #059669 is 3.77, #F59E0B is 2.15). */
+    --accent:      #6366F1;
+    --accent-ink:  #4F46E5;
+    --accent-soft: rgba(99, 102, 241, 0.10);
+    --accent-line: rgba(99, 102, 241, 0.35);
+    --good:        #059669;
+    --good-ink:    #047857;
+    --good-soft:   rgba(5, 150, 105, 0.10);
+    --warn:        #F59E0B;
+    --warn-ink:    #B45309;
+    --warn-soft:   rgba(245, 158, 11, 0.12);
+    --crit:        #DC2626;
+    --crit-ink:    #B91C1C;
+    --crit-soft:   rgba(220, 38, 38, 0.08);
+    /* Ink on a solid accent or status fill. On green it is its own token:
+       white passes on the light theme's deep green and fails on the dark
+       theme's bright one, so dark puts the page's ink on it instead. */
+    --btn-fg:      #fff;
+    --on-good:     #fff;
+
+    /* The one place the window is glass: the bar that lists scroll under. */
+    --glass:       rgba(255, 255, 255, 0.72);
+
+    /* Task colours. A label, not a status, so they sit apart from the semantic
+       set above. Each is dark enough to read as text on --surface here and is
+       replaced by a lighter one in the dark set, which is the whole reason a
+       task stores the name and not the hex. */
+    --tc-blue:   #2c6bd8;
+    --tc-teal:   #0f7a80;
+    --tc-green:  #2f8757;
+    --tc-amber:  #8a6a00;
+    --tc-orange: #b4581f;
+    --tc-red:    #c04a41;
+    --tc-purple: #7b4bd1;
+    --tc-slate:  #5a6376;
+
+    /* The Sheet's entry kinds, one hue each, so a glance down the sigil column
+       says who did what. Close to the --tc-* set but not referenced from it:
+       decide and the run states needed more contrast on the light ground than
+       the task colours carry. Note and the ledger are the accent, as they
+       always were. */
+    --kind-say:    #4B5563;
+    --kind-agent:  #7b4bd1;
+    --kind-run:    #0b6a70;
+    --kind-ask:    #7a5d00;
+    --kind-decide: #25754c;
+    --kind-note:   #4F46E5;
+    --kind-ledger: #4F46E5;
+    --run-ok:      #166a3f;
+    --run-fail:    #b4283f;
+    --run-busy:    #845508;
+    /* Ink on a solid --kind-decide fill. White passes on the light fill and
+       fails on the dark one, which is a light green, so each theme says. */
+    --on-decide:   #fff;
+    /* The scrim a dialog puts over the task panel: dim enough to separate
+       them, light enough that the panel still says which task it is. */
+    --scrim:       rgba(15, 21, 35, 0.18);
+    /* Each agent's own mark, so a column of runs says at a glance who is on
+       what. Close to the colours the agents use for themselves; Codex's near
+       black turns near white on the dark ground, so it carries its own ink. */
+    --agent-claude:     #d97757;
+    --agent-codex:      #3a3f47;
+    --agent-copilot:    #6e40c9;
+    --on-agent:         #fff;
+    --on-agent-codex:   #fff;
+
+    /* Code: a ground a shade off the page, and four hues for the highlighter. */
+    --code-bg: #F6F7F9;
+    --kw: #7C3AED; --str: #047857; --key: #B45309; --tag: #2563EB;
+
+    /* Three depths: a control resting on the page, a card lifted off it, and a
+       layer over everything (a drawer, the command bar). --shadow is the
+       middle one under the name every component already uses. */
+    --shadow-1: 0 1px 2px rgba(15, 21, 35, 0.05);
+    --shadow-2: 0 8px 24px rgba(15, 21, 35, 0.08), 0 1px 3px rgba(15, 21, 35, 0.06);
+    --shadow-3: 0 24px 64px rgba(15, 21, 35, 0.16), 0 2px 8px rgba(15, 21, 35, 0.08);
+    --shadow:   var(--shadow-2);
+
+    /* Spacing scale. Everything uses these, so rhythm stays consistent
+       rather than being decided per component. */
+    --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+    --s5: 24px; --s6: 32px; --s7: 48px;
+
+    /* Tight. A large radius reads as friendly and costs density, and this is a
+       window somebody keeps open all day with four agents running in it. */
+    --r-sm: 4px; --r: 6px; --r-lg: 10px;
+
+    /* Inter for words, JetBrains Mono for ids, paths and code, both bundled
+       (assets/fonts.css). --display is the same face: headings differ by
+       weight and size, not by family. */
+    --font:    'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    --display: var(--font);
+    --mono:    'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
+
+    /* One curve for everything that moves: quick out, soft landing. */
+    --ease: cubic-bezier(.2, .8, .2, 1);
+    color-scheme: light;
+}
+
+/* The dark set applies in two cases: when the system asks for dark and the
+   user has not overridden it, and when the user has chosen dark outright.
+
+   The declarations are repeated rather than shared, because a media query
+   condition cannot be OR'd into a selector list. The two blocks have to be
+   identical, which is why they are written from one source: they once were
+   not, and choosing Dark in Settings painted light task colours on the dark
+   ground. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #090D16; --surface: #111827; --raised: #151E2E;
+    --line: #1F2937; --line-soft: #172131;
+    /* The same idea as light, inverted the same way round: the frame is darker
+       than the work, not lighter. */
+    --chrome: #0D1320; --chrome-deep: #090D16;
+
+    --ink: #E7EAF0; --ink-dim: #9AA4B4; --ink-faint: #657084;
+
+    /* Violet on the dark ground, where the light theme's indigo goes muddy. */
+    --accent: #8B5CF6; --accent-ink: #A78BFA;
+    --accent-soft: rgba(139, 92, 246, 0.14); --accent-line: rgba(139, 92, 246, 0.45);
+    --good: #10B981; --good-ink: #10B981; --good-soft: rgba(16, 185, 129, 0.13);
+    --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.13);
+    --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.12);
+    --btn-fg: #fff; --on-good: #090D16;
+    --glass: rgba(17, 24, 39, 0.72);
+
+    --tc-blue:   #7c9bff;
+    --tc-teal:   #4fc4c0;
+    --tc-green:  #4fb477;
+    --tc-amber:  #e0b95c;
+    --tc-orange: #f0925c;
+    --tc-red:    #e2685f;
+    --tc-purple: #b48bf0;
+    --tc-slate:  #98a1b2;
+
+    --kind-say: #9AA4B4; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+    --kind-decide: #4fb477; --kind-note: #A78BFA; --kind-ledger: #A78BFA;
+    --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
+    --on-decide: #090D16; --scrim: rgba(3, 6, 12, 0.55);
+    --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #8a63d8;
+    --on-agent: #fff; --on-agent-codex: #090D16;
+
+    --code-bg: #0B111D;
+    --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
+
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);
+    --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #090D16; --surface: #111827; --raised: #151E2E;
+  --line: #1F2937; --line-soft: #172131;
+  /* The same idea as light, inverted the same way round: the frame is darker
+     than the work, not lighter. */
+  --chrome: #0D1320; --chrome-deep: #090D16;
+
+  --ink: #E7EAF0; --ink-dim: #9AA4B4; --ink-faint: #657084;
+
+  /* Violet on the dark ground, where the light theme's indigo goes muddy. */
+  --accent: #8B5CF6; --accent-ink: #A78BFA;
+  --accent-soft: rgba(139, 92, 246, 0.14); --accent-line: rgba(139, 92, 246, 0.45);
+  --good: #10B981; --good-ink: #10B981; --good-soft: rgba(16, 185, 129, 0.13);
+  --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.13);
+  --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.12);
+  --btn-fg: #fff; --on-good: #090D16;
+  --glass: rgba(17, 24, 39, 0.72);
+
+  --tc-blue:   #7c9bff;
+  --tc-teal:   #4fc4c0;
+  --tc-green:  #4fb477;
+  --tc-amber:  #e0b95c;
+  --tc-orange: #f0925c;
+  --tc-red:    #e2685f;
+  --tc-purple: #b48bf0;
+  --tc-slate:  #98a1b2;
+
+  --kind-say: #9AA4B4; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+  --kind-decide: #4fb477; --kind-note: #A78BFA; --kind-ledger: #A78BFA;
+  --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
+  --on-decide: #090D16; --scrim: rgba(3, 6, 12, 0.55);
+  --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #8a63d8;
+  --on-agent: #fff; --on-agent-codex: #090D16;
+
+  --code-bg: #0B111D;
+  --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);
+  --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03);
+  color-scheme: dark;
+}

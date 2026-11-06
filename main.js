@@ -201,7 +201,15 @@ function loadSettings() {
   }
   // Write the file on first run so it exists to be edited. A setting you are
   // told to change in a file that was never created is not a setting.
-  if (existing === null) saveSettings();
+  //
+  // A new install starts dark, which is the look v2 was designed in. Only here,
+  // not in the defaults above: every older install wrote "system" into its file
+  // on its own first run, and an older file without the key predates the
+  // setting, so neither is moved off what it has been showing.
+  if (existing === null) {
+    settings.theme = "dark";
+    saveSettings();
+  }
 }
 
 function saveSettings() {

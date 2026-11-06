@@ -80,6 +80,13 @@ module.exports = {
     // running. build/ is not in this list: that holds what the installer
     // consumes, and none of it is read after installation.
     "assets/",
+    // The renderer split out of app.js and index.html: one script per surface
+    // in ui/ and one stylesheet per surface in styles/. Folders, never files one
+    // by one, so a slice that adds a surface never edits this list.
+    // tools/package_test.js follows every <script src> and
+    // <link rel="stylesheet"> in index.html against it.
+    "ui/",
+    "styles/",
   ],
 
   // The MCP server is launched by an editor using its own Node, and a plain Node
