@@ -1073,7 +1073,7 @@ const TOOLS = {
                 ${asked != null ? `CASE WHEN t.project_id IS ${asked} THEN NULL ELSE p.key END` : "NULL"} AS home
          FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
          ${where.length ? "WHERE " + where.join(" AND ") : ""}
-         ORDER BY CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 1 WHEN 'todo' THEN 2 ELSE 3 END,
+         ORDER BY CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 2 WHEN 'todo' THEN 3 WHEN 'done' THEN 4 ELSE 1 END,
                   CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, t.id DESC
          LIMIT 200`,
         params
@@ -1223,10 +1223,12 @@ const TOOLS = {
       // Blocked work is not available work: something outside the task is
       // being waited on, and an agent given it can only hand it back. Values
       // are literals here because this text is spliced into several statements.
+      // The statuses are named rather than excluded, so one a newer Delphi
+      // wrote (In review) is never handed out by this one.
       const stepId = auditor.step();
       const chosen = `SELECT id FROM tasks
              WHERE queue = ${literal(queue)}
-               AND status NOT IN ('done', 'blocked')
+               AND status IN ('todo', 'doing')
                AND (claimed_by IS NULL OR claim_expires < datetime('now'))
                ${projectId == null ? "" : `AND project_id = ${literal(Number(projectId))}`}
              ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
@@ -1389,7 +1391,7 @@ const TOOLS = {
         // whole pool is exactly where you need to know whose work it is.
         waiting: sql(
           `SELECT id, title, priority, project_id FROM tasks
-            WHERE queue = :p1 AND status NOT IN ('done', 'blocked')
+            WHERE queue = :p1 AND status IN ('todo', 'doing')
               AND (claimed_by IS NULL OR claim_expires < datetime('now'))
               ${mine}
             ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id`,

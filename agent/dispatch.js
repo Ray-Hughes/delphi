@@ -579,7 +579,7 @@ function createDispatcher({
       `SELECT t.id, t.project_id, t.title, t.queue, t.queued_by, t.queued_by_type, p.auto_approve
          FROM tasks t JOIN harnesses h ON h.key = t.queue AND h.enabled = 1
          JOIN projects p ON p.id = t.project_id
-        WHERE t.status NOT IN ('done', 'blocked')
+        WHERE t.status IN ('todo', 'doing')
           AND (t.claimed_by IS NULL OR t.claim_expires < datetime('now'))
           AND NOT EXISTS (SELECT 1 FROM handoffs j WHERE j.task_id = t.id AND j.state IN (${jobs.OPEN_SQL}))
         ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, t.id`, []);
@@ -592,7 +592,7 @@ function createDispatcher({
       // row is written only when the recheck chose the task.
       const stepId = auditor.step();
       const chosen = `SELECT id FROM tasks WHERE id = ${Number(t.id)} AND queue = '${String(t.queue).replace(/'/g, "''")}'
-                        AND status NOT IN ('done', 'blocked') AND (claimed_by IS NULL OR claim_expires < datetime('now'))`;
+                        AND status IN ('todo', 'doing') AND (claimed_by IS NULL OR claim_expires < datetime('now'))`;
       auditor.run(auditor.update("task", { sql: chosen }, { summary: `taken from the ${t.queue} queue`, stepId }, [
         [`UPDATE tasks SET queue = NULL, updated_at = datetime('now') WHERE id = ${auditor.stepRowId("task", stepId)}`, []],
       ]));

@@ -1141,7 +1141,9 @@ function listTasks({ projectId = null, organizerId = null, includeDone = false, 
      LEFT JOIN organizers o ON o.id = t.organizer_id
      ${where}
      ORDER BY
-       CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 1 WHEN 'todo' THEN 2 ELSE 3 END,
+       -- ELSE is a status a newer Delphi wrote (In review): it reads as in
+       -- progress, so it sorts straight after doing rather than with done.
+       CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 2 WHEN 'todo' THEN 3 WHEN 'done' THEN 4 ELSE 1 END,
        CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END,
        COALESCE(t.due, '9999-99-99'),
        t.id DESC`,
@@ -1322,7 +1324,7 @@ function queueState(queue = "ready", projectId = null) {
               p.name AS project_name, p.colour AS project_colour
        FROM tasks t
        LEFT JOIN projects p ON p.id = t.project_id
-       WHERE t.queue = :queue AND t.status NOT IN ('done', 'blocked')
+       WHERE t.queue = :queue AND t.status IN ('todo', 'doing')
          AND (t.claimed_by IS NULL OR t.claim_expires < datetime('now'))
          ${mine}
        ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, t.id`,
@@ -1380,8 +1382,10 @@ function claimNext({ queue = "ready", agent, minutes = LEASE_MINUTES, projectId 
          WHERE queue = :queue
            -- Blocked work is not available work. Something outside this task is
            -- being waited on, and handing it to an agent produces an agent that
-           -- discovers it is blocked and hands it straight back.
-           AND status NOT IN ('done', 'blocked')
+           -- discovers it is blocked and hands it straight back. Named rather
+           -- than excluded, so a status a newer Delphi wrote (In review) is
+           -- never handed out by this one.
+           AND status IN ('todo', 'doing')
            AND (claimed_by IS NULL OR claim_expires < datetime('now'))
            ${projectId == null ? "" : "AND project_id = :projectId"}
          ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, id
