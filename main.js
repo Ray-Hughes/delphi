@@ -2016,6 +2016,11 @@ const folderTools = createFolders({
 registerFolders(handle, { folders: folderTools, db });
 require("./main/ledger").register(handle, { db });
 
+// Today: stuck tasks and the brief (today/brief.js), and when you were last here.
+const today = require("./main/today").createToday({ sql: db.sqlP, dataDir: paths.DATA_DIR });
+require("./main/today").register(handle, { today });
+today.watch(app);
+
 handle("backups:list", () => ({ dir: backups.dir, backups: backups.list(), lastRestore }));
 handle("backups:preview", (name) => backups.preview(name));
 // The window has already shown the preview and asked. The current file is

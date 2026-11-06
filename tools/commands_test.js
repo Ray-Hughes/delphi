@@ -62,7 +62,7 @@ async function main() {
   const all = { projectId: null, view: "new" };
   const proj = { projectId: 1, view: "overview" };
   const places = [
-    ["today", all, [["go", { projectId: null, view: "inbox" }]]],
+    ["today", all, [["go", { projectId: null, view: "today" }]]],
     ["needs", all, [["go", { projectId: null, view: "inbox" }], ["top"]]],
     ["whats-new", proj, [["go", { projectId: null, view: "new" }]]],
     ["reminders", proj, [["go", { projectId: null, view: "reminders" }]]],

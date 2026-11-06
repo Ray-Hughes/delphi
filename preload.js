@@ -269,6 +269,8 @@ contextBridge.exposeInMainWorld("delphi", {
     give: (id, toProjectId) => call("folders:give", id, toProjectId),
     merge: (id, fromProjectId) => call("folders:merge", id, fromProjectId),
   },
+  // Today: stuck tasks, the one banner and the brief, and "Mark as seen".
+  today: { view: (opts) => call("today:view", opts || {}), seen: () => call("today:seen") },
   // The path of a dropped file or folder. File.path is gone in this Electron,
   // and only the preload can ask; the window gets the path and nothing else.
   pathForFile: (file) => {

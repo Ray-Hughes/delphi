@@ -7,7 +7,7 @@
 //
 // The tabs are the six of Direction B. Each maps onto a view that exists
 // today, until the slices that build its own page:
-//   Today    the Needs you page (it grows due and stuck work in slice 7)
+//   Today    its own page (ui/today.js): what is on, Needs you, the brief
 //   Tasks    the task list, in the current scope
 //   Memory   a project's notes, or the mind map across all of them
 //   Pads     a project's pads
@@ -32,7 +32,7 @@ globalThis.DelphiCommands = (() => {
   // Which tab a view belongs to. A view in none (Overview, History, Settings,
   // a search) leaves every tab unlit rather than lighting the wrong one.
   const VIEW_TAB = {
-    inbox: "today", new: "today", reminders: "today",
+    today: "today", inbox: "today", new: "today", reminders: "today",
     tasks: "tasks", queue: "tasks",
     notes: "memory", links: "memory", graph: "memory",
     pads: "pads", chat: "chat", runs: "runs",
@@ -51,7 +51,7 @@ globalThis.DelphiCommands = (() => {
     const inProject = state.projectId != null;
     const needsProject = (view) => (inProject ? { view } : { projectId: projectFor(), view });
     switch (id) {
-      case "today": return { projectId: null, view: "inbox" };
+      case "today": return { projectId: null, view: "today" };
       case "tasks": return { view: "tasks" };
       case "memory": return inProject ? { view: "notes" } : { view: "graph" };
       case "pads": return needsProject("pads");

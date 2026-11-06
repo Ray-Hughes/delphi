@@ -96,6 +96,9 @@ module.exports = {
     // The cost and time ledger, shared with the server (tools/after-pack.js
     // copies it out as well) and loaded by index.html for its formatting.
     "ledger/",
+    // Stuck tasks and the daily brief: main/today.js requires it, and the
+    // server's daily_brief does too (tools/after-pack.js copies it out).
+    "today/",
   ],
 
   // The MCP server is launched by an editor using its own Node, and a plain Node

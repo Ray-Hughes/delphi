@@ -566,6 +566,8 @@ const benches = createWorkbench({
 // type falls back to what the name looks like, so an agent whose launcher did
 // not say what it is cannot approve a proposal by leaving the type out.
 const { makeItemStore, inProject } = require("../items/store");
+// Stuck tasks and the daily brief, shared with the window's Today (main/today.js).
+const todayBrief = require("../today/brief");
 const ITEM_AUTHOR_TYPE = AUTHOR_TYPE || sheetFormat.inferAuthorType(ACTOR);
 const itemStore = makeItemStore({
   sql, batch, actor: ACTOR, authorType: ITEM_AUTHOR_TYPE, settings: () => readSettings(),
@@ -2665,6 +2667,27 @@ const TOOLS = {
     run: (a) =>
       sql(`SELECT at, action, entity, entity_id, summary, label, undone
            FROM audit ORDER BY id DESC LIMIT :p1`, [Math.min(a.limit || 30, 200)]),
+  },
+
+  // The daily brief (today/brief.js), the rows the window's Today shows under
+  // "While you were away". Deterministic SQL, no model. Brief by default, one
+  // line per thing inside a budget, the way recall answers.
+  daily_brief: {
+    description: "What happened since a time, grouped by task: decisions agents made on a Sheet, open asks, finished runs nobody reviewed, Workbenches with work not seen pushed, tasks that went quiet. Each line names its History row.",
+    schema: {
+      type: "object",
+      properties: {
+        since: { type: "string", description: "UTC 'YYYY-MM-DD HH:MM:SS' or ISO. Default 24 hours ago" },
+        project_id: { type: "number" },
+        project: { type: "string" },
+        budget: { type: "number" },
+        detail: { type: "string", enum: ["brief", "full"] },
+      },
+    },
+    run: (a) => {
+      const full = todayBrief.brief(sql, { since: a.since || null, projectId: resolveProjectId(a) });
+      return a.detail === "full" ? full : todayBrief.compact(full, { budget: a.budget || 1200 });
+    },
   },
 };
 
