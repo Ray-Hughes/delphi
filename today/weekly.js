@@ -34,6 +34,9 @@ const OBJECTIVES_TITLE = "Objectives for the week of ";
 // How a Drop's note begins (main/weekly.js writes it), so the look back can
 // count a task let go apart from one finished.
 const DROP_PREFIX = "Dropped in the weekly review";
+// What marks the note as a Drop for counting. Meta, not the words: a person
+// may edit a note, and words that merely start the same way are not a Drop.
+const DROP_META = { dropped_in: "weekly_review" };
 
 // How far along a status is, so a change can be called a step back. Blocked
 // sits beside in progress: being blocked is not undoing anything, but being
@@ -174,16 +177,20 @@ function review(sql, { now = new Date(), projectId = null, days = 7 } = {}) {
 
   // Done means done now and finished inside the week, so a task reopened
   // since is not counted as an achievement it no longer is. A Drop is done
-  // with a note, and is counted apart: letting go is not finishing.
+  // with a note, and is counted apart: letting go is not finishing. The note
+  // must be the one written with this completion, so a task dropped, reopened
+  // and then finished for real counts as finished.
   const doneRows = sql(
     `SELECT t.id, t.title, t.completed_at AS at, t.project_id, p.name AS project_name, t.parent_id,
-            EXISTS (SELECT 1 FROM comments c WHERE c.task_id = t.id AND c.kind = 'note' AND c.body LIKE :p4
-                      AND datetime(c.created_at) > datetime(:p1)) AS dropped
+            EXISTS (SELECT 1 FROM comments c WHERE c.task_id = t.id AND c.kind = 'note'
+                      AND CASE WHEN json_valid(c.meta) THEN json_extract(c.meta, '$.dropped_in') END = :p4
+                      AND datetime(c.created_at) > datetime(:p1)
+                      AND datetime(c.created_at) >= datetime(t.completed_at, '-60 seconds')) AS dropped
        FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
       WHERE t.status = 'done' AND t.completed_at IS NOT NULL
         AND datetime(t.completed_at) > datetime(:p1) AND datetime(t.completed_at) <= datetime(:p2)
         AND ${LIVE_PROJECT} AND ${inScope("t", 3)}
-      ORDER BY datetime(t.completed_at) DESC, t.id DESC`, [since, until, scope, `${DROP_PREFIX}%`]);
+      ORDER BY datetime(t.completed_at) DESC, t.id DESC`, [since, until, scope, DROP_META.dropped_in]);
   const finished = doneRows.filter((r) => Number(r.dropped) !== 1);
   const done = {
     count: finished.length,
@@ -299,7 +306,9 @@ function review(sql, { now = new Date(), projectId = null, days = 7 } = {}) {
     next_week: {
       week: objectivesWeek(msOf(until)), min: OBJECTIVES_MIN, max: OBJECTIVES_MAX,
       candidates, last,
-      saved_this_week: Boolean(last && msOf(until) - msOf(last.created_at) < 6 * DAY_MS),
+      // Saved for the week a save now would be for, not saved lately: a
+      // Wednesday's objectives are that week's, and Friday still plans the next.
+      saved_this_week: Boolean(last && last.week === objectivesWeek(msOf(until))),
     },
   };
 }
@@ -346,19 +355,30 @@ function compact(r, { budget = 1200 } = {}) {
     note: "Read only. Park, Drop and saving objectives happen in the Delphi window.",
   };
   const limit = Math.max(200, Number(budget) || 1200) * CHARS_PER_TOKEN;
+  const MORE = "Trimmed to the budget. Pass a project, a larger budget, or detail: \"full\".";
+  const size = () => JSON.stringify(out).length;
+  if (JSON.stringify(out).length <= limit) return out;
+  out.trimmed = true;
+  out.more = MORE;
+  // The longest section gives up its last line first. The first two lines of
+  // look back are the week's totals, kept until nothing else is left.
   const parts = [out.look_back, out.tidy, out.next_week];
-  // The first two lines of look back are the totals, kept to the end.
-  while (JSON.stringify(out).length > limit) {
-    const longest = parts.reduce((a, b) => (b.length > a.length ? b : a));
-    if (longest.length <= (longest === out.look_back ? 2 : 0)) break;
-    longest.pop();
-    out.trimmed = true;
+  const floor = (p) => (p === out.look_back ? 2 : 0);
+  while (size() > limit) {
+    const can = parts.filter((p) => p.length > floor(p));
+    if (!can.length) break;
+    can.reduce((a, b) => (b.length > a.length ? b : a)).pop();
   }
-  if (out.trimmed) out.more = "Trimmed to the budget. Pass a project, a larger budget, or detail: \"full\".";
+  // Still over: what is left goes, in order of least use, until it fits. The
+  // counts, the window and the note saying it was trimmed always stay.
+  for (const drop of [() => { out.look_back.length = 0; }, () => { delete out.note; }, () => { delete out.cost_note; }]) {
+    if (size() <= limit) break;
+    drop();
+  }
   return out;
 }
 
 module.exports = {
-  IDLE_DAYS, EXPIRING_DAYS, OBJECTIVES_MIN, OBJECTIVES_MAX, OBJECTIVES_TITLE, DROP_PREFIX, RANK,
+  IDLE_DAYS, EXPIRING_DAYS, OBJECTIVES_MIN, OBJECTIVES_MAX, OBJECTIVES_TITLE, DROP_PREFIX, DROP_META, RANK,
   review, counts, compact, objectivesWeek, parseObjectives, objectivesBody, restoreCommand, localDate,
 };
