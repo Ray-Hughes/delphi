@@ -164,6 +164,30 @@ function writeSettingsFile(file, settings) {
 }
 
 /**
+ * The temporary files of writes that never reached their rename: a process
+ * killed between open and rename leaves settings.json.<pid>.tmp behind. Only
+ * those of processes that are gone: this one's, or a live one's, may be
+ * mid-write.
+ */
+const pidAlive = (pid) => {
+  try { process.kill(pid, 0); return true; } catch (error) { return Boolean(error && error.code === "EPERM"); }
+};
+function sweepTemps(file, pid = process.pid, alive = pidAlive) {
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  const own = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, (m) => "\\" + m)}\\.(\\d+)\\.tmp$`);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  const removed = [];
+  for (const name of names) {
+    const m = name.match(own);
+    if (!m || Number(m[1]) === pid || alive(Number(m[1]))) continue;
+    try { fs.rmSync(path.join(dir, name), { force: true }); removed.push(name); } catch {}
+  }
+  return removed;
+}
+
+/**
  * settings.json as found, over the schema's defaults.
  *
  * A missing file is a new install: it gets the defaults, and the file is
@@ -180,12 +204,17 @@ function writeSettingsFile(file, settings) {
  * Returns { settings, write, broken, protect }: write says the file should be
  * written now, broken is where the bad file went, or null.
  */
-function readSettingsFile(file, defaults, { now = () => new Date() } = {}) {
+function readSettingsFile(file, defaults, { now = () => new Date(), pid = process.pid, alive = pidAlive } = {}) {
+  const swept = sweepTemps(file, pid, alive);
+  if (swept.length) console.log(`settings: removed ${swept.join(", ")}, left by writes that never finished`);
   let text = null;
   try { text = fs.readFileSync(file, "utf8"); } catch (error) {
     if (error && error.code === "ENOENT") return { settings: { ...defaults }, write: true, broken: null, protect: false };
     return { settings: { ...defaults }, write: false, broken: null, protect: true };
   }
+  // Editors on Windows save UTF-8 with a byte-order mark, which JSON.parse
+  // refuses; the file is fine without it.
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -200,4 +229,4 @@ function readSettingsFile(file, defaults, { now = () => new Date() } = {}) {
   return { settings, write: false, broken: null, protect: false };
 }
 
-module.exports = { vaultFolderProblem, makeContext, register, writeSettingsFile, readSettingsFile, VAULT_SCAN_LIMIT, VAULT_MARKER };
+module.exports = { vaultFolderProblem, makeContext, register, writeSettingsFile, readSettingsFile, sweepTemps, VAULT_SCAN_LIMIT, VAULT_MARKER };
