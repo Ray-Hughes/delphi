@@ -1245,6 +1245,7 @@ function render() {
   if (window.DelphiTopbar) DelphiTopbar.paint();
   if (window.DelphiAddFolder) DelphiAddFolder.paintFix(state);
   if (window.DelphiToday) DelphiToday.paint(state);
+  if (window.DelphiTasks) DelphiTasks.paint(state);
   // --- end MOUNTS ---
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
@@ -1275,7 +1276,7 @@ function render() {
     oracle: renderOracle,
     overview: renderOverview,
     chat: renderChat,
-    tasks: renderTasks,
+    tasks: (root) => (window.DelphiTasks && DelphiTasks.owns(state) ? DelphiTasks.render(root) : renderTasks(root)),
     pads: renderPads,
     notes: renderNotes,
     links: renderLinks,
@@ -14641,15 +14642,19 @@ DelphiToday.init({
   },
 });
 COMMANDS.push(...DelphiToday.commands());
+// The Tasks tab (ui/tasks.js): quick entry, inline edit, pills, List or Kanban.
+DelphiTasks.init({ ...shell, refresh: () => refresh(), repaint: () => render(), notify: (text) => notify(text), openTask: (id) => openTaskSheet(id), isAgent, isOverdue, taskMenu: (t, x, y) => taskMenu(t, x, y), quickLook: (id) => quickLook(id), projectById, projectName: (id) => (projectById(id) || {}).name || "", setProjectMode: (mode) => setTaskViewMode(mode), busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay") || window.DelphiPalette?.isOpen()) });
+COMMANDS.push(...DelphiTasks.commands());
 DelphiKeys.install({
   commands: () => COMMANDS,
   // A panel, a menu, a dialog or a popover owns the keyboard while it is open.
   // body > .overlay, not .overlay: on Windows the body itself carries an
   // "overlay" class for the window controls, and would make every key dead.
-  busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay")),
+  busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay") || DelphiTasks.isOpen()),
   openBar: () => openBar(),
   openSwitcher: () => DelphiTopbar.openSwitcher(),
   openTask: async (id, how) => {
+    if (how === "edit" && DelphiTasks.startEdit(id)) return;
     await openTaskSheet(id);
     if (how === "edit") document.querySelector(".ts-title")?.focus();
   },
