@@ -250,6 +250,18 @@ console.log("\nsettings.json");
   check("a file that is not JSON is kept aside, and defaults are written", [path.basename(bad.broken || ""), bad.write, bad.settings.theme, fs.existsSync(file)],
     ["settings.json.broken-2026-11-06T10-00-00-000Z", true, "dark", false]);
   check("with what was being typed still in it", fs.readFileSync(bad.broken, "utf8"), "{ \"theme\": \"light\", oops");
+  fs.writeFileSync(file, "\uFEFF" + JSON.stringify({ theme: "light", snoozeMinutes: 7 }));
+  const bom = settingsMain.readSettingsFile(file, d);
+  check("a valid file saved with a byte-order mark is read, not set aside", [bom.settings.theme, bom.settings.snoozeMinutes, bom.broken, bom.write], ["light", 7, null, false]);
+  for (const n of ["settings.json.111.tmp", "settings.json.222.tmp", "settings.json.333.tmp", "settings.json.900.tmp", "other.json.111.tmp", "settings.json.tmp"]) fs.writeFileSync(path.join(tmpS, n), "{");
+  settingsMain.readSettingsFile(file, d, { pid: 900, alive: (p) => p === 333 });
+  check("starting removes the temporary files killed writes left, but not this process's own, a live one's, or anyone else's",
+    fs.readdirSync(tmpS).filter((n) => n.endsWith(".tmp")).sort(), ["other.json.111.tmp", "settings.json.333.tmp", "settings.json.900.tmp", "settings.json.tmp"]);
+  check("and the file itself is left as it was", JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "")).snoozeMinutes, 7);
+  fs.writeFileSync(file, "\uFEFF{ oops");
+  const bomBad = settingsMain.readSettingsFile(file, d);
+  check("a byte-order mark before something that is not JSON is still set aside, as it was", fs.readFileSync(bomBad.broken, "utf8"), "\uFEFF{ oops");
+  for (const n of fs.readdirSync(tmpS)) if (n.endsWith(".tmp")) fs.rmSync(path.join(tmpS, n));
   fs.rmSync(file, { force: true }); fs.mkdirSync(file);
   const unreadable = settingsMain.readSettingsFile(file, d);
   check("a settings.json that is there but cannot be read is never written over", [unreadable.write, unreadable.protect], [false, true]);
