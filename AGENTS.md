@@ -38,6 +38,7 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `oracle_entities` | What the graph knows about, most referenced first |
 | `oracle_ask` | Meaning and connections together. The main way to ask what we know |
 | `recent_activity` | What changed lately and which agent changed it |
+| `daily_brief` | What happened since a time, by task: agents' decisions, open asks, unreviewed runs, unpushed Workbenches, tasks gone quiet |
 | `flag_item` | Say an item may be in the wrong project, where it belongs and why. Changes nothing |
 | `propose_move` | Propose one to three moves, copies or associations for an item. Never applies them |
 | `list_flags` | Flags on possibly misfiled items, each with its proposal in a line |

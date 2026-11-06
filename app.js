@@ -17,7 +17,7 @@ const state = {
   // else the first that holds it. The others show a pointer row instead.
   wsHome: new Map(),
   projectId: null,     // null means the All view
-  view: "new",         // new | overview | tasks | notes | links | history | settings
+  view: "today",       // today | new | overview | tasks | notes | links | history | settings
   showDone: false,
   // Set by the dashboard tiles, so a tile is a way into the list rather than a
   // number you then have to go and find yourself. Cleared whenever the list is
@@ -1244,6 +1244,7 @@ function render() {
   if (window.DelphiRecovery) DelphiRecovery.remember({ projectId: state.projectId, view: state.view });
   if (window.DelphiTopbar) DelphiTopbar.paint();
   if (window.DelphiAddFolder) DelphiAddFolder.paintFix(state);
+  if (window.DelphiToday) DelphiToday.paint(state);
   // --- end MOUNTS ---
 
   // Replaced rather than emptied, so that a slow async view cannot paint into a
@@ -1288,6 +1289,7 @@ function render() {
     settings: renderSettings,
     runs: renderRuns,
     inbox: renderInbox,
+    today: (root) => DelphiToday.render(root),
   })[state.view];
 
   // Several views are async. Without this, a throw inside one leaves an empty
@@ -6019,6 +6021,7 @@ async function renderActivity(root) {
     const row = el("div", {
       className: "audit-row" + (e.undone ? " undone" : "") + (e.action === "delete" ? " deleted" : ""),
     });
+    row.dataset.audit = String(e.id);
     row.append(el("span", { className: "audit-when", textContent: ago(e.at) }));
 
     const who = auditWho(e);
@@ -6087,6 +6090,7 @@ async function renderHistory(root) {
   const list = el("section", { className: "card" });
   entries.forEach((e) => {
     const row = el("div", { className: "audit-row" + (e.undone ? " undone" : "") });
+    row.dataset.audit = String(e.id);
     row.append(el("span", { className: "audit-when", textContent: ago(e.at) }));
     const who = auditWho(e);
     const what = el("div", { className: "audit-what" },
@@ -9979,7 +9983,7 @@ async function openTaskSheet(taskId) {
 // ---------------------------------------------------------------------------
 
 // The places that are not a project and have no tabs of their own.
-const HOME_VIEWS = ["runs", "inbox"];
+const HOME_VIEWS = ["today", "runs", "inbox"];
 const RUN_OPEN = ["queued", "needs_approval", "running", "waiting_on_human"];
 const RUN_WAITING = ["needs_approval", "waiting_on_human"];
 
@@ -14593,6 +14597,32 @@ function openBar(query = "") {
 DelphiTopbar.init(shell);
 DelphiAddFolder.init({ ...shell, refresh: () => refresh(), notify: (text, o) => notify(text, o) });
 DelphiNeeds.init({ refresh: () => refresh(), notify: (text) => notify(text) });
+// Today (ui/today.js), lent the Needs you rows and the hand-off dialog rather
+// than drawing its own, so an approval looks and works the same on both pages.
+DelphiToday.init({
+  ...shell, refresh: () => refresh(), repaint: () => { if (onHomeView()) repaintKeepingFocus(); },
+  notify: (text) => notify(text), openTask: (id) => openTaskSheet(id), isAgent,
+  projectName: (id) => (projectById(id) || {}).name || "",
+  needs: () => ({ waiting: waitingRuns().sort(byWaitAge), reviews: reviewRuns(), flags: flagRowsNow() }),
+  rows: { waiting: (r) => waitingRow(r), review: (r) => reviewRow(r), flag: (r) => flagNode(r) },
+  handTo: async (id, request) => {
+    const detail = await window.delphi.tasks.detail(id);
+    // Loaded first so the dialog is built in this tick and its request can be
+    // filled in; Do, since the ask is to carry the work forward. A cancel
+    // puts back whichever kind was last used.
+    if (!state.harnesses.length) { try { state.harnesses = await window.delphi.harnesses.list(); } catch {} }
+    const kindWas = state.lastHandKind;
+    state.lastHandKind = "do";
+    const pending = handToAgent(detail);
+    const field = document.getElementById("hand-request");
+    if (field && !field.value) field.value = request;
+    const run = await pending;
+    if (!run) state.lastHandKind = kindWas;
+    if (run) { notify(`Handed #${id} to an agent.`); await refresh(); }
+    return run;
+  },
+});
+COMMANDS.push(...DelphiToday.commands());
 DelphiKeys.install({
   commands: () => COMMANDS,
   // A panel, a menu, a dialog or a popover owns the keyboard while it is open.

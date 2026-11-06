@@ -61,6 +61,8 @@ const OUTSIDE_TOO = [
   // Move, copy, associate and flag: the server's tools and the app's IPC use
   // the one store.
   "items",
+  // Stuck tasks and the daily brief: the window's Today and daily_brief.
+  "today",
 ];
 
 function resourcesDir(context) {

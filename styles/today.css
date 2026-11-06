@@ -1,0 +1,159 @@
+/* Today (ui/today.js): capture, the brief, Needs you, the one banner, your
+   day in Focus order, and the tasks gone quiet.
+
+   Direction B's Today, so the same rhythm as the mockup: a section heading in
+   ink with its count and a quiet hint, then a white box of 38px rows on the
+   page's grey. Stuck marks are words as well as colour ("Idle 4d", "9d"), and
+   a quiet row fades toward the faint ink the longer it sits, rather than
+   getting louder: --td-fade is set per row, 0% at three days, 100% at thirty. */
+
+.td-page { max-width: 980px; margin: 0 auto; padding-bottom: var(--s7); }
+
+/* Sections */
+.td-sec { margin-top: 22px; }
+.td-h { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; min-height: 26px; }
+.td-h h2 { margin: 0; font-size: 13px; font-weight: 600; color: var(--ink); letter-spacing: -0.005em; }
+.td-h .grow { flex: 1; }
+.td-n { font-size: 12px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+.td-hint { font-size: 12px; color: var(--ink-faint); }
+.td-box { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-1); overflow: hidden; }
+.td-quiet-line { padding: 12px 14px; font-size: 12.5px; color: var(--ink-dim); line-height: 1.5;
+  border: 1px dashed var(--line); border-radius: var(--r-lg); }
+.td-msg { margin-top: 6px; font-size: 12px; color: var(--good-ink); }
+.td-msg.err { color: var(--crit-ink); }
+.td-ib { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Quick capture: dashed until you are in it, as in the mockup's quick entry. */
+.td-capture-box { margin-top: 4px; }
+.td-capture { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px;
+  border: 1px dashed var(--line); border-radius: var(--r-lg); color: var(--ink-faint); background: transparent;
+  transition: border-color .12s, background .12s, box-shadow .12s; }
+.td-capture:hover { border-color: color-mix(in srgb, var(--ink-faint) 60%, var(--line)); }
+.td-capture:focus-within { border-style: solid; border-color: var(--accent); background: var(--surface);
+  box-shadow: 0 0 0 3px var(--accent-soft); color: var(--ink); }
+.td-capture-in { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; }
+.td-capture-in::placeholder { color: var(--ink-faint); }
+.td-capture-to { font-size: 12px; color: var(--ink-faint); white-space: nowrap; }
+
+/* Rows */
+.td-row { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 38px; padding: 0 14px;
+  border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: var(--ink);
+  font: inherit; font-size: 13px; text-align: left; }
+.td-row:last-child { border-bottom: 0; }
+.td-row:hover { background: var(--raised); }
+.td-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.td-row .grow { flex: 1 1 0; min-width: 8px; }
+.td-id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); flex: none; letter-spacing: 0; }
+.td-row .td-id { width: 40px; }
+.td-title { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.td-proj { flex: none; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px; color: var(--ink-faint); }
+.td-age { flex: none; min-width: 34px; text-align: right; font-size: 12px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+
+/* The status mark: a ring for to do, half filled in progress, amber blocked. */
+.td-st { flex: none; width: 12px; height: 12px; border-radius: 99px; border: 1.6px solid var(--ink-faint); }
+.td-st.doing { border-color: var(--accent); background: linear-gradient(90deg, var(--accent) 50%, transparent 50%); }
+.td-st.blocked { border-color: var(--warn); background: var(--warn-soft); }
+.td-st.done { border-color: var(--good); background: var(--good); }
+
+/* Stuck: the marks, the edge, and the fade. */
+.td-tag { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 6px; border-radius: 5px; flex: none;
+  font-size: 11px; font-weight: 600; letter-spacing: .01em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.td-tag.amber { color: var(--warn-ink); background: var(--warn-soft); }
+.td-tag.red { color: var(--crit-ink); background: var(--crit-soft); }
+.td-row.quiet.amber { box-shadow: inset 2px 0 0 var(--warn); }
+.td-row.quiet.red { box-shadow: inset 2px 0 0 var(--crit); }
+.td-row.quiet .td-title { color: color-mix(in srgb, var(--ink-faint) var(--td-fade, 0%), var(--ink)); }
+.td-row.quiet .td-st { border-color: color-mix(in srgb, var(--ink-faint) var(--td-fade, 0%), var(--accent)); }
+.td-row.quiet .td-st.doing { background: linear-gradient(90deg, color-mix(in srgb, var(--ink-faint) var(--td-fade, 0%), var(--accent)) 50%, transparent 50%); }
+.td-row.quiet .td-st.blocked { border-color: color-mix(in srgb, var(--ink-faint) var(--td-fade, 0%), var(--warn)); }
+
+/* Up next in Focus */
+.td-next { display: flex; align-items: center; gap: 18px; padding: 16px 18px; margin-bottom: 8px;
+  border: 1px solid var(--accent-line); border-radius: var(--r-lg);
+  background: linear-gradient(100deg, var(--accent-soft), transparent 65%), var(--surface); box-shadow: var(--shadow-1); }
+.td-next-main { flex: 1; min-width: 0; }
+.td-kicker { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--accent-ink); }
+.td-next-title { display: block; margin: 4px 0 6px; padding: 0; border: 0; background: none; color: var(--ink);
+  font: inherit; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; text-align: left; }
+.td-next-title:hover { text-decoration: underline; text-underline-offset: 3px; }
+.td-next-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-dim); }
+.td-then { margin-top: 8px; font-size: 12px; color: var(--ink-dim); line-height: 1.5; }
+.td-then b { color: var(--ink); font-weight: 600; }
+.td-next-side { flex: none; }
+.td-focus { height: 34px; padding: 0 14px; font-size: 13px; }
+
+/* While you were away */
+.td-brief-sum { display: block; width: 100%; padding: 11px 14px; border: 1px solid var(--line); border-radius: var(--r-lg);
+  background: var(--surface); color: var(--ink-dim); font: inherit; font-size: 12.5px; text-align: left; box-shadow: var(--shadow-1); }
+.td-brief-sum:hover { background: var(--raised); color: var(--ink); }
+.td-bg { display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 0 14px;
+  background: var(--chrome); border-bottom: 1px solid var(--line-soft); }
+.td-bg:not(:first-child) { border-top: 1px solid var(--line); }
+.td-bg-t { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0; border: 0; background: none;
+  color: var(--ink); font: inherit; font-size: 12.5px; font-weight: 600; text-align: left; }
+.td-bg-t span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.td-bg-t:not(.plain):hover span:last-child { text-decoration: underline; text-underline-offset: 3px; }
+.td-bl { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 4px 14px; border-bottom: 1px solid var(--line-soft); font-size: 12.5px; color: var(--ink-dim); }
+.td-bl:last-child { border-bottom: 0; }
+.td-bl-i { flex: none; width: 24px; height: 24px; border-radius: 7px; display: grid; place-items: center; background: var(--raised); color: var(--ink-dim); }
+.td-bl.k-decision .td-bl-i { background: var(--good-soft); color: var(--good-ink); }
+.td-bl.k-ask .td-bl-i { background: var(--accent-soft); color: var(--accent-ink); }
+.td-bl.k-job .td-bl-i { background: var(--accent-soft); color: var(--accent-ink); }
+.td-bl.k-workbench .td-bl-i { background: var(--warn-soft); color: var(--warn-ink); }
+.td-bl.k-stuck .td-bl-i { background: var(--crit-soft); color: var(--crit-ink); }
+.td-bl-t { flex: 1; min-width: 0; line-height: 1.45; overflow-wrap: anywhere; }
+.td-bl-t b { color: var(--ink); font-weight: 600; }
+.td-bl-side { flex: none; display: flex; align-items: center; gap: 6px; }
+.td-bl-msg { margin: 0; padding: 0 14px 8px 48px; }
+.td-page .btn.ghost { border-color: transparent; background: transparent; color: var(--ink-dim); }
+.td-page .btn.ghost:hover { background: var(--raised); color: var(--ink); border-color: transparent; }
+
+/* Needs you: the Needs you page's own rows, in a box. */
+.td-needs .td-more { display: block; width: 100%; padding: 10px 14px; border: 0; border-top: 1px solid var(--line-soft);
+  background: transparent; color: var(--accent-ink); font: inherit; font-size: 12.5px; text-align: left; }
+.td-needs .td-more:hover { background: var(--raised); }
+
+/* The one banner: Direction B's, red-tinted, a pulse, and three ways out. */
+.td-banner { display: flex; align-items: center; gap: 12px; margin-top: 22px; padding: 10px 10px 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--crit) 35%, var(--line)); border-radius: var(--r-lg);
+  background: linear-gradient(90deg, var(--crit-soft), transparent 70%), var(--surface); box-shadow: var(--shadow-1); }
+.td-pulse { position: relative; flex: none; width: 8px; height: 8px; border-radius: 99px; background: var(--crit); }
+.td-pulse::after { content: ""; position: absolute; inset: -4px; border-radius: 99px; border: 2px solid var(--crit); opacity: 0;
+  animation: td-pulse 1.8s var(--ease) infinite; }
+@keyframes td-pulse { 0% { transform: scale(.5); opacity: .7; } 100% { transform: scale(1.6); opacity: 0; } }
+.td-banner-t { flex: 1; min-width: 0; font-size: 12.5px; color: var(--ink-dim); line-height: 1.5; }
+.td-banner-t b { color: var(--ink); font-weight: 600; }
+.td-banner-s { color: var(--ink-faint); margin-top: 1px; }
+.td-banner-a { display: flex; align-items: center; gap: 6px; flex: none; }
+.td-linkish { padding: 0; border: 0; background: none; color: var(--ink); font: inherit; font-weight: 600; text-align: left;
+  text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
+.td-banner-s .td-linkish { color: var(--ink-dim); font-weight: 400; }
+.td-linkish:hover { text-decoration-color: currentColor; }
+.td-x { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-faint); }
+.td-x:hover { background: var(--raised); color: var(--ink); }
+
+/* Re-assign's menu */
+.td-menu { position: fixed; z-index: 70; min-width: 200px; padding: 5px; border-radius: var(--r-lg);
+  background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow-3); }
+.td-menu button { display: flex; align-items: center; width: 100%; height: 30px; padding: 0 8px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--ink-dim); font: inherit; font-size: 12.5px; text-align: left; }
+.td-menu button:hover, .td-menu button:focus-visible { background: var(--raised); color: var(--ink); outline: none; }
+
+/* The first run */
+.td-first { margin-top: 22px; padding: var(--s7) var(--s5); text-align: center; border: 1px dashed var(--line); border-radius: var(--r-lg); }
+.td-first-i { display: inline-grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; background: var(--accent-soft); color: var(--accent-ink); }
+.td-first h2 { margin: 12px 0 6px; font-size: 15px; font-weight: 600; color: var(--ink); }
+.td-first p { max-width: 460px; margin: 0 auto; font-size: 12.5px; line-height: 1.55; color: var(--ink-dim); }
+.td-first-a { margin-top: 16px; }
+
+/* A History row the brief pointed at, lit for a moment. */
+[data-audit].td-flash { animation: td-flash 2.4s var(--ease); }
+@keyframes td-flash { 0%, 40% { background: var(--accent-soft); } 100% { background: transparent; } }
+
+@media (max-width: 760px) {
+  .td-next { flex-direction: column; align-items: stretch; }
+  .td-banner { flex-wrap: wrap; }
+  .td-banner-a { width: 100%; justify-content: flex-end; }
+  .td-proj { display: none; }
+}

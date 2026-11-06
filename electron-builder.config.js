@@ -93,6 +93,9 @@ module.exports = {
     // The settings schema, required by main/settings.js and loaded by
     // index.html, so both halves read the one list.
     "settings/",
+    // Stuck tasks and the daily brief: main/today.js requires it, and the
+    // server's daily_brief does too (tools/after-pack.js copies it out).
+    "today/",
   ],
 
   // The MCP server is launched by an editor using its own Node, and a plain Node
