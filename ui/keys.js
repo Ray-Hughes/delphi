@@ -1,14 +1,20 @@
-// The keyboard: Cmd+K, G then a letter, and J, K, Enter, E and F in a list.
+// The keyboard: Cmd+K, G then a letter, and J, K, Enter and E in a list.
 //
 // G then a letter goes to a place (ui/commands.js says which letter is which):
 // the second key has to come within 1.5 seconds, or the G is forgotten. In a
 // list, J and K move a highlight down and up the tasks, Enter opens the one
-// highlighted, E opens it to edit its title, and F opens it to focus on.
+// highlighted, and E opens it to edit its title. There is no F: there is no
+// Focus view yet, and an F that only did what Enter does was a second name
+// for the same key. It comes back with Focus.
 //
 // No single key fires while the focus is in somewhere to type, or while a
 // panel, a menu or the bar is open over the page: those own the keyboard. The
 // menu's accelerators (Cmd+1 to 4, Cmd+N, Cmd+,) are the main process's and
 // are left alone.
+//
+// The modifier is Cmd on macOS and Ctrl elsewhere, and only that one (modKey
+// in ui/core.js): on a Mac, Ctrl+K, Ctrl+P and Ctrl+F belong to the text box
+// the focus is in, and a key with Ctrl held is never a single-key shortcut.
 
 globalThis.DelphiKeys = (() => {
   const CHORD_MS = 1500;
@@ -35,11 +41,11 @@ globalThis.DelphiKeys = (() => {
    * @param app.busy()           true while a panel or menu owns the keyboard
    * @param app.openBar()        the Cmd+K bar
    * @param app.openSwitcher()   the project switcher (Cmd+P)
-   * @param app.openTask(id, how) how is "open", "edit" or "focus"
+   * @param app.openTask(id, how) how is "open" or "edit"
    */
   function install(app) {
     document.addEventListener("keydown", (e) => {
-      const mod = e.metaKey || e.ctrlKey;
+      const mod = modKey(e);
       // Not over an open panel: what the bar opens would land behind it, and
       // the panel would be left over a page it does not belong to.
       const lower = String(e.key || "").toLowerCase();
@@ -56,7 +62,7 @@ globalThis.DelphiKeys = (() => {
         app.openSwitcher();
         return;
       }
-      if (mod || e.altKey || typing(e.target) || app.busy() || window.DelphiPalette?.isOpen()) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || typing(e.target) || app.busy() || window.DelphiPalette?.isOpen()) return;
       // Shift on its own is the first half of a capital, not a key of its own:
       // it must not cancel a G waiting for its letter.
       if (["Shift", "Meta", "Control", "Alt", "CapsLock"].includes(e.key)) return;
@@ -78,7 +84,7 @@ globalThis.DelphiKeys = (() => {
       // control's own, whatever row the keyboard last stopped on.
       const focus = document.activeElement;
       if (focus && focus !== document.body && !row.contains(focus)) return;
-      const how = e.key === "Enter" ? "open" : key === "e" ? "edit" : key === "f" ? "focus" : null;
+      const how = e.key === "Enter" ? "open" : key === "e" ? "edit" : null;
       if (how) { e.preventDefault(); app.openTask(Number(row.dataset.taskId), how); }
     });
   }

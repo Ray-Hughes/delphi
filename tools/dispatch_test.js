@@ -396,6 +396,9 @@ async function main() {
   d.tick();
   const agentPid = await waitFor("the agent to start", () => d.get(sj.id).agent_pid);
   await waitFor("its command on the Sheet", () => entriesOf(st.id).some((e) => e.kind === "run"));
+  // Read from the row while the turn is still running: a crash now would
+  // never reach the end of the turn, and Resume needs the session to resume.
+  check("the harness's session is kept as soon as it is named, mid-turn", [d.get(sj.id).state, d.get(sj.id).native_session], ["running", "sess-claude-hang"]);
   d.stop(sj.id);
   await d.idle();
   const stopped = d.get(sj.id);

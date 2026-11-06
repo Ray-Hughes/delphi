@@ -41,7 +41,6 @@ globalThis.DelphiTopbar = (() => {
     return sq;
   }
   const folderName = (path) => String(path || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
-  const tilde = (path) => String(path || "").replace(/^\/Users\/[^/]+/, "~");
 
   // --- the switcher -----------------------------------------------------------
 
@@ -50,7 +49,7 @@ globalThis.DelphiTopbar = (() => {
     const b = el("button", { className: "scope" + (pop && pop.kind === "switcher" ? " open" : ""), type: "button" });
     b.setAttribute("aria-haspopup", "listbox");
     b.setAttribute("aria-expanded", String(Boolean(pop && pop.kind === "switcher")));
-    b.title = "Switch project (⌘P)";
+    b.title = `Switch project (${shortcut("P")})`;
     const chip = p
       ? (p.path ? el("span", { className: "chip mono", title: p.path }, I("folder", "xs"), folderName(p.path)) : el("span", { className: "chip quiet", textContent: "No folder" }))
       : el("span", { className: "chip", textContent: `${state.projects.length} projects` });
@@ -59,7 +58,7 @@ globalThis.DelphiTopbar = (() => {
     return b;
   }
 
-  function projectRow(p, state, { onPick }) {
+  function projectRow(p, state, { onPick, counts }) {
     const on = state.projectId === p.id;
     const row = el("div", { className: "opt" + (on ? " cur" : ""), role: "option", tabIndex: -1 });
     if (on) row.setAttribute("aria-current", "true");
@@ -70,10 +69,10 @@ globalThis.DelphiTopbar = (() => {
     if (p.path) l2.append(I("folder", "xs"), el("span", { className: "mono", textContent: tilde(p.path) }));
     else l2.append(el("span", { textContent: p.summary ? `No folder · ${p.summary}` : "No folder" }));
     const r = el("div", { className: "r" });
-    const agents = app.runningIn(p.id);
+    const agents = counts.running.get(p.id) || 0;
     if (agents) r.append(el("span", { className: "agents", title: `${agents} working here now` }, el("span", { className: "live-dot" }), String(agents)));
     r.append(el("span", { textContent: `${p.open_count || 0} open` }));
-    const late = app.lateIn(p.id);
+    const late = counts.late.get(p.id) || 0;
     if (late) r.append(el("span", { className: "tag red", title: `${late} late`, textContent: String(late) }));
     const more = el("button", { className: "icon-btn more", type: "button", title: "Overview, settings, pin, archive" }, I("more", "sm"));
     more.setAttribute("aria-label", `More for ${p.name}`);
@@ -107,7 +106,7 @@ globalThis.DelphiTopbar = (() => {
       add.onclick = () => { closePop(); globalThis.DelphiAddFolder.open(); };
       foot.prepend(add);
     }
-    node.append(el("div", { className: "pop-search" }, I("search", "sm"), find, el("kbd", { textContent: "⌘" }), el("kbd", { textContent: "P" })), listBox, foot);
+    node.append(el("div", { className: "pop-search" }, I("search", "sm"), find, el("kbd", { textContent: modLabel() }), el("kbd", { textContent: "P" })), listBox, foot);
 
     // The same place in the new scope, where there is one: the tab that is
     // lit, mapped the way the tab itself maps it. Elsewhere, the start.
@@ -122,6 +121,8 @@ globalThis.DelphiTopbar = (() => {
 
     function paintList() {
       const state = app.state();
+      // Once per paint, not once per row: see app.js.
+      const counts = { running: app.runningByProject(), late: app.lateByProject() };
       const q = find.value.trim().toLowerCase();
       const hit = (p) => !q || p.name.toLowerCase().includes(q) || String(p.path || "").toLowerCase().includes(q) || String(p.key || "").toLowerCase().includes(q);
       listBox.textContent = "";
@@ -151,7 +152,7 @@ globalThis.DelphiTopbar = (() => {
         listBox.append(all);
       }
       const byId = new Map(state.projects.map((p) => [p.id, p]));
-      const draw = ([items, shown] = []) => { if (items) for (const p of shown) items.append(projectRow(p, state, { onPick: pick })); };
+      const draw = ([items, shown] = []) => { if (items) for (const p of shown) items.append(projectRow(p, state, { onPick: pick, counts })); };
       draw(group("PINNED", (state.pinned || []).map((id) => byId.get(id))));
       draw(group("RECENT", readRecent().filter((id) => id !== state.projectId).slice(0, 4).map((id) => byId.get(id))));
       draw(group("FOLDERS", state.projects.filter((p) => p.path), "A project is a folder"));
@@ -160,7 +161,7 @@ globalThis.DelphiTopbar = (() => {
       if (g.length) {
         const [items, shown] = g;
         const cut = q || showAllUnlinked ? shown : shown.slice(0, NO_FOLDER_SHOWN);
-        for (const p of cut) items.append(projectRow(p, state, { onPick: pick }));
+        for (const p of cut) items.append(projectRow(p, state, { onPick: pick, counts }));
         if (cut.length < shown.length) {
           const more = el("div", { className: "opt more-row", role: "option", tabIndex: -1, textContent: `${shown.length - cut.length} more` });
           more.onclick = () => { showAllUnlinked = true; paintList(); };
@@ -198,7 +199,7 @@ globalThis.DelphiTopbar = (() => {
       body.append(app.sessionKids());
       if (row) body.querySelector(`[data-row="${row}"]`)?.focus({ preventScroll: true });
     };
-    node.onkeydown = (e) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closePop(); } };
+    node.onkeydown = (e) => { if (e.key === "Escape" && !e.isComposing) { e.preventDefault(); e.stopPropagation(); closePop(); } };
     pop = { kind: "sessions", node, button, repaint };
     document.body.classList.add("pop-open");
     document.body.append(node);
@@ -245,12 +246,15 @@ globalThis.DelphiTopbar = (() => {
     if (e.key === "ArrowDown") { e.preventDefault(); highlight(box, Math.min(opts.length - 1, at + 1), owner); }
     else if (e.key === "ArrowUp") { e.preventDefault(); highlight(box, Math.max(0, at - 1), owner); }
     else if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); opts[Math.max(0, at)]?.click(); }
-    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closePop(); }
+    else if (e.key === "Escape" && !e.isComposing) { e.preventDefault(); e.stopPropagation(); closePop(); }
   }
 
   // Escape closes a popover wherever the focus is. Without this, after a click
   // left the focus on the page, it reached app.js, whose Escape hides the window.
   document.addEventListener("keydown", (e) => {
+    // During an IME composition Escape is the input method's: kept from
+    // app.js (which would hide the window) but not acted on.
+    if (pop && e.key === "Escape" && e.isComposing) { e.stopPropagation(); return; }
     if (pop && e.key === "Escape" && !document.querySelector(".ctx")) {
       e.preventDefault();
       e.stopPropagation();
@@ -286,8 +290,8 @@ globalThis.DelphiTopbar = (() => {
     const bar = document.getElementById("bar");
     if (!bar || bar.firstChild) return;
     const b = el("button", { className: "searchbtn", type: "button" }, I("search", "sm"),
-      el("span", { className: "grow", textContent: "Search, jump, or run a command" }), el("kbd", { textContent: "⌘" }), el("kbd", { textContent: "K" }));
-    b.setAttribute("aria-label", "Search, jump, or run a command (Command K)");
+      el("span", { className: "grow", textContent: "Search, jump, or run a command" }), el("kbd", { textContent: modLabel() }), el("kbd", { textContent: "K" }));
+    b.setAttribute("aria-label", `Search, jump, or run a command (${isMac() ? "Command" : "Control"} K)`);
     b.onclick = () => app.openBar();
     bar.append(b);
   }
@@ -306,9 +310,11 @@ globalThis.DelphiTopbar = (() => {
     const waiting = app.needsYou();
     box.append(
       iconBtn("inbox", waiting ? `Needs you: ${waiting}` : "Needs you", () => app.go({ projectId: null, view: "inbox" }), waiting || null),
-      iconBtn("gear", "Settings (⌘,)", () => app.openSettings()),
+      iconBtn("gear", `Settings (${shortcut(",")})`, () => app.openSettings()),
       iconBtn(app.themeIs() === "dark" ? "sun" : "moon", app.themeIs() === "dark" ? "Switch to light" : "Switch to dark", () => app.toggleTheme()));
-    const neu = el("button", { className: "btn primary", type: "button", title: "New task (⌘N)" }, I("plus", "sm"), "New", el("kbd", { textContent: "⌘N" }));
+    const neu = el("button", { className: "btn primary", type: "button", title: `New task (${shortcut("N")})` }, I("plus", "sm"),
+      el("span", { className: "neu-label", textContent: "New" }), el("kbd", { textContent: shortcut("N") }));
+    neu.setAttribute("aria-label", "New task");
     neu.onclick = () => app.newTask();
     box.append(neu);
   }

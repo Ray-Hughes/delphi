@@ -701,6 +701,9 @@ app.whenReady().then(async () => {
   // the file open. See main/backups.js.
   const restored = backups.applyPending();
   if (restored && !restored.ok) console.error(`could not restore ${restored.from}: ${restored.error}`);
+  // No database, and a restore's folder holding one: said loudly, before the
+  // first open quietly makes an empty file over the gap.
+  if (!askAboutLostDatabase()) return;
   // A new version on an old file: a copy of it as the old version left it,
   // before opening migrates it. Awaited, because the first open is next.
   let updated = null;
@@ -1987,6 +1990,37 @@ registerRecovery(handle, { recovery, dispatcher });
 const backups = createBackups({
   dataDir: paths.RESOLVED.dataDir, dbPath: paths.DB_PATH, source: () => db.handle(), sqlite: require("node:sqlite"),
 });
+
+/**
+ * When there is no database at the live path but backups/replaced-* holds
+ * one, which is what an older Delphi left when it was stopped part way through
+ * a restore. Opening the path would make a new empty database and the tracker
+ * would look wiped, so the person chooses first. False means quit.
+ */
+function askAboutLostDatabase() {
+  let lost = null;
+  try { lost = backups.orphaned(); } catch (error) { console.error("looking for a set-aside database", error); }
+  if (!lost) return true;
+  const newest = lost.replaced[0];
+  const when = new Date(newest.at).toLocaleString();
+  const choice = dialog.showMessageBoxSync({
+    type: "warning", noLink: true, defaultId: 0, cancelId: 1,
+    buttons: ["Restore it", "Quit", "Start with an empty database"],
+    message: "Delphi found no database, but a restore set one aside",
+    detail: `There is no database at ${lost.dbPath}. A restore that did not finish moved the one that was there to ${newest.folder}${newest.wal ? ", with its -wal" : ""}. It was last changed ${when}.\n\n` +
+      "Restore it puts that file back, copied, so the folder keeps its own. Starting empty makes a new database and leaves the folder where it is for 30 days.",
+  });
+  if (choice === 1) { app.quit(); return false; }
+  try {
+    if (choice === 0) backups.putBack(newest.folder);
+    else backups.moveStrays(newest.folder);
+  } catch (error) {
+    dialog.showErrorBox("Delphi could not put the database back", `${error.message}\n\nNothing was deleted. The file is still in ${newest.folder}.`);
+    app.quit();
+    return false;
+  }
+  return true;
+}
 
 /**
  * The rows that say a snapshot was taken before something big, once the

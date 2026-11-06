@@ -31,4 +31,35 @@ const safeColour = (value, fallback = "var(--ink-faint)") => {
   return /^#[0-9a-f]{3,8}$/i.test(v) || /^var\(--[a-z0-9-]+\)$/i.test(v) || /^[a-z]{3,20}$/i.test(v) ? v : fallback;
 };
 
-if (typeof module !== "undefined" && module.exports) module.exports = { $, el, safeColour };
+/**
+ * The platform the window runs on, from the preload (process.platform), which
+ * is there before any page script runs. navigator.platform only as a fallback,
+ * for a page opened outside Electron.
+ */
+const PLATFORM = (() => {
+  try { if (globalThis.window && window.delphi && window.delphi.platform) return window.delphi.platform; } catch {}
+  try { return /Mac/i.test(globalThis.navigator.platform) ? "darwin" : "other"; } catch { return "other"; }
+})();
+const isMac = () => PLATFORM === "darwin";
+
+/**
+ * The command modifier, held alone: Cmd on macOS and Ctrl everywhere else.
+ * Never either on either. On macOS Ctrl+K, Ctrl+P and Ctrl+F are the text
+ * system's own (kill to the end of the line, up a line, forward a character),
+ * and a shortcut that answered to them would eat those keys in every box.
+ */
+const modKey = (e, mac = isMac()) => (mac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey);
+
+/** How that modifier is written on a key cap or in a tooltip. */
+const modLabel = (mac = isMac()) => (mac ? "\u2318" : "Ctrl");
+/** A shortcut as this platform writes it: "⌘K" on a Mac, "Ctrl+K" elsewhere. */
+const shortcut = (key, mac = isMac()) => (mac ? `\u2318${key}` : `Ctrl+${key}`);
+
+/**
+ * A path with the home folder written as ~, on every platform's layout: macOS
+ * /Users/name, Linux /home/name (and /root), Windows C:\Users\name. Only a
+ * whole folder name: /Users/ann is ~, /Users/annabel/x is not ~bel/x.
+ */
+const tilde = (path) => String(path || "").replace(/^(?:\/Users\/[^/]+|\/home\/[^/]+|\/root|[A-Za-z]:[\\/]Users[\\/][^\\/]+)(?=[\\/]|$)/i, "~");
+
+if (typeof module !== "undefined" && module.exports) module.exports = { $, el, safeColour, PLATFORM, isMac, modKey, modLabel, shortcut, tilde };

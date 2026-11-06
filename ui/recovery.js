@@ -7,6 +7,10 @@
 // - Drafts: what was typed into a box and not yet saved, one key per box, so a
 //   crash, a reload or a closed window costs nothing that was being written.
 //   Cleared the moment the write succeeds; dropped after 30 days unopened.
+//   A task's drafts are keyed by its id and when it was made (taskDraftId),
+//   because SQLite hands a deleted task's id to the next one made, and a
+//   restored backup brings back ids that meant other tasks since: a bare id
+//   would put one task's half-written comment into another's box.
 // - The banner after an unclean exit, from the main process (main/recovery.js),
 //   with the runs it interrupted.
 //
@@ -66,6 +70,58 @@ globalThis.DelphiRecovery = (() => {
     if (text == null || !String(text).trim()) { remove(draftKey(kind, id)); return; }
     write(draftKey(kind, id), { text: String(text), at: Date.now() });
   }
+  /**
+   * The id a task's drafts are kept under: its id and its created_at, so the
+   * draft can only ever come back into the task it was typed for.
+   */
+  function taskDraftId(task) {
+    if (!task || task.id == null) return null;
+    const made = String(task.created_at || "").replace(/\D/g, "");
+    return made ? `${Number(task.id)}-${made}` : String(Number(task.id));
+  }
+
+  /** Every key in the store a test says yes to, then removed. */
+  function dropWhere(test) {
+    const s = store();
+    if (!s) return 0;
+    const gone = [];
+    try {
+      for (let i = 0; i < s.length; i++) {
+        const key = s.key(i);
+        if (key && key.startsWith(DRAFT) && test(key)) gone.push(key);
+      }
+    } catch {}
+    for (const key of gone) remove(key);
+    return gone.length;
+  }
+
+  /** The boxes a task has. A flag's or a project's draft shares the number space and is not the task's. */
+  const TASK_KINDS = ["title", "desc", "sheet"];
+
+  /** A task deleted: every draft of every box it had goes with it. */
+  function clearTaskDrafts(taskId) {
+    const id = String(Number(taskId));
+    // kind.id or kind.id-created: the id and then the end or a dash, so task 4
+    // never takes task 42's.
+    return dropWhere((key) => {
+      const rest = key.slice(DRAFT.length);
+      const dot = rest.indexOf(".");
+      if (dot < 0 || !TASK_KINDS.includes(rest.slice(0, dot))) return false;
+      const what = rest.slice(dot + 1);
+      return what === id || what.startsWith(`${id}-`);
+    });
+  }
+
+  /**
+   * After a backup was restored, every draft written before it: each was typed
+   * against the file that has just been replaced, and the task, flag or
+   * project it was for may not exist in the restored one, or be another thing
+   * under the same id.
+   */
+  function dropDraftsBefore(when) {
+    return dropWhere((key) => { const d = read(key); return !d || !(Number(d.at || 0) >= when); });
+  }
+
   function draft(kind, id) { const d = read(draftKey(kind, id)); return d && typeof d.text === "string" ? d.text : null; }
   function clearDraft(kind, id) { remove(draftKey(kind, id)); }
 
@@ -166,9 +222,17 @@ globalThis.DelphiRecovery = (() => {
     const list = el("div", { className: "recovery-runs" });
     for (const run of state.runs) {
       const row = el("div", { className: "recovery-run" });
-      const resume = el("button", { className: "btn sm primary", type: "button", textContent: "Resume" });
+      const again = run.kind === "do" ? "Start again in its Workbench" : "Start again";
+      const resume = el("button", { className: "btn sm primary", type: "button", textContent: run.canResume ? "Resume" : again });
       const drop = el("button", { className: "btn sm", type: "button", textContent: "Dismiss" });
       const why = el("span", { className: "recovery-why" });
+      // Honest about what the button does: with no session to hand back, the
+      // agent starts from its request, and a Workbench keeps what it changed.
+      if (!run.canResume) {
+        why.textContent = run.kind === "do"
+          ? "It stopped before it had a session to resume, so this starts it over. Its Workbench keeps what it changed."
+          : "It stopped before it had a session to resume, so this starts it over.";
+      }
       if (run.agentAlive) {
         resume.disabled = true;
         why.textContent = "Its agent may still be running. Resume once it has exited.";
@@ -200,7 +264,8 @@ globalThis.DelphiRecovery = (() => {
     host.prepend(box);
   }
 
-  return { remember, taskOpened, taskClosed, watchScroll, lastPlace, saveDraft, draft, clearDraft, draftsOf, pruneDrafts, bindDraft, showBanner };
+  return { remember, taskOpened, taskClosed, watchScroll, lastPlace, saveDraft, draft, clearDraft, draftsOf, pruneDrafts, bindDraft, showBanner,
+    taskDraftId, clearTaskDrafts, dropDraftsBefore };
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = globalThis.DelphiRecovery;

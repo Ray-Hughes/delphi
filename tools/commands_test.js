@@ -124,6 +124,24 @@ async function main() {
   check("and is from inside one", C.match(commands, "links", state).map((c) => c.place), ["links"]);
   check("nothing typed lists everything available", C.match(commands, "", state).length > 20, true);
 
+  section("every view outside the six tabs has its own title and a way back");
+  const head = (view, projectId = null) => C.heading({ view, projectId, query: "" }, "Caseflow");
+  for (const [view, title] of [["settings", "Settings"], ["history", "History"], ["queue", "Queue"], ["reminders", "Reminders"], ["graph", "Mind map"], ["new", "What's new"]]) {
+    const h = head(view);
+    check(`${title}, in All projects`, [h && h.title, h && h.crumbs[0].label, Boolean(h && h.subtitle)], [title, "All projects", true]);
+  }
+  for (const [view, title] of [["project", "Settings"], ["activity", "History"], ["links", "Links"], ["queue", "Queue"]]) {
+    const h = head(view, 4);
+    check(`a project's ${title}, under the project`, [h && h.title, h && h.crumbs[0].label, h && h.crumbs[0].target], [title, "Caseflow", { view: "overview" }]);
+  }
+  check("a view the tabs name keeps the project's heading", [head("tasks", 4), head("notes", 4), head("overview", 4)], [null, null, null]);
+  check("a search has its own heading", C.heading({ view: "settings", projectId: null, query: "x" }), null);
+
+  section("a search can be seen both ways, and switching keeps the query");
+  const sv = C.searchViews({ view: "oracle", query: "task", oracleHits: [1, 2], tasks: [1, 2, 3], notes: [1] });
+  check("Oracle and Matches, with counts, Oracle lit", sv.map((v) => [v.label, v.count, v.on]), [["Oracle", 2, true], ["Matches", 4, false]]);
+  check("neither target names the query, so navigate() keeps it", sv.every((v) => !("query" in v.target) && !("projectId" in v.target)), true);
+
   console.log(`\n${checks - failures}/${checks} checks passed`);
   process.exit(failures ? 1 : 0);
 }
