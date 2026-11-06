@@ -2035,6 +2035,8 @@ today.watch(app);
 // The weekly review (today/weekly.js), and its Park, Drop and objectives.
 const weeklyMain = require("./main/weekly");
 weeklyMain.register(handle, { weekly: weeklyMain.createWeekly({ db, sheets, after: () => scheduleVaultExport() }) });
+// Focus mode: delegation that always waits for approval, and the break notice.
+require("./main/focus").register(handle, { dispatcher, Notification });
 
 handle("backups:list", () => ({ dir: backups.dir, backups: backups.list(), lastRestore }));
 handle("backups:preview", (name) => backups.preview(name));

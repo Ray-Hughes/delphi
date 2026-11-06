@@ -7,7 +7,7 @@
 //   - While you were away: the daily brief, grouped by task (today/brief.js)
 //   - Needs you: the rows the Needs you page draws, lent by app.js
 //   - one banner, for the single most important task with no movement
-//   - Your day: overdue, due today and in progress, in Focus order, with the
+//   - Your day: your open work in Focus mode's own order, with the
 //     first of them as "Up next" and a Start focus entry
 //   - Gone quiet: every stuck task, fading toward grey the longer it sits
 //
@@ -185,29 +185,21 @@ globalThis.DelphiToday = (() => {
   // What is on today, in Focus order
 
   const dueState = (t) => (t.due ? TIME.dueState(t.due) : null);
-  const PRI = { high: 0, med: 1, low: 2 };
-  const pri = (t) => PRI[t.priority] ?? 1;
   /** Yours or nobody's: Today is your day, and an agent's work is on Runs. */
   const mine = (t) => !app.isAgent(t.assignee || t.owner || "");
 
   /**
-   * The Focus queue: overdue first (the oldest due date first), then due
-   * today, then in progress that is yours or unowned; priority breaks ties.
-   * Until Focus mode exists this order is the whole of it, and Start focus
-   * opens the first.
+   * The Focus queue: the order Focus mode itself uses (ui/focus.js order:
+   * priority, then due date, then oldest, and only a person's own work), so
+   * "Up next in Focus", Start focus, F and Done all name the same task. Each
+   * carries why it is on your day (overdue, due today, in progress) for its tag.
    */
   function focusQueue(tasks) {
-    const open = tasks.filter((t) => t.status !== "done" && !t.parent_id);
-    const seen = new Set();
-    const take = (list) => list.filter((t) => (seen.has(t.id) ? false : (seen.add(t.id), true)));
-    const overdue = take(open.filter((t) => dueState(t) === "overdue")
-      .sort((a, b) => String(a.due).localeCompare(String(b.due)) || pri(a) - pri(b)));
-    const due = take(open.filter((t) => dueState(t) === "today").sort((a, b) => pri(a) - pri(b) || a.id - b.id));
-    // Not review: that is finished work waiting on your look, and it is under
-    // Needs you, not in the queue of things you are doing.
-    const doing = take(open.filter((t) => !["todo", "review", "blocked", "done"].includes(t.status) && mine(t))
-      .sort((a, b) => pri(a) - pri(b) || String(b.updated_at).localeCompare(String(a.updated_at))));
-    return [...overdue.map((t) => ({ t, why: "overdue" })), ...due.map((t) => ({ t, why: "due" })), ...doing.map((t) => ({ t, why: "doing" }))];
+    // Focus names todo and doing only, so In review, finished work waiting on
+    // your look, is under Needs you and never in the queue of things to do.
+    const why = (t) => (dueState(t) === "overdue" ? "overdue" : dueState(t) === "today" ? "due" : t.status === "doing" ? "doing" : null);
+    if (window.DelphiFocus) return DelphiFocus.order(tasks || [], (app.state() || {}).runs || []).map((t) => ({ t, why: why(t) }));
+    return (tasks || []).filter((t) => (t.status === "todo" || t.status === "doing") && !t.parent_id && mine(t)).map((t) => ({ t, why: why(t) }));
   }
 
   function whyTag(item) {
@@ -255,6 +247,8 @@ globalThis.DelphiToday = (() => {
 
   function startFocus() {
     const q = focusQueue((app.state().everyTask) || []);
+    // The card names Focus's own first task, so entering Focus shows it.
+    if (window.DelphiFocus) { DelphiFocus.enter(); return; }
     if (!q.length) { app.notify("Nothing is due or in progress for you, so there is nothing to focus on yet."); return; }
     app.openTask(q[0].t.id);
   }
@@ -631,7 +625,7 @@ globalThis.DelphiToday = (() => {
     if (data && data.banner && !hidden.has(bannerKey(data.banner))) page.append(banner(data));
 
     const queue = focusQueue(tasks);
-    const day = section("Your day", queue.length, "Overdue, due today, then in progress: yours or nobody's, in Focus order");
+    const day = section("Your day", queue.length, "Yours or nobody's, in Focus order: priority, then due date, then oldest");
     if (queue.length) {
       day.append(upNext(queue[0], queue.slice(1), stuckById));
       if (queue.length > 1) {

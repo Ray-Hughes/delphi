@@ -10088,7 +10088,7 @@ function paintRunsLive() {
  * it is (data-act, else its words). Only the sidebar and the page are named;
  * focus inside a dialog is never at risk from a repaint underneath it.
  */
-function focusKey(node) {
+function focusLetter(node) {
   if (!node || node === document.body || !node.closest) return null;
   const scope = node.closest("#projects") ? "side" : node.closest("#content") ? "content" : null;
   if (!scope) return null;
@@ -10101,7 +10101,7 @@ function focusKey(node) {
   };
 }
 
-/** Focus the control a focusKey named, if it is still there and there is only one it could be. */
+/** Focus the control a focusLetter named, if it is still there and there is only one it could be. */
 function restoreFocus(key) {
   if (!key) return;
   const root = key.scope === "side" ? $("projects") : $("content");
@@ -10148,11 +10148,11 @@ for (const type of ["pointerup", "pointercancel", "dragend"]) document.addEventL
  *
  * render() replaces the pane, so focus would drop to the page on every
  * activity ping. Drafts live in runDrafts; the focused control, a field or a
- * button or a sidebar row, is found again by focusKey.
+ * button or a sidebar row, is found again by focusLetter.
  */
 function repaintKeepingFocus() {
   if (pointerDown) { afterPointer.add(repaintKeepingFocus); return; }
-  const key = focusKey(document.activeElement);
+  const key = focusLetter(document.activeElement);
   render();
   restoreFocus(key);
 }
@@ -12853,7 +12853,7 @@ function renderSidebar() {
   if (sig === sidebarSig && $("projects").childNodes.length) return;
   if (pointerDown && $("projects").childNodes.length) { afterPointer.add(renderSidebar); return; }
   sidebarSig = sig;
-  const key = focusKey(document.activeElement);
+  const key = focusLetter(document.activeElement);
   paintSidebar();
   if (key && key.scope === "side") restoreFocus(key);
 }
@@ -14645,6 +14645,7 @@ if (window.DelphiSettingsPanel) {
       if ("animations" in fields) applyMotion(settings.animations !== false);
       if ("noteView" in fields) state.noteView = settings.noteView;
       if ("pinnedProjects" in fields) state.pinned = readPins(settings);
+      if ("focusLetter" in fields) DelphiFocus.paintEntry();
       render();
     },
     refresh: () => refresh(),
@@ -14732,6 +14733,11 @@ if (window.DelphiWeekly) {
     finishWorkbench: (wbId, taskId, opts) => finishWorkbench(wbId, taskId, opts) });
   COMMANDS.push(...DelphiWeekly.commands());
 }
+// Focus mode (ui/focus.js): one task, Interruption, delegation and Break. busy
+// is what sits over Focus and owns the keyboard while it is up.
+DelphiFocus.init({ ...shell, refresh: () => refresh(), notify: (text) => notify(text), openTask: (id) => openTaskSheet(id), isAgent,
+  busy: () => Boolean(openSheet || openMenu || dialogStack.length || document.querySelector("body > .overlay") || window.DelphiPalette?.isOpen() || (window.DelphiSettingsPanel && DelphiSettingsPanel.isOpen())) });
+COMMANDS.push(...DelphiFocus.commands());
 DelphiKeys.install({
   commands: () => COMMANDS,
   // A panel, a menu, a dialog or a popover owns the keyboard while it is open.
@@ -14740,6 +14746,7 @@ DelphiKeys.install({
   busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay") || DelphiTasks.isOpen()),
   openBar: () => openBar(),
   openSwitcher: () => DelphiTopbar.openSwitcher(),
+  singleKey: (key, taskId) => DelphiFocus.key(key, taskId),
   openTask: async (id, how) => {
     if (how === "edit" && DelphiTasks.startEdit(id)) return;
     await openTaskSheet(id);
@@ -14759,6 +14766,7 @@ function goTo(next) {
 const someProjectId = () => state.projectId || (state.projects[0] && state.projects[0].id) || null;
 
 window.delphi.onMenu(async ({ action, view, theme }) => {
+  if (DelphiFocus.menu(action)) return;
   if (window.DelphiSettingsPanel && DelphiSettingsPanel.handleMenu(action)) return;
   switch (action) {
     case "search":
