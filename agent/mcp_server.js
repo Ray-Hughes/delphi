@@ -17,67 +17,25 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
-/** Where an installed copy keeps its data, worked out without Electron. */
-function installedDatabase() {
-  if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db");
-  }
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-    return path.join(appData, "Delphi", "delphi.db");
-  }
-  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-  return path.join(configHome, "Delphi", "delphi.db");
-}
-
 /**
- * Finds the database.
+ * Finds the database, by the one rule the app and the command line also use.
  *
- * A checkout keeps it beside the source, an installed copy keeps it in the
- * per-user data directory, and the same server file is used by both. This
- * duplicates paths.js on purpose, because that file ends up inside app.asar and a
- * plain Node process cannot read in there.
- *
- * The installed copy is preferred, and that ordering is the whole point. It used
- * to look beside the source first, on the reasoning that only a checkout has a
- * neighbouring database. True, but it assumed a checkout means you are *running*
- * from the checkout, and someone who has cloned the repository and also installed
- * the app has both. Their editor then registers the server by its path inside the
- * checkout, so the neighbour won, and the agent wrote to a database the app does
- * not read. Nothing errors: notes and tasks are written, and simply never appear.
- * Preferring the installed copy fixes it, and costs nothing for a developer
- * working purely from a checkout, who has no installed copy to prefer.
- *
- * DELPHI_DB still overrides both, which is the escape hatch for running the
- * server against a checkout on purpose.
+ * It used to be worked out here, as a twin of paths.js that preferred the
+ * installed copy, while paths.js preferred the checkout when run from source.
+ * Each was right alone and together they were the bug: the app read one file
+ * and every agent wrote the other, and nothing errored. agent/locate.js is now
+ * the only place this is decided. DELPHI_DB still names a file outright, which
+ * is what the app passes to every agent it launches.
  */
-function findDatabase() {
-  if (process.env.DELPHI_DB) return path.resolve(process.env.DELPHI_DB);
-
-  const installed = installedDatabase();
-  const beside = path.join(__dirname, "..", "delphi.db");
-
-  if (fs.existsSync(installed)) {
-    // Worth saying out loud. stderr goes to the client's MCP log rather than into
-    // the protocol stream on stdout, so it cannot corrupt a response.
-    if (fs.existsSync(beside)) {
-      process.stderr.write(
-        `delphi: two databases exist. Using the installed one at ${installed}. ` +
-        `The checkout copy at ${beside} is being ignored. ` +
-        `Set DELPHI_DB to override.\n`
-      );
-    }
-    return installed;
-  }
-
-  if (fs.existsSync(beside)) return beside;
-  return installed;
-}
-
-const DB = findDatabase();
+const locate = require("./locate");
+const RESOLVED = locate.resolve();
+const DB = RESOLVED.dbPath;
 
 const directives = require("./directives");
-const readSettings = directives.makeSettingsReader(directives.settingsBesideDatabase(DB));
+// settings.json lives in the data folder, which is the database's own folder
+// unless DELPHI_DATA_DIR says otherwise, exactly as the app reads it.
+const SETTINGS_FILE = path.join(RESOLVED.dataDir, "settings.json");
+const readSettings = directives.makeSettingsReader(SETTINGS_FILE);
 
 /**
  * The scratchpad setting, resolved against the projects that actually exist.
@@ -111,6 +69,41 @@ function scratchpadState() {
 // is the mistake this is guarding against, and the description is the last place
 // to catch it.
 const SCRATCHPAD_TOOLS = new Set(["write_scratchpad", "list_scratchpads", "add_note", "list_projects"]);
+
+/**
+ * The second opinion setting, and the agent it names.
+ *
+ * The row is read from harnesses so a model or flag set in Settings applies, and
+ * falls back to the built-in definition because a database the app has never
+ * opened since an upgrade has no row yet, and the tool has to work without the
+ * app running. A row someone turned off stays off.
+ */
+function secondOpinionAgent() {
+  const key = String(readSettings().secondOpinionAgent || "copilot");
+  let row = null;
+  try { row = sql("SELECT * FROM harnesses WHERE key = :p1", [key])[0] || null; } catch { row = null; }
+  if (!row) {
+    const builtin = harness.BUILTINS.find((h) => h.key === key);
+    if (builtin) row = { ...builtin, args_json: JSON.stringify(builtin.args), enabled: 1 };
+  }
+  return row;
+}
+
+function secondOpinionState() {
+  if (readSettings().secondOpinionMode !== true) return { on: false, label: null };
+  const row = secondOpinionAgent();
+  return { on: true, label: (row && row.label) || "the second opinion agent" };
+}
+
+// Which tools carry the second opinion note. second_opinion itself, and the
+// moments the rule is about: finishing a queued task, writing up what was found,
+// and the orienting call.
+const SECOND_OPINION_TOOLS = new Set(["second_opinion", "queue_complete", "add_comment", "sheet_append", "list_projects"]);
+// How often a running session is reminded through tool results. Once an hour is
+// enough to reach a session that started before the mode was turned on, without
+// repeating itself so often that the model learns to skip it.
+const SECOND_OPINION_REMIND_MS = 60 * 60 * 1000;
+let secondOpinionRemindedAt = 0;
 const ACTOR = process.env.DELPHI_ACTOR || "agent";
 
 /**
@@ -172,6 +165,19 @@ function openDatabase() {
         // out version produced, so nothing downstream has to know which is in use.
         return handle.prepare(statement).all();
       },
+      // Several statements as one unit, for a move that must land whole. A
+      // savepoint so it nests if a caller ever holds a transaction already.
+      batch(statements) {
+        handle.exec("SAVEPOINT delphi_batch");
+        try {
+          for (const statement of statements) handle.prepare(statement).all();
+          handle.exec("RELEASE delphi_batch");
+        } catch (error) {
+          handle.exec("ROLLBACK TO delphi_batch");
+          handle.exec("RELEASE delphi_batch");
+          throw error;
+        }
+      },
     };
   } catch {
     const binary = findSqlite();
@@ -209,7 +215,82 @@ function openDatabase() {
           try { fs.unlinkSync(file); } catch {}
         }
       },
+      // Each query() is its own process, so no transaction spans two of them.
+      // A batch is therefore one script in one process, between BEGIN and
+      // COMMIT, with .bail so the first failure ends the process before the
+      // COMMIT and the whole script rolls back. execFileSync throws on that
+      // exit, with sqlite3's own message on stderr.
+      batch(statements) {
+        const lines = [".timeout 5000", ".bail on", "BEGIN IMMEDIATE;",
+          ...statements.map((q) => (q.trim().endsWith(";") ? q : `${q};`)), "COMMIT;"];
+        const file = path.join(os.tmpdir(), `delphi-${process.pid}-${Date.now()}-batch.sql`);
+        fs.writeFileSync(file, lines.join("\n"));
+        try {
+          execFileSync(binary, [DB], { input: `.read ${file}\n`, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] });
+        } catch (error) {
+          const said = String((error && error.stderr) || "").trim().split("\n")[0];
+          throw new Error(said || String(error.message || error));
+        } finally {
+          try { fs.unlinkSync(file); } catch {}
+        }
+      },
     };
+  }
+}
+
+/**
+ * The id of the file at DB, read without writing anything, or null.
+ *
+ * Read-only on both routes, because it is asked before the database is opened
+ * for real: opening it for real migrates it, mints an id in it, or creates it
+ * when it is missing, and a server about to refuse a file must not have done
+ * any of that to it first.
+ */
+function readIdReadOnly() {
+  const statement = "SELECT value FROM meta WHERE key = 'db_id'";
+  let DatabaseSync = null;
+  if (process.env.DELPHI_SQLITE_ROUTE !== "binary") {
+    try { ({ DatabaseSync } = require("node:sqlite")); } catch {}
+  }
+  try {
+    if (DatabaseSync) {
+      const handle = new DatabaseSync(DB, { readOnly: true });
+      try { return (handle.prepare(statement).get() || {}).value || null; } finally { handle.close(); }
+    }
+    const out = execFileSync(findSqlite(), ["-readonly", "-json", DB, statement], { encoding: "utf8" }).trim();
+    return out ? (JSON.parse(out)[0] || {}).value || null : null;
+  } catch {
+    // No meta table, or not a database at all: either way it has no id.
+    return null;
+  }
+}
+
+// An agent the app launched is told which database it is for, by id as well as
+// by path. A path can be right and the file behind it wrong: restored from a
+// backup, swapped for another copy, or a second checkout's. Writing on regardless
+// is how work disappears without an error, so this refuses to start at all,
+// before the file is opened, migrated, given an id or created, and says why
+// where the client's MCP log will show it. fs.writeSync rather than
+// process.stderr.write, because on macOS a pipe is written asynchronously and
+// process.exit does not wait for it.
+if (process.env.DELPHI_DB_ID) {
+  const wanted = process.env.DELPHI_DB_ID;
+  const exists = fs.existsSync(DB);
+  const found = exists ? readIdReadOnly() : null;
+  if (found !== wanted) {
+    // When the app that launched this still reports the wanted id from its open
+    // handle, the file at the path was replaced under it, and launching the
+    // agent again from that app would only be refused again.
+    const beat = require("./identity").readAlive(RESOLVED);
+    const appStale = Boolean(beat && beat.db_id === wanted);
+    fs.writeSync(2,
+      `delphi: refusing to start. This server was launched for the database with id ${wanted}, but ` +
+      (exists ? `${DB} ${found ? `has the id ${found}` : "has no Delphi id at all"}. ` : `there is no file at ${DB}. `) +
+      `Nothing was read, written or created. ` +
+      (appStale
+        ? `The Delphi app still has the database with id ${wanted} open, but the file at that path is now a different one: restart the Delphi app.\n`
+        : `Start the agent again from the Delphi app that owns the database, or unset DELPHI_DB_ID if this file is the one you meant.\n`));
+    process.exit(1);
   }
 }
 
@@ -244,6 +325,41 @@ for (const failure of MIGRATED.errors) {
   process.stderr.write(`delphi: could not migrate (${failure.message}): ${failure.statement.split("\n")[0]}\n`);
 }
 
+/**
+ * The file's identity, minted if this is the first process to meet it since
+ * meta arrived. See agent/identity.js.
+ */
+const identity = require("./identity");
+// Jobs (handoffs, queued work, a person's own requests): rows and rules shared
+// with the app's dispatcher. See agent/jobs.js.
+const jobs = require("./jobs");
+// Second opinions: another agent's CLI, run read only and waited for.
+const secondOpinion = require("./second_opinion");
+const harness = require("../harness");
+let IDENTITY = { db_id: null, created_at: null };
+try {
+  IDENTITY = identity.ensure((statement) => DATABASE.query(statement));
+} catch (error) {
+  process.stderr.write(`delphi: could not read this database's identity (${error.message})\n`);
+}
+
+// A checkout's own delphi.db is never used now, and that deserves saying once
+// rather than on every start: stderr from here reaches a person running the
+// delphi command on every command. "Once" is remembered in the database, per
+// checkout path, so a different checkout is still mentioned. Only when nothing
+// was overridden: with DELPHI_DB or DELPHI_DATA_DIR set, a file was chosen on
+// purpose and the checkout one is not being ignored by surprise.
+if (RESOLVED.source === "default" && RESOLVED.checkoutDbIgnored && IDENTITY.db_id) {
+  try {
+    const said = (DATABASE.query("SELECT value FROM meta WHERE key = 'checkout_db_noticed';")[0] || {}).value;
+    if (said !== RESOLVED.checkoutDbIgnored) {
+      process.stderr.write(`${locate.ignoredNotice(RESOLVED)} Run delphi doctor to see it again.\n`);
+      const quoted = `'${RESOLVED.checkoutDbIgnored.replace(/'/g, "''")}'`;
+      DATABASE.query(`INSERT INTO meta (key, value) VALUES ('checkout_db_noticed', ${quoted}) ON CONFLICT(key) DO UPDATE SET value = excluded.value;`);
+    }
+  } catch {}
+}
+
 // --- database ---------------------------------------------------------------
 
 /**
@@ -260,7 +376,7 @@ function literal(v) {
   return `'${String(v).replace(/'/g, "''")}'`;
 }
 
-function sql(query, params = []) {
+function render(query, params = []) {
   // Values are substituted into the statement rather than bound. Both routes take
   // the statement as text, so doing it once here keeps them interchangeable.
   //
@@ -289,8 +405,18 @@ function sql(query, params = []) {
   if (highest !== params.length) {
     throw new Error(`sql(): ${params.length} values given for ${highest} placeholders`);
   }
+  return statement;
+}
 
+function sql(query, params = []) {
+  const statement = render(query, params);
   return DATABASE.query(statement.endsWith(";") ? statement : statement + ";");
+}
+
+/** [[query, params], ...] as one transaction, on either route. For the shared stores. */
+function batch(statements) {
+  if (!statements.length) return;
+  DATABASE.batch(statements.map(([query, params]) => render(query, params || [])));
 }
 
 /**
@@ -348,9 +474,9 @@ const sheetFormat = require("../sheet/format");
 const AUTHOR_TYPE = ["human", "agent", "tool"].includes(process.env.DELPHI_AUTHOR_TYPE)
   ? process.env.DELPHI_AUTHOR_TYPE : null;
 const sheets = makeSheetStore({ sql, actor: ACTOR, authorType: AUTHOR_TYPE });
-// Run logs live beside the database, which is DATA_DIR in the app's terms, so
-// they inherit its "never in git" rule.
-const SHEET_LOG_DIR = path.join(path.dirname(DB), "sheets");
+// Run logs live in the data folder, DATA_DIR in the app's terms, so they
+// inherit its "never in git" rule.
+const SHEET_LOG_DIR = path.join(RESOLVED.dataDir, "sheets");
 
 // Workbenches, from the same modules the app uses, for the same reason the
 // Sheet store is shared. Setup commands run through sheet/run.js so they are
@@ -362,6 +488,18 @@ const benchStore = makeWorkbenchStore({ sql, actor: ACTOR });
 const benches = createWorkbench({
   store: benchStore, sheet: sheets, runEntry, logDir: SHEET_LOG_DIR,
   settings: () => readSettings(),
+});
+
+// Cross-project items and flags, from the store the app uses. Its moves are
+// batches, which on the sqlite3 route are one script in one process, so a
+// task never lands in one project with its subtasks in another. The author
+// type falls back to what the name looks like, so an agent whose launcher did
+// not say what it is cannot approve a proposal by leaving the type out.
+const { makeItemStore, inProject } = require("../items/store");
+const ITEM_AUTHOR_TYPE = AUTHOR_TYPE || sheetFormat.inferAuthorType(ACTOR);
+const itemStore = makeItemStore({
+  sql, batch, actor: ACTOR, authorType: ITEM_AUTHOR_TYPE, settings: () => readSettings(),
+  derive: (padId) => derivePad(padId),
 });
 
 // When sheet_read last swept a task for lost runs. See sheet_read.
@@ -389,6 +527,77 @@ function workbenchNotice(taskId) {
     note: `This task still has a live Workbench at ${wb.path}. A person will Finish it; do not remove the folder or the branch yourself.`,
   };
 }
+
+/**
+ * get_task without the parts that repeat or rarely matter, so reading a task
+ * before working on it stays near a few hundred tokens. The Sheet's entries
+ * were sent twice, as JSON and as text; the text is kept, with the ids beside
+ * it for sheet_promote and the rest. Empty columns go, a long detail or Sheet is
+ * clipped with a word saying so, and only the latest statuses are listed.
+ */
+const TASK_TITLE_CHARS = 300;
+const TASK_DETAIL_CHARS = 2000;
+const TASK_SHEET_CHARS = 3000;
+const TASK_ENTRY_CHARS = 200;
+const TASK_HISTORY_SHOWN = 4;
+// The newest of the ledger, then the recent tail. A ledger is meant to be
+// short, but nothing stops an agent promoting everything, and a task with
+// thousands of promoted entries returned all of them.
+const TASK_LEDGER_SHOWN = 8;
+const TASK_TAIL_SHOWN = 6;
+const TASK_LIST_SHOWN = 50;
+const TASK_BUDGET = 1500;
+function taskBrief(task) {
+  const id = Number(task.id);
+  const row = {};
+  for (const [k, v] of Object.entries(task)) if (v !== null && v !== "" && k !== "colour") row[k] = v;
+  const clipped = [];
+  if (row.title && String(row.title).length > TASK_TITLE_CHARS) {
+    row.title = String(row.title).slice(0, TASK_TITLE_CHARS) + "…";
+    clipped.push("title");
+  }
+  if (row.detail && String(row.detail).length > TASK_DETAIL_CHARS) {
+    row.detail = String(row.detail).slice(0, TASK_DETAIL_CHARS) + "…";
+    clipped.push("detail");
+  }
+
+  const context = sheets.context(id);
+  let entries = context.entries;
+  let text = context.text;
+  let ledgerMore = 0;
+  if (text.length > TASK_SHEET_CHARS) {
+    // The newest of the ledger and of the tail, bodies clipped.
+    const ledger = entries.filter((e) => e.promoted || e.kind === "decide" || e.kind === "ask");
+    const tail = entries.filter((e) => !ledger.includes(e)).slice(-TASK_TAIL_SHOWN);
+    ledgerMore = Math.max(0, ledger.length - TASK_LEDGER_SHOWN);
+    const short = (e) => ({ ...e, body: String(e.body || "").length > TASK_ENTRY_CHARS ? String(e.body).slice(0, TASK_ENTRY_CHARS) + "…" : e.body });
+    entries = [...ledger.slice(-TASK_LEDGER_SHOWN), ...tail].sort((x, y) => x.id - y.id).map(short);
+    text = sheetFormat.format({ header: { ...sheets.header(id), title: row.title }, entries }, { clean: true });
+    clipped.push("sheet");
+  }
+  const ids = entries.map((e) => e.id);
+  const subtasks = sql("SELECT id, title, status FROM tasks WHERE parent_id = :p1 ORDER BY id", [id]);
+
+  const history = sql("SELECT status, actor, at FROM status_events WHERE task_id = :p1 ORDER BY at, id", [id]);
+  // Whatever the caps above miss (a title of thousands of characters, say),
+  // the budget catches: fit trims the longest field or list until it fits.
+  return recallFit({
+    task: row,
+    project: task.project_id ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [task.project_id])[0] : null,
+    subtasks: subtasks.slice(0, TASK_LIST_SHOWN),
+    ...(subtasks.length > TASK_LIST_SHOWN ? { subtasks_total: subtasks.length } : {}),
+    sheet: text,
+    ...(ledgerMore ? { ledger_more: `${ledgerMore} older ledger entries are not shown; sheet_read mode ledger has them.` } : {}),
+    entry_ids: ids.slice(-TASK_LIST_SHOWN),
+    ...(ids.length > TASK_LIST_SHOWN ? { entry_ids_total: ids.length } : {}),
+    comments_total: context.total,
+    comments_shown: entries.length,
+    history: history.slice(-TASK_HISTORY_SHOWN),
+    ...(history.length > TASK_HISTORY_SHOWN ? { history_total: history.length } : {}),
+    ...(clipped.length ? { clipped, more: "get_task with detail \"full\", or sheet_read mode full, for the rest." } : {}),
+  }, TASK_BUDGET, ["subtasks", "history"]);
+}
+const recallFit = (...args) => require("./recall").fit(...args);
 
 /** What an agent is shown of a task's Sheet: the ledger plus the recent tail. */
 function sheetContext(taskId) {
@@ -449,13 +658,20 @@ const audit = (action, entity, entityId, summary, label) =>
 // duplicated, only the writes.
 
 /** A pad by id, or by project and key, which is how an agent addresses one. */
-function findPad(a) {
+function findPad(a, { shown = false } = {}) {
   if (a.id != null) return sql("SELECT * FROM scratchpads WHERE id = :p1", [Number(a.id)])[0] || null;
   if (!a.key) throw new Error("Pass either id, or project_id and key.");
   const projectId = resolveProjectId(a);
   if (projectId == null) throw new Error("Pass either id, or project_id and key.");
-  return sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
-             [projectId, String(a.key)])[0] || null;
+  const own = sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
+                  [projectId, String(a.key)])[0] || null;
+  if (own || !shown) return own;
+  // For reading only: a pad shown here from another project, when exactly one
+  // has the key. A write by key stays home only, so it never lands in a
+  // project the agent did not name.
+  const others = sql(`SELECT s.* FROM scratchpads s JOIN item_projects ip ON ip.entity = 'scratchpad' AND ip.entity_id = s.id
+                       WHERE ip.project_id = :p1 AND s.key = :p2`, [projectId, String(a.key)]);
+  return others.length === 1 ? others[0] : null;
 }
 
 /**
@@ -594,10 +810,125 @@ function derivePad(padId) {
 
 // --- tools ------------------------------------------------------------------
 
+/** Whether a Delphi app is running against this database: true, false or "unknown". See agent/identity.js. */
+const appState = () => identity.appState(RESOLVED, { isAlive: pidAlive });
+
+/**
+ * The project this server was scoped to by whatever launched it, or null.
+ *
+ * Looked up rather than trusted, and never thrown over: whoami is the call an
+ * agent makes when it is unsure of its footing, and it has to answer.
+ */
+function projectScope() {
+  const raw = process.env.DELPHI_PROJECT;
+  if (!raw) return null;
+  try {
+    const row = /^\d+$/.test(raw)
+      ? sql("SELECT id, key, name FROM projects WHERE id = :p1", [Number(raw)])[0]
+      : sql("SELECT id, key, name FROM projects WHERE key = :p1", [raw])[0];
+    return row || { id: null, key: null, name: null, unknown: raw };
+  } catch {
+    return { id: null, key: null, name: null, unknown: raw };
+  }
+}
+
+const isDirectory = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+const holds = (root, p) => {
+  const a = (() => { try { return fs.realpathSync(root); } catch { return null; } })();
+  const b = (() => { try { return fs.realpathSync(p); } catch { return null; } })();
+  if (!a || !b) return false;
+  const rel = path.relative(a, b);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+};
+
+/**
+ * Which task and project a second opinion is about, the folders it may read,
+ * and where it runs.
+ *
+ * The folders are the project's own (repositories, workspaces, its path) and the
+ * task's live Workbench, and nothing else: the reviewer is let into every folder
+ * here, and an agent that could name any folder could hand it a home directory.
+ * With no project named, the session's own scope is used, then the project
+ * whose folder holds cwd.
+ */
+function secondOpinionScope(a) {
+  let task = null;
+  if (a.task_id != null) {
+    task = sql("SELECT id, title, project_id FROM tasks WHERE id = :p1", [a.task_id])[0];
+    if (!task) throw new Error(`No task ${a.task_id}`);
+  }
+  let projectId = resolveProjectId(a);
+  if (projectId != null && task && Number(task.project_id) !== Number(projectId)) {
+    throw new Error(`Task ${task.id} is not in the project you named (it is in project ${task.project_id}). Pass the task alone, or the project it belongs to.`);
+  }
+  if (projectId == null && task) projectId = task.project_id;
+  if (projectId == null) {
+    const scope = projectScope();
+    if (scope && scope.id) projectId = scope.id;
+  }
+  const benches = (where, params) => sql(`SELECT w.path, w.task_id, t.project_id FROM workbenches w JOIN tasks t ON t.id = w.task_id
+                                           WHERE w.state IN ('active', 'parked') ${where} ORDER BY w.id DESC`, params);
+  // A Workbench cwd belongs to a task; without one named, it is the folder that
+  // says which, and it is let in as that task's.
+  let inferredBench = null;
+  if (projectId == null) {
+    const here = a.cwd || process.cwd();
+    const bench = benches("", []).find((b) => holds(b.path, here));
+    if (bench) { projectId = bench.project_id; inferredBench = bench.path; }
+    else {
+      const found = sql("SELECT id FROM projects ORDER BY id", []).find((p) => jobs.folders(sql, p.id).some((f) => holds(f, here)));
+      if (found) projectId = found.id;
+    }
+  }
+  if (projectId == null) {
+    throw new Error("A second opinion reads only inside a project's folders or a task's Workbench, and none was given. Pass project or task_id, or a cwd inside a project's folder.");
+  }
+  const own = task ? benches("AND w.task_id = :p1", [task.id]).map((b) => b.path) : (inferredBench ? [inferredBench] : []);
+  const roots = [...own, ...jobs.folders(sql, projectId)];
+  const cwd = a.cwd || own.find(isDirectory) || jobs.readFolder(sql, projectId);
+  if (!cwd) throw new Error(jobs.folderProblem(sql, projectId) || "The project has no folder for a second opinion to read.");
+  return { task, projectId: Number(projectId), roots, cwd };
+}
+
+/** A plain comment on a task, as add_comment and second_opinion both write it. */
+function addComment(taskId, body) {
+  const task = sql("SELECT id, title FROM tasks WHERE id = :p1", [taskId])[0];
+  if (!task) throw new Error(`No task ${taskId}`);
+  if (!body || !String(body).trim()) throw new Error("A comment needs something in it");
+  const row = sql(`INSERT INTO comments (task_id, author, body, kind, author_type)
+                   VALUES (:p1, :p2, :p3, 'say', :p4) RETURNING *`,
+                  [taskId, ACTOR, String(body).trim(), AUTHOR_TYPE])[0];
+  audit("update", "task", taskId, "commented", task.title);
+  return row;
+}
+
 const TOOLS = {
+  whoami: {
+    description:
+      "Your database, who your writes are attributed to, and whether a Delphi app is running to dispatch handoffs (app_running: true, false or \"unknown\"). Call it when unsure your work lands where the person sees it.",
+    schema: { type: "object", properties: {} },
+    run: () => {
+      const app = appState();
+      return {
+        db_path: DB,
+        db_id: IDENTITY.db_id,
+        db_created_at: IDENTITY.created_at,
+        data_dir: RESOLVED.dataDir,
+        resolved_by: RESOLVED.source,
+        actor: ACTOR,
+        author_type: AUTHOR_TYPE || "agent",
+        project_scope: projectScope(),
+        app_running: app.running,
+        app,
+        checkout_db_ignored: RESOLVED.checkoutDbIgnored,
+        sqlite_route: DATABASE.kind,
+      };
+    },
+  },
+
   list_projects: {
     description:
-      "List every project with its open task count. Call this first to find the right project_id.",
+      "List projects with open task counts. Call this first to find the right project_id.",
     schema: { type: "object", properties: {} },
     run: () =>
       sql(`SELECT p.id, p.key, p.name, p.summary, p.status,
@@ -608,15 +939,15 @@ const TOOLS = {
 
   add_project: {
     description:
-      "Create a project. Use this when work does not belong to any existing project rather than filing it under General, so its tasks and notes have a home. Call list_projects first to check one does not already exist.",
+      "Create a project for work no existing one fits (check list_projects first), rather than filing it under General.",
     schema: {
       type: "object",
       required: ["key", "name"],
       properties: {
-        key: { type: "string", description: "Short slug, e.g. co-hearing-address" },
+        key: { type: "string", description: "Slug, e.g. co-hearing-address" },
         name: { type: "string" },
-        summary: { type: "string", description: "One line: what this project is" },
-        colour: { type: "string", description: "Accent for the sidebar dot, e.g. #4A90D9" },
+        summary: { type: "string", description: "One line" },
+        colour: { type: "string", description: "e.g. #4A90D9" },
       },
     },
     run: (a) => {
@@ -662,35 +993,39 @@ const TOOLS = {
     run: (a) => {
       const where = [];
       const params = [];
-      if (a.project_id != null) { params.push(a.project_id); where.push(`t.project_id = :p${params.length}`); }
+      // Home or shown here from another project; a row from elsewhere says
+      // its home, so an agent knows where it really lives.
+      if (a.project_id != null) { params.push(resolveProjectId(a)); where.push(inProject("task", "t", `:p${params.length}`)); }
       if (a.status) { params.push(a.status); where.push(`t.status = :p${params.length}`); }
       else if (!a.include_done) where.push("t.status != 'done'");
+      const asked = a.project_id != null ? Number(params[0]) : null;
       return sql(
-        `SELECT t.id, t.title, t.detail, t.status, t.priority, t.due, t.ref, p.name AS project
+        `SELECT t.id, t.title, t.detail, t.status, t.priority, t.due, t.ref, p.name AS project,
+                ${asked != null ? `CASE WHEN t.project_id IS ${asked} THEN NULL ELSE p.key END` : "NULL"} AS home
          FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
          ${where.length ? "WHERE " + where.join(" AND ") : ""}
          ORDER BY CASE t.status WHEN 'doing' THEN 0 WHEN 'blocked' THEN 1 WHEN 'todo' THEN 2 ELSE 3 END,
                   CASE t.priority WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, t.id DESC
          LIMIT 200`,
         params
-      );
+      ).map(({ home, ...row }) => (home ? { ...row, home } : row));
     },
   },
 
   add_task: {
     description:
-      "Create a task. Use this whenever work is identified that will not be finished immediately, without waiting to be asked.",
+      "Create a task for work that will not be finished now, without waiting to be asked.",
     schema: {
       type: "object",
       required: ["title"],
       properties: {
         title: { type: "string" },
         project_id: { type: "number" },
-        detail: { type: "string", description: "Why it matters and how to verify it" },
+        detail: { type: "string", description: "Why it matters, how to verify" },
         priority: { type: "string", enum: ["high", "med", "low"] },
         due: { type: "string", description: "YYYY-MM-DD" },
-        ref: { type: "string", description: "Ticket or pull request reference" },
-        parent_id: { type: "number", description: "Make this a subtask of that task" },
+        ref: { type: "string", description: "Ticket or PR" },
+        parent_id: { type: "number", description: "Makes it a subtask" },
       },
     },
     run: (a) => {
@@ -729,14 +1064,36 @@ const TOOLS = {
         status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
         priority: { type: "string", enum: ["high", "med", "low"] },
         due: { type: "string" },
-        project_id: { type: "number" },
-        assignee: { type: "string", description: "Who is holding this. Your own actor name if you are taking it." },
+        project_id: { type: "number", description: "Moves it, subtasks too: only a task you filed in the last day, else flag_item" },
+        assignee: { type: "string", description: "Who holds it; your actor name to take it" },
       },
     },
     run: (a) => {
-      const before = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
+      let before = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
       if (!before) throw new Error(`No task ${a.id}`);
-      const fields = ["title", "detail", "status", "priority", "due", "project_id", "assignee"].filter((f) => a[f] !== undefined);
+      // A change of project is a move (owner decision D2). An agent may move a
+      // task it filed itself in the last day, which is fixing its own
+      // misfiling, the common case; anything else is a person's call, so it is
+      // refused with the tool that asks for one. The move goes through the
+      // shared store, so the subtasks follow and the epic it left is cleared:
+      // setting the column here used to leave the task filed under an epic in
+      // the project it had left.
+      if (a.project_id !== undefined && a.project_id !== null && Number(a.project_id) !== Number(before.project_id)) {
+        // Only for a named writer: with no DELPHI_ACTOR every agent is
+        // "agent", and "you filed it" would let one move another's work.
+        const named = Boolean(process.env.DELPHI_ACTOR) && ACTOR !== "agent";
+        const suffix = `(by ${ACTOR})`;
+        const mine = named && sql(`SELECT id FROM audit WHERE action = 'create' AND entity = 'task' AND entity_id = :p1
+                            AND substr(summary, -length(:p2)) = :p2 AND at >= datetime('now', '-24 hours') LIMIT 1`,
+                         [before.id, suffix])[0];
+        if (!mine) {
+          throw new Error(`Task ${before.id} was not filed by you in the last 24 hours, so moving it is a person's call. ` +
+            `Flag it instead: flag_item with entity "task", id ${before.id}, and a note saying where it belongs and why.`);
+        }
+        itemStore.move("task", before.id, Number(a.project_id));
+        before = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
+      }
+      const fields = ["title", "detail", "status", "priority", "due", "assignee"].filter((f) => a[f] !== undefined);
       if (!fields.length) return before;
       const params = fields.map((f) => a[f]);
       const sets = fields.map((f, i) => `${f} = :p${i + 1}`).join(", ");
@@ -759,14 +1116,14 @@ const TOOLS = {
 
   queue_next: {
     description:
-      "Claim the next piece of work from the queue and get everything needed to do it. Call this when you are ready to work rather than waiting to be given something. Returns null when the queue is empty, which means there is nothing to do and you should stop rather than invent work. Pass project_id or project when you are only able to work on one project, for example because you are running in that project's checkout: without it you will be handed whatever is at the top of the pool, whichever project it belongs to.",
+      "Claim the next queued task with everything needed to do it, when you are ready to work. claimed null means the queue is empty: stop, do not invent work. Pass project_id or project if you can only work on one project (say you run in its checkout); otherwise you get the top of the whole pool.",
     schema: {
       type: "object",
       properties: {
-        queue: { type: "string", description: "Which pool. Defaults to ready." },
-        minutes: { type: "number", description: "How long to hold it before the claim lapses. Defaults to 30." },
-        project_id: { type: "number", description: "Only take work from this project. Leave it out to take from any." },
-        project: { type: "string", description: "The same thing by project key, if that is what you have." },
+        queue: { type: "string", description: "Pool, default ready" },
+        minutes: { type: "number", description: "Claim length, default 30" },
+        project_id: { type: "number", description: "Only this project" },
+        project: { type: "string", description: "Same, by key" },
       },
     },
     run: (a) => {
@@ -837,7 +1194,7 @@ const TOOLS = {
 
   queue_release: {
     description:
-      "Give a claimed task back without finishing it. Always say why: the next agent reads that reason before starting, and an unexplained release is a task that gets picked up and abandoned again.",
+      "Give a claimed task back unfinished. Say why: the next agent reads it first, and an unexplained release is picked up and abandoned again.",
     schema: {
       type: "object",
       required: ["task_id", "reason"],
@@ -869,13 +1226,13 @@ const TOOLS = {
 
   queue_extend: {
     description:
-      "Push your claim's expiry out because you are still working. A lease is short so a dead agent's task comes back quickly, which makes a slow but healthy agent the awkward case. Call this rather than letting the lease lapse: once it has, the task may already belong to someone else.",
+      "Extend your claim while you are still working. Do it before the lease lapses: after that the task may be someone else's.",
     schema: {
       type: "object",
       required: ["task_id"],
       properties: {
         task_id: { type: "number" },
-        minutes: { type: "number", description: "How much longer you need. Defaults to another full lease." },
+        minutes: { type: "number", description: "Default another full lease" },
       },
     },
     run: (a) => {
@@ -901,13 +1258,13 @@ const TOOLS = {
 
   queue_complete: {
     description:
-      "Finish a claimed task. The summary is left as a comment and is what the next person or agent reads to know what actually happened, so write it for them rather than for a changelog. Your summary is promoted into the task's ledger automatically, so the next agent reads it first. If you learned something that matters beyond this task, sheet_file it.",
+      "Finish a claimed task. Your summary is promoted into the task's ledger automatically, the first thing the next agent reads: write it for them, not as a changelog. If something matters beyond this task, sheet_file it.",
     schema: {
       type: "object",
       required: ["task_id", "summary"],
       properties: {
         task_id: { type: "number" },
-        summary: { type: "string", description: "What you did, and anything the next person needs to know." },
+        summary: { type: "string", description: "What you did, and what the next person needs to know" },
       },
     },
     run: (a) => {
@@ -932,13 +1289,13 @@ const TOOLS = {
   },
 
   queue_status: {
-    description: "What is waiting in the queue and what other agents are already holding. Read it before claiming if you want to know whether it is worth starting.",
+    description: "What is waiting in the queue and what other agents hold.",
     schema: {
       type: "object",
       properties: {
         queue: { type: "string" },
-        project_id: { type: "number", description: "Only count work in this project. Leave it out for the whole pool." },
-        project: { type: "string", description: "The same thing by project key." },
+        project_id: { type: "number", description: "Only this project" },
+        project: { type: "string", description: "Same, by key" },
       },
     },
     run: (a) => {
@@ -972,15 +1329,19 @@ const TOOLS = {
 
   get_task: {
     description:
-      "Everything about one task: its detail, subtasks, the discussion on it, and every status it has been through. Read this before starting work on a task, because the last agent probably left you something. The discussion is the task's Sheet: its ledger (what was promoted as mattering) plus the last 20 entries, as entries in comments and as text in sheet. comments_total says how many there are in all; call sheet_read with mode full when you need the rest.",
+      "One task: detail, subtasks, recent statuses, and its Sheet as text (the ledger of what was promoted, plus the last 20 entries). Read it before starting a task: the last agent probably left you something. detail full adds the entries as JSON; sheet_read has older ones.",
     schema: {
       type: "object",
       required: ["id"],
-      properties: { id: { type: "number" } },
+      properties: {
+        id: { type: "number" },
+        detail: { type: "string", enum: ["brief", "full"] },
+      },
     },
     run: (a) => {
       const task = sql("SELECT * FROM tasks WHERE id = :p1", [a.id])[0];
       if (!task) throw new Error(`No task ${a.id}`);
+      if (a.detail !== "full") return taskBrief(task);
       return {
         task,
         project: task.project_id
@@ -995,25 +1356,16 @@ const TOOLS = {
 
   add_comment: {
     description:
-      "Leave a comment on a task. Use it for what you found, what you tried, and what you would do next, so the agent that picks this up after you does not start from nothing.",
+      "Comment on a task: what you found, tried and would do next, so the next agent does not start from nothing.",
     schema: {
       type: "object",
       required: ["task_id", "body"],
       properties: {
         task_id: { type: "number" },
-        body: { type: "string", description: "Markdown. Be specific: an unread comment is better than a vague one." },
+        body: { type: "string", description: "Markdown. Be specific." },
       },
     },
-    run: (a) => {
-      const task = sql("SELECT id, title FROM tasks WHERE id = :p1", [a.task_id])[0];
-      if (!task) throw new Error(`No task ${a.task_id}`);
-      if (!a.body || !String(a.body).trim()) throw new Error("A comment needs something in it");
-      const row = sql(`INSERT INTO comments (task_id, author, body, kind, author_type)
-                       VALUES (:p1, :p2, :p3, 'say', :p4) RETURNING *`,
-                      [a.task_id, ACTOR, String(a.body).trim(), AUTHOR_TYPE])[0];
-      audit("update", "task", a.task_id, "commented", task.title);
-      return row;
-    },
+    run: (a) => addComment(a.task_id, a.body),
   },
 
   // --- the Sheet ---------------------------------------------------------------
@@ -1023,16 +1375,16 @@ const TOOLS = {
 
   sheet_read: {
     description:
-      "Read a task's Sheet: its entries as JSON and as text. mode tail (the default) is the last n entries, ledger is only what was promoted as mattering, full is everything. To poll, pass back the cursor you were given as after_id and since; you then get only entries that are new or changed, and should dedupe by id.",
+      "A task's Sheet entries, as JSON and text. mode: tail (default, the last n), ledger (only what was promoted), full. To poll, pass the cursor back as after_id and since, and dedupe by id.",
     schema: {
       type: "object",
       required: ["task_id"],
       properties: {
         task_id: { type: "number" },
-        mode: { type: "string", enum: ["ledger", "tail", "full"], description: "Defaults to tail." },
-        n: { type: "number", description: "How many entries in tail mode. Defaults to 20, at most 500." },
-        after_id: { type: "number", description: "Only entries with a higher id (or changed since `since`)." },
-        since: { type: "string", description: "Server time from a previous cursor. Inclusive." },
+        mode: { type: "string", enum: ["ledger", "tail", "full"] },
+        n: { type: "number", description: "Tail size, default 20, max 500" },
+        after_id: { type: "number", description: "Entries after this id, or changed since `since`" },
+        since: { type: "string", description: "Cursor time, inclusive" },
       },
     },
     run: (a) => {
@@ -1071,14 +1423,14 @@ const TOOLS = {
   },
 
   sheet_get: {
-    description: "One Sheet entry by its id, with its task id. For when you have an entry id and need what it says.",
+    description: "One Sheet entry by id, with its task id.",
     schema: { type: "object", required: ["id"], properties: { id: { type: "number" } } },
     run: (a) => sheets.get(a.id),
   },
 
   sheet_append: {
     description:
-      "Write an entry on a task's Sheet. kind say is a remark or finding, note is a short marker of something that happened (a file edited, a deploy done), run records a shell command (one line) with meta {state, code, cwd, out}. Questions and answers have their own tools, sheet_ask and sheet_decide. " +
+      "Write an entry on a task's Sheet. kind say: a remark or finding; note: a marker of something done (a file edited, a deploy); run: a one-line shell command, meta {state, code, cwd, out}. Questions go through sheet_ask and sheet_decide. " +
       PROMOTE_DIRECTIVE,
     schema: {
       type: "object",
@@ -1086,10 +1438,10 @@ const TOOLS = {
       properties: {
         task_id: { type: "number" },
         kind: { type: "string", enum: ["say", "run", "note"] },
-        body: { type: "string", description: "Markdown for say and note. The command itself for run." },
-        meta: { type: "object", description: "Kind specific. For run: state (running, ok, fail), code, cwd, out." },
-        ref_id: { type: "number", description: "An entry on the same task this one answers or follows." },
-        promote: { type: "boolean", description: "Put it in the ledger, which every later agent reads first." },
+        body: { type: "string", description: "Markdown; for run, the command" },
+        meta: { type: "object", description: "For run: state (running, ok, fail), code, cwd, out" },
+        ref_id: { type: "number", description: "The entry this answers or follows" },
+        promote: { type: "boolean", description: "Into the ledger, which every later agent reads first" },
       },
     },
     run: (a) => {
@@ -1101,7 +1453,7 @@ const TOOLS = {
 
   sheet_update: {
     description:
-      "Change an entry's meta, its body, or both. Meta is merged one level deep. This is how a run entry is finished: pass meta {state: ok or fail, code, dur_ms, lines}. An ask's options and a decision's choice cannot change.",
+      "Change an entry: meta (merged one level deep), body, or promote. Finish a run entry with meta {state: ok or fail, code, dur_ms, lines}. promote true puts it in the ledger, which is read first: promote what changes what the next agent should do. An ask's options and a decision's choice are fixed.",
     schema: {
       type: "object",
       required: ["id"],
@@ -1109,32 +1461,41 @@ const TOOLS = {
         id: { type: "number" },
         meta: { type: "object" },
         body: { type: "string" },
+        promote: { type: "boolean" },
       },
     },
-    run: (a) => sheets.update(a.id, { meta: a.meta, body: a.body }),
+    // promote is sheet_promote folded in, so the list carries one tool, not two.
+    run: (a) => {
+      let entry = null;
+      if (a.meta !== undefined || a.body !== undefined || a.promote === undefined) {
+        entry = sheets.update(a.id, { meta: a.meta, body: a.body });
+      }
+      if (a.promote !== undefined) entry = sheets.promote(a.id, a.promote === true);
+      return entry;
+    },
   },
 
   sheet_promote: {
     description:
-      "Put an entry in its task's ledger (on: true, the default) or take it out. The ledger is what the next agent reads first, so promote what changes what they should do: a finding, a dead end, a decision.",
+      "Put an entry in its task's ledger (on: true, default) or take it out. The ledger is read first, so promote what changes what the next agent should do: a finding, a dead end, a decision.",
     schema: {
       type: "object",
       required: ["id"],
-      properties: { id: { type: "number" }, on: { type: "boolean", description: "Defaults to true." } },
+      properties: { id: { type: "number" }, on: { type: "boolean" } },
     },
     run: (a) => sheets.promote(a.id, a.on === undefined ? true : a.on),
   },
 
   sheet_file: {
     description:
-      "Turn a Sheet entry into a project note (decision, gotcha, reference or note), so the graph and search find it from other tasks. Also promotes it. Filing twice returns the first note. Use it for anything that would matter on a different task.",
+      "Turn a Sheet entry into a project note (decision, gotcha, reference, note) that search and the graph find from other tasks. Also promotes it; filing twice returns the first note.",
     schema: {
       type: "object",
       required: ["id", "kind"],
       properties: {
         id: { type: "number" },
         kind: { type: "string", enum: ["decision", "gotcha", "reference", "note"] },
-        title: { type: "string", description: "Defaults to the entry's first line." },
+        title: { type: "string", description: "Default: the entry's first line" },
       },
     },
     run: (a) => sheets.file(a.id, a.kind, a.title ?? null),
@@ -1142,7 +1503,7 @@ const TOOLS = {
 
   sheet_ask: {
     description:
-      "Ask a question on a task's Sheet with two to four answers, keyed a to d. Use it when a person (or another agent) has to choose before work can go on. The question is one line; put background in a say entry first.",
+      "Ask a one-line question on a task's Sheet with two to four answers (a to d), when a person or agent must choose before work goes on. Put background in a say entry first.",
     schema: {
       type: "object",
       required: ["task_id", "question", "options"],
@@ -1157,7 +1518,7 @@ const TOOLS = {
 
   sheet_decide: {
     description:
-      "Answer a question asked with sheet_ask. The decision is promoted into the ledger automatically, since it is what the next agent most needs. Say why when it is not obvious.",
+      "Answer a sheet_ask question. The decision is promoted automatically; say why when it is not obvious.",
     schema: {
       type: "object",
       required: ["ask_id", "choice"],
@@ -1167,12 +1528,22 @@ const TOOLS = {
         why: { type: "string" },
       },
     },
-    run: (a) => sheets.decide(a.ask_id, a.choice, a.why ?? null),
+    // A person answering here (the delphi command, the Sheet in a terminal)
+    // puts the job waiting on the question back in the queue in the same
+    // call, so the app's dispatcher starts it as soon as it sees the write
+    // rather than at its next pass. jobs.resumeAnswered counts only a
+    // decision whose author_type is human, so an agent cannot answer its own.
+    run: (a) => {
+      const entry = sheets.decide(a.ask_id, a.choice, a.why ?? null);
+      let resumed = [];
+      try { resumed = jobs.resumeAnswered(sql, { taskId: entry.task_id }); } catch (error) { console.error(`resuming jobs after decide: ${error.message}`); }
+      return resumed.length ? { ...entry, resumed_jobs: resumed.map((r) => r.id) } : entry;
+    },
   },
 
   sheet_resolve: {
     description:
-      "Find a task from whatever you have: its id, its legacy id, or its ticket ref. Also says which folder a command for it should run in, and where run logs go.",
+      "Find a task by id, legacy id or ticket ref, with the folder its commands should run in and where run logs go.",
     schema: {
       type: "object",
       required: ["task"],
@@ -1189,14 +1560,14 @@ const TOOLS = {
 
   workbench_start: {
     description:
-      "Give a task its own folder and branch to work in (a Workbench), so it cannot collide with any other task's work. Returns the folder's path: run your commands there. If the task already has one, that one is returned (created: false). The branch is named for the task; existing branches are reused. Setup (npm ci and the like) runs as a recorded command unless run_setup is false. Read warnings: they say when the remote could not be reached and the local copy was used.",
+      "Give a task its own folder and branch (a Workbench) so its work cannot collide with another task's; run your commands in the path returned. An existing one is returned as is (created: false). Setup (npm ci and the like) runs as a recorded command unless run_setup is false. Read warnings: they say when the remote was unreachable.",
     schema: {
       type: "object",
       required: ["task_id"],
       properties: {
         task_id: { type: "number" },
-        repo: { type: "string", description: "Which repository, by name or path, when the project has several and none is primary." },
-        run_setup: { type: "boolean", description: "Defaults to true." },
+        repo: { type: "string", description: "Name or path, when the project has several and none is primary" },
+        run_setup: { type: "boolean" },
       },
     },
     run: async (a) => {
@@ -1210,7 +1581,7 @@ const TOOLS = {
 
   workbench_status: {
     description:
-      "Whether a task's Workbench has unsaved changes, commits not shared yet, or is behind its base branch, in words. Returns workbench null when the task has none.",
+      "A task's Workbench in words: unsaved changes, unpushed commits, behind its base. workbench is null when it has none.",
     schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
     run: async (a) => {
       const wb = benchStore.live(a.task_id);
@@ -1221,7 +1592,7 @@ const TOOLS = {
 
   workbench_finish: {
     description:
-      "Put a task's Workbench away once its work is committed and pushed: the folder is removed and the branch is kept. Refuses, saying why, when anything is unsaved (hidden changes included) or not pushed, when a rebase or merge is part way through, when there is a git repository inside the folder, or when the folder holds files git does not keep (an edited .env, notes in build/): removing those is a person's decision, so say in the Sheet what is there and leave it to them. It never forces and never stashes. There is no tool to throw a Workbench away either: that is a person's decision too.",
+      "Put a task's Workbench away once its work is committed and pushed: the folder goes, the branch stays. Refuses, saying why, when anything is unsaved or unpushed, a rebase or merge is part way, a repository is nested inside, or it holds files git does not keep (an edited .env): removing those is a person's decision, so say in the Sheet what is there. Never forces or stashes. There is no tool to throw a Workbench away: that is a person's decision too.",
     schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" } } },
     // No confirm here, on purpose: through this server Finish only goes
     // ahead when nothing at all would be removed that git does not keep.
@@ -1232,12 +1603,13 @@ const TOOLS = {
   },
 
   workbench_list: {
-    description: "Live Workbenches (active, parked or missing), with status in words. Pass project_id or project to narrow to one project.",
+    description: "Live Workbenches (active, parked, missing) with status in words; project_id or project narrows it. With task_id, that task's Workbench checked fresh (null when it has none).",
     schema: {
       type: "object",
-      properties: { project_id: { type: "number" }, project: { type: "string" } },
+      properties: { project_id: { type: "number" }, project: { type: "string" }, task_id: { type: "number" } },
     },
-    run: (a) => benches.list({ projectId: resolveProjectId(a) }),
+    // task_id is workbench_status folded in.
+    run: (a) => (a.task_id != null ? TOOLS.workbench_status.run(a) : benches.list({ projectId: resolveProjectId(a) })),
   },
 
   // The rest are for the delphi command line only: left out of tools/list and
@@ -1357,7 +1729,7 @@ const TOOLS = {
 
   add_note: {
     description:
-      "Store something worth remembering against a project: a decision and why, a gotcha, a reference. Use this for anything a future session would otherwise have to rediscover. Prefer this over leaving knowledge only in chat.",
+      "Store knowledge against a project: a decision and why, a gotcha, a reference. Anything a future session would otherwise rediscover; prefer it to leaving knowledge in chat.",
     schema: {
       type: "object",
       required: ["project_id", "title", "body"],
@@ -1379,7 +1751,7 @@ const TOOLS = {
 
   list_scratchpads: {
     description:
-      "List the scratchpads in a project: the working documents, with their keys. Call this before writing one, so you add to the existing plan rather than starting a second one beside it.",
+      "A project's scratchpads (working documents) with their keys. Call it before writing one, to add to the existing plan rather than start a second.",
     schema: {
       type: "object",
       properties: {
@@ -1390,19 +1762,19 @@ const TOOLS = {
     run: (a) => {
       const projectId = a.project_id ?? (a.project ? resolveProjectId(a) : null);
       return sql(
-        `SELECT id, project_id, key, title, author, derives_tasks, updated_at,
-                length(body) AS size
-         FROM scratchpads
-         ${projectId ? "WHERE project_id = :p1" : ""}
-         ORDER BY pinned DESC, updated_at DESC LIMIT 100`,
-        projectId ? [projectId] : []
-      );
+        `SELECT s.id, s.project_id, s.key, s.title, s.author, s.derives_tasks, s.updated_at,
+                length(s.body) AS size, CASE WHEN s.project_id IS :p1 THEN NULL ELSE p.key END AS home
+         FROM scratchpads s LEFT JOIN projects p ON p.id = s.project_id
+         ${projectId ? `WHERE ${inProject("scratchpad", "s", ":p1")}` : "WHERE :p1 IS NULL"}
+         ORDER BY s.pinned DESC, s.updated_at DESC LIMIT 100`,
+        [projectId || null]
+      ).map(({ home, ...row }) => (projectId && home ? { ...row, home } : row));
     },
   },
 
   read_scratchpad: {
     description:
-      "Read a scratchpad in full, by id or by project and key. This is how you pick up what the last session, or another agent, was in the middle of.",
+      "Read a scratchpad in full, by id or by project and key: how you pick up what the last session or another agent was doing.",
     schema: {
       type: "object",
       properties: {
@@ -1412,7 +1784,7 @@ const TOOLS = {
       },
     },
     run: (a) => {
-      const pad = findPad(a);
+      const pad = findPad(a, { shown: true });
       if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
       return pad;
     },
@@ -1420,26 +1792,26 @@ const TOOLS = {
 
   write_scratchpad: {
     description:
-      "Write a scratchpad: the working document for a piece of work. Plans, findings, handover notes, what you tried and what it did. Creates it if the key is new, replaces the body if it is not.\n\n" +
-      "Checkbox lines become real tasks on the board, kept in step in both directions:\n" +
+      "Write a scratchpad, the working document for a piece of work: plan, findings, handover, what you tried. Creates it for a new key, replaces the body otherwise.\n\n" +
+      "Checkbox lines become tasks on the board, kept in step both ways:\n" +
       "  - [ ] wire the codex adapter @ray !high\n" +
       "  - [x] a finished one\n" +
       "    - [ ] an indented one is a subtask\n" +
-      "So write the plan as checkboxes and the board follows. Do not also call add_task for the same work.\n\n" +
-      "Delphi adds an <!--d:123--> marker to each line it has filed. Leave those in place when you edit around them: they are how a line and its task stay the same thing. If you drop them, the lines are matched back up by their exact text.\n\n" +
-      "Prefer append_scratchpad or patch_scratchpad when you are adding to a pad another agent may also be writing.",
+      "So write the plan as checkboxes, and do not also add_task the same work.\n\n" +
+      "Delphi marks each filed line <!--d:123-->. Leave those in place: they keep a line and its task the same thing.\n\n" +
+      "Prefer append_scratchpad or patch_scratchpad when another agent may be writing the same pad.",
     schema: {
       type: "object",
       required: ["title", "body"],
       properties: {
         project_id: { type: "number" },
         project: { type: "string", description: "Project key, as an alternative to project_id" },
-        key: { type: "string", description: "Short slug to address this pad by later. Defaults to the title." },
+        key: { type: "string", description: "Slug to address it by; default the title" },
         title: { type: "string" },
-        body: { type: "string", description: "Markdown. Checkbox lines become tasks." },
+        body: { type: "string", description: "Markdown" },
         derives_tasks: {
           type: "boolean",
-          description: "False for a sketch full of options nobody has agreed to yet. Defaults to true.",
+          description: "False for a sketch of options nobody agreed to",
         },
       },
     },
@@ -1467,7 +1839,7 @@ const TOOLS = {
 
   append_scratchpad: {
     description:
-      "Add to the end of a scratchpad without reading it first. The safe write when another agent may be working the same pad: it cannot overwrite what they added.",
+      "Add to the end of a scratchpad without reading it: the safe write when another agent may be on the same pad.",
     schema: {
       type: "object",
       required: ["text"],
@@ -1475,7 +1847,7 @@ const TOOLS = {
         id: { type: "number" },
         project_id: { type: "number" },
         key: { type: "string" },
-        text: { type: "string", description: "Markdown to add. Checkbox lines become tasks." },
+        text: { type: "string", description: "Markdown" },
       },
     },
     run: (a) => {
@@ -1491,7 +1863,7 @@ const TOOLS = {
 
   patch_scratchpad: {
     description:
-      "Replace one section of a scratchpad, found by its markdown heading. Use this to update your own part of a shared pad without touching anyone else's. The section is added at the end if the heading is not there yet.",
+      "Replace one section of a scratchpad, found by its markdown heading (added at the end if missing), leaving everyone else's alone.",
     schema: {
       type: "object",
       required: ["heading", "text"],
@@ -1499,8 +1871,8 @@ const TOOLS = {
         id: { type: "number" },
         project_id: { type: "number" },
         key: { type: "string" },
-        heading: { type: "string", description: "The heading text, without the leading hashes" },
-        text: { type: "string", description: "What the section should now say" },
+        heading: { type: "string", description: "Without the hashes" },
+        text: { type: "string" },
       },
     },
     run: (a) => {
@@ -1515,70 +1887,94 @@ const TOOLS = {
 
   handoff_send: {
     description:
-      "Hand a piece of work to another agent. Use this when something is better done by a different tool, or by a second opinion: \"have Codex review this branch\", \"ask Claude to write the migration\".\n\n" +
-      "It returns immediately with a handoff id. Delphi runs the request in that agent's own session in this project, keeps the reply, and gives you a turn of your own with the answer when it lands. So do not wait, do not poll in a loop, and do not sleep: finish what you were doing and say you have handed it over. You will be woken.\n\n" +
-      "Call list_agents first if you are not sure which agents this machine has.",
+      "Hand work to another agent as a job. kind ask: it reads the project and answers (\"have Codex review this branch\"). kind do: it changes code in the task's own Workbench, never the main checkout, and a person reviews it. Without task_id the job gets a task whose Sheet is its log.\n\n" +
+      "Returns a job_id at once. An agent's job waits for a person's approval (needs_approval) unless the project lets agents start work; the result says which, whether a Delphi app is running to dispatch it, and whether you will be woken. Believe it. Do not wait, poll or sleep: finish and say you handed it over; read it later with run_status. Unsure of the name? list_agents.",
     schema: {
       type: "object",
       required: ["to", "request"],
       properties: {
-        to: { type: "string", description: "The agent's key, e.g. codex, claude-code, copilot" },
-        request: { type: "string", description: "What you want done, written for them rather than for a log" },
+        to: { type: "string", description: "Agent key: codex, claude-code, copilot" },
+        request: { type: "string", description: "Written for them, not for a log" },
+        kind: { type: "string", enum: ["ask", "do"], description: "Default ask" },
         project_id: { type: "number" },
-        project: { type: "string", description: "Project key, as an alternative to project_id" },
-        task_id: { type: "number", description: "The task this is about, if there is one" },
-        context: {
-          type: "object",
-          description: "Branch, files, pad ids: whatever they will need and cannot work out",
-        },
-        wake: {
-          type: "boolean",
-          description: "Whether you want a turn when the reply lands. True unless you are handing something over and leaving.",
-        },
+        project: { type: "string", description: "Key, instead of project_id" },
+        task_id: { type: "number" },
+        context: { type: "object", description: "Branch, files, pad ids: what they cannot work out" },
+        wake: { type: "boolean", description: "A turn when the reply lands; false if you are leaving" },
       },
     },
     run: (a) => {
-      const projectId = a.project_id ?? resolveProjectId(a);
-      if (projectId == null) throw new Error("A handoff needs a project. Pass project_id or project.");
+      // A job about a task belongs to the task's project, where its Workbench is
+      // built; naming another project beside it is refused (agent/jobs.js).
+      const named = a.project_id ?? resolveProjectId(a);
+      if (named == null && a.task_id == null) throw new Error("A handoff needs a project. Pass project_id or project.");
+      const projectId = jobs.projectFor(sql, { projectId: named, taskId: a.task_id ?? null });
       const target = sql("SELECT key, label, enabled FROM harnesses WHERE key = :p1", [String(a.to)])[0];
       if (!target) {
         const known = sql("SELECT key FROM harnesses WHERE enabled = 1").map((r) => r.key).join(", ");
         throw new Error(`No agent called '${a.to}'. This machine has: ${known || "none configured"}.`);
       }
       if (!target.enabled) throw new Error(`${target.label} is turned off in Delphi's settings.`);
+      const kind = a.kind === undefined || a.kind === null ? "ask" : String(a.kind);
+      if (!jobs.KINDS.includes(kind)) throw new Error(`kind must be ask (read and answer) or do (change code), not '${kind}'.`);
+      // Refused now rather than failed later: an agent told at once that the
+      // project has no folder can tell its person what to set.
+      const problem = jobs.folderProblem(sql, Number(projectId));
+      if (problem) throw new Error(problem);
 
-      // RETURNING for the reason derivePad gives: on the binary route a fresh
-      // connection's last_insert_rowid() is 0, and this returned nothing.
-      const row = sql(
-        `INSERT INTO handoffs (project_id, from_session_id, to_harness, task_id, request, context_json, wake)
-         VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7)
-         RETURNING *`,
-        [
-          projectId,
-          // Set by whatever launched this server. A handoff from a tab knows
-          // which tab it came from and can be woken; one from an editor's own
-          // MCP client does not, and simply has nobody to wake.
-          process.env.DELPHI_SESSION ? Number(process.env.DELPHI_SESSION) : null,
-          String(a.to), a.task_id ?? null, String(a.request),
-          a.context ? JSON.stringify(a.context) : null,
-          a.wake === false ? 0 : 1,
-        ]
-      )[0];
-      audit("create", "handoff", row.id, `asked ${row.to_harness}`, row.request.slice(0, 80));
+      // An agent's request waits for a person unless the project says its
+      // agents may start work by themselves. Nothing here can approve one.
+      const project = sql("SELECT auto_approve FROM projects WHERE id = :p1", [Number(projectId)])[0] || {};
+      const { state, approval } = jobs.approvalFor({ requesterType: "agent", autoApprove: Number(project.auto_approve) === 1 });
+      const run = jobs.insert(sql, {
+        projectId: Number(projectId),
+        // Set by whatever launched this server. A handoff from a tab knows
+        // which tab it came from and can be woken; one from an editor's own
+        // MCP client does not, and simply has nobody to wake.
+        fromSessionId: process.env.DELPHI_SESSION ? Number(process.env.DELPHI_SESSION) : null,
+        toHarness: target.key, request: String(a.request), taskId: a.task_id ?? null,
+        context: a.context ?? null, wake: a.wake !== false, kind, source: "handoff",
+        requestedBy: ACTOR, requesterType: AUTHOR_TYPE || "agent", state, approval,
+      });
+      audit("create", "handoff", run.id, `asked ${run.harness} (${kind})`, run.request.slice(0, 80));
+      // Told honestly. Only a Delphi app's dispatcher ever runs a job, and
+      // only a session the app launched has a turn to be woken into, so an
+      // agent promised both when neither holds stops and waits for nothing.
+      const app = appState();
+      const wakeable = run.from_session_id != null && run.wake;
+      // "nothing will dispatch it" only when that is certain: a running app
+      // from before heartbeats looks, from here, like no app at all.
+      const when = app.running === true
+        ? "A Delphi app is running against this database and will dispatch it."
+        : app.running === false
+          ? `No Delphi app is running against this database, so nothing will dispatch it until one is started. ${app.reason}`
+          : `It is not certain a Delphi app is running against this database to dispatch it. ${app.reason}`;
+      const gate = state === "needs_approval"
+        ? " It waits for a person to approve it in Delphi's Runs panel before it starts."
+        : " The project lets agents start work by themselves, so it runs without waiting for approval.";
+      const after = wakeable
+        ? (app.running === true ? " You will be woken with the reply." : " You will be woken with the reply once it has run.")
+        : " Nothing can wake you with the reply, because this session was not started by Delphi: read it later with run_status.";
       return {
-        ...row,
-        note: "Queued. Delphi will run it and wake you with the reply. Do not wait for it here.",
+        ...run,
+        // The row as written, for a reader that wants the stored text.
+        context_json: sql("SELECT context_json FROM handoffs WHERE id = :p1", [run.id])[0].context_json,
+        job_id: run.id,
+        needs_approval: state === "needs_approval",
+        dispatcher_running: app.running,
+        will_wake: wakeable,
+        note: `Job ${run.id} created.${gate} ${when}${after} Do not wait for it here.`,
       };
     },
   },
 
   handoff_status: {
     description:
-      "What has been handed to and from you, and where each one got to. Use this when you have come back to a session and want to know whether an answer arrived while you were away.",
+      "What was handed to and from you and where each got to: check it on returning to a session. run_status and run_list say more.",
     schema: {
       type: "object",
       properties: {
-        id: { type: "number", description: "One handoff, in full, including the reply" },
+        id: { type: "number", description: "One, in full, with the reply" },
         project_id: { type: "number" },
         project: { type: "string" },
       },
@@ -1587,17 +1983,136 @@ const TOOLS = {
       if (a.id != null) {
         const row = sql("SELECT * FROM handoffs WHERE id = :p1", [Number(a.id)])[0];
         if (!row) throw new Error("No such handoff");
-        return row;
+        return { ...row, state: jobs.toRun(row).state };
       }
       const projectId = a.project_id ?? resolveProjectId(a);
       const session = process.env.DELPHI_SESSION ? Number(process.env.DELPHI_SESSION) : null;
       return sql(
-        `SELECT id, from_session_id, to_harness, status, request, reply, created_at, finished_at
+        `SELECT id, from_session_id, to_harness, status, state, kind, request, reply, created_at, finished_at
          FROM handoffs
          WHERE ${projectId != null ? "project_id = :p1" : "1 = :p1"}
          ORDER BY id DESC LIMIT 25`,
         [projectId != null ? projectId : 1]
-      ).map((h) => ({ ...h, mine: session != null && h.from_session_id === session }));
+      ).map((h) => ({ ...h, state: jobs.toRun(h).state, mine: session != null && h.from_session_id === session }));
+    },
+  },
+
+  run_status: {
+    description:
+      "One job: state (queued, needs_approval, running, waiting_on_human, done, failed, stopped), who asked and approved, Workbench, tokens, reply. Its log is the task's Sheet. Read it when you return; do not poll.",
+    schema: {
+      type: "object",
+      required: ["job_id"],
+      properties: { job_id: { type: "number", description: "From handoff_send" } },
+    },
+    run: (a) => {
+      const run = jobs.get(sql, Number(a.job_id));
+      if (!run) throw new Error(`No job ${a.job_id}.`);
+      return { ...run, dispatcher_running: appState().running };
+    },
+  },
+
+  run_list: {
+    description:
+      "Jobs, newest first, by project, states, or only yours. Approving one is a person's decision in the app; no tool does it.",
+    schema: {
+      type: "object",
+      properties: {
+        project_id: { type: "number" },
+        project: { type: "string" },
+        states: { type: "array", items: { type: "string", enum: jobs.STATES } },
+        mine: { type: "boolean", description: "Ones you asked for or run" },
+        limit: { type: "number", description: "Default 25" },
+      },
+    },
+    run: (a) => {
+      const projectId = a.project_id ?? resolveProjectId(a);
+      return {
+        dispatcher_running: appState().running,
+        jobs: jobs.list(sql, { projectId, states: Array.isArray(a.states) ? a.states : null, actor: a.mine ? ACTOR : null, limit: a.limit || 25 })
+          // The request and reply in full are one run_status away.
+          .map((r) => ({ ...r, request: r.request.length > 300 ? `${r.request.slice(0, 297)}...` : r.request, reply: r.reply && r.reply.length > 300 ? `${r.reply.slice(0, 297)}...` : r.reply })),
+      };
+    },
+  },
+
+  second_opinion: {
+    description:
+      "Ask another agent (Copilot by default) for a second opinion and wait for its answer. It runs read only, with Delphi's tools, in the task's Workbench or the project's folder, and returns what it said. " +
+      "It reads only inside the project's folders and the task's Workbench, never key files, one at a time, and a limited number an hour. " +
+      "Use it to review a diff before a commit or pull request (write the diff to a file inside the project and pass it in files), to diagnose a bug independently (give it the symptom, not your conclusion), or to summarise unfamiliar code. " +
+      "Verify what it says before acting on it. Never send secrets or real personal data. With task_id the answer is also kept on the task's Sheet.",
+    schema: {
+      type: "object",
+      required: ["request"],
+      properties: {
+        request: { type: "string", description: "What to look at and what you want to know, written for them" },
+        files: { type: "array", items: { type: "string" }, description: "Paths it should read: a diff, the files in question" },
+        cwd: { type: "string", description: "Folder to run in. Default: the project's folder" },
+        task_id: { type: "number", description: "Keep the answer on this task's Sheet" },
+        project_id: { type: "number" },
+        project: { type: "string", description: "Key, instead of project_id" },
+        timeout_seconds: { type: "number", description: "Default 300, at most 600" },
+      },
+    },
+    run: async (a) => {
+      const row = secondOpinionAgent();
+      const key = String(readSettings().secondOpinionAgent || "copilot");
+      if (!row) throw new Error(`There is no agent called "${key}" to ask. Set the second opinion agent in Delphi's Settings.`);
+      if (!Number(row.enabled)) throw new Error(`${row.label} is turned off in Delphi's Settings, under Agents. Turn it on to ask it for a second opinion.`);
+
+      const { task, projectId, roots, cwd } = secondOpinionScope(a);
+
+      // Claimed only once everything else has been checked, immediately before
+      // the agent starts, so a call that was refused for a missing file or a
+      // folder outside the project does not count against the hour.
+      let claim = null;
+      const beforeStart = () => {
+        const limit = secondOpinion.hourlyLimit(readSettings());
+        if (limit === 0) return "Second opinions are turned off: the hourly limit in Delphi's Settings is 0.";
+        claim = secondOpinion.claimHourly(sql, { limit, actor: ACTOR, agent: row.key, projectId, taskId: task ? task.id : null });
+        return claim ? null : `${limit} second opinions have been asked for on this database in the last hour, which is the limit in Delphi's Settings. Carry on without one and say so, or ask again later.`;
+      };
+
+      let result;
+      try {
+        result = await secondOpinion.run({
+          row,
+          request: a.request,
+          files: a.files || [],
+          cwd,
+          roots,
+          dataDir: RESOLVED.dataDir,
+          dbPath: DB,
+          beforeStart,
+          timeoutMs: a.timeout_seconds ? Number(a.timeout_seconds) * 1000 : undefined,
+          // Its own name in History, so a note it writes is never mistaken for
+          // the caller's.
+          mcp: { dbPath: DB, dbId: IDENTITY.db_id, projectId, sessionId: null, actor: `${row.key}:second-opinion`, tag: "second-opinion", readOnly: true },
+        });
+      } catch (error) {
+        secondOpinion.finishHourly(sql, claim, "failed");
+        throw error;
+      }
+      secondOpinion.finishHourly(sql, claim, "answered");
+
+      // Kept on the task after the answer is in hand, and a failure to keep it
+      // is reported beside the answer rather than instead of it: the task may
+      // have gone while the agent was thinking, and the answer is still good.
+      if (!task) return result;
+      const first = secondOpinion.redact(String(a.request).trim().split("\n")[0].slice(0, 200)).text;
+      // A Sheet is read by every later session and mirrored into the vault, so
+      // a key the reviewer quoted back from a file it read is taken out first,
+      // and the entry says so rather than leaving a gap nobody can explain.
+      const clean = secondOpinion.redact(result.answer);
+      const said = clean.count
+        ? `\n\n_${clean.count} ${clean.count === 1 ? "thing" : "things"} shaped like a token or private key ${clean.count === 1 ? "was" : "were"} replaced with [redacted] before this was kept._`
+        : "";
+      try {
+        return { ...result, redacted: clean.count, comment_id: addComment(task.id, `**Second opinion from ${result.label}** (asked: ${first})\n\n${clean.text}${said}`).id };
+      } catch (error) {
+        return { ...result, comment_error: `The answer could not be kept on task ${task.id}: ${error.message}` };
+      }
     },
   },
 
@@ -1617,17 +2132,16 @@ const TOOLS = {
 
   lock_acquire: {
     description:
-      "Take a lease on something, so another agent working the same project does not touch it at the same time. Use it for a file two of you are editing, a migration, a branch, a dev server.\n\n" +
-      "A lease, not a lock: it expires, because an agent that takes one and dies must not hold it forever. Extend it by calling again with the same key and holder. Check the answer: held false means somebody else has it and says who.",
+      "Take a lease on something two agents could both touch: a file, a migration, a branch, a dev server. It expires, so a dead agent cannot hold it forever; call again with the same key to extend. held false means someone else has it, and says who.",
     schema: {
       type: "object",
       required: ["key"],
       properties: {
-        key: { type: "string", description: "What is being held, e.g. db/schema.sql or migration" },
+        key: { type: "string", description: "e.g. db/schema.sql" },
         project_id: { type: "number" },
         project: { type: "string" },
-        note: { type: "string", description: "What you are doing with it, for whoever finds it held" },
-        minutes: { type: "number", description: "How long you need it. 15 by default." },
+        note: { type: "string", description: "What you are doing, for whoever finds it held" },
+        minutes: { type: "number", description: "Default 15" },
       },
     },
     run: (a) => {
@@ -1659,7 +2173,7 @@ const TOOLS = {
   },
 
   lock_release: {
-    description: "Give back a lease you took. Do this as soon as you are done rather than letting it expire.",
+    description: "Give back a lease as soon as you are done.",
     schema: {
       type: "object",
       required: ["key"],
@@ -1678,7 +2192,7 @@ const TOOLS = {
   },
 
   lock_status: {
-    description: "What is currently held in a project, and by whom. Expired leases are cleared rather than reported.",
+    description: "What is held in a project, and by whom.",
     schema: {
       type: "object",
       properties: { project_id: { type: "number" }, project: { type: "string" } },
@@ -1694,16 +2208,38 @@ const TOOLS = {
     },
   },
 
+  // The three lease tools as one entry in the list. They stay callable by name.
+  lock: {
+    description:
+      "Leases on something two agents could both touch: a file, a migration, a branch, a dev server. take (the default) holds key for minutes (15) and extends your own; held false means someone else has it, and says who. A lease expires, so a dead agent cannot hold it forever. release gives it back as soon as you are done; status lists what is held in a project.",
+    schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["take", "release", "status"] },
+        key: { type: "string", description: "e.g. db/schema.sql" },
+        project_id: { type: "number" },
+        project: { type: "string" },
+        note: { type: "string", description: "What you are doing, for whoever finds it held" },
+        minutes: { type: "number" },
+      },
+    },
+    run: (a) => {
+      const action = a.action || "take";
+      if (action === "status") return TOOLS.lock_status.run(a);
+      if (!a.key) throw new Error(`lock ${action} needs a key.`);
+      return action === "release" ? TOOLS.lock_release.run(a) : TOOLS.lock_acquire.run(a);
+    },
+  },
+
   timer_set: {
     description:
-      "Ask to be given a turn later. Use this instead of waiting: for a build you have started, a deploy, anything that finishes on its own clock.\n\n" +
-      "Only works from inside a Delphi agent tab, because there has to be a session to wake. Waiting in a loop instead burns tokens for no reason and stops the moment your turn ends.",
+      "Get a turn later instead of waiting, for a build, a deploy, anything on its own clock. Only inside a Delphi agent tab, which has a session to wake. Waiting in a loop burns tokens and stops when your turn ends.",
     schema: {
       type: "object",
       required: ["minutes", "message"],
       properties: {
-        minutes: { type: "number", description: "How long from now" },
-        message: { type: "string", description: "What to tell you when you wake, in enough detail to carry on" },
+        minutes: { type: "number", description: "From now" },
+        message: { type: "string", description: "What to tell you on waking, enough to carry on" },
       },
     },
     run: (a) => {
@@ -1726,34 +2262,76 @@ const TOOLS = {
     },
   },
 
+  // The four memory tools answer in a few hundred tokens by default: ids, titles,
+  // scores and one sentence each, inside `budget` (tokens, default 1500). See
+  // agent/recall.js. detail "full" is the answer each gave before, unchanged, so
+  // a client written against it still works.
   search: {
     description:
-      "Search tasks and memory notes. Check here before searching a repository: a previous session may have already worked out the answer.",
-    schema: { type: "object", required: ["query"], properties: { query: { type: "string" } } },
+      "Find tasks and notes by words, best first, one line each. Check here before searching a repository. Read one with get_note or get_task; detail full returns whole bodies.",
+    schema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number", description: "Per kind, default 8" },
+        budget: { type: "number", description: "Max tokens, default 1500" },
+        detail: { type: "string", enum: ["brief", "full"] },
+      },
+    },
     run: (a) => {
+      if (a.detail !== "full") return recall.search(String(a.query), opts(a, 8));
       const like = `%${a.query}%`;
+      const also = (entity) => `(SELECT GROUP_CONCAT(ap.name, ', ') FROM item_projects ip JOIN projects ap ON ap.id = ip.project_id
+                                  WHERE ip.entity = '${entity}' AND ip.entity_id = x.id) AS also_in`;
       return {
         tasks: sql(
-          `SELECT t.id, t.title, t.status, p.name AS project FROM tasks t
-           LEFT JOIN projects p ON p.id = t.project_id
-           WHERE t.title LIKE :p1 OR t.detail LIKE :p1 OR t.ref LIKE :p1 LIMIT 30`, [like]),
+          `SELECT x.id, x.title, x.status, p.name AS project, ${also("task")} FROM tasks x
+           LEFT JOIN projects p ON p.id = x.project_id
+           WHERE x.title LIKE :p1 OR x.detail LIKE :p1 OR x.ref LIKE :p1 LIMIT 30`, [like]),
         notes: sql(
-          `SELECT n.id, n.title, n.kind, n.body, p.name AS project FROM notes n
-           LEFT JOIN projects p ON p.id = n.project_id
-           WHERE n.title LIKE :p1 OR n.body LIKE :p1 LIMIT 30`, [like]),
+          `SELECT x.id, x.title, x.kind, x.body, p.name AS project, ${also("note")} FROM notes x
+           LEFT JOIN projects p ON p.id = x.project_id
+           WHERE x.title LIKE :p1 OR x.body LIKE :p1 LIMIT 30`, [like]),
       };
+    },
+  },
+
+  get_note: {
+    description: "Notes in full by id, after search, oracle_ask or oracle_context.",
+    schema: {
+      type: "object",
+      properties: { id: { type: "number" }, ids: { type: "array", items: { type: "number" } } },
+    },
+    run: (a) => {
+      const ids = [...(a.ids || []), ...(a.id != null ? [a.id] : [])].map(Number).filter(Number.isInteger);
+      if (!ids.length) throw new Error("Pass id, or ids for several.");
+      const rows = sql(
+        `SELECT n.id, n.title, n.kind, n.body, n.pinned, n.created_at, n.updated_at, p.id AS project_id, p.name AS project
+         FROM notes n LEFT JOIN projects p ON p.id = n.project_id WHERE n.id IN (${ids.slice(0, 20).join(",")})`);
+      if (a.id != null && !a.ids) {
+        if (!rows[0]) throw new Error(`No note ${a.id}`);
+        return rows[0];
+      }
+      return { notes: rows, missing: ids.filter((id) => !rows.some((r) => Number(r.id) === id)) };
     },
   },
 
   oracle_context: {
     description:
-      "Everything connected to a thing: a ticket, service, repository, file or concept. Returns the notes and tasks that mention it, the projects it spans, and the entities it appears alongside. Use this before reading a repository: it answers 'what do we already know about X' in one call, including connections nobody wrote down explicitly.",
+      "What we know about one thing (project, ticket, service, repo, file, person, term): notes and tasks that mention it, its projects, and what it appears alongside. Use it before reading a repository. No name lists what the graph knows.",
     schema: {
       type: "object",
-      required: ["name"],
-      properties: { name: { type: "string", description: "e.g. deploy pipeline, auth service, PROJ-1234, billing API" } },
+      properties: {
+        name: { type: "string", description: "e.g. Offerworks, PROJ-1234, billing API" },
+        kind: { type: "string", description: "Filters the list when there is no name" },
+        limit: { type: "number", description: "Per list, default 8" },
+        budget: { type: "number", description: "Max tokens, default 1500" },
+        detail: { type: "string", enum: ["brief", "full"] },
+      },
     },
     run: (a) => {
+      if (a.detail !== "full" || !a.name) return recall.context(a.name ? String(a.name) : "", { ...opts(a, 8), kind: a.kind || null });
       const like = `%${a.name}%`;
       const entity = sql(
         "SELECT * FROM entities WHERE name LIKE :p1 ORDER BY mentions DESC LIMIT 1", [like]
@@ -1796,13 +2374,15 @@ const TOOLS = {
     },
   },
 
+  // Not listed: oracle_context with no name does this now. Still callable, so
+  // nothing that already calls it breaks.
   oracle_entities: {
     description:
       "List the things the graph knows about, most referenced first. Useful for orienting at the start of a session, or finding the exact name to pass to oracle_context.",
     schema: {
       type: "object",
       properties: {
-        kind: { type: "string", enum: ["ticket", "pr", "repo", "service", "file", "person", "env", "concept"] },
+        kind: { type: "string", enum: ["ticket", "pr", "repo", "service", "file", "person", "env", "concept", "project", "term", "code"] },
         limit: { type: "number" },
       },
     },
@@ -1820,19 +2400,21 @@ const TOOLS = {
 
   oracle_ask: {
     description:
-      "The main way to ask what we know. Combines meaning and connections: finds text that means something similar even with no words in common, then expands through the graph to what those things are connected to. Prefer this over reading a repository, and over plain search when you are not sure of the exact words.",
+      "The main way to ask what we know. Ranks notes and tasks by meaning (when a local embedding model runs), words and graph links, and answers in sentences quoted from the best notes, cited by id. Prefer it to reading a repository, and to search when unsure of the words.",
     schema: {
       type: "object",
       required: ["question"],
       properties: {
         question: { type: "string" },
-        limit: { type: "number", description: "How many results, default 8" },
+        limit: { type: "number", description: "Per kind, default 6" },
+        budget: { type: "number", description: "Max tokens, default 1500" },
+        detail: { type: "string", enum: ["brief", "full"] },
       },
     },
     run: (a) => {
-      // Semantic scoring needs the vector runtime, which this process does not
-      // have, so it delegates to the app's helper. Lexical and graph results are
-      // produced here so the tool still answers when that is unavailable.
+      if (a.detail !== "full") return recall.ask(String(a.question), opts(a, 6));
+      // The answer this tool gave before it ranked anything: lexical matches with
+      // whole bodies, and the entities the best of them mention.
       const limit = Math.min(a.limit || 8, 30);
       const words = String(a.question).toLowerCase()
         .split(/[^a-z0-9_.-]+/).filter((w) => w.length > 3);
@@ -1857,8 +2439,6 @@ const TOOLS = {
          WHERE (${noteClause}) > 0 ORDER BY hits DESC LIMIT :p${params.length + 1}`,
         [...params, limit]) : [];
 
-      // Expand through the graph: entities mentioned by the best matches, and
-      // what those entities travel with. This is the part plain search cannot do.
       // The graph's tables are made by the app (oracle.sql), so a database an
       // agent reached before the app ever opened it has none. That is no reason
       // to lose the matches already found.
@@ -1872,10 +2452,81 @@ const TOOLS = {
          ORDER BY e2.mentions DESC LIMIT 12`) : [];
 
       return {
-        note: "Lexical and graph results. For meaning-based ranking the app exposes oracle.nearest; this tool covers what is reachable without the vector runtime.",
+        note: "Lexical and graph results with whole bodies. The brief answer (the default) also ranks by meaning when a local embedding model is running.",
         tasks, notes, connected,
       };
     },
+  },
+
+  // --- items in the wrong place ------------------------------------------------
+  //
+  // An agent may say an item is misfiled and propose where it belongs. Nothing
+  // here applies a proposal: approving is a person's, in the window or with
+  // delphi flags approve, which the guard blocks in an agent's shell.
+
+  flag_item: {
+    description:
+      "Say an item may be in the wrong project: note where it belongs and why. Changes nothing; the Oracle proposes a home and a person decides.",
+    schema: {
+      type: "object",
+      required: ["entity", "id", "note"],
+      properties: {
+        entity: { type: "string", enum: ["task", "note", "scratchpad", "link", "organizer", "session"] },
+        id: { type: "number" },
+        note: { type: "string" },
+        evidence: { type: "array", items: { type: "object" }, description: "{type: text|url, value} or {type: task|note|pad|project, id}" },
+      },
+    },
+    run: (a) => {
+      const made = itemStore.flag({ entity: a.entity, id: a.id, note: a.note, evidence: a.evidence ?? null, suggest: a.suggest ?? null, source: "agent" });
+      return { flag_id: made.flag.id, status: made.flag.status, appended: made.appended, proposal: made.flag.proposal_summary };
+    },
+  },
+
+  propose_move: {
+    description:
+      "Propose where an item belongs: 1 to 3 ops (move, copy, associate, dissociate). Never applies: returns the plan with any refusals, for a person to approve.",
+    schema: {
+      type: "object",
+      required: ["ops", "reasoning"],
+      properties: {
+        flag_id: { type: "number", description: "Or entity and id" },
+        entity: { type: "string" },
+        id: { type: "number" },
+        ops: { type: "array", items: { type: "object" }, description: "{op, entity, id, to, keepInSource}" },
+        reasoning: { type: "string" },
+        confidence: { type: "number", description: "0 to 1" },
+      },
+    },
+    run: (a) => {
+      const done = itemStore.propose({ flagId: a.flag_id ?? null, entity: a.entity ?? null, id: a.id ?? null, ops: a.ops,
+        reasoning: a.reasoning, confidence: a.confidence ?? null, by: ACTOR, evaluator: ACTOR });
+      return { flag_id: done.flag.id, status: done.flag.status, plan: done.plan.map((p) => ({ ok: p.ok, summary: p.summary, refusals: p.refusals })) };
+    },
+  },
+
+  list_flags: {
+    description: "Flags on possibly misfiled items, with each proposal in a line. Open ones unless status says.",
+    schema: {
+      type: "object",
+      properties: {
+        status: { type: "string", description: "e.g. applied, rejected, all" },
+        project_id: { type: "number" },
+        project: { type: "string" },
+      },
+    },
+    run: (a) => itemStore.listFlags({ status: a.status ? (a.status === "live" ? null : a.status) : null, projectId: resolveProjectId(a) })
+      .map((f) => ({ id: f.id, item: `${f.entity} ${f.entity_id}`, label: f.label, home: f.project ? f.project.key : null,
+        status: f.status, proposal: f.proposal_summary, by: f.created_by })),
+  },
+
+  // There is no decide tool. Approving or rejecting a proposal happens only in
+  // the Delphi window: nothing that reaches this server, the command line
+  // included, can show it is a person rather than an agent saying it is one.
+  flag_get: {
+    description: "One flag with its thread and the plan of its proposal.",
+    schema: { type: "object", required: ["flag_id"], properties: { flag_id: { type: "number" } } },
+    run: (a) => itemStore.getFlag(a.flag_id),
   },
 
   recent_activity: {
@@ -1887,14 +2538,47 @@ const TOOLS = {
   },
 };
 
+// Recall for the memory tools. The query embedding comes from Ollama when it
+// answers inside a short timeout (embeddings.js embedQuery); the stored vectors
+// are read through sql like everything else, so semantic ranking works on both
+// routes, and without Ollama the ranking is words and graph alone.
+const embeddings = require("../embeddings");
+const recall = require("./recall").makeRecall({
+  sql,
+  hasTable: (name) => schemaLater.hasTable((s) => DATABASE.query(s), name),
+  embedQuery: (text) => embeddings.embedQuery(text),
+});
+const opts = (a, limit) => ({
+  limit: Math.max(1, Math.min(Number(a.limit) || limit, 50)),
+  budget: Math.max(200, Number(a.budget) || 1500),
+});
+
+// Listed nowhere but still callable by anyone, because a broader tool covers
+// them and a client that already calls one by name must keep working.
+const UNLISTED_TOOLS = new Set([
+  "oracle_entities", "sheet_promote", "workbench_status", "lock_acquire", "lock_release", "lock_status",
+]);
+
 // Callable only by the delphi command line, and not listed. See the comment
 // above workbench_park.
 const INTERNAL_TOOLS = new Set([
   "workbench_park", "workbench_resume", "workbench_update", "workbench_commit", "workbench_push",
   "workbench_pr", "workbench_finish_plan", "workbench_finished", "workbench_busy", "workbench_closing", "workbench_discarded", "workbench_recreate",
   "workbench_forget", "workbench_housekeep", "workbench_advanced",
+  "flag_get",
 ]);
 const CLI_CLIENT = process.env.DELPHI_CLIENT === "delphi-cli";
+
+// A server started for a second opinion offers only what reads. The reviewer is
+// handed whatever it is reviewing, and a diff can carry instructions; read only
+// has to mean it cannot file work, change a pad, hand a job to an agent that
+// writes, or ask for a second opinion of its own and start a chain. Listed by
+// what is allowed rather than what is not, so a tool added later is closed to it
+// until someone decides otherwise.
+const READ_ONLY = process.env.DELPHI_READ_ONLY === "1";
+// The list lives in agent/second_opinion.js, which hands the same names to
+// Copilot as --available-tools.
+const READ_ONLY_TOOLS = new Set(secondOpinion.READ_ONLY_TOOLS);
 
 // --- JSON-RPC ---------------------------------------------------------------
 
@@ -1913,7 +2597,14 @@ async function handle(req) {
   const { id, method, params } = req;
 
   if (method === "initialize") {
-    const scratchpad = scratchpadState();
+    const scratchpad = READ_ONLY ? { on: false } : scratchpadState();
+    const second = READ_ONLY ? { on: false } : secondOpinionState();
+    // Both directives, when both are on, as separate sections of one text.
+    const instructions = [
+      scratchpad.on ? directives.scratchpadInstructions(scratchpad.project) : null,
+      second.on ? directives.secondOpinionInstructions(second.label) : null,
+    ].filter(Boolean).join("\n\n");
+    if (second.on) secondOpinionRemindedAt = Date.now();
     return {
       protocolVersion: "2024-11-05",
       // listChanged, because the scratchpad setting rewrites tool descriptions.
@@ -1921,19 +2612,26 @@ async function handle(req) {
       // nothing until the agent is restarted.
       capabilities: { tools: { listChanged: true } },
       serverInfo: { name: "brain", version: "1.0.0" },
-      ...(scratchpad.on
-        ? { instructions: directives.scratchpadInstructions(scratchpad.project) }
-        : {}),
+      ...(instructions ? { instructions } : {}),
     };
   }
 
   if (method === "tools/list") {
-    const scratchpad = scratchpadState();
+    // A server started read only carries none of the directives: they tell the
+    // reviewer to write pads and ask for second opinions, which it cannot, and
+    // each one is tokens on someone else's quota spent on an instruction it has
+    // to ignore.
+    const scratchpad = READ_ONLY ? { on: false } : scratchpadState();
     const suffix = scratchpad.on ? directives.scratchpadToolNote(scratchpad.project) : "";
+    const second = READ_ONLY ? { on: false } : secondOpinionState();
+    const secondNote = second.on ? directives.secondOpinionToolNote(second.label) : "";
     return {
-      tools: Object.entries(TOOLS).filter(([name]) => !INTERNAL_TOOLS.has(name)).map(([name, t]) => ({
+      tools: Object.entries(TOOLS).filter(([name]) => !INTERNAL_TOOLS.has(name) && !UNLISTED_TOOLS.has(name) &&
+                                                      (!READ_ONLY || READ_ONLY_TOOLS.has(name))).map(([name, t]) => ({
         name,
-        description: t.description + (suffix && SCRATCHPAD_TOOLS.has(name) ? suffix : ""),
+        description: t.description +
+          (suffix && SCRATCHPAD_TOOLS.has(name) ? suffix : "") +
+          (secondNote && SECOND_OPINION_TOOLS.has(name) ? secondNote : ""),
         inputSchema: t.schema,
       })),
     };
@@ -1942,16 +2640,32 @@ async function handle(req) {
   if (method === "tools/call") {
     const tool = TOOLS[params.name];
     if (!tool || (INTERNAL_TOOLS.has(params.name) && !CLI_CLIENT)) throw new Error(`Unknown tool ${params.name}`);
+    if (READ_ONLY && !READ_ONLY_TOOLS.has(params.name)) {
+      throw new Error(`${params.name} is not available here: this Delphi server was started read only, for a second opinion. Say what you would do instead.`);
+    }
     const result = await tool.run(params.arguments || {});
-    const content = [{ type: "text", text: JSON.stringify(result, null, 2) }];
+    // Compact JSON. Indentation is a fifth of a pretty-printed answer and an
+    // agent reads the structure without it, so every call paid for whitespace.
+    const content = [{ type: "text", text: JSON.stringify(result) }];
 
     // The last word, and the one an agent is most likely to act on, because it
     // arrives while it is already working rather than at startup. Only on
     // list_projects: that is the orienting call, and repeating this on every
     // result would train the model to skip it.
-    const scratchpad = scratchpadState();
+    // None of this on a read-only server; see tools/list.
+    const scratchpad = READ_ONLY ? { on: false } : scratchpadState();
     if (scratchpad.on && params.name === "list_projects") {
       content.push({ type: "text", text: directives.scratchpadReminder(scratchpad.project) });
+    }
+    // On the orienting call, and on any call when this session has not been
+    // told for an hour. The second half is what reaches a session that was
+    // already running when the mode was turned on: it read its instructions
+    // before the mode existed and will not read them again.
+    const second = READ_ONLY ? { on: false } : secondOpinionState();
+    if (second.on && params.name !== "second_opinion" &&
+        (params.name === "list_projects" || Date.now() - secondOpinionRemindedAt >= SECOND_OPINION_REMIND_MS)) {
+      secondOpinionRemindedAt = Date.now();
+      content.push({ type: "text", text: directives.secondOpinionReminder(second.label) });
     }
     return { content };
   }
@@ -1974,8 +2688,9 @@ async function handle(req) {
  * write such as a theme change stays quiet.
  */
 function watchSettings() {
-  const settingsPath = directives.settingsBesideDatabase(DB);
-  let previous = JSON.stringify(scratchpadState());
+  const settingsPath = SETTINGS_FILE;
+  const effective = () => JSON.stringify([scratchpadState(), secondOpinionState()]);
+  let previous = effective();
   let timer = null;
 
   try {
@@ -1983,7 +2698,7 @@ function watchSettings() {
       if (filename && String(filename) !== path.basename(settingsPath)) return;
       clearTimeout(timer);
       timer = setTimeout(() => {
-        const next = JSON.stringify(scratchpadState());
+        const next = effective();
         if (next === previous) return;
         previous = next;
         send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });

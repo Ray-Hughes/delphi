@@ -27,6 +27,9 @@ module.exports = {
     "main.js",
     "preload.js",
     "app.js",
+    // Loaded by index.html with a script tag, not required, so no require
+    // walk finds it; tools/package_test.js follows the script tags instead.
+    "timefmt.js",
     "index.html",
     "db.js",
     "paths.js",
@@ -51,8 +54,22 @@ module.exports = {
     // requires, so a gap shows up in `npm test` rather than on someone's Mac.
     "agent/schema_later.js",
     "agent/launch.js",
+    // Where the database is and which one it is. paths.js and db.js require
+    // them inside the archive; the server and the CLI need them outside it.
+    "agent/locate.js",
+    "agent/identity.js",
+    // Jobs: the rows the server writes and the dispatcher that runs them. The
+    // server needs jobs.js outside the archive too (tools/after-pack.js).
+    "agent/jobs.js",
+    "agent/dispatch.js",
+    // Which binary an agent may be started from. The dispatcher and the
+    // server's second_opinion both ask it, so it is copied out as well.
+    "agent/binaries.js",
     "sheet/",
     "workbench/",
+    // Items across projects and flags: the store and the Oracle's evaluator,
+    // shared with the server (tools/after-pack.js copies them out as well).
+    "items/",
     "schema.sql",
     "oracle.sql",
     "package.json",
@@ -71,7 +88,8 @@ module.exports = {
   // file listed here and in `files` ends up outside the archive and missing from
   // it. That is how 1.6.0 shipped a main process that died on require("./pads")
   // before it could open a window. The modules both sides need (pads.js, git.js,
-  // harness.js, agent/schema_later.js, agent/launch.js, sheet/, workbench/) are
+  // harness.js, embeddings.js, agent/schema_later.js, agent/launch.js, agent/locate.js,
+  // agent/identity.js, agent/jobs.js, agent/binaries.js, sheet/, workbench/, items/) are
   // copied out by tools/after-pack.js instead, from its OUTSIDE_TOO list, after
   // the archive is written. tools/package_test.js reads both lists and the real
   // archive, so neither half can go missing again without a test failing.
@@ -87,6 +105,10 @@ module.exports = {
     // file arrived, and every installed build since shipped a server that died
     // at its first require.
     { from: "agent/directives.js", to: "agent/directives.js" },
+    // Ranking, snippets and budgets for the memory tools. Only the server needs it.
+    { from: "agent/recall.js", to: "agent/recall.js" },
+    // Second opinions: another agent's CLI, run read only. Only the server needs it.
+    { from: "agent/second_opinion.js", to: "agent/second_opinion.js" },
     // The command line tool. Resources/bin/delphi spawns ../agent/mcp_server.js,
     // the same server an editor uses. tools/after-pack.js makes sure it is still
     // executable once it lands here.

@@ -104,27 +104,42 @@ WRAPPERS = [re.compile(p) for p in (
 
 # The delphi command itself, however it is named: on PATH, by a path, through
 # node or npx, or found at run time by which or command -v.
-DELPHI = re.compile(
+DELPHI_HEAD = (
     r"(?:(?:node|npx|bun|deno\s+run)(?:\s+-\S+)*\s+)?"
     r"(?:\"?\$\((?:which|command\s+-v|type\s+-p|whence\s+-p)\s+delphi\)\"?"
     r"|`(?:which|command\s+-v|type\s+-p)\s+delphi`"
     r"|[\"']?(?:\S*/)?delphi(?:\.js)?[\"']?)"
-    r"\s+[\"']?discard\b"
 )
+DELPHI = re.compile(DELPHI_HEAD + r"\s+[\"']?discard\b")
+# Approving or rejecting a proposal to move, copy or show work in another
+# project. The same fence as discard, for the same reason: it is a person's
+# decision, and an agent that reached it would be deciding about its own
+# proposal. The store refuses an agent's decision too; this is the courtesy in
+# front of it for a harness whose author type is not set.
+#
+# Any words may come between flags and the verb: the command line takes its
+# options anywhere, so "delphi flags --all approve 1" approves, and a pattern
+# that wanted approve straight after flags let exactly that through.
+DELPHI_FLAGS = re.compile(DELPHI_HEAD + r"\s+[\"']?flags[\"']?(?:\s+\S+)*?\s+[\"']?(?:approve|reject)\b")
 
 
-def runs_discard(rest: str, depth: int = 0) -> bool:
-    """Whether this text, read as a command, is delphi discard once wrappers go."""
+def runs_delphi(rest: str, verb, depth: int = 0) -> bool:
+    """Whether this text, read as a command, is that delphi verb once wrappers go."""
     rest = rest.lstrip()
-    if DELPHI.match(rest):
+    if verb.match(rest):
         return True
     if depth >= 10:
         return False
     for wrapper in WRAPPERS:
         m = wrapper.match(rest)
-        if m and m.end() and runs_discard(rest[m.end():], depth + 1):
+        if m and m.end() and runs_delphi(rest[m.end():], verb, depth + 1):
             return True
     return False
+
+
+def runs_discard(rest: str, depth: int = 0) -> bool:
+    """Whether this text, read as a command, is delphi discard once wrappers go."""
+    return runs_delphi(rest, DELPHI, depth)
 
 
 def unmask(cmd: str) -> str:
@@ -148,10 +163,13 @@ def unmask(cmd: str) -> str:
 ARGV_DISCARD = re.compile(
     r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']discard["']"""
 )
+ARGV_FLAGS = re.compile(
+    r"""["'](?:\S*/)?delphi["']\s*,\s*\[?\s*["']flags["'](?:\s*,\s*["'][^"']*["'])*?\s*,\s*["'](?:approve|reject)["']"""
+)
 
 
-def is_delphi_discard(cmd: str) -> bool:
-    """Whether delphi discard is run anywhere in this segment, in command position.
+def in_command_position(cmd: str, verb, argv) -> bool:
+    """Whether that delphi verb is run anywhere in this segment, in command position.
 
     Command position is the start, or just inside a $( ), a backquote, a ( or
     a <( ), or the quoted argument of an -c flag (sh -c, bash -lc, script -qc,
@@ -159,12 +177,86 @@ def is_delphi_discard(cmd: str) -> bool:
     grep pattern, a Sheet entry) is not in command position and is allowed.
     """
     cmd = unmask(cmd)
-    if ARGV_DISCARD.search(cmd):
+    if argv.search(cmd):
         return True
     starts = [0]
     starts += [m.end() for m in re.finditer(r"\$\(|<\(|`|\(|\{\s", cmd)]
     starts += [m.end() for m in re.finditer(r"\s-[a-zA-Z]*c\s+[\"']", cmd)]
-    return any(runs_discard(cmd[i:]) for i in starts)
+    return any(runs_delphi(cmd[i:], verb) for i in starts)
+
+
+# A program that can write SQLite, run on Delphi's own database. An agent with
+# a shell could otherwise rewrite the harness table (the command a job runs),
+# approve its own jobs, or rewrite History.
+#
+# A tripwire against an agent doing it in passing, not a boundary: the
+# database is a file the agent's user can write, and copying it, editing the
+# copy and copying it back, or a script file that opens it, are out of scope.
+# Only the real database is fenced (the per-user data folder, the folders
+# DELPHI_DB and DELPHI_DATA_DIR name, and $DELPHI_DB written as a variable),
+# so a test's own delphi.db in a temp folder is not. Read only is allowed:
+# sqlite3 with -readonly among its own options, or a file: URI with mode=ro.
+def _data_paths():
+    """Spellings of the real database's folder or file a command could use."""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        folders = [os.path.join(home, "Library", "Application Support", "Delphi")]
+    elif sys.platform.startswith("win"):
+        folders = [os.path.join(os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming"), "Delphi")]
+    else:
+        folders = [os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "Delphi")]
+    if os.environ.get("DELPHI_DATA_DIR"):
+        folders.append(os.environ["DELPHI_DATA_DIR"])
+    files = [os.path.join(f, "delphi.db") for f in folders]
+    if os.environ.get("DELPHI_DB"):
+        files.append(os.environ["DELPHI_DB"])
+    out = set()
+    for f in files:
+        for p in (f, os.path.realpath(f)):
+            out.add(p)
+            if p.startswith(home + os.sep):
+                rest = p[len(home):]
+                out.update(("~" + rest, "$HOME" + rest, "${HOME}" + rest))
+    pieces = []
+    for p in sorted(out, key=len, reverse=True):
+        # A space may be written escaped, and a quote may sit anywhere in it.
+        pieces.append(r"\\? ".join(re.escape(part) for part in p.split(" ")))
+    return pieces
+
+
+DB_NAMED = r"(?:\$\{?DELPHI_DB\b|" + "|".join(_data_paths()) + r")"
+# sqlite3 with -readonly among its own options, before the file argument.
+SQLITE_RO = r"""sqlite3[\"']?(?:\s+-(?!readonly\b)(?:cmd|separator|newline|nullvalue|init|vfs|lookaside|pagecache|heap|maxsize|mmap)\s+\S+|\s+-(?!readonly\b)[\w-]+)*\s+-readonly\b"""
+DB_WRITER = re.compile(
+    r"""[\"']?(?:\S*/)?(?:sqlite3(?!""" + SQLITE_RO[len("sqlite3"):] + r""")|sqlite-utils|litecli|python[\d.]*|node|ruby|perl|deno|bun)[\"']?(?:\s|$)[^;&|]*?""" + DB_NAMED
+)
+ARGV_DB_WRITER = re.compile(
+    r"""["'](?:\S*/)?(?:sqlite3|python[\d.]*|node)["']\s*,\s*\[?[^\]]*?""" + DB_NAMED
+)
+# An interpreter given a script with -c or -e: judged on the whole line,
+# because the script's own semicolons split it into segments that each look
+# innocent.
+INTERP_DB = re.compile(
+    r"""[\"']?(?:\S*/)?(?:python[\d.]*|node|ruby|perl|deno|bun)[\"']?(?:\s+-\S+)*?\s+-[a-zA-Z]*[ce]\s.*""" + DB_NAMED, re.S
+)
+# A file: URI that opens the database read only, taken out before matching, so
+# the same script naming it read write elsewhere is still caught.
+RO_URI = re.compile(r"""file:[^\s'"]*[?&]mode=ro\b[^\s'"]*""")
+
+
+def writes_delphi_db(cmd: str) -> bool:
+    """Whether this segment runs something that can write SQLite on Delphi's database."""
+    return in_command_position(RO_URI.sub(" ", cmd), DB_WRITER, ARGV_DB_WRITER)
+
+
+def is_delphi_discard(cmd: str) -> bool:
+    """Whether delphi discard is run anywhere in this segment, in command position."""
+    return in_command_position(cmd, DELPHI, ARGV_DISCARD)
+
+
+def is_delphi_flags_decision(cmd: str) -> bool:
+    """Whether delphi flags approve or reject is run anywhere in this segment, in command position."""
+    return in_command_position(cmd, DELPHI_FLAGS, ARGV_FLAGS)
 
 
 def check_segment(cmd: str):
@@ -248,6 +340,19 @@ def check_segment(cmd: str):
             "delphi discard throws a Workbench away, and that is for a person to "
             "decide. Say what you would discard and why in the task's Sheet instead."
         )
+    if is_delphi_flags_decision(c):
+        return (
+            "Approve or reject this in the Delphi window: deciding where someone's "
+            "work lives is for a person, and the command line refuses it anyway. Say "
+            "what you think on the flag instead: flag_item adds to it, and "
+            "propose_move records a proposal."
+        )
+    if writes_delphi_db(c):
+        return (
+            "This opens Delphi's own database with something that can write to it. "
+            "Change Delphi through its tools (or delphi on the command line), which "
+            "check and record what changed; open it with sqlite3 -readonly to look."
+        )
     # DELPHI_CLIENT tells the MCP server the command line is calling, which
     # unlocks its command line only tools. An agent has no reason to say so.
     if re.search(r"(?:^|[\s;&|(`])(?:export\s+|env\s+(?:-\S+\s+)*)?DELPHI_CLIENT=", c):
@@ -280,6 +385,14 @@ def check_bash(command: str):
         return (
             "Piping a downloaded script straight into a shell runs code nobody has read. "
             "Download it, look at it, then run it."
+        )
+
+    whole = unmask(norm(command))
+    if in_command_position(RO_URI.sub(" ", whole), INTERP_DB, ARGV_DB_WRITER):
+        return (
+            "This opens Delphi's own database with something that can write to it. "
+            "Change Delphi through its tools (or delphi on the command line), which "
+            "check and record what changed; open it read only to look."
         )
 
     # Unmasked on the whole line first, because a variable assigned in one

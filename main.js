@@ -28,11 +28,38 @@ const path = require("path");
 const fs = require("fs");
 const paths = require("./paths");
 const { isNewer } = require("./version");
+const locate = require("./agent/locate");
+const identity = require("./agent/identity");
 
 // Before anything reads it. Packaged, the name comes from the bundle, but running
 // from a checkout Electron falls back to its own name and the macOS menu bar reads
 // "Electron" instead of "Delphi".
 app.setName("Delphi");
+
+// One app per database.
+//
+// Two copies of Delphi on one database run two schedulers and two handoff
+// dispatchers, and a handoff then goes to whichever looks first; that is how
+// work vanished between a checkout's `npm start` and the installed app. So the
+// second launch hands over to the first (which comes forward) and quits.
+//
+// Electron's lock is per userData folder, so the folder is chosen to make the
+// lock per database: the per-user folder for the per-user database, set
+// explicitly so a checkout and the installed app share it, and for any other
+// database a profile named by a hash of its path. That keeps the lock rather
+// than skipping it under an override, so a developer's dev copy still cannot
+// run twice, while a test's hidden app, a dev copy, or a second file in the
+// same folder never collides with the app in use. It also stops those sharing the real app's cookies and local storage.
+// See agent/locate.js electronProfileDir.
+{
+  const profile = locate.electronProfileDir(paths.RESOLVED);
+  app.setPath("userData", profile || paths.RESOLVED.conventional);
+}
+const FIRST_INSTANCE = app.requestSingleInstanceLock();
+if (!FIRST_INSTANCE) {
+  console.log(`Delphi is already running against ${paths.DB_PATH}; bringing that one forward instead.`);
+  app.quit();
+}
 
 const db = require("./db");
 const vault = require("./vault");
@@ -75,6 +102,16 @@ let settings = {
   // for someone without asking. See agent/directives.js for how it reaches them.
   scratchpadMode: false,
   scratchpadProjectId: null,   // null means "no default, pick a project"
+  // Whether connected agents are told to ask another agent for a second opinion
+  // (the second_opinion tool) before a commit and when they reach a root cause.
+  // Off by default for the same reason as the scratchpad: it changes how every
+  // agent sharing this database works, and spends the other agent's quota.
+  secondOpinionMode: false,
+  secondOpinionAgent: "copilot",
+  // How many second opinions may start in an hour, across every agent on this
+  // database. Each one spends the other agent's quota. See
+  // harness.SECOND_OPINION_HOURLY.
+  secondOpinionHourlyLimit: harness.SECOND_OPINION_HOURLY.default,
   // On by default because the celebration is the confirmation that a task was
   // completed, and the row leaves straight afterwards. The system reduced motion
   // preference already suppresses all of it for the people who need that, so
@@ -87,6 +124,20 @@ let settings = {
   // What Workbench branches start with. null means the OS username, which is
   // what shows whose branch is whose on a shared remote.
   workbenchBranchPrefix: null,
+  // The checkout database the person has already been told is ignored, so the
+  // notice in Settings is shown once per file rather than on every visit.
+  // null means not yet acknowledged. See app:dataInfo.
+  checkoutNoticeSeen: null,
+  // The dispatcher (agent/dispatch.js): how many jobs run at once in all, how
+  // many per harness (a key missing here means 1, because subscriptions
+  // throttle), and how long one may run before it is stopped. Bounded by
+  // dispatch.BOUNDS, here and again where the dispatcher reads them.
+  jobConcurrency: 3,
+  jobHarnessLimits: {},
+  jobTimeoutMinutes: 60,
+  // Projects kept at the top of the sidebar, in the person's order. Ids, so a
+  // renamed project stays pinned; settings:set drops any that do not exist.
+  pinnedProjects: [],
 };
 let schedulerTimer = null;
 let vaultTimer = null;
@@ -99,6 +150,11 @@ let dbWatchTimer = null;
 // The vault is a mirror, so it is rebuilt after changes rather than kept in step
 // edit by edit. Debounced because typing in a note fires an update per blur and
 // a full rewrite per keystroke would be silly.
+const graphRebuild = oracle.makeRebuildScheduler(
+  () => oracle.rebuildAsync(db.handle()).catch((error) => console.error("oracle rebuild failed", error)),
+  { gapMs: 30000 }
+);
+
 function scheduleVaultExport() {
   if (settings.vaultEnabled === false) return;
   if (vaultTimer) clearTimeout(vaultTimer);
@@ -108,13 +164,10 @@ function scheduleVaultExport() {
     } catch (error) {
       console.error("vault export failed", error);
     }
-    // The graph is derived, so it is rebuilt rather than patched. Doing it here
-    // means it can never be staler than the notes it was built from.
-    try {
-      oracle.rebuild(db.handle());
-    } catch (error) {
-      console.error("oracle rebuild failed", error);
-    }
+    // The graph is derived, so it is rebuilt from the rows. Paced, so the window
+    // stays live on a big store, and throttled, because a running job writes
+    // about once a second; the last change of a burst is always rebuilt.
+    graphRebuild.poke();
 
     // Embedding is asynchronous and can be slow when a model is warming up, so it
     // is not awaited. Rows whose text is unchanged are skipped, so this settles
@@ -616,7 +669,16 @@ async function checkForUpdate({ quiet = true } = {}) {
   }
 }
 
+app.on("second-instance", () => {
+  if (!app.isReady() || SMOKE) return;
+  if (win && !win.isDestroyed() && win.isMinimized()) win.restore();
+  show();
+});
+
 app.whenReady().then(() => {
+  // The second launch does nothing but quit; app.quit() above is not
+  // synchronous, so this would otherwise still open a window and a scheduler.
+  if (!FIRST_INSTANCE) return;
   if (SMOKE) return smoke();
   loadSettings();
   // Before the database is opened for the first time, or the migration finds a
@@ -641,6 +703,14 @@ app.whenReady().then(() => {
   } catch (error) {
     console.error("sweeping lost runs", error);
   }
+  // Jobs the last app was running when it died are failed as interrupted,
+  // with a note on their Sheet, and never rerun on their own.
+  try {
+    const interrupted = dispatcher.recover();
+    if (interrupted.length) console.log(`marked ${interrupted.length} interrupted jobs`);
+  } catch (error) {
+    console.error("recovering jobs", error);
+  }
   benches.housekeep().then((report) => {
     if ((report.missing.length || report.restored.length || report.adopted.length || (report.reconciled || []).length) && win && !win.isDestroyed()) {
       win.webContents.send("db-changed");
@@ -651,8 +721,12 @@ app.whenReady().then(() => {
   refreshMenu();
   registerHotkey(settings.hotkey);
   startScheduler();
+  startHeartbeat();
   watchForExternalWrites();
   scheduleVaultExport();
+  // Said once in the log as well as in Settings, for whoever started this from
+  // a terminal and is wondering why the board is not the one they had.
+  if (paths.RESOLVED.checkoutDbIgnored) console.log(locate.ignoredNotice(paths.RESOLVED));
 
   // A panel has no dock presence; a normal application does.
   if (app.dock && settings.panelMode === true) app.dock.hide();
@@ -675,7 +749,7 @@ app.whenReady().then(() => {
 
 // Windows and Linux keep the process alive with no windows, which for a tray app
 // is correct. Clicking the dock icon on macOS should still bring the panel back.
-app.on("activate", () => { if (!SMOKE) show(); });
+app.on("activate", () => { if (!SMOKE && FIRST_INSTANCE) show(); });
 
 // See DELPHI_SMOKE at the top of this file.
 function smoke() {
@@ -796,6 +870,13 @@ function checkForExternalWrites() {
         // So an open task panel shows an agent's Sheet entries as they land,
         // rather than when the person next clicks something.
         win.webContents.send("db-changed");
+        // An agent's flag or proposal lands in Needs you without a click. Only
+        // when the flags themselves changed, so every other write stays quiet.
+        const flags = flagSignature();
+        if (flags !== lastFlagSignature) {
+          lastFlagSignature = flags;
+          win.webContents.send("flags-changed", { external: true });
+        }
       }
     }
   } catch (error) {
@@ -832,6 +913,37 @@ function watchForExternalWrites() {
   } catch (error) {
     console.error("could not watch the database directory, falling back to polling", error);
   }
+}
+
+/**
+ * Tells agents a Delphi app is running against this database.
+ *
+ * A small file beside the database (agent/identity.js aliveFile), replaced
+ * every 30 seconds. whoami and handoff_send read it, so an agent handing work
+ * over is told whether anything will dispatch it now, instead of being promised
+ * a wake-up by an app that is not running. A file and not a row: a row is a
+ * write every other connection sees through PRAGMA data_version, and another
+ * Delphi on the same file took each beat for an agent's write and refreshed
+ * everything. Its own timer rather than the scheduler's, whose interval is a
+ * setting a person can stretch to minutes.
+ *
+ * db_id is the one this app's open handle reports, so a server refusing a
+ * mismatched DELPHI_DB_ID can tell when it is this app that is on a stale file.
+ */
+let heartbeatTimer = null;
+function startHeartbeat() {
+  const started = new Date().toISOString();
+  const beat = () => {
+    try {
+      identity.writeAlive(paths.RESOLVED, { version: app.getVersion(), dbId: db.identity().db_id, started });
+    } catch (error) {
+      console.error("could not write the app heartbeat", error);
+    }
+  };
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  beat();
+  heartbeatTimer = setInterval(beat, identity.BEAT_MS);
+  if (heartbeatTimer.unref) heartbeatTimer.unref();
 }
 
 function startScheduler() {
@@ -873,8 +985,20 @@ app.on("before-quit", () => {
     try { sheets.update(entryId, { meta: { state: "fail", code: "quit", exit: null } }); } catch {}
   }
   appRuns.clear();
+  // Running jobs the same: their agents are stopped and their rows say
+  // interrupted now, rather than at the next start's recovery.
+  try { dispatcher.shutdown("Delphi quit"); } catch {}
 });
 app.on("will-quit", () => globalShortcut.unregisterAll());
+// Taken away on the way out, so an agent is told at once that nothing is
+// dispatching. Only this app's own beat, and only by the instance that wrote
+// one: a second launch quitting must not erase the first's.
+app.on("will-quit", () => {
+  if (!heartbeatTimer) return;
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  try { identity.clearAlive(paths.RESOLVED); } catch {}
+});
 
 // ---------------------------------------------------------------------------
 // IPC. Every handler is a thin wrapper so the renderer never touches the
@@ -1079,7 +1203,16 @@ handle("sheet:append", (taskId, payload = {}) => {
 handle("sheet:promote", (id, on) => { const r = sheets.promote(id, on !== false); scheduleVaultExport(); return r; });
 handle("sheet:file", (id, kind, title) => { const r = sheets.file(id, kind, title || null); scheduleVaultExport(); return r; });
 handle("sheet:ask", (taskId, question, options) => { const r = sheets.ask(taskId, question, options); scheduleVaultExport(); return r; });
-handle("sheet:decide", (askId, choice, why) => { const r = sheets.decide(askId, choice, why || null); scheduleVaultExport(); return r; });
+// A person's answer, so a job waiting on that question goes back to its agent
+// now rather than at the next scheduler pass. The window's writes are this
+// process's own, which PRAGMA data_version never reports, so nothing else
+// would notice it sooner.
+handle("sheet:decide", (askId, choice, why) => {
+  const r = sheets.decide(askId, choice, why || null);
+  scheduleVaultExport();
+  try { dispatcher.answered(r && r.task_id != null ? r.task_id : null); } catch (error) { console.error("waking jobs after a decision", error); }
+  return r;
+});
 handle("sheet:log", (id) => readSheetLog(sheets.get(id)));
 
 // Runs started from the composer, by entry id, for interrupting and for
@@ -1357,6 +1490,82 @@ handle("organizers:create", (payload) => { const r = db.createOrganizer(payload)
 handle("organizers:update", (id, fields) => { const r = db.updateOrganizer(id, fields); scheduleVaultExport(); return r; });
 handle("organizers:delete", (id) => { const r = db.deleteOrganizer(id); scheduleVaultExport(); return r; });
 
+// ---------------------------------------------------------------------------
+// Items across projects, and flags
+//
+// Move, copy, also-belongs-to and flag-for-review, from items/store.js, the
+// store the MCP server uses too, so the window and an agent write the same
+// History rows. The window's writes are the person's. Refusals come back with
+// code REFUSED and details.refusals, each a sentence naming the blocker.
+
+const { makeItemStore } = require("./items/store");
+const itemStore = makeItemStore({
+  sql: db.sqlP, batch: db.batchP, actor: "you", authorType: "human",
+  settings: () => settings, derive: (padId) => db.derive(padId),
+});
+let lastFlagSignature = null;
+function flagSignature() {
+  try {
+    const row = db.handle().prepare("SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') || ':' || COALESCE(MAX(id), 0) AS sig FROM item_flags").get();
+    return row ? row.sig : null;
+  } catch {
+    return null;
+  }
+}
+// After every write here: the vault mirrors where things live, and Needs you
+// and the Flags list redraw from flags-changed, { flagId?, change }.
+function itemsChanged(change) {
+  scheduleVaultExport();
+  lastFlagSignature = flagSignature();
+  if (win && !win.isDestroyed()) win.webContents.send("flags-changed", change || {});
+}
+const itemWrite = (change, fn) => async (...args) => {
+  const r = await fn(...args);
+  itemsChanged(typeof change === "function" ? change(r, ...args) : { change });
+  return r;
+};
+// The op's own shape, or one wrapped as {op}; both, because a picker builds
+// the op and a proposal stores it.
+handle("items:plan", (payload = {}) => itemStore.plan(payload && payload.op ? payload.op : payload));
+handle("items:move", itemWrite("move", ({ entity, id, to, options } = {}) => itemStore.move(entity, id, to, options || {})));
+handle("items:copy", itemWrite("copy", ({ entity, id, to, options } = {}) => itemStore.copy(entity, id, to, options || {})));
+handle("items:associate", itemWrite("associate", ({ entity, id, projectId } = {}) => itemStore.associate(entity, id, projectId)));
+handle("items:dissociate", itemWrite("dissociate", ({ entity, id, projectId } = {}) => itemStore.dissociate(entity, id, projectId)));
+handle("items:where", ({ entity, id } = {}) => itemStore.where(entity, id));
+handle("items:flag", itemWrite((r) => ({ change: "flagged", flagId: r.flag.id }),
+  ({ entity, id, note, evidence, evaluate } = {}) => itemStore.flag({ entity, id, note, evidence: evidence ?? null, evaluate: evaluate || "oracle", source: "person" })));
+// A project delete offers to rehome what other projects still show (D7).
+handle("items:rehomePlan", (projectId) => itemStore.rehomePlan(projectId));
+handle("items:rehome", itemWrite("rehome", (projectId) => itemStore.rehome(projectId)));
+
+// opts: { status (string, list or "all"; open, evaluating and proposed when
+// left out), projectId, source, entity, entityId, needsYou }. With needsYou
+// the rows come back in the Needs you shape instead, sweep flags grouped.
+handle("flags:list", (opts = {}) => {
+  const o = opts || {};
+  if (o.needsYou) return itemStore.needsYou({ projectId: o.projectId ?? null });
+  return itemStore.listFlags({ status: o.status ?? null, projectId: o.projectId ?? null, source: o.source ?? null,
+    entity: o.entity ?? null, entityId: o.entityId ?? null });
+});
+handle("flags:get", (id) => itemStore.getFlag(id));
+handle("flags:reply", itemWrite((r) => ({ change: "reply", flagId: r.flag_id }), (id, body) => itemStore.reply(id, body)));
+handle("flags:evaluate", itemWrite((r) => ({ change: "evaluated", flagId: r.flag.id }), (id, opts = {}) => itemStore.evaluate(id, { mode: (opts && opts.mode) || "oracle" })));
+handle("flags:approve", itemWrite((r) => ({ change: "approved", flagId: r.flag.id }),
+  // opts: { entryId (required: the proposal entry the card showed, its
+  // proposal_entry_id), ops?, note? }. A newer proposal refuses with STALE.
+  (id, opts = {}) => itemStore.decide(id, { approve: true, entryId: (opts && opts.entryId) ?? null, ops: (opts && opts.ops) || null,
+    note: (opts && opts.note) || null, by: "you", byType: "human", via: "window" })));
+handle("flags:reject", itemWrite((r) => ({ change: "rejected", flagId: r.flag.id }), (id, opts = {}) => {
+  // The window is the one place a decision is taken (see items/store.js decide).
+  const done = itemStore.decide(id, { approve: false, entryId: (opts && opts.entryId) ?? null, note: (opts && opts.note) || null,
+    by: "you", byType: "human", via: "window" });
+  if (opts && opts.reevaluate) done.flag = itemStore.evaluate(id, { mode: "oracle" }).flag;
+  return done;
+}));
+handle("flags:withdraw", itemWrite((r) => ({ change: "withdrawn", flagId: r.id }), (id) => itemStore.withdraw(id)));
+// On demand only (owner decision D5). It flags; it never moves anything.
+handle("flags:sweep", itemWrite("sweep", (opts = {}) => itemStore.sweep({ projectId: (opts && opts.projectId) ?? null, limit: (opts && opts.limit) || 20 })));
+
 handle("oracle:stats", () => ({
   ...oracle.stats(db.handle()),
   embeddings: embeddings.status(db.handle()),
@@ -1541,6 +1750,14 @@ handle("harness:list", (force) =>
 handle("harness:create", (payload) => db.createHarness(payload));
 handle("harness:update", (id, fields) => db.updateHarness(id, fields));
 handle("harness:delete", (id) => db.deleteHarness(id));
+// trust: true lets jobs run this harness's command as it is now, though it is
+// not the agent's own binary; false takes that back. A person's decision.
+// Stored as the real file the command resolves to now (agent/dispatch.js).
+handle("harness:trustCommand", (id, trust) => {
+  const row = db.listHarnesses().find((h) => h.id === Number(id));
+  const resolved = trust === true && row ? require("./agent/dispatch").resolveCommand(row.command) : null;
+  return db.trustHarnessCommand(id, trust === true, resolved ? resolved.real : null);
+});
 
 // One turn per session, not one turn overall. Two harnesses working two
 // sessions at once is the case this whole feature exists for; two turns in one
@@ -1590,6 +1807,7 @@ async function runTurn({ sessionId, prompt, system = null, autoAllow, collect = 
       resume: session.native_id || null,
       autoAllow: autoAllow === true || session.auto_allow === 1,
       dbPath: db.DB_PATH,
+      dbId: db.identity().db_id,
       projectId: session.project_id,
       // What the audit trail will say. This is the point of the whole
       // arrangement: every row the agent writes is attributed to the tab it was
@@ -1626,128 +1844,113 @@ handle("harness:start", ({ sessionId, prompt, system, autoAllow }) =>
   runTurn({ sessionId, prompt, system, autoAllow }).then(() => ({ ok: true })));
 
 // ---------------------------------------------------------------------------
-// Handoffs
+// Jobs
 //
-// An agent asking another agent. The MCP server can only write the row: it runs
-// in a separate process with no registry and no window, so it cannot spawn
-// anything. This is the half that reads those rows and runs them, and it is here
-// because this is where the harnesses already live.
+// One unit of agent work, whoever asked for it: a handoff an agent sent, a task
+// queued for a harness, or a person's own request. The MCP server can only
+// write the rows: it runs in a separate process with no window, so it cannot
+// spawn anything. agent/dispatch.js is the half that runs them, several at
+// once, each code-changing one in its own Workbench, with a person approving
+// what agents asked for. It is here because this is where the harnesses live.
 
-handle("handoffs:list", (opts) => db.listHandoffs(opts || {}));
-handle("handoffs:create", (payload) => {
-  const created = db.createHandoff(payload);
-  // Straight away rather than at the next sweep. A minute of nothing happening
-  // is how a feature like this gets a reputation for not working.
-  setTimeout(dispatchHandoffs, 50);
-  return created;
+const { createDispatcher } = require("./agent/dispatch");
+const { makeWorkbenchStore: makeJobBenchStore } = require("./workbench/store");
+// Its own Workbench verbs, attributed to Delphi rather than to "you": a
+// Workbench a job started was started by the dispatcher, on a person's say-so.
+const jobBenches = createWorkbench({
+  store: makeJobBenchStore({ sql: db.sqlP, actor: "delphi" }),
+  sheet: makeSheetStore({ sql: db.sqlP, actor: "delphi", authorType: "tool" }),
+  runEntry: sheetRun.runEntry,
+  logDir: SHEET_LOG_DIR,
+  settings: () => settings,
+  onEvent: (event) => {
+    if (win && !win.isDestroyed()) win.webContents.send("workbench-event", event);
+  },
 });
-handle("handoffs:cancel", (id) => db.updateHandoff(id, { status: "cancelled" }));
+const dispatcher = createDispatcher({
+  sql: db.sqlP,
+  benches: jobBenches,
+  logDir: SHEET_LOG_DIR,
+  dbPath: db.DB_PATH,
+  dbId: () => db.identity().db_id,
+  settings: () => settings,
+  onChange: (change) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("runs-changed", change);
+      // The Sheet a job writes on is open in a task panel more often than not.
+      win.webContents.send("db-changed");
+    }
+    scheduleVaultExport();
+  },
+  // The wake. The sender's turn ended minutes ago, so the only way it learns
+  // the answer is to be given a turn of its own, which is what a timer is for.
+  onFinished: (run) => {
+    if (run.state === "done" && run.wake && run.from_session_id) {
+      db.createAlert({
+        sessionId: run.from_session_id,
+        kind: "harvest",
+        fireAt: new Date().toISOString().slice(0, 19).replace("T", " "),
+        payload: { handoffId: run.id },
+      });
+      setTimeout(fireTimers, 50);
+    }
+  },
+});
+
+// opts: { projectId, states, taskId, needsReview, limit }. Newest first.
+// needsReview: done or failed, and nobody has reviewed it yet.
+handle("runs:list", (opts = {}) => dispatcher.list({
+  projectId: opts && opts.projectId != null ? opts.projectId : null,
+  states: opts && Array.isArray(opts.states) ? opts.states : null,
+  taskId: opts && opts.taskId != null ? opts.taskId : null,
+  needsReview: Boolean(opts && opts.needsReview === true),
+  limit: (opts && opts.limit) || 100,
+}));
+handle("runs:get", (id) => dispatcher.get(id));
+// A person's own request: it runs without approval. Refused at once, with the
+// sentence that says what to set, when the project has nowhere to run it.
+handle("runs:create", (payload = {}) => dispatcher.create({
+  projectId: payload.projectId, harness: payload.harness, request: payload.request,
+  taskId: payload.taskId ?? null, kind: payload.kind || "ask", context: payload.context ?? null,
+}, { by: "you", type: "human" }));
+// opts.harnessHash: the run's harness_hash_now as the window showed it, so a
+// person approves the agent as they saw it, not as it is at the click.
+// The window always sends the harness hash it showed, so a click can only ever
+// approve the agent setup the person was looking at.
+handle("runs:approve", (id, opts = {}) => dispatcher.approve(id, { by: "you", harnessHash: opts && opts.harnessHash ? String(opts.harnessHash) : null, requireHash: true }));
+handle("runs:reject", (id, why) => dispatcher.reject(id, { by: "you", why: why ?? null }));
+handle("runs:stop", (id) => dispatcher.stop(id, { by: "you" }));
+handle("runs:reply", (id, message) => dispatcher.reply(id, message, { by: "you" }));
+// { accepted: true|false, note? } -> { run, entry, continue }. continue is null
+// when accepted, else { available, why?, create?, workbench, task_id }; create
+// is the runs:create payload that carries on in the same Workbench.
+handle("runs:review", (id, verdict = {}) => dispatcher.review(id, {
+  accepted: verdict ? verdict.accepted : undefined, note: verdict && verdict.note != null ? verdict.note : null,
+}, { by: "you" }));
+// ids of queued jobs, first to run first -> every queued job, in the new order.
+handle("runs:reorder", (ids) => dispatcher.reorder(ids, { by: "you" }));
+
+// The older channels, kept for the window that still calls them.
+handle("handoffs:list", (opts) => db.listHandoffs(opts || {}));
+handle("handoffs:create", (payload = {}) => dispatcher.create({
+  projectId: payload.projectId, harness: payload.toHarness, request: payload.request,
+  taskId: payload.taskId ?? null, kind: payload.kind || "ask", context: payload.context ?? null,
+  wake: payload.wake === true, fromSessionId: payload.fromSessionId ?? null,
+}, { by: "you", type: "human" }));
+handle("handoffs:cancel", (id) => {
+  const run = dispatcher.get(id);
+  return run && run.state === "needs_approval" ? dispatcher.reject(id, { by: "you" }) : dispatcher.stop(id, { by: "you" });
+});
 handle("locks:list", (projectId) => db.listLocks(projectId ?? null));
 handle("locks:release", (projectId, key, holder) => db.releaseLock({ projectId, key, holder }));
 
-// One dispatch at a time. Two overlapping passes would both see the same queued
-// row and run it twice, and "twice" here means two agents doing the same work in
-// the same folder.
-let dispatching = false;
-
-async function dispatchHandoffs() {
-  if (dispatching) return;
-  dispatching = true;
-  try {
-    for (const handoff of db.pendingHandoffs()) {
-      try {
-        await runHandoff(handoff);
-      } catch (error) {
-        db.updateHandoff(handoff.id, { status: "failed", reply: String(error.message || error) });
-      }
-    }
-  } finally {
-    dispatching = false;
-    if (win && !win.isDestroyed()) win.webContents.send("alerts-changed");
-  }
-  // The wake, straight after the work. Outside the guard so a wake that itself
-  // hands something off does not deadlock against the pass that is still
-  // holding it.
-  await fireTimers();
-}
-
 /**
- * Runs one handoff, in the receiving agent's own session.
- *
- * Its own session rather than a throwaway, so "ask Codex" means the same Codex
- * that has been working this project all week and knows what it looked at an
- * hour ago. That continuity is most of the value: a reviewer with no memory of
- * the codebase is a worse reviewer.
+ * A dispatch pass, then any wakes that are due. The pass only starts jobs and
+ * never waits on one, so calling it from every external write is cheap.
  */
-// How many handoffs one project may finish in an hour before Delphi stops
-// running them by itself. Two agents that each wake the other are a loop that
-// spends money at machine speed with nobody watching, and a limit somebody has
-// to raise deliberately is the only thing that reliably stops it.
-const HANDOFF_LIMIT_PER_HOUR = 12;
-
-async function runHandoff(handoff) {
-  if (db.handoffsSince(handoff.project_id, 1) >= HANDOFF_LIMIT_PER_HOUR) {
-    db.updateHandoff(handoff.id, {
-      status: "failed",
-      reply:
-        `Delphi stopped this one. ${HANDOFF_LIMIT_PER_HOUR} handoffs have already finished in this ` +
-        `project in the last hour, which usually means two agents are handing work back and forth. ` +
-        `Nothing is lost: the request is on the handoff and can be run again.`,
-    });
-    return;
-  }
-  const target = db.getHarness(handoff.to_harness);
-  if (!target || !target.enabled) {
-    db.updateHandoff(handoff.id, {
-      status: "failed",
-      reply: `There is no agent called "${handoff.to_harness}" turned on here.`,
-    });
-    return;
-  }
-
-  let session = db.listSessions(handoff.project_id).find((x) => x.harness === handoff.to_harness);
-  if (!session) {
-    session = db.createSession({
-      projectId: handoff.project_id,
-      title: target.label,
-      harness: handoff.to_harness,
-    });
-  }
-  db.updateHandoff(handoff.id, { status: "running", to_session_id: session.id });
-
-  const from = handoff.from_session_id ? db.getSession(handoff.from_session_id) : null;
-  const context = handoff.context_json ? `\n\nContext:\n${handoff.context_json}` : "";
-  const task = handoff.task_id ? db.taskDetail(handoff.task_id) : null;
-  const asked = from ? (from.harness || "the Delphi chat") : "the person using Delphi";
-
-  const { text, failure } = await runTurn({
-    sessionId: session.id,
-    collect: true,
-    prompt:
-      `A request has been handed to you through Delphi by ${asked}.\n\n` +
-      `${handoff.request}${context}` +
-      (task ? `\n\nThis is about task ${task.task.id}: ${task.task.title}` : "") +
-      `\n\nAnswer it directly. Your reply goes straight back to whoever asked, ` +
-      `so write it for them rather than for a person reading a terminal.`,
-  });
-
-  db.updateHandoff(handoff.id, {
-    status: failure ? "failed" : "ready",
-    reply: failure || text,
-  });
-
-  // The wake. The sender's turn ended minutes ago, so the only way it learns the
-  // answer is to be given a turn of its own, which is what a timer is for. Due
-  // now rather than later: there is nothing to wait for, and the delay would
-  // only be there to look like waiting.
-  if (!failure && handoff.wake && handoff.from_session_id) {
-    db.createAlert({
-      sessionId: handoff.from_session_id,
-      kind: "harvest",
-      fireAt: new Date().toISOString().slice(0, 19).replace("T", " "),
-      payload: { handoffId: handoff.id },
-    });
-  }
+async function dispatchHandoffs() {
+  dispatcher.tick();
+  await fireTimers();
 }
 
 /**
@@ -1882,6 +2085,23 @@ handle("stats", () => db.stats());
 // workbenchBranchPrefixDefault is read only: the prefix a branch gets when
 // workbenchBranchPrefix is empty (the OS username, as workbench/naming.js
 // makes it), which the window cannot find out for itself.
+// Where the data lives, for Settings: the database this window is really
+// using, its id (the same one whoami and delphi doctor print, which is how a
+// person checks an agent is on this database), and a checkout database that
+// exists and is being ignored, so that can be said rather than discovered.
+handle("app:dataInfo", () => {
+  const id = db.identity();
+  const ignored = paths.RESOLVED.checkoutDbIgnored;
+  return {
+    path: db.DB_PATH,
+    dbId: id.db_id,
+    createdAt: id.created_at,
+    dataDir: paths.DATA_DIR,
+    resolvedBy: paths.RESOLVED.source,
+    checkoutDbIgnored: ignored,
+    checkoutNoticeDue: Boolean(ignored) && settings.checkoutNoticeSeen !== ignored,
+  };
+});
 handle("settings:get", () => ({ ...settings, workbenchBranchPrefixDefault: require("./workbench/naming").defaultPrefix() }));
 handle("settings:set", (fields) => {
   if (fields.panelMode !== undefined) {
@@ -1910,7 +2130,26 @@ handle("settings:set", (fields) => {
 
   if (fields.scratchpadMode !== undefined) settings.scratchpadMode = fields.scratchpadMode === true;
 
+  if (fields.secondOpinionMode !== undefined) settings.secondOpinionMode = fields.secondOpinionMode === true;
+  if (fields.secondOpinionAgent !== undefined) {
+    // A harness key, not a command: the server looks the row up by it, so
+    // anything that could not be one is refused here rather than there.
+    const key = String(fields.secondOpinionAgent || "");
+    if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(key)) throw new Error("secondOpinionAgent must be an agent's key, such as copilot");
+    settings.secondOpinionAgent = key;
+  }
+
   if (fields.animations !== undefined) settings.animations = fields.animations !== false;
+
+  // A path, and only ever the one app:dataInfo reported: anything else would
+  // acknowledge a notice nobody was shown.
+  if (fields.checkoutNoticeSeen !== undefined) {
+    const value = fields.checkoutNoticeSeen;
+    if (value !== null && value !== paths.RESOLVED.checkoutDbIgnored) {
+      throw new Error("checkoutNoticeSeen must be the ignored checkout database app:dataInfo reported, or null");
+    }
+    settings.checkoutNoticeSeen = value;
+  }
 
   if (fields.workbenchEditor !== undefined) {
     const value = fields.workbenchEditor == null ? "" : String(fields.workbenchEditor).trim();
@@ -1941,6 +2180,47 @@ handle("settings:set", (fields) => {
     }
   }
 
+  // The dispatcher's limits. Whole numbers inside dispatch.BOUNDS, refused
+  // rather than clamped, so Settings shows the sentence instead of a number
+  // that quietly became another one. Read on every pass, and a pass is run
+  // below, so a raised limit starts what was waiting at once.
+  const { BOUNDS } = require("./agent/dispatch");
+  const whole = (key, value, [min, max]) => {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${key} must be a whole number from ${min} to ${max}`);
+    return n;
+  };
+  if (fields.jobConcurrency !== undefined) settings.jobConcurrency = whole("jobConcurrency", fields.jobConcurrency, BOUNDS.jobConcurrency);
+  if (fields.jobTimeoutMinutes !== undefined) settings.jobTimeoutMinutes = whole("jobTimeoutMinutes", fields.jobTimeoutMinutes, BOUNDS.jobTimeoutMinutes);
+  if (fields.secondOpinionHourlyLimit !== undefined) {
+    settings.secondOpinionHourlyLimit = whole("secondOpinionHourlyLimit", fields.secondOpinionHourlyLimit, harness.SECOND_OPINION_HOURLY.bounds);
+  }
+  // The whole map, as the window shows it: a harness left out goes back to 1.
+  // Keys are harness keys, which is what a job's to_harness holds.
+  if (fields.jobHarnessLimits !== undefined) {
+    const value = fields.jobHarnessLimits;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("jobHarnessLimits must be an object of harness key to a number");
+    const next = {};
+    for (const [key, limit] of Object.entries(value)) {
+      if (!/^[A-Za-z0-9._:-]{1,64}$/.test(key)) throw new Error(`"${key}" is not a harness key`);
+      next[key] = whole(`jobHarnessLimits.${key}`, limit, BOUNDS.jobHarnessLimit);
+    }
+    settings.jobHarnessLimits = next;
+  }
+  // Checked against the projects that exist, like scratchpadProjectId, and
+  // kept in the order given with repeats dropped.
+  if (fields.pinnedProjects !== undefined) {
+    const value = fields.pinnedProjects == null ? [] : fields.pinnedProjects;
+    if (!Array.isArray(value)) throw new Error("pinnedProjects must be a list of project ids");
+    const ids = [];
+    for (const raw of value) {
+      const id = Number(raw);
+      if (!Number.isInteger(id) || !db.getProject(id)) throw new Error(`No project ${raw}`);
+      if (!ids.includes(id)) ids.push(id);
+    }
+    settings.pinnedProjects = ids;
+  }
+
   const numeric = ["snoozeMinutes", "checkIntervalSeconds", "autoRemindBeforeDueHours"];
   for (const key of numeric) {
     if (fields[key] !== undefined) {
@@ -1951,6 +2231,7 @@ handle("settings:set", (fields) => {
   }
   saveSettings();
   if (fields.checkIntervalSeconds !== undefined) startScheduler();
+  if (fields.jobConcurrency !== undefined || fields.jobHarnessLimits !== undefined) dispatcher.tick();
   // The Appearance menu carries a radio mark, and the Windows control overlay is
   // painted by the system rather than by the stylesheet. Both are stale the moment
   // the theme is changed from inside the window instead of from the menu.

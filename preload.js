@@ -99,6 +99,7 @@ contextBridge.exposeInMainWorld("delphi", {
     create: (payload) => call("harness:create", payload),
     update: (id, fields) => call("harness:update", id, fields),
     remove: (id) => call("harness:delete", id),
+    trustCommand: (id, trust) => call("harness:trustCommand", id, trust),
     start: (payload) => call("harness:start", payload),
     stop: (sessionId) => call("harness:stop", sessionId),
   },
@@ -107,6 +108,20 @@ contextBridge.exposeInMainWorld("delphi", {
     list: (opts) => call("handoffs:list", opts),
     create: (payload) => call("handoffs:create", payload),
     cancel: (id) => call("handoffs:cancel", id),
+  },
+  // Jobs, for the Runs panel: handoffs, queued tasks and a person's own
+  // requests, as one list. See agent/jobs.js for a run's shape.
+  runs: {
+    list: (opts) => call("runs:list", opts),
+    get: (id) => call("runs:get", id),
+    create: (payload) => call("runs:create", payload),
+    // opts: { harnessHash } from the run as shown (run.harness_hash_now).
+    approve: (id, opts) => call("runs:approve", id, opts),
+    reject: (id, why) => call("runs:reject", id, why),
+    stop: (id) => call("runs:stop", id),
+    reply: (id, message) => call("runs:reply", id, message),
+    review: (id, verdict) => call("runs:review", id, verdict),
+    reorder: (ids) => call("runs:reorder", ids),
   },
   locks: {
     list: (projectId) => call("locks:list", projectId),
@@ -133,6 +148,37 @@ contextBridge.exposeInMainWorld("delphi", {
     create: (payload) => call("organizers:create", payload),
     update: (id, fields) => call("organizers:update", id, fields),
     remove: (id) => call("organizers:delete", id),
+  },
+  // Items across projects. entity is task, note, scratchpad, link, organizer,
+  // session or repo for move; task, note, scratchpad or link for the rest. A
+  // refusal throws with code REFUSED and details.refusals, one sentence each.
+  items: {
+    // op: {op: move|copy|associate|dissociate, entity, id, to, options}. Never
+    // throws for a refusal: it lists them, so a picker can show why.
+    plan: (op) => call("items:plan", { op }),
+    // options: {keepInSource, detach, organizerId, pad: "keep"|"carry", targetPadId, tasks: "follow"|"stay"}
+    move: (entity, id, to, options) => call("items:move", { entity, id, to, options }),
+    // options: {subtasks = true, ledger = true, derive = false, organizerId}
+    copy: (entity, id, to, options) => call("items:copy", { entity, id, to, options }),
+    associate: (entity, id, projectId) => call("items:associate", { entity, id, projectId }),
+    dissociate: (entity, id, projectId) => call("items:dissociate", { entity, id, projectId }),
+    where: (entity, id) => call("items:where", { entity, id }),
+    // evaluate: "oracle" (default) | "agent" (off, says so) | "none"
+    flag: (entity, id, note, evidence, evaluate) => call("items:flag", { entity, id, note, evidence, evaluate }),
+    rehomePlan: (projectId) => call("items:rehomePlan", projectId),
+    rehome: (projectId) => call("items:rehome", projectId),
+  },
+  // Flags on items that may be misfiled. list(opts) takes {status, projectId,
+  // source, entity, entityId}; with {needsYou: true} it returns Needs you rows.
+  flags: {
+    list: (opts) => call("flags:list", opts),
+    get: (id) => call("flags:get", id),
+    reply: (id, body) => call("flags:reply", id, body),
+    evaluate: (id, opts) => call("flags:evaluate", id, opts),
+    approve: (id, opts) => call("flags:approve", id, opts),
+    reject: (id, opts) => call("flags:reject", id, opts),
+    withdraw: (id) => call("flags:withdraw", id),
+    sweep: (opts) => call("flags:sweep", opts),
   },
   vault: {
     export: () => call("vault:export"),
@@ -225,6 +271,12 @@ contextBridge.exposeInMainWorld("delphi", {
     set: (fields) => call("settings:set", fields),
     setHotkey: (accelerator) => call("settings:setHotkey", accelerator),
   },
+  app: {
+    // Where your data lives: { path, dbId, createdAt, dataDir, resolvedBy,
+    // checkoutDbIgnored (a path or null), checkoutNoticeDue }. See
+    // app:dataInfo in main.js.
+    dataInfo: () => call("app:dataInfo"),
+  },
   hide: () => ipcRenderer.send("hide"),
   openExternal: (url) => ipcRenderer.send("open-external", url),
   onShown: (fn) => ipcRenderer.on("shown", fn),
@@ -240,6 +292,11 @@ contextBridge.exposeInMainWorld("delphi", {
   onSheetRunOutput: (fn) => ipcRenderer.on("sheet-run-output", (_e, payload) => fn(payload)),
   onSheetRunDone: (fn) => ipcRenderer.on("sheet-run-done", (_e, payload) => fn(payload)),
   onWorkbenchEvent: (fn) => ipcRenderer.on("workbench-event", (_e, payload) => fn(payload)),
+  // A flag changed, here or by an agent: { change, flagId } or { external: true }.
+  // Fetch flags:list again.
+  onFlagsChanged: (fn) => ipcRenderer.on("flags-changed", (_e, payload) => fn(payload || {})),
+  // A job changed: { id, state, project_id }. Fetch the list again.
+  onRunsChanged: (fn) => ipcRenderer.on("runs-changed", (_e, payload) => fn(payload)),
   // A task with a live Workbench was marked done in the app: offer Finish.
   // { taskId, workbenchId, taskTitle, path, branch, state }
   onWorkbenchPrompt: (fn) => ipcRenderer.on("workbench-prompt", (_e, payload) => fn(payload)),

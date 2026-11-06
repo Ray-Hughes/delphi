@@ -17,6 +17,9 @@ const { execFileSync } = require("child_process");
 
 const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "delphi-main-ipc-")));
 process.env.DELPHI_DATA_DIR = path.join(dir, "data");
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 process.env.DELPHI_DB = path.join(dir, "data", "delphi.db");
 fs.mkdirSync(process.env.DELPHI_DATA_DIR);
 for (const real of [path.join(os.homedir(), "va", "delphi", "delphi.db"),
@@ -164,6 +167,39 @@ async function main() {
   const finished = await call("workbench:finish", wb.id);
   check("finish", [finished.finished, fs.existsSync(wb.path)], [true, false]);
 
+  // Before composer runs, whose quit hooks shut the dispatcher down.
+  section("runs: review, reorder, and a decision that wakes a job");
+  for (const c of ["runs:list", "runs:review", "runs:reorder", "runs:reply", "sheet:decide"]) {
+    check(`${c} is in preload and handled`, [called.includes(c), handlers.has(c)], [true, true]);
+  }
+  const runProject = db.createProject({ key: "ipc-runs", name: "IPC runs", path: dir });
+  const runTask2 = db.createTask({ projectId: runProject.id, title: "job to review" });
+  // A harness with no row: if anything starts these, it fails at once and
+  // spawns nothing, so no real agent CLI can be reached from this test.
+  const doneJob = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, task_id, request, kind, state, status, finished_at)
+                           VALUES (:p1, 'nobody', :p2, 'done already', 'ask', 'done', 'ready', datetime('now')) RETURNING id`, [runProject.id, runTask2.id])[0].id;
+  check("runs:list({needsReview: true}) lists it", (await call("runs:list", { needsReview: true })).map((r) => r.id), [doneJob]);
+  const reviewed = await call("runs:review", doneJob, { accepted: false, note: "Not this way." });
+  check("runs:review sends it back: { run, entry, continue }",
+    [reviewed.run.review, reviewed.entry.body, reviewed.entry.author_type, reviewed.continue.available], ["sent_back", "Not this way.", "human", false]);
+  check("and it leaves the list", (await call("runs:list", { needsReview: true })).length, 0);
+  const badReview = await handlers.get("runs:review")({}, doneJob, { accepted: true });
+  check("a second review is refused", [badReview.ok, /already reviewed/.test(badReview.error)], [false, true]);
+  const q1 = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, request, state, status) VALUES (:p1, 'nobody', 'q1', 'queued', 'queued') RETURNING id`, [runProject.id])[0].id;
+  const q2 = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, request, state, status) VALUES (:p1, 'nobody', 'q2', 'queued', 'queued') RETURNING id`, [runProject.id])[0].id;
+  check("runs:reorder returns the queue in its new order", (await call("runs:reorder", [q2, q1])).map((r) => [r.id, r.queue_rank]), [[q2, 1], [q1, 2]]);
+  const badOrder = await handlers.get("runs:reorder")({}, [doneJob]);
+  check("only queued jobs", [badOrder.ok, /not queued/.test(badOrder.error)], [false, true]);
+  db.sqlP("UPDATE handoffs SET state = 'stopped', status = 'cancelled' WHERE id IN (:p1, :p2)", [q1, q2]);
+  const waitTask = db.createTask({ projectId: runProject.id, title: "waiting on a person" });
+  const waiting = db.sqlP(`INSERT INTO handoffs (project_id, to_harness, task_id, request, kind, state, status, actor, updated_at)
+                           VALUES (:p1, 'nobody', :p2, 'wait', 'ask', 'waiting_on_human', 'running', 'nobody:job', datetime('now', '-1 minute')) RETURNING id`, [runProject.id, waitTask.id])[0].id;
+  const asked = require("../sheet/store").makeSheetStore({ sql: db.sqlP, actor: "nobody:job", authorType: "agent" }).ask(waitTask.id, "Which?", ["this", "that"]);
+  await call("sheet:decide", asked.id, "a", null);
+  const woken = db.sqlP("SELECT state, reply FROM handoffs WHERE id = :p1", [waiting])[0];
+  check("sheet:decide starts the waiting job in the same call, not at the next pass",
+    [woken.state, /no agent called "nobody"/.test(woken.reply || "")], ["failed", true]);
+
   section("composer runs");
   const runTask = db.createTask({ projectId: project.id, title: "run here" });
   sent.length = 0;
@@ -224,6 +260,44 @@ async function main() {
   check("the default branch prefix is there to show, and is naming.js's",
     got.workbenchBranchPrefixDefault, require("../workbench/naming").defaultPrefix());
 
+  check("the dispatcher's settings and pinned projects have defaults", [got.jobConcurrency, got.jobHarnessLimits, got.pinnedProjects], [3, {}, []]);
+  const refusedSet = async (fields) => { const r = await handlers.get("settings:set")({}, fields); return r.ok ? null : r.error; };
+  check("jobConcurrency is a whole number from 1 to 8",
+    [await refusedSet({ jobConcurrency: 0 }), await refusedSet({ jobConcurrency: 9 }), await refusedSet({ jobConcurrency: 2.5 }), (await call("settings:set", { jobConcurrency: 8 })).jobConcurrency],
+    ["jobConcurrency must be a whole number from 1 to 8", "jobConcurrency must be a whole number from 1 to 8", "jobConcurrency must be a whole number from 1 to 8", 8]);
+  check("a harness's limit is a whole number from 0 to 4, and the map is replaced whole",
+    [await refusedSet({ jobHarnessLimits: { codex: 5 } }), await refusedSet({ jobHarnessLimits: [1] }), await refusedSet({ jobHarnessLimits: { "no spaces": 1 } }),
+     (await call("settings:set", { jobHarnessLimits: { codex: 0, "claude-code": "2" } })).jobHarnessLimits],
+    ["jobHarnessLimits.codex must be a whole number from 0 to 4", "jobHarnessLimits must be an object of harness key to a number", "\"no spaces\" is not a harness key", { codex: 0, "claude-code": 2 }]);
+  const pinA = db.createProject({ key: "pin-a", name: "Pin A" });
+  const pinB = db.createProject({ key: "pin-b", name: "Pin B" });
+  check("pinned projects are existing ids, in order, once each",
+    [await refusedSet({ pinnedProjects: [pinA.id, 999999] }), await refusedSet({ pinnedProjects: "1" }),
+     (await call("settings:set", { pinnedProjects: [pinB.id, String(pinA.id), pinB.id] })).pinnedProjects],
+    ["No project 999999", "pinnedProjects must be a list of project ids", [pinB.id, pinA.id]]);
+  check("a refused field changes nothing", (await call("settings:get")).jobConcurrency, 8);
+  check("and the dispatcher reads them on its next pass", JSON.parse(fs.readFileSync(path.join(process.env.DELPHI_DATA_DIR, "settings.json"), "utf8")).jobHarnessLimits, { codex: 0, "claude-code": 2 });
+  await call("settings:set", { jobConcurrency: 3, jobHarnessLimits: {}, pinnedProjects: [] });
+
+  section("where the data lives");
+  const info = await call("app:dataInfo");
+  const locate = require("../agent/locate");
+  check("app:dataInfo names the database this process really opened, and its folder",
+    [info.path, info.dataDir, info.resolvedBy], [process.env.DELPHI_DB, process.env.DELPHI_DATA_DIR, "DELPHI_DB"]);
+  check("and its id, the same one the file holds", info.dbId, db.identity().db_id);
+  check("the id is a uuid", /^[0-9a-f-]{36}$/.test(String(info.dbId)), true);
+  check("an ignored checkout database is a path or null, never a boolean",
+    info.checkoutDbIgnored, locate.resolve().checkoutDbIgnored);
+  check("preload exposes it as delphi.app.dataInfo", /app: \{[\s\S]*?dataInfo: \(\) => call\("app:dataInfo"\)/.test(preload), true);
+  const notShown = await handlers.get("settings:set")({}, { checkoutNoticeSeen: "/somewhere/else.db" });
+  check("acknowledging a notice nobody was shown is refused", notShown.ok, false);
+  if (info.checkoutDbIgnored) {
+    await call("settings:set", { checkoutNoticeSeen: info.checkoutDbIgnored });
+    check("once acknowledged, the notice is no longer due", (await call("app:dataInfo")).checkoutNoticeDue, false);
+  }
+  const beat = require("../agent/identity").appState(locate.resolve(), { isAlive: require("../sheet/store").pidAlive, processes: () => [] });
+  check("the app has written its heartbeat, so agents see it running", [beat.running, beat.pid], [true, process.pid]);
+
   section("refusals keep their code");
   const loose = db.createTask({ projectId: null, title: "in no project" });
   const coded = await handlers.get("workbench:start")({}, loose.id, {});
@@ -233,6 +307,48 @@ async function main() {
   check("an uncoded one has no code", [plain.ok, plain.code], [false, undefined]);
   const preloadText = fs.readFileSync(path.join(__dirname, "..", "preload.js"), "utf8");
   check("preload carries code and details through", /code: result\.code, details:/.test(preloadText), true);
+
+  section("items and flags");
+  for (const c of ["items:plan", "items:move", "items:copy", "items:associate", "items:dissociate", "items:where", "items:flag",
+    "items:rehomePlan", "items:rehome", "flags:list", "flags:get", "flags:reply", "flags:evaluate", "flags:approve",
+    "flags:reject", "flags:withdraw", "flags:sweep"]) {
+    check(`${c} is in preload and handled`, [called.includes(c), handlers.has(c)], [true, true]);
+  }
+  check("preload exposes onFlagsChanged", preload.includes("onFlagsChanged:"), true);
+  const here = db.createProject({ key: "ipc-here", name: "IPC here" });
+  const there = db.createProject({ key: "ipc-there", name: "IPC there" });
+  const parent = db.createTask({ projectId: here.id, title: "moves whole" });
+  const kid = db.createTask({ parentId: parent.id, title: "its kid" });
+  const planned = await call("items:plan", { op: { op: "move", entity: "task", id: parent.id, to: there.id } });
+  check("plan", [planned.ok, planned.counts.subtasks], [true, 1]);
+  const moved = await call("items:move", { entity: "task", id: parent.id, to: there.id, options: { keepInSource: true } });
+  check("move returns the audit id and the tasks", [typeof moved.auditId, moved.moved.tasks.sort()], ["number", [parent.id, kid.id].sort()]);
+  check("tasks:update with a project moves the subtree too", await (async () => {
+    await call("tasks:update", parent.id, { project_id: here.id });
+    return db.handle().prepare("SELECT project_id FROM tasks WHERE id = ?").get(kid.id).project_id;
+  })(), here.id);
+  const subtaskMove = await handlers.get("items:move")({}, { entity: "task", id: kid.id, to: there.id });
+  check("a refused move is {ok: false} with the sentence and REFUSED", [subtaskMove.ok, subtaskMove.code, /moves with its parent/.test(subtaskMove.error), Array.isArray(subtaskMove.details.refusals)],
+    [false, "REFUSED", true, true]);
+  const where = await call("items:where", { entity: "task", id: parent.id });
+  check("where", [where.home.id, where.also.map((p) => p.id)], [here.id, []]);
+  const sentBefore = sent.length;
+  const flagged = await call("items:flag", { entity: "task", id: parent.id, note: "belongs in IPC there", evaluate: "oracle" });
+  check("flag returns the flag, evaluated", [flagged.appended, flagged.flag.status, flagged.flag.proposal.ops[0].to], [false, "proposed", there.id]);
+  check("flags-changed went to the window", sent.slice(sentBefore).some(([c, p]) => c === "flags-changed" && p.flagId === flagged.flag.id), true);
+  const needs = await call("flags:list", { needsYou: true });
+  check("Needs you rows", needs.some((r) => r.source === "flag" && r.id === flagged.flag.id && r.kind === "decision"), true);
+  const noEntry = await handlers.get("flags:approve")({}, flagged.flag.id, { note: "yes" });
+  check("approve without the entry the person saw is refused", [noEntry.ok, /needs the proposal you looked at/.test(noEntry.error)], [false, true]);
+  const approved = await call("flags:approve", flagged.flag.id, { note: "yes", entryId: flagged.flag.proposal_entry_id });
+  check("approve applies", [approved.flag.status, db.handle().prepare("SELECT project_id FROM tasks WHERE id = ?").get(parent.id).project_id], ["applied", there.id]);
+  const selfDecided = db.createNote({ projectId: here.id, title: "decide it myself", body: "x" });
+  const openFlag = await call("items:flag", { entity: "note", id: selfDecided.id, note: "?", evaluate: "none" });
+  const mine = await call("flags:approve", openFlag.flag.id, { ops: [{ op: "move", entity: "note", id: selfDecided.id, to: there.id }], note: "mine" });
+  check("flags:approve with the person's own ops and no entryId applies them", [mine.flag.status,
+    db.handle().prepare("SELECT project_id FROM notes WHERE id = ?").get(selfDecided.id).project_id], ["applied", there.id]);
+  const swept = await call("flags:sweep", {});
+  check("sweep answers in its shape", [Array.isArray(swept.created), typeof swept.skipped], [true, "number"]);
 
   console.log(`\n${checks - failures}/${checks} checks passed`);
   fs.rmSync(dir, { recursive: true, force: true });

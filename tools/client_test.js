@@ -15,6 +15,9 @@ const { openServer } = require("../sheet/client");
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "delphi-client-"));
 process.env.DELPHI_DATA_DIR = dir;
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 process.env.DELPHI_DB = path.join(dir, "delphi.db");
 
 let failures = 0;

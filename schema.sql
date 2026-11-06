@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS projects (
   -- a value on a new install and accept it on an old one. Validated in db.js,
   -- where every database behaves the same.
   task_view   TEXT NOT NULL DEFAULT 'list',
+  -- Whether a job an agent asks for here starts without a person approving it.
+  -- Off by default: an agent setting another agent to work is the loop a
+  -- person is there to see.
+  auto_approve    INTEGER NOT NULL DEFAULT 0,
+  -- Whether a job may run where agent/guard.py cannot see its commands
+  -- (Copilot always, Claude Code when the hook is not installed). A person's
+  -- decision per project, never a default.
+  allow_unguarded INTEGER NOT NULL DEFAULT 0,
   sort_order  INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
@@ -80,6 +88,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- someone made; a claim is a lease an agent took and can lose.
   claimed_by   TEXT,
   claim_expires TEXT,
+  -- Who put it in the queue, and what kind of writer that was. A queue named
+  -- after a harness is run by the app's dispatcher, and a job an agent queued
+  -- waits for a person; NULL is treated as an agent, because asking is the
+  -- safe mistake.
+  queued_by      TEXT,
+  queued_by_type TEXT,
   -- A person's marker for the card. Declared here as well as in
   -- agent/schema_later.js because a new database gets this definition after
   -- schema_later has run, so without it a fresh install had no colour column
@@ -507,6 +521,11 @@ CREATE TABLE IF NOT EXISTS harnesses (
   -- a flag that turns out to be wrong stays wrong on every install that already
   -- exists.
   seeded_json TEXT,
+  -- The command a person has said a job may run although it is not the
+  -- harness's own binary (a wrapper, a build of their own). Holds the command
+  -- as it was when trusted, so changing the command undoes the trust. Set
+  -- only from the window (harness:trustCommand); never through MCP.
+  trusted_command TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -549,10 +568,67 @@ CREATE TABLE IF NOT EXISTS handoffs (
   wake            INTEGER NOT NULL DEFAULT 1,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   started_at      TEXT,
-  finished_at     TEXT
+  finished_at     TEXT,
+  -- A handoff is now one kind of job, the unit of agent work the dispatcher
+  -- runs (agent/jobs.js, agent/dispatch.js); a task queued for an agent and a
+  -- person's own request are the others. The same table rather than a second
+  -- one, so every reader of handoffs keeps working.
+  --
+  -- ask reads and answers; do changes code, and only ever in a Workbench.
+  kind            TEXT NOT NULL DEFAULT 'ask',
+  -- The job's real state: queued, needs_approval, running, waiting_on_human,
+  -- done, failed, stopped. No CHECK, because status above has one that cannot
+  -- be widened, and status is kept in step with this for older readers. NULL
+  -- on a row an older server wrote; agent/jobs.js reads that from status.
+  state           TEXT,
+  source          TEXT NOT NULL DEFAULT 'handoff',   -- handoff, queue or person
+  requested_by    TEXT,
+  requester_type  TEXT,                              -- human, agent or tool
+  -- pending, approved, rejected, auto (the project lets agents start work), or
+  -- not_needed (a person asked).
+  approval        TEXT,
+  approved_by     TEXT,
+  approved_at     TEXT,
+  actor           TEXT,                              -- who the agent writes as
+  workbench_id    INTEGER REFERENCES workbenches(id) ON DELETE SET NULL,
+  cwd             TEXT,
+  -- The process running it, so a restart can tell a job whose app died from
+  -- one another app is still running.
+  runner_pid      INTEGER,
+  runner_host     TEXT,
+  agent_pid       INTEGER,
+  native_session  TEXT,                              -- the harness's id, for a reply
+  unguarded       INTEGER NOT NULL DEFAULT 0,
+  tokens_in       INTEGER,
+  tokens_out      INTEGER,
+  cost_usd        REAL,
+  last_activity   TEXT,
+  followup        TEXT,                              -- a person's reply, not yet sent
+  -- The harness row it was approved against (agent/jobs.js harnessHash). A
+  -- row that changed since refuses the job at spawn.
+  harness_hash    TEXT,
+  turns           INTEGER NOT NULL DEFAULT 0,
+  updated_at      TEXT,
+  -- A person looking at what a finished job did, apart from the job finishing:
+  -- done means the agent stopped, not that anyone has read the Workbench.
+  -- review is accepted or sent_back. Cleared when the job runs again, because
+  -- a new turn is new work nobody has looked at.
+  reviewed_at     TEXT,
+  reviewed_by     TEXT,
+  review          TEXT,
+  review_note     TEXT,
+  -- A person's order for queued jobs, lowest first; NULL runs after every
+  -- ranked one, oldest first. Cleared when the job starts, so a reply that
+  -- queues it again goes to the back rather than jumping the queue.
+  queue_rank      INTEGER,
+  -- Copilot's premium requests, from usage.premiumRequests on its result
+  -- line. A count in Copilot's units (a cheap model is a fraction of one),
+  -- summed over turns. NULL for a harness that does not report it.
+  premium_requests REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status, id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_state ON handoffs(state, id);
 CREATE INDEX IF NOT EXISTS idx_handoffs_project ON handoffs(project_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_handoffs_from ON handoffs(from_session_id, status);
 
@@ -618,3 +694,152 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_live
   ON workbenches(task_id, repo_id) WHERE state IN ('active', 'parked', 'missing', 'closing');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workbenches_path
   ON workbenches(path) WHERE state IN ('active', 'parked', 'missing', 'closing');
+
+-- What this file is, as opposed to what is in it. db_id is a uuid minted once,
+-- the first time a process that knows about this table opens the file (see
+-- agent/identity.js), and never changed: it is how the app, `delphi doctor`
+-- and an agent's whoami can tell two databases apart, and how a server the app
+-- launched refuses to write to any file but the one it was launched for. The
+-- app's heartbeat is deliberately not here: a write every 30 seconds would look
+-- to every other connection like an agent's write (see agent/identity.js). Key
+-- and value, because these are a handful of facts about the file, not rows.
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+
+-- Cross-project items. A row lives in one project, its home, which stays its
+-- own project_id. These four tables are what lets it be moved, copied, shown in
+-- other projects and flagged as filed in the wrong place. The rules live in
+-- items/store.js, shared by the app and the MCP server like sheet/store.js.
+-- No CHECK constraints on the new text columns, for the reason
+-- projects.task_view gives: they are validated in items/store.js, and a CHECK
+-- cannot be changed on a database that already exists.
+
+-- A person (or an agent, or the sweep) saying "this may be in the wrong place".
+-- The flag holds the request and, once evaluated, a proposal. Nothing about the
+-- item changes until a person approves; flagging never touches the item's row.
+CREATE TABLE IF NOT EXISTS item_flags (
+  id              INTEGER PRIMARY KEY,
+  entity          TEXT NOT NULL,          -- task | note | scratchpad | link | organizer | session
+  entity_id       INTEGER NOT NULL,
+  project_id      INTEGER REFERENCES projects(id) ON DELETE SET NULL,  -- home when flagged
+  label           TEXT,                   -- the item's title when flagged
+  note            TEXT NOT NULL DEFAULT '',
+  evidence        TEXT,                   -- JSON list of typed chips
+  status          TEXT NOT NULL DEFAULT 'open',
+                  -- open | evaluating | proposed | applied | rejected | withdrawn | stale | failed
+  source          TEXT NOT NULL DEFAULT 'person',   -- person | agent | sweep
+  created_by      TEXT,
+  created_by_type TEXT,
+  run_id          INTEGER,
+  proposal        TEXT,                   -- JSON, the current proposal
+  proposed_by     TEXT,
+  proposed_at     TEXT,
+  decided_by      TEXT,
+  decided_at      TEXT,
+  decision_note   TEXT,
+  applied_audit_id INTEGER,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_item_flags_status ON item_flags(status, id);
+CREATE INDEX IF NOT EXISTS idx_item_flags_item ON item_flags(entity, entity_id);
+-- One live flag per item. A second flag on the same item is appended to the
+-- first as a 'say' entry rather than starting a parallel review that could be
+-- approved the other way.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_item_flags_live
+  ON item_flags(entity, entity_id) WHERE status IN ('open', 'evaluating', 'proposed');
+
+-- The review thread on a flag, in the Sheet's own shape so sheet/format.js can
+-- render it. Its own table because comments.task_id is NOT NULL and a flag on a
+-- note has no task.
+CREATE TABLE IF NOT EXISTS flag_entries (
+  id          INTEGER PRIMARY KEY,
+  flag_id     INTEGER NOT NULL REFERENCES item_flags(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL DEFAULT 'say',   -- say | note | ask | decide
+  author      TEXT NOT NULL,
+  author_type TEXT,
+  body        TEXT NOT NULL,
+  meta        TEXT,
+  ref_id      INTEGER REFERENCES flag_entries(id) ON DELETE SET NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_flag_entries_flag ON flag_entries(flag_id, id);
+
+-- The other projects an item also belongs to. The home is not here: it is the
+-- item's own project_id, and a home row as well would be a second answer to
+-- "where does this live". Polymorphic on purpose (one table for four kinds of
+-- row), so entity_id has no foreign key; the triggers below are what keep it
+-- from pointing at nothing.
+CREATE TABLE IF NOT EXISTS item_projects (
+  entity     TEXT NOT NULL,              -- task | note | scratchpad | link
+  entity_id  INTEGER NOT NULL,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  added_by   TEXT,
+  added_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  flag_id    INTEGER REFERENCES item_flags(id) ON DELETE SET NULL,
+  PRIMARY KEY (entity, entity_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_item_projects_project ON item_projects(project_id, entity, entity_id);
+
+-- Where a copy came from. One row per copied row, subtasks included.
+-- source_label keeps the original's title, so "copied from" still reads after
+-- the original is deleted, which is also why a deleted source keeps its rows.
+CREATE TABLE IF NOT EXISTS item_copies (
+  entity            TEXT NOT NULL,
+  entity_id         INTEGER NOT NULL,     -- the copy
+  source_id         INTEGER NOT NULL,     -- the original, same entity
+  source_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  source_label      TEXT,
+  copied_by         TEXT,
+  copied_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  flag_id           INTEGER REFERENCES item_flags(id) ON DELETE SET NULL,
+  PRIMARY KEY (entity, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_item_copies_source ON item_copies(entity, source_id);
+
+-- Triggers rather than code in each delete, because rows are deleted by
+-- cascades (a project takes its notes, a task its subtasks) that no delete
+-- function sees, and on two routes. agent/schema_later.js holds the same text.
+CREATE TRIGGER IF NOT EXISTS items_task_ad AFTER DELETE ON tasks BEGIN
+  DELETE FROM item_projects WHERE entity = 'task' AND entity_id = old.id;
+  DELETE FROM item_copies   WHERE entity = 'task' AND entity_id = old.id;
+  UPDATE item_flags SET status = 'stale', updated_at = datetime('now')
+   WHERE entity = 'task' AND entity_id = old.id AND status IN ('open', 'evaluating', 'proposed');
+END;
+CREATE TRIGGER IF NOT EXISTS items_note_ad AFTER DELETE ON notes BEGIN
+  DELETE FROM item_projects WHERE entity = 'note' AND entity_id = old.id;
+  DELETE FROM item_copies   WHERE entity = 'note' AND entity_id = old.id;
+  UPDATE item_flags SET status = 'stale', updated_at = datetime('now')
+   WHERE entity = 'note' AND entity_id = old.id AND status IN ('open', 'evaluating', 'proposed');
+END;
+CREATE TRIGGER IF NOT EXISTS items_pad_ad AFTER DELETE ON scratchpads BEGIN
+  DELETE FROM item_projects WHERE entity = 'scratchpad' AND entity_id = old.id;
+  DELETE FROM item_copies   WHERE entity = 'scratchpad' AND entity_id = old.id;
+  UPDATE item_flags SET status = 'stale', updated_at = datetime('now')
+   WHERE entity = 'scratchpad' AND entity_id = old.id AND status IN ('open', 'evaluating', 'proposed');
+END;
+CREATE TRIGGER IF NOT EXISTS items_link_ad AFTER DELETE ON links BEGIN
+  DELETE FROM item_projects WHERE entity = 'link' AND entity_id = old.id;
+  DELETE FROM item_copies   WHERE entity = 'link' AND entity_id = old.id;
+  UPDATE item_flags SET status = 'stale', updated_at = datetime('now')
+   WHERE entity = 'link' AND entity_id = old.id AND status IN ('open', 'evaluating', 'proposed');
+END;
+
+-- One row per second_opinion started, kept a day. What the hourly limit counts,
+-- across every server on this database: each one spends another agent's quota,
+-- and only the ones asked with a task leave a Sheet entry to count instead.
+-- No foreign keys, because a row outlives the task it was about and is only
+-- ever counted. agent/schema_later.js holds the same text.
+CREATE TABLE IF NOT EXISTS second_opinions (
+  id          INTEGER PRIMARY KEY,
+  actor       TEXT,
+  agent       TEXT NOT NULL,
+  project_id  INTEGER,
+  task_id     INTEGER,
+  started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT,
+  outcome     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_second_opinions_started ON second_opinions(started_at);

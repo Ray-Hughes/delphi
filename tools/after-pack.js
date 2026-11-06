@@ -44,10 +44,21 @@ const OUTSIDE_TOO = [
   "pads.js",
   "git.js",
   "harness.js",
+  // The app indexes with it; the server embeds a query with it.
+  "embeddings.js",
   "agent/schema_later.js",
   "agent/launch.js",
+  "agent/locate.js",
+  "agent/identity.js",
+  "agent/jobs.js",
+  // Which binary an agent may be started from: the dispatcher's rule, which
+  // second_opinion in the server applies too.
+  "agent/binaries.js",
   "sheet",
   "workbench",
+  // Move, copy, associate and flag: the server's tools and the app's IPC use
+  // the one store.
+  "items",
 ];
 
 function resourcesDir(context) {

@@ -8,9 +8,14 @@
 //   FAKE_AGENT_FAIL_RESUME=1   exit 1 silently when asked to resume, as a CLI
 //                              does for a session it no longer has
 //   FAKE_AGENT_LOG             a file to append { argv, cwd, env } to, per run
+//   FAKE_AGENT_TIMES           a file to append { pid, cwd, start, end } to when it
+//                              finishes, for the dispatcher's concurrency test
 //
 // In a fixture, {{CWD}} is replaced by the folder it runs in, and a line
-// {"fake":"hang"} stops there until the process is killed.
+// {"fake":"hang"} stops there until the process is killed. {"fake":"sleep","ms":N}
+// waits N ms, and {"fake":"write","file":F,"text":T} writes T to F in the folder
+// it runs in, the way an agent's edit would. {"fake":"orphan","pidfile":P} leaves
+// a grandchild outside its process group holding stdout open.
 
 const fs = require("fs");
 
@@ -22,7 +27,7 @@ let stdin = null;
 try { if (fs.fstatSync(0).isFIFO() || fs.fstatSync(0).isSocket()) stdin = fs.readFileSync(0, "utf8"); } catch {}
 if (process.env.FAKE_AGENT_LOG) {
   const env = {};
-  for (const k of ["DELPHI_ACTOR", "DELPHI_AUTHOR_TYPE", "DELPHI_DB"]) env[k] = process.env[k];
+  for (const k of ["DELPHI_ACTOR", "DELPHI_AUTHOR_TYPE", "DELPHI_DB", "DELPHI_JOB"]) env[k] = process.env[k];
   // The MCP config it was handed, read now, the way a CLI reads it at start.
   let mcpActor = null;
   for (const a of argv) {
@@ -40,8 +45,27 @@ if (resuming && process.env.FAKE_AGENT_FAIL_RESUME === "1") {
 const file = resuming && process.env.FAKE_AGENT_RESUME_FIXTURE ? process.env.FAKE_AGENT_RESUME_FIXTURE : process.env.FAKE_AGENT_FIXTURE;
 const lines = fs.readFileSync(file, "utf8").split("\n").filter((l) => l.trim());
 
+const started = Date.now();
 (async () => {
   for (const line of lines) {
+    if (line.includes('"fake":"sleep"')) {
+      await new Promise((r) => setTimeout(r, JSON.parse(line).ms || 0));
+      continue;
+    }
+    if (line.includes('"fake":"write"')) {
+      const w = JSON.parse(line);
+      fs.writeFileSync(require("path").join(process.cwd(), w.file), String(w.text));
+      continue;
+    }
+    if (line.includes('"fake":"orphan"')) {
+      // A grandchild in a process group of its own that keeps stdout open,
+      // the way a daemon an agent started would. Its pid goes to pidfile.
+      const o = JSON.parse(line);
+      const child = require("child_process").spawn("sleep", ["30"], { detached: true, stdio: ["ignore", "inherit", "inherit"] });
+      fs.writeFileSync(o.pidfile, String(child.pid));
+      child.unref();
+      continue;
+    }
     if (line.includes('"fake":"hang"')) {
       process.on("SIGINT", () => process.exit(130));
       setInterval(() => {}, 1000);
@@ -49,5 +73,8 @@ const lines = fs.readFileSync(file, "utf8").split("\n").filter((l) => l.trim());
     }
     process.stdout.write(line.split("{{CWD}}").join(process.cwd().replace(/\\/g, "\\\\")) + "\n");
     await new Promise((r) => setTimeout(r, 5));
+  }
+  if (process.env.FAKE_AGENT_TIMES) {
+    fs.appendFileSync(process.env.FAKE_AGENT_TIMES, JSON.stringify({ pid: process.pid, cwd: process.cwd(), start: started, end: Date.now() }) + "\n");
   }
 })();

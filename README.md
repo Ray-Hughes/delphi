@@ -131,9 +131,10 @@ make setup     # dependencies, AI agents, Desktop icon
 make start
 ```
 
-A checkout keeps its database, settings and vault beside the source, so it does
-not touch anything an installed copy is using and the two can be run side by
-side.
+A checkout uses the same database as an installed copy (see [Your data](#your-data)),
+and only one app runs per database: with the installed app open, `make start`
+brings it forward instead of starting a second. `make dev` runs the checkout on
+a separate database in `~/.delphi-dev`, beside the installed one.
 
 | Command | What it does |
 | --- | --- |
@@ -498,15 +499,22 @@ tasks and findings as it goes rather than waiting to be asked.
 | --- | --- |
 | `list_projects` | Projects with open task counts |
 | `add_project` | Create a project when work fits none of the existing ones |
-| `list_tasks` | Tasks, filtered by project or status |
+| `list_tasks` | Tasks, filtered by project or status. An unknown `project_id` is refused |
 | `add_task` | Create a task |
-| `update_task` | Change status, priority, detail or project |
+| `update_task` | Change status, priority or detail. Moves only a task you filed in the last day |
 | `add_note` | Store a decision, gotcha or reference |
-| `search` | Search tasks and notes |
+| `whoami` | Which database this is, who you write as, and whether an app is dispatching |
+| `search` | Search tasks and notes, one line each unless `detail: "full"` |
+| `get_note` | Notes in full by id |
 | `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
 | `oracle_entities` | What the graph knows about, most referenced first |
 | `oracle_ask` | Meaning and connections together. The main way to ask what we know |
 | `recent_activity` | What changed, and which agent changed it |
+| `flag_item` | Flag an item that may be in the wrong project. Changes nothing |
+| `propose_move` | Propose where an item belongs. A person approves it |
+| `list_flags` | Flags on possibly misfiled items, with their proposals |
+| `run_status` / `run_list` | One job, or a list of them, as the Runs panel shows them |
+| `lock` | Take, release or list leases on files, branches and the like |
 | `sheet_read` | A task's Sheet: the tail, the ledger, or all of it, with a cursor for polling |
 | `sheet_get` | One entry by its id |
 | `sheet_append` | Write on a Sheet: something said, a note, or a command and its result |
@@ -615,19 +623,27 @@ terminal.
 
 One SQLite file, `delphi.db`. Nothing is sent anywhere.
 
-Where it lives depends on how Delphi was installed, because a packaged
-application is a read-only archive and cannot keep a database inside itself:
+It lives in the per-user data folder, whether Delphi was installed or is run from
+a checkout, and the app, every agent and the `delphi` command all find it by the
+same rule (`agent/locate.js`):
 
 | | Database and settings | Markdown vault |
 | --- | --- | --- |
-| **Installed, macOS** | `~/Library/Application Support/Delphi` | `~/Documents/Delphi` |
-| **Installed, Windows** | `%APPDATA%\Delphi` | `Documents\Delphi` |
-| **From a checkout** | beside the source, as before | `vault/`, beside the source |
+| **macOS** | `~/Library/Application Support/Delphi` | `~/Documents/Delphi` |
+| **Windows** | `%APPDATA%\Delphi` | `Documents\Delphi` |
+| **Linux** | `$XDG_CONFIG_HOME/Delphi` | `~/Documents/Delphi` |
 
-**Help**, then **Show Data Folder** opens whichever applies. The first time an
-installed copy starts it looks for a checkout's database in the usual places and
-brings it across, so upgrading from a source install does not present you with an
-empty tracker. Set `DELPHI_DATA_DIR` to override the location entirely.
+**Help**, then **Show Data Folder** opens it. Settings shows the path and the
+database's id, the same id an agent's `whoami` and `delphi doctor` print, so
+you can check everything is looking at one file. A checkout used to keep its own
+database beside the source; one that still has a `delphi.db` there is told, once,
+that it is ignored, and it is never opened. The first time an installed copy
+starts with no database it looks for a pre-installer one in the usual places and
+brings it across, and never over one that exists.
+
+Set `DELPHI_DATA_DIR` (a folder) or `DELPHI_DB` (a file) to use somewhere else.
+`make dev` runs the checkout's app on `~/.delphi-dev` that way. Only one app runs
+per database: a second launch brings the first forward and quits.
 
 Back up from **File**, then **Back Up Database**. That runs `VACUUM INTO` rather
 than copying the file, which matters: the database uses write-ahead logging, so
@@ -635,7 +651,7 @@ recent rows can still be sitting in `delphi.db-wal` and a plain copy produces a
 backup quietly missing the last session.
 
 ```bash
-make backup     # from a checkout
+make backup     # from a checkout; uses sqlite3 .backup, safe while the app runs
 ```
 
 The database is deliberately not tracked in git. It holds your work, not code,

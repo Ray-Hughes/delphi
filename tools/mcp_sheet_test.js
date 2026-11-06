@@ -17,6 +17,9 @@ const path = require("path");
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "delphi-mcp-sheet-"));
 process.env.DELPHI_DATA_DIR = dir;
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 process.env.DELPHI_DB = path.join(dir, "delphi.db");
 for (const real of [path.join(os.homedir(), "va", "delphi", "delphi.db"),
                     path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db")]) {
@@ -74,9 +77,13 @@ async function route(name, env) {
   try {
     const listed = (await client.request("tools/list", {})).tools;
     const byName = Object.fromEntries(listed.map((t) => [t.name, t]));
-    for (const tool of ["sheet_read", "sheet_get", "sheet_append", "sheet_update", "sheet_promote", "sheet_file", "sheet_ask", "sheet_decide", "sheet_resolve"]) {
+    for (const tool of ["sheet_read", "sheet_get", "sheet_append", "sheet_update", "sheet_file", "sheet_ask", "sheet_decide", "sheet_resolve"]) {
       check(`${tool} is listed`, Boolean(byName[tool]), true);
     }
+    // sheet_promote is folded into sheet_update to keep the list short, and is
+    // still callable by name further down.
+    check("sheet_update carries promote instead of a listed sheet_promote",
+          [Boolean(byName.sheet_promote), "promote" in byName.sheet_update.inputSchema.properties], [false, true]);
     check("sheet_append carries the promotion directive",
           /Promote \(promote: true\) anything that changes what the next agent should do/.test(byName.sheet_append.description)
           && /call sheet_file on it as well/.test(byName.sheet_append.description), true);
@@ -223,7 +230,7 @@ async function route(name, env) {
       const e = await client.call("sheet_append", { task_id: busy.id, kind: "say", body: `step ${i}`, promote: i === 2 });
       busyIds.push(e.id);
     }
-    const got = await client.call("get_task", { id: busy.id });
+    const got = await client.call("get_task", { id: busy.id, detail: "full" });
     check("get_task: the ledger plus the last 20", got.comments.map((c) => c.id), [busyIds[2], ...busyIds.slice(10)]);
     check("get_task: counts", [got.comments_total, got.comments_shown], [30, 21]);
     check("get_task: the old fields are kept", Object.keys(got.comments[0]).filter((k) => ["author", "body", "created_at"].includes(k)), ["author", "body", "created_at"]);

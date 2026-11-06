@@ -325,6 +325,19 @@ function inSimulatedAsar(config, rel) {
 }
 
 /**
+ * The local scripts index.html loads with a script tag, as paths relative to
+ * the project. The renderer has no require, so the walk above never sees them,
+ * and a renderer file left out of `files` is a window that opens blank.
+ */
+const SCRIPT_SRC = /<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi;
+function rendererScripts(html) {
+  return [...String(html).replace(/<!--[\s\S]*?-->/g, "").matchAll(SCRIPT_SRC)]
+    .map((m) => m[1])
+    .filter((src) => !/^[a-z]+:|^\/\//i.test(src))
+    .map((src) => path.posix.normalize(src.replace(/^\.\//, "")));
+}
+
+/**
  * Follows every relative require from main.js, preload.js and db.js inside a
  * real app.asar, reading the files out of the archive. @electron/asar is what
  * electron-builder itself uses, so it is already in node_modules.
@@ -358,6 +371,12 @@ function checkAsar(asarPath, label) {
     }
   }
   if (!missing) console.log(`  ok   ${label}: ${seen.size} files reachable from main.js, preload.js and db.js are all in app.asar`);
+  if (isFile("index.html")) {
+    const scripts = rendererScripts(asar.extractFile(asarPath, "index.html").toString("utf8"));
+    for (const src of scripts) {
+      check(`${label}: index.html loads ${src}, and app.asar has it`, isFile(src), "the window would open without it");
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +495,8 @@ async function main() {
   const dbPath = path.join(dataDir, "delphi.db");
   const env = { ...process.env, DELPHI_DATA_DIR: dataDir, DELPHI_DB: dbPath };
   delete env.ELECTRON_RUN_AS_NODE;
-  for (const name of ["DELPHI_ACTOR", "DELPHI_SESSION", "DELPHI_PROJECT", "DELPHI_WORKBENCH", "DELPHI_CLIENT"]) delete env[name];
+  for (const name of ["DELPHI_ACTOR", "DELPHI_SESSION", "DELPHI_PROJECT", "DELPHI_WORKBENCH", "DELPHI_CLIENT", "DELPHI_DB_ID"]) delete env[name];
+  delete process.env.DELPHI_DB_ID;
 
   try {
     section("electron-builder.config.js");
@@ -497,6 +517,14 @@ async function main() {
                  "it is in extraResources too, and electron-builder leaves anything extraResources copies out of the archive. List it in OUTSIDE_TOO in tools/after-pack.js instead");
     }
     console.log(`  ok   ${app.files.size} files reachable from main.js, preload.js and db.js checked against the archive electron-builder will make`);
+    const scripts = rendererScripts(fs.readFileSync(path.join(ROOT, "index.html"), "utf8"));
+    check("index.html loads at least app.js", scripts.includes("app.js"), scripts.join(", "));
+    for (const rel of scripts) {
+      if (!exists(rel)) { check(`index.html loads ${rel}, which exists`, false); continue; }
+      if (!inFiles(config, rel)) check(`files covers ${rel}`, false, "index.html loads it, and it would not be in app.asar");
+      else check(`${rel} is in app.asar`, inSimulatedAsar(config, rel), "it is in extraResources too, which takes it out of the archive");
+    }
+    console.log(`  ok   ${scripts.length} renderer scripts index.html loads checked the same way`);
     for (const rel of OUTSIDE_TOO) {
       check(`OUTSIDE_TOO ${rel} exists`, exists(rel));
       check(`OUTSIDE_TOO ${rel} is in files, so the app has it too`, inFiles(config, rel) || inFiles(config, `${rel}/`) || config.files.includes(`${rel}/`));
@@ -505,7 +533,10 @@ async function main() {
     // A real database, made the way the app makes one, so tools have tables to
     // read. Done after the config checks so a db.js mid-edit fails here, with a
     // message, rather than masking them.
+    // Both, because db.js now honours DELPHI_DB as the server does, and the one
+    // inherited from the test runner would otherwise win.
     process.env.DELPHI_DATA_DIR = dataDir;
+    process.env.DELPHI_DB = dbPath;
     try {
       require(path.join(ROOT, "db.js")).handle();
     } catch (error) {

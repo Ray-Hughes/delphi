@@ -106,6 +106,13 @@ const forgetPaths = () => whichCache.clear();
 //                                              this harness needs to be told
 //                                              about Delphi's own MCP server
 //   {if:autoAllow} {ifnot:autoAllow}           gate a group and are then removed
+//   {if:jobWrite} {if:jobRead} {if:jobUnguarded}
+//                                              the same, for a job the dispatcher
+//                                              runs (agent/dispatch.js): one that
+//                                              changes code in its Workbench, one
+//                                              that only reads, and one a project
+//                                              has let run where the guard cannot
+//                                              see. A job never sets autoAllow.
 
 const BUILTINS = [
   {
@@ -128,7 +135,17 @@ const BUILTINS = [
       // whether this can edit the folder it is pointed at, so it is a decision
       // somebody makes rather than a default they inherit.
       ["--permission-mode", "bypassPermissions", "{if:autoAllow}"],
-      ["--tools", "", "{ifnot:autoAllow}"],
+      ["--tools", "", "{ifnot:autoAllow}", "{ifnot:jobWrite}", "{ifnot:jobRead}"],
+      // A job that only reads gets the reading tools, and Delphi's own MCP
+      // tools (the server is registered as "delphi"), which in -p mode are
+      // refused unless allowed: without them it could not ask a person
+      // anything on the Sheet.
+      ["--tools", "Read,Glob,Grep", "--allowedTools", "mcp__delphi", "{if:jobRead}"],
+      // A job that changes code: edits accepted, which Claude Code keeps to the
+      // folder it runs in (the Workbench), and Bash allowed, which is why the
+      // dispatcher runs this only with agent/guard.py installed as the hook, or
+      // with the project's explicit say-so. Never bypassPermissions.
+      ["--permission-mode", "acceptEdits", "--allowedTools", "Bash,mcp__delphi", "{if:jobWrite}"],
       "{mcpFlags}",
     ],
   },
@@ -149,7 +166,10 @@ const BUILTINS = [
       "--skip-git-repo-check",
       ["-m", "{model}"],
       ["-s", "danger-full-access", "{if:autoAllow}"],
-      ["-s", "read-only", "{ifnot:autoAllow}"],
+      ["-s", "read-only", "{ifnot:autoAllow}", "{ifnot:jobWrite}"],
+      // A job that changes code: Codex's own sandbox, writable only in the
+      // folder it runs in (the Workbench), with no network.
+      ["-s", "workspace-write", "{if:jobWrite}"],
       "{mcpFlags}",
       "{prompt}",
     ],
@@ -173,6 +193,11 @@ const BUILTINS = [
       "--no-color",
       ["--model", "{model}"],
       ["--allow-all-tools", "{if:autoAllow}"],
+      // Nothing can guard Copilot's commands, so a job gets its tools only in a
+      // project that has said unguarded agents may run there.
+      ["--allow-all-tools", "{if:jobUnguarded}"],
+      // Delphi's own MCP server, by name, for a job that only reads.
+      ["--allow-tool", "delphi", "{if:jobRead}"],
       // --session-id rather than --resume. --resume takes an optional value, so
       // passing it without one opens an interactive picker, and there is nobody
       // here to pick.
@@ -273,16 +298,26 @@ function serverPath() {
  * Electron's own binary in that mode is a Node that is certainly present and
  * can read inside app.asar besides.
  */
-function serverLaunch({ dbPath, projectId, sessionId, actor }) {
+function serverLaunch({ dbPath, dbId, projectId, sessionId, actor, readOnly = false }) {
   return {
     command: process.execPath,
     args: [serverPath()],
     env: {
       ELECTRON_RUN_AS_NODE: "1",
       DELPHI_DB: dbPath,
+      // The id as well as the path. The server refuses to start when the file
+      // at the path is not this database, so an agent the app launched can
+      // never write anywhere the app is not looking.
+      ...(dbId ? { DELPHI_DB_ID: dbId } : {}),
       DELPHI_ACTOR: actor,
       ...(projectId ? { DELPHI_PROJECT: String(projectId) } : {}),
       ...(sessionId ? { DELPHI_SESSION: String(sessionId) } : {}),
+      // A server that offers only the tools that read. See READ_ONLY_TOOLS in
+      // agent/mcp_server.js.
+      // Typed as an agent too, because the caller's own DELPHI_AUTHOR_TYPE is
+      // taken out of the reviewer's environment and a server that cannot tell
+      // would draw it as a person.
+      ...(readOnly ? { DELPHI_READ_ONLY: "1", DELPHI_AUTHOR_TYPE: "agent" } : {}),
     },
   };
 }
@@ -307,13 +342,17 @@ function toml(value) {
 function mcpFlags(style, context) {
   if (!style || style === "none") return { flags: [], file: null };
   const launch = serverLaunch(context);
+  // "delphi" unless the caller names it. A second opinion names its read only
+  // server apart, because Copilot merges an added server into the person's own
+  // config by name, and one called "delphi" would meet their read-write entry.
+  const name = /^[A-Za-z0-9_]+$/.test(String(context.serverName || "")) ? String(context.serverName) : "delphi";
 
   if (style === "codex-config") {
     return {
       flags: [
-        "-c", `mcp_servers.delphi.command=${toml(launch.command)}`,
-        "-c", `mcp_servers.delphi.args=${toml(launch.args)}`,
-        "-c", `mcp_servers.delphi.env=${toml(launch.env)}`,
+        "-c", `mcp_servers.${name}.command=${toml(launch.command)}`,
+        "-c", `mcp_servers.${name}.args=${toml(launch.args)}`,
+        "-c", `mcp_servers.${name}.env=${toml(launch.env)}`,
       ],
       file: null,
     };
@@ -322,12 +361,12 @@ function mcpFlags(style, context) {
   // "flag:--mcp-config" names the flag. An optional "|@" after it is a prefix the
   // path is handed with, for a CLI that distinguishes a file from inline JSON
   // that way.
-  const [name, prefix = ""] = (style.startsWith("flag:") ? style.slice(5) : "--mcp-config").split("|");
+  const [flag, prefix = ""] = (style.startsWith("flag:") ? style.slice(5) : "--mcp-config").split("|");
   // Copilot gates each server's tools behind a list on the entry itself, and an
   // absent list means none of them: the server starts, and the agent then says
   // it cannot reach it. The others have no such field, so it is added only for
   // the flag that wants it rather than to everyone.
-  const entry = name === "--additional-mcp-config" ? { ...launch, tools: ["*"] } : launch;
+  const entry = flag === "--additional-mcp-config" ? { ...launch, tools: ["*"] } : launch;
   const dir = path.join(os.tmpdir(), "delphi-mcp");
   fs.mkdirSync(dir, { recursive: true });
   // One file per launch, never per session: two turns on the same task at
@@ -336,8 +375,8 @@ function mcpFlags(style, context) {
   // identity, and the first to finish would delete the file under the other.
   const tag = String(context.tag || context.sessionId || "adhoc").replace(/[^A-Za-z0-9._-]/g, "_");
   const file = path.join(dir, `session-${tag}-${process.pid}-${require("crypto").randomBytes(6).toString("hex")}.json`);
-  fs.writeFileSync(file, JSON.stringify({ mcpServers: { delphi: entry } }, null, 2), { mode: 0o600 });
-  return { flags: [name, `${prefix}${file}`], file };
+  fs.writeFileSync(file, JSON.stringify({ mcpServers: { [name]: entry } }, null, 2), { mode: 0o600 });
+  return { flags: [flag, `${prefix}${file}`], file };
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +590,7 @@ const live = new Map();
 function start(options, emit) {
   const {
     harness, sessionId, cwd, prompt, model, system, resume,
-    autoAllow = false, dbPath, projectId, actor, env: extraEnv,
+    autoAllow = false, dbPath, dbId, projectId, actor, env: extraEnv,
   } = options;
 
   const command = harness.command && path.isAbsolute(harness.command)
@@ -566,7 +605,7 @@ function start(options, emit) {
 
   const sessionActor = actor || `${harness.key}:${sessionId || "adhoc"}`;
   const { flags, file } = mcpFlags(harness.mcp_style, {
-    dbPath, projectId, sessionId,
+    dbPath, dbId, projectId, sessionId,
     actor: sessionActor,
   });
   // The same identity in the agent's own environment, not only in its MCP
@@ -577,6 +616,7 @@ function start(options, emit) {
     DELPHI_ACTOR: sessionActor,
     DELPHI_AUTHOR_TYPE: "agent",
     ...(dbPath ? { DELPHI_DB: dbPath } : {}),
+    ...(dbId ? { DELPHI_DB_ID: dbId } : {}),
   };
 
   const template = typeof harness.args === "string" ? JSON.parse(harness.args) : harness.args;
@@ -678,8 +718,20 @@ function detect(harnesses, { force = false } = {}) {
   });
 }
 
+/**
+ * How many second opinions may start in an hour, across every server on this
+ * database: the default and the range settings:set accepts.
+ *
+ * Here because both sides need it and this file is already shared: main.js
+ * validates the setting with it, and agent/second_opinion.js clamps a
+ * hand-edited settings.json to it. Each call spends the other agent's quota,
+ * and an agent told to ask for reviews can otherwise ask for one on every turn.
+ * 0 turns the tool off.
+ */
+const SECOND_OPINION_HOURLY = { default: 12, bounds: [0, 60] };
+
 module.exports = {
-  BUILTINS, MAPPERS,
+  BUILTINS, MAPPERS, SECOND_OPINION_HOURLY,
   which, forgetPaths, expand, mcpFlags, serverPath, serverLaunch, toml,
   start, stop, running, detect,
 };

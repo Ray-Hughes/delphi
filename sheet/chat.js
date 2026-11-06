@@ -60,6 +60,8 @@ const COPILOT_EDITS = new Set(["edit", "create", "write"]);
 //   { type: "ran", key, output, code }    that command finished
 //   { type: "edited", path }              it changed a file
 //   { type: "session", id }               the harness's own session id, for resume
+//   { type: "usage", input, output, cost } tokens (and dollars, when it says) so far;
+//     Copilot's adds premiumRequests, the one cost it reports
 //   { type: "error", message }            the turn failed
 //
 // and has flush(), for what is still buffered when the stream ends.
@@ -134,6 +136,15 @@ function claudeSheetMapper(emit) {
     }
     if (m.type === "result") {
       flush();
+      if (m.usage || m.total_cost_usd !== undefined) {
+        const u = m.usage || {};
+        emit({
+          type: "usage",
+          input: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0),
+          output: u.output_tokens || 0,
+          cost: typeof m.total_cost_usd === "number" ? m.total_cost_usd : null,
+        });
+      }
       if (m.is_error) emit({ type: "error", message: String(m.result || m.subtype || "The agent reported an error.") });
     }
   };
@@ -171,6 +182,7 @@ function copilotSheetMapper(emit) {
         const text = typeof data.content === "string" && data.content.trim() ? data.content : deltas.get(id) || "";
         deltas.delete(id);
         if (text.trim()) emit({ type: "say", text });
+        if (data.outputTokens) emit({ type: "usage", input: 0, output: Number(data.outputTokens) || 0, cost: null });
         return;
       }
       case "tool.execution_start": {
@@ -196,10 +208,16 @@ function copilotSheetMapper(emit) {
         emit({ type: "ran", key: String(data.toolCallId), output, code });
         return;
       }
-      case "result":
+      case "result": {
         flush();
         if (m.sessionId) emit({ type: "session", id: String(m.sessionId) });
+        // The only cost Copilot reports: its premium requests for this run of
+        // the CLI (usage.premiumRequests, a fraction for a cheaper model). No
+        // dollars and no input tokens, so none are invented here.
+        const premium = m.usage && m.usage.premiumRequests != null ? Number(m.usage.premiumRequests) : NaN;
+        if (Number.isFinite(premium)) emit({ type: "usage", input: 0, output: 0, cost: null, premiumRequests: premium });
         return;
+      }
       case "error":
         emit({ type: "error", message: String(data.message || m.message || "Copilot reported an error.") });
         return;
@@ -207,6 +225,54 @@ function copilotSheetMapper(emit) {
     }
   };
   map.flush = flush;
+  return map;
+}
+
+/**
+ * Codex's `exec --json` stream. An item arrives started and completed; a
+ * command is a `$` entry from its start, finished from its completion, which
+ * carries the output and exit code. A completed item that never said it
+ * started is both at once. Files changed arrive as one item with a list.
+ */
+function codexSheetMapper(emit) {
+  const commands = new Set();
+  const map = (line) => {
+    let m;
+    try { m = JSON.parse(line); } catch { return; }
+    if (!m || typeof m !== "object") return;
+    if (m.type === "thread.started" && m.thread_id) { emit({ type: "session", id: String(m.thread_id) }); return; }
+    if (m.type === "turn.completed" && m.usage) {
+      emit({ type: "usage", input: (m.usage.input_tokens || 0), output: m.usage.output_tokens || 0, cost: null });
+      return;
+    }
+    if (m.type === "turn.failed") { emit({ type: "error", message: String((m.error && m.error.message) || "The turn failed.") }); return; }
+    if (m.type === "error") {
+      // A reconnect is reported on the same channel as a failure and is not one.
+      if (!/^Reconnecting/i.test(String(m.message || ""))) emit({ type: "error", message: String(m.message || "Codex reported an error.") });
+      return;
+    }
+    const item = m.item;
+    if (!item || typeof m.type !== "string" || !m.type.startsWith("item.")) return;
+    const key = String(item.id || item.type);
+    if (item.type === "command_execution") {
+      if (!commands.has(key) && (m.type === "item.started" || m.type === "item.completed")) {
+        commands.add(key);
+        emit({ type: "run", key, command: String(item.command || "") });
+      }
+      if (m.type === "item.completed") {
+        const code = Number.isInteger(item.exit_code) ? item.exit_code : (item.status === "completed" ? 0 : 1);
+        emit({ type: "ran", key, output: String(item.aggregated_output || ""), code });
+      }
+      return;
+    }
+    if (m.type !== "item.completed") return;
+    if (item.type === "agent_message" && String(item.text || "").trim()) emit({ type: "say", text: String(item.text) });
+    else if (item.type === "file_change") {
+      const changes = Array.isArray(item.changes) ? item.changes.map((c) => c && c.path) : Object.keys(item.changes || {});
+      for (const file of changes.filter(Boolean)) emit({ type: "edited", path: String(file) });
+    } else if (item.type === "error" && item.message) emit({ type: "error", message: String(item.message) });
+  };
+  map.flush = () => {};
   return map;
 }
 
@@ -477,6 +543,14 @@ process.on("exit", () => {
 function chatTurn({
   adapter, harness: row, prompt, cwd, resume = null, autoAllow = false, agentClient, taskId, projectId = null,
   actor, logDir, onEntry, onError, onStart = () => {}, env = {},
+  // For the dispatcher (agent/dispatch.js): template switches beyond autoAllow
+  // (jobWrite, jobRead), the database to hand the agent's MCP server when this
+  // process was not itself given one in its environment, and a look at every
+  // action before it is written, which is where tokens are counted.
+  values = {}, dbPath = null, dbId = null, onAction = null,
+  // (argv, { mcpFlags, prompt, resume }) => a refusal or null, asked of the
+  // real argv immediately before the spawn. The dispatcher's permission check.
+  checkArgv = null,
 }) {
   const command = resolveCommand(row.command);
   if (!command) {
@@ -487,14 +561,26 @@ function chatTurn({
   }
   turns++;
   const mcp = harness.mcpFlags(row.mcp_style, {
-    dbPath: process.env.DELPHI_DB || undefined, projectId, tag: `chat-${taskId}`, actor,
+    dbPath: dbPath || process.env.DELPHI_DB || undefined, dbId: dbId || process.env.DELPHI_DB_ID || undefined,
+    projectId, tag: `chat-${taskId}`, actor,
   });
   // Claude Code reads the prompt from stdin when -p has none after it, so it
   // goes there: a message starting with '-' in argv would be read as a flag.
   const onStdin = Boolean(adapter.promptOnStdin);
-  const argv = harness.expand(row.args, { prompt: onStdin ? undefined : prompt, resume, cwd, autoAllow, mcpFlags: mcp.flags });
+  const argv = harness.expand(row.args, { ...values, prompt: onStdin ? undefined : prompt, resume, cwd, autoAllow, mcpFlags: mcp.flags });
+  if (checkArgv) {
+    let refusal;
+    try { refusal = checkArgv(argv, { mcpFlags: mcp.flags, prompt: onStdin ? null : prompt, resume }); } catch (error) { refusal = error.message; }
+    if (refusal) {
+      if (mcp.file) { try { fs.unlinkSync(mcp.file); } catch {} }
+      return Promise.reject(new Error(refusal));
+    }
+  }
   const writer = createSheetWriter({ client: agentClient, taskId, adapter, cwd, logDir, onEntry, onError });
-  const mapper = adapter.mapper((action) => writer.apply(action));
+  const mapper = adapter.mapper((action) => {
+    if (onAction) { try { onAction(action); } catch {} }
+    return writer.apply(action);
+  });
   const childEnv = { ...process.env, ...env, DELPHI_ACTOR: actor, DELPHI_AUTHOR_TYPE: "agent" };
   // The agent is not Delphi, and must not inherit the switch that makes
   // Electron's binary behave as Node.
@@ -542,6 +628,16 @@ function chatTurn({
       signal(reason ? "SIGTERM" : "SIGINT");
       if (!reason) timers.push(setTimeout(() => signal("SIGTERM"), 3000));
       timers.push(setTimeout(() => signal("SIGKILL"), reason ? 2000 : 6000));
+      // A stop with a reason ends the turn even if something outside the
+      // group (a daemon the agent started) still holds its output open: the
+      // pipes are let go and the turn finishes, rather than waiting on them.
+      if (reason) {
+        timers.push(setTimeout(() => {
+          try { child.stdout.destroy(); } catch {}
+          try { child.stderr.destroy(); } catch {}
+          finish(null);
+        }, 3000));
+      }
       for (const t of timers) if (t.unref) t.unref();
     };
     try { onStart({ stop, pid: child.pid }); } catch {}
@@ -707,6 +803,6 @@ async function createChatSession({
 }
 
 module.exports = {
-  ADAPTERS, claudeSheetMapper, copilotSheetMapper, createSheetWriter, openingContext, sheetContext,
+  ADAPTERS, claudeSheetMapper, copilotSheetMapper, codexSheetMapper, createSheetWriter, openingContext, sheetContext,
   findSession, harnessRow, guardRefusal, chatTurn, createChatSession,
 };

@@ -29,6 +29,11 @@ const path = require("path");
 const DEFAULTS = {
   scratchpadMode: false,
   scratchpadProjectId: null,
+  // Whether connected agents are told to ask another agent for a second opinion
+  // through the second_opinion tool, and which one. The tool itself works either
+  // way; this is only whether agents are told to reach for it.
+  secondOpinionMode: false,
+  secondOpinionAgent: "copilot",
   // Read by the MCP server's Workbenches, so a branch an agent starts carries
   // the same prefix as one started in the app.
   workbenchBranchPrefix: null,
@@ -124,14 +129,13 @@ function scratchpadInstructions(project) {
 /** The short form, appended to the descriptions of the tools it bears on. */
 function scratchpadToolNote(project) {
   const where = project
-    ? `Default destination is the "${project.name}" project, project_id ${project.id}, ` +
-      `unless the draft plainly belongs to another project's work.`
+    ? `Default: "${project.name}" (project_id ${project.id}) unless the work plainly belongs elsewhere.`
     : `No default project is set, so pick the project that fits.`;
+  // Short, because it rides on four tool descriptions that every session pays
+  // for. The full directive is in the server's instructions.
   return (
-    ` SCRATCHPAD MODE IS ON: this tracker holds the scratchpad for this session. ` +
-    `Your plan and working document belong here, through write_scratchpad, not in ` +
-    `a temp directory, a scratchpad folder or /tmp. Checkbox lines in a pad become ` +
-    `tasks, so write the plan as checkboxes rather than calling add_task as well. ` +
+    ` SCRATCHPAD MODE IS ON: your plan and working notes go in a pad (write_scratchpad), ` +
+    `not /tmp or a scratchpad folder. Checkbox lines become tasks, so do not add_task them too. ` +
     `${where}`
   );
 }
@@ -147,6 +151,68 @@ function scratchpadReminder(project) {
   );
 }
 
+/**
+ * The full statement of the second opinion rule, for initialize.
+ *
+ * The exclusions are written out for the same reason as the scratchpad's: an
+ * agent told to ask for a review will otherwise ask for one on a typo, and an
+ * agent told the reviewer is free will send it everything, secrets included.
+ * "Never call it to generate usage" is stated outright because a rule that
+ * reads like a quota gets met like one.
+ */
+function secondOpinionInstructions(label) {
+  return [
+    "SECOND OPINION MODE IS ON.",
+    "",
+    `${label} is set up as a second reviewer for this tracker. The second_opinion`,
+    "tool runs it read only and returns its answer. Use it for real work:",
+    "",
+    "  1. Before you commit or open a pull request, write the diff to a file and",
+    "     ask second_opinion to review it for bugs and regressions.",
+    "  2. When you reach a root cause for a bug, ask second_opinion to diagnose the",
+    "     same symptom from the same files, without telling it your conclusion.",
+    "     Compare the two before you report.",
+    "  3. Before relying on a large file or flow you do not know, ask it for a",
+    "     summary and reconcile that with your own reading.",
+    "",
+    "Skip it for trivial work: one line changes, chat answers, docs only edits.",
+    "Never call it just to show that it was used.",
+    "",
+    "Verify every finding against the code before acting on it or repeating it.",
+    `Report the result labelled, for example "${label} review: 2 findings, 1 valid`,
+    '(fixed), 1 not a bug because ...". Say so when it caught something you missed.',
+    "",
+    "Never send it secrets, tokens or credentials, or real personal data. Use test",
+    "values or redact.",
+    "",
+    "Pass task_id when the work has a task, so the answer is kept on its Sheet for",
+    "the next session.",
+  ].join("\n");
+}
+
+/** The short form, appended to the descriptions of the tools it bears on. */
+function secondOpinionToolNote(label) {
+  return (
+    ` SECOND OPINION MODE IS ON: before a commit or pull request, and when you reach a root cause, ` +
+    `ask second_opinion (${label}, read only) and verify what it says. Not for trivial work, never for secrets or personal data.`
+  );
+}
+
+/**
+ * The reminder returned alongside a tool's result.
+ *
+ * This is the channel that reaches a session which was already running when the
+ * mode was turned on: its instructions were read at startup and will not be read
+ * again, but it is still calling tools.
+ */
+function secondOpinionReminder(label) {
+  return (
+    `[delphi] Second opinion mode is on. Before you commit or open a pull request, and when ` +
+    `you reach a root cause, call second_opinion (${label}, read only) and verify its findings ` +
+    `before acting on them. Skip it for trivial work. Never send it secrets or personal data.`
+  );
+}
+
 module.exports = {
   DEFAULTS,
   makeSettingsReader,
@@ -154,4 +220,7 @@ module.exports = {
   scratchpadInstructions,
   scratchpadToolNote,
   scratchpadReminder,
+  secondOpinionInstructions,
+  secondOpinionToolNote,
+  secondOpinionReminder,
 };

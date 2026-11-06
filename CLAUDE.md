@@ -46,6 +46,8 @@ loads all of them at startup, so a renderer change needs a restart, not a reload
 | `harness.js` | Running somebody else's agent CLI as a session. Templates, parsers, MCP wiring |
 | `agent/mcp_server.js` | JSON-RPC 2.0 MCP server over stdio, no dependencies |
 | `agent/schema_later.js` | Columns and tables added after a database was made. Run by the app and the server alike |
+| `agent/second_opinion.js` | Running another agent's CLI read only and waiting for its answer, for the `second_opinion` tool. Copilot only for now |
+| `agent/binaries.js` | Whether an agent's command is the real binary an installer put there, or one a person trusted. Shared by the dispatcher and `second_opinion` |
 | `agent/launch.js` | Splitting a command line, finding a binary, and whether the guard is wired in. Shared by the runner, `delphi chat` and `sheet/run.js` |
 | `sheet/` | Sheets: the text format, the shared store, the MCP client, `run.js`, `decide.js` and `chat.js` |
 | `sheet/tui/` | The Sheet in a terminal (`delphi open`): keys, screen, clipboard and the view itself |
@@ -98,7 +100,8 @@ read. So these are shared:
   routes.
 
 A shared module must load under a plain Node with no dependencies, and every one
-of them has to be in `extraResources` as well as `files` (see packaging below).
+of them has to be in `files` and in `OUTSIDE_TOO` in `tools/after-pack.js` (see
+packaging below).
 Old twins are not being refactored onto this; new shared code follows it.
 
 **New columns go in `schema.sql` and `agent/schema_later.js`, not `db.js`.**
@@ -117,8 +120,8 @@ the importers) kept working. The vault mirrors each Sheet as a clean `.sheet`
 file beside the project's pads.
 
 **Run logs live in `DATA_DIR/sheets/<task>/<entry>.log`**, beside the database,
-so they inherit its never-in-git rule. From a checkout that is the checkout, which
-is why `/sheets/` is in `.gitignore`. `make prune-logs` drops the logs of tasks
+so they inherit its never-in-git rule. `/sheets/` is in `.gitignore` anyway, for
+a data folder pointed at the checkout on purpose. `make prune-logs` drops the logs of tasks
 done over 30 days ago, opening the database read-only through `sqlite3`.
 `make cli` links `bin/delphi` onto PATH.
 
@@ -195,20 +198,86 @@ commands Copilot or Codex run; that is why `delphi chat --auto` with Copilot nee
 `--allow-unguarded`. `sheet/run.js` asks it before every `$ ` run, a person's or
 an agent's, and fails closed when python3 or `guard.py` cannot be found.
 
-**Everything the server and the CLI require must be in `extraResources`.** They
-run under a plain Node outside `app.asar`, from `Resources/`, and find their
-modules by relative require, so the layout there mirrors the checkout: `agent/`,
-`sheet/`, `workbench/`, `bin/delphi`, `pads.js`, `git.js`, `harness.js`.
-electron-builder skips a missing entry without a word, and that is how every
-installed build from 1.3.0 shipped a server missing `agent/directives.js`.
-`tools/package_test.js` copies the layout to a temp folder, follows every
-relative require from the server and the CLI, and starts both, so a gap fails
-`npm test` rather than an install.
+**What a job may run is a tripwire, not a boundary.** `agent/dispatch.js`
+refuses a job whose argv carries a flag off its per-harness allowlist, whose
+harness row changed after approval, or whose command is not the agent as an
+installer put it (under the npm global root, Homebrew, or Claude's own install
+folders, in folders nobody else can write) unless a person clicked "Trust this
+command", which stores the real file it resolved to. The guard's database rule
+blocks writing the real `delphi.db` from a shell (sqlite3 without `-readonly`
+among its options, or an interpreter naming it), and leaves any other
+`delphi.db` alone. These catch accidents, casual edits and an agent doing it in
+passing. They do not stop a determined process running as the same user, which
+can write those folders and that file; copying the database, editing the copy
+and copying it back, or a script file that opens it, are out of scope.
 
-**Tests never touch a real database.** Not `delphi.db` in the checkout, not the
-one in `~/Library/Application Support/Delphi`. Each test makes a temp directory
-and sets `DELPHI_DATA_DIR` (which `db.js` reads) and `DELPHI_DB` (which the
-server reads; it ignores `DELPHI_DATA_DIR`) inside it. `test_all.js` sets both to
+**Approving or rejecting a flag happens only in the window.** `flags:approve`
+and `flags:reject` in `main.js` are the one caller of `items/store.js` decide,
+and the only one that passes `via: "window"`, which decide requires. The command
+line cannot tell a person from an agent that sets `DELPHI_ACTOR` and
+`DELPHI_AUTHOR_TYPE` to look like one, and the guard can be spelled around, so
+there is no decide tool in the MCP server and `delphi flags approve` and `reject`
+only say "Approve or reject this in the Delphi window." The guard still blocks
+those commands, as a courtesy. An Approve names the proposal entry the person
+saw (`entryId`), and decide refuses with code `STALE` when a newer one exists.
+
+**A module the app and the server both need goes in `files` and in
+`OUTSIDE_TOO`, never in `extraResources`.** The server and the CLI run under a
+plain Node outside `app.asar`, from `Resources/`, and find their modules by
+relative require, so the layout there mirrors the checkout. electron-builder
+leaves out of the archive anything `extraResources` copies, without a word, which
+is how 1.6.0 shipped an app that could not start: `db.js` could not find
+`./pads`. So shared modules are listed in `files` only, and `tools/after-pack.js`
+copies them out to `Resources/` before signing. `extraResources` keeps only what
+the app itself never loads. Every build from 1.3.0 to 1.5.0 had the opposite gap,
+a server missing `agent/directives.js`.
+
+`tools/package_test.js` reads the real `app.asar` and follows every require and
+`<script src>` from the app, follows every require from the server and the CLI
+in `Resources/`, starts both, and launches the packaged app with
+`DELPHI_SMOKE=1` against an old database to prove it opens and migrates. The
+release workflow runs it on macOS and Windows before anything is published.
+
+**There is one database, and everything finds it the same way.**
+`agent/locate.js` is the only resolver: `DELPHI_DB`, then `DELPHI_DATA_DIR`,
+then the per-user data folder, whether the app is packaged or run from the
+checkout. A `delphi.db` beside the source is never opened, only reported, because
+the app once preferred it when unpackaged while agents used the installed one, and
+each wrote to a database the other never read. Every database carries a `db_id` in
+its `meta` table; agents Delphi launches get it as `DELPHI_DB_ID` and the server
+refuses to start on a mismatch. `whoami` and `delphi doctor` report which database
+is in use. A second copy of the app on the same data folder only brings the first
+forward. `make dev` runs the checkout on a separate database in `~/.delphi-dev`.
+
+**The job dispatcher refuses more than it runs.** `agent/dispatch.js` runs every
+job (a handoff, a queued task, a person's request) from rows in `handoffs`, which
+`agent/jobs.js` writes for the app and the server alike. Three rules hold. A job's
+real argv is checked against an allowlist per harness (`POLICY`) immediately
+before every spawn, follow-ups included, so a flag nobody listed fails closed;
+adding a flag to a built-in template means adding it there too. An agent's job
+waits in `needs_approval` until a person approves it, unless the project has
+`auto_approve`; no MCP tool approves one. A `do` job runs only in its task's
+Workbench and an `ask` job only reads, in the project's folder. Limits come from
+`jobConcurrency` and `jobHarnessLimits`, bounded by `dispatch.BOUNDS` and read on
+every pass, and the order of queued jobs from `queue_rank`.
+
+**`items/` is one shared store, and agents never apply.** Moving, copying,
+associating and flagging items across projects all go through `items/store.js`,
+handed `sql` and a `batch`, so the app and the server write the same History
+rows and a move lands as one batch on either route. An agent may flag an item or
+propose a move; only a person's decision applies one, and the store refuses an
+agent's decision whatever reached it. The one move an agent makes itself is a task
+it filed in the last 24 hours (`update_task`, owner decision D2).
+
+**Memory is compact by default.** `search`, `oracle_ask` and `oracle_context`
+answer through `agent/recall.js`: one line per hit inside a token budget, with
+`get_note` and `get_task` to read more. `detail: "full"` returns the old
+whole-body answer unchanged, for clients written against it. A new recall tool
+follows the same rule: the brief answer by default, the full one on request.
+
+**Tests never touch a real database.** Not the one in
+`~/Library/Application Support/Delphi`, not a stray one in the checkout. Each test
+makes a temp directory and sets `DELPHI_DATA_DIR` and `DELPHI_DB` inside it. `test_all.js` sets both to
 a temp folder before each test and strips the `DELPHI_*` variables an agent
 session carries, as a floor under that, not instead of it.
 

@@ -12,9 +12,9 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | --- | --- |
 | `list_projects` | Every project with open task counts. Call first to find a `project_id` |
 | `add_project` | Create a project when work fits none of the existing ones |
-| `list_tasks` | Tasks, optionally filtered by project or status |
+| `list_tasks` | Tasks, optionally filtered by project or status. A `project_id` that does not exist is refused, not answered with an empty list |
 | `add_task` | Create a task |
-| `update_task` | Change status, priority, detail, or move between projects |
+| `update_task` | Change status, priority or detail. Moving it to another project only for a task you filed in the last day; see Moving work between projects |
 | `add_note` | Store a decision, gotcha or reference against a project |
 | `list_scratchpads` | The working documents in a project. Call before writing one |
 | `read_scratchpad` | One pad in full: what the last session was in the middle of |
@@ -24,15 +24,23 @@ For how to work on delphi itself, see `CLAUDE.md`.
 | `list_agents` | The other agents on this machine that work can be handed to |
 | `handoff_send` | Hand a piece of work to another agent. You are woken with the reply |
 | `handoff_status` | What has been handed to and from you, and the replies |
+| `run_status` | One job: its state, who asked and approved it, its Workbench, tokens, and the reply |
+| `run_list` | Jobs, newest first, by project, state, or only yours (`mine`). No tool approves one |
 | `lock_acquire` | Take a lease on a file, a branch, a migration, so two agents do not collide |
 | `lock_release` | Give one back |
 | `lock_status` | What is held in a project, and by whom |
+| `lock` | The three above in one tool: `action` is `take` (the default), `release` or `status` |
 | `timer_set` | Ask to be given a turn later, instead of waiting in a loop |
-| `search` | Text matching across tasks and notes |
+| `whoami` | Which database you are on, who your writes are attributed to, and whether an app is dispatching |
+| `search` | Tasks and notes by words, best first, one line each |
+| `get_note` | Notes in full by id, after `search`, `oracle_ask` or `oracle_context` |
 | `oracle_context` | Everything connected to a ticket, service, repo, file or concept |
 | `oracle_entities` | What the graph knows about, most referenced first |
 | `oracle_ask` | Meaning and connections together. The main way to ask what we know |
 | `recent_activity` | What changed lately and which agent changed it |
+| `flag_item` | Say an item may be in the wrong project, where it belongs and why. Changes nothing |
+| `propose_move` | Propose one to three moves, copies or associations for an item. Never applies them |
+| `list_flags` | Flags on possibly misfiled items, each with its proposal in a line |
 | `get_task` | One task in full: detail, subtasks, discussion, every status it has been through |
 | `add_comment` | Leave your reasoning on a task, for whoever picks it up next |
 | `queue_status` | What is waiting for an agent and what other agents are holding |
@@ -56,6 +64,15 @@ For how to work on delphi itself, see `CLAUDE.md`.
 
 There is no tool to discard a Workbench, on purpose. See Safety.
 
+### Memory is brief unless you ask
+
+`search`, `oracle_ask` and `oracle_context` answer compactly by default: an id, a
+title and a line each, inside a token budget (`budget`, 1500 by default), so consulting
+memory costs a fraction of what reading it in full does. `get_task` gives the Sheet as
+text rather than every entry as JSON. Read what you need with `get_note` or
+`get_task`, or pass `detail: "full"` for whole bodies, which is what these tools
+returned before.
+
 Every write is attributed. Set `DELPHI_ACTOR` in the server's environment to name the
 agent, and its changes appear in the History tab labelled with that name. Give each
 agent a different one. That is the only thing making History useful when more than one
@@ -63,20 +80,21 @@ is working.
 
 ## Which database it writes to
 
-An installed copy keeps its database in the per-user data directory
+The database is in the per-user data directory
 (`~/Library/Application Support/Delphi` on macOS, `%APPDATA%\Delphi` on Windows,
-`$XDG_CONFIG_HOME/Delphi` otherwise). A checkout keeps one beside the source. If you
-have both, the installed one wins, because that is the one the app you are looking at
-is reading.
+`$XDG_CONFIG_HOME/Delphi` otherwise), for the installed app and for a checkout alike.
+`agent/locate.js` decides it, and the app, this server and the `delphi` command all
+use it, so they cannot disagree. A checkout's own `delphi.db` is never opened; if one
+exists the server says so once on stderr, which your client keeps in its MCP log.
 
-This ordering matters more than it sounds. The server is registered by its path inside
-the checkout, so it used to find the neighbouring database first and write there, while
-the app read the other one. Nothing errors in that state: notes and tasks are written,
-and simply never appear. If two databases exist, the server says which it chose on
-stderr, which your client will have in its MCP log.
+Set `DELPHI_DB` to a file or `DELPHI_DATA_DIR` to a folder to use somewhere else.
+Call the `whoami` tool to see which database a session is on (path and id), who its
+writes are attributed to, and whether a Delphi app is running to dispatch handoffs.
+`delphi doctor` prints the same and checks the Claude Code, Codex and Copilot configs.
 
-Set `DELPHI_DB` to an absolute path to override, which is how you point the server at a
-checkout on purpose.
+A server the app launches is also given `DELPHI_DB_ID`, and refuses to start if the
+file it opens is a different database, so an agent Delphi starts cannot write to the
+wrong one.
 
 ## Connecting
 
@@ -307,6 +325,65 @@ Delphi stops running handoffs by itself after twelve finish in one project in an
 hour. Two agents that each wake the other are a loop that spends money at machine
 speed with nobody watching, and the limit is the thing that notices.
 
+## Second opinions
+
+`second_opinion` asks another agent, Copilot by default, and waits for the answer.
+It is not a job: there is no approval, no app needs to be running, and the answer
+comes back in the same call, usually within a minute. That is what it is for: the
+question you are blocked on right now.
+
+```
+second_opinion(request, files?, cwd?, task_id?, project?, timeout_seconds?)
+```
+
+Copilot runs read only. Its command line may carry only a short list of flags, and a
+Copilot command line in Settings that passes anything else is refused rather than
+trimmed. The tools it can see are an allowlist (view and glob, not grep, and
+Delphi's read tools), its built-in and your own MCP servers are switched off, and
+write, shell and web fetches are denied by name, because Copilot's saved approvals
+apply in this mode too. It is the same binary check jobs use: Copilot as an
+installer put it, or a command a person trusted in Settings. It does get Delphi's
+own tools, from a server named `delphi_readonly` and started with
+`DELPHI_READ_ONLY=1`, that offers only the tools that read, carries no directives,
+and writes under its own name in History (`copilot:second-opinion`). So it can read
+the same notes and pads you can, and cannot file work, change a pad, hand off a job
+or ask for a second opinion of its own.
+
+It reads only inside the project's folders (its path, repositories and workspaces)
+and the task's Workbench. It runs in `cwd`, or the task's Workbench, or the
+project's folder; with no project or task given it uses the session's project, then
+the project whose folder holds `cwd`. Relative paths in `files` are taken from
+that folder, followed through links, and refused when they land outside those
+folders. A cwd or file in a key folder or named like a key file is refused
+(`.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.netrc`, `.env*`, `*.pem`, `*.key`,
+`id_*`, Keychains, `~/.copilot`, `~/.claude`, Delphi's data folder and its
+database), and so are the filesystem root, a home folder and anything above one.
+Inside a folder it was let into, Copilot is told to deny reading `.env*`,
+`.netrc`, `*.pem`, `*.key` and `id_*`. Write a diff to a file inside the
+project and pass the path, because the request is a prompt and Copilot reads
+nothing from stdin. A `task_id` and a `project` that disagree are refused.
+
+One runs at a time per session, and a limited number start in an hour across every
+agent on the database (Settings, `secondOpinionHourlyLimit`, default 12, 0 turns it
+off). The timeout is five minutes by default and ten at most. An answer longer than
+about 64 KB is cut and says so. With `task_id` the answer is also kept on the task's
+Sheet, so the next session has it, with anything shaped like a token or private key
+replaced by `[redacted]` first and the entry saying how many were.
+
+**Second opinion mode** (Settings, Second opinion) tells every connected agent when to
+use it: on a diff before a commit or pull request, on a root cause, reached
+independently, and on large unfamiliar code. Verify what it says before acting on
+it, say what it found and which findings held up, skip trivial work, and never send
+it secrets or personal data. The rule reaches an agent three ways, as the
+scratchpad's does: the server's instructions, a note on `second_opinion`,
+`queue_complete`, `add_comment`, `sheet_append` and `list_projects`, and a reminder
+on a tool result. The reminder comes on `list_projects` and on the first result an
+hour, which is how a session that was already running when the mode was turned on
+hears about it.
+
+Only Copilot can be the second opinion for now. Each CLI says "read only" in its own
+flags, and a second one should arrive with its own.
+
 ## Taking work from the queue
 
 Tasks placed in the queue are work someone has decided is ready for an agent. Nobody
@@ -365,6 +442,19 @@ Do not claim more than one task at a time. Finish or release before taking anoth
 `--workbenches` it gives each task its own Workbench and runs the agent there, leaving
 the Workbench for a person to review and finish. That is what makes `--concurrency`
 above 1 safe in one repository. It is off by default in this release.
+
+## Moving work between projects
+
+An item filed in the wrong project is fixed by a person, with one exception. You may
+move a task you filed yourself in the last 24 hours, with `update_task` and a new
+`project_id`: that is correcting your own misfiling, and its subtasks move with it.
+Any other move is refused with the sentence that says so. For those, `flag_item`
+with a note saying where it belongs and why, or `propose_move` with the exact
+operations. Both are records for a person to approve in the app; nothing an agent
+calls applies one, and there is no tool that approves a flag. Approving or
+rejecting one happens only in the Delphi window: `delphi flags approve` and `reject`
+refuse, whatever DELPHI_ACTOR or DELPHI_AUTHOR_TYPE say. `list_flags` shows
+what is already flagged, so check it before flagging the same thing twice.
 
 ## Delegation
 

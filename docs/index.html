@@ -822,7 +822,7 @@ Windows    powershell -ExecutionPolicy Bypass -File install\mcp.ps1</code></pre>
           <tbody>
             <tr><td>macOS</td><td><code>~/Library/Application Support/Delphi</code></td><td><code>~/Documents/Delphi</code></td></tr>
             <tr><td>Windows</td><td><code>%APPDATA%\Delphi</code></td><td><code>Documents\Delphi</code></td></tr>
-            <tr><td>From source</td><td>Beside the source</td><td><code>vault/</code>, beside the source</td></tr>
+            <tr><td>From source</td><td>The same per-user folder</td><td>The same Documents folder</td></tr>
           </tbody>
         </table>
       </div>
@@ -909,9 +909,9 @@ cd ~/delphi
 make setup     # dependencies, AI agents, Desktop icon
 make start</code></pre>
       <p>
-        A checkout keeps its database, settings and vault beside the source, so it
-        does not touch anything an installed copy is using and the two can be run
-        side by side.
+        A checkout uses the same database as an installed copy, and only one app
+        runs per database. <code>make dev</code> runs the checkout on a separate
+        database in <code>~/.delphi-dev</code>, beside the installed one.
       </p>
       <p>
         Building the installers needs <code>npm run dist:mac</code> or

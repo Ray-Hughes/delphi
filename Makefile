@@ -17,15 +17,21 @@ OLLAMA_LOG:= /tmp/delphi-ollama.log
 OLLAMA_URL:= http://127.0.0.1:11434
 MODEL     := nomic-embed-text
 
-# Where the database and the Sheet run logs live. From a checkout that is the
-# checkout itself, as paths.js decides. Point it at an installed app's data with
-# DELPHI_DATA_DIR="$HOME/Library/Application Support/Delphi" make prune-logs.
-DATA_DIR  := $(or $(DELPHI_DATA_DIR),$(APP_DIR))
 PRUNE_DAYS:= 30
 
 # Resolved rather than assumed: an editor or launcher may run make without the
 # PATH a terminal has.
 NODE := $(shell command -v node 2>/dev/null || echo /usr/local/bin/node)
+
+# Where the database and the Sheet run logs live, asked of agent/locate.js, the
+# same rule the app, the MCP server and the delphi command use. These used to
+# assume the checkout, which made backup and doctor report on a database the app
+# was no longer using. DELPHI_DATA_DIR and DELPHI_DB still override, as they do
+# everywhere. Recursive (=) so a target that does not need them does not ask.
+LOCATE    = $(shell "$(NODE)" -e 'process.stdout.write(require(process.argv[1]).resolve().$(1))' "$(APP_DIR)/agent/locate.js")
+DB_PATH   = $(call LOCATE,dbPath)
+DATA_DIR  = $(call LOCATE,dataDir)
+DEV_DATA  := $(HOME)/.delphi-dev
 
 green := \033[32m
 dim   := \033[2m
@@ -34,7 +40,7 @@ off   := \033[0m
 
 .PHONY: help start stop restart status app app-stop app-restart model model-stop \
         reindex rebuild logs applogs modellogs doctor install backup setup desktop mcp \
-        icons dist test cli prune-logs
+        icons dist test cli prune-logs dev
 
 help: ## Show this help
 	@echo ""
@@ -73,9 +79,9 @@ status: ## What is running
 	@if ollama list 2>/dev/null | grep -q "$(MODEL)"; then echo -e "$(green)$(MODEL)$(off)"; \
 	  else echo -e "$(dim)missing$(off)  run: ollama pull $(MODEL)"; fi
 	@printf "  %-22s" "Indexed"
-	@sqlite3 "$(APP_DIR)/delphi.db" "SELECT COUNT(*)||' vectors, '||(SELECT COUNT(*) FROM entities)||' entities, '||(SELECT COUNT(*) FROM edges)||' edges' FROM embeddings;" 2>/dev/null || echo "database not readable"
+	@sqlite3 -readonly "$(DB_PATH)" "SELECT COUNT(*)||' vectors, '||(SELECT COUNT(*) FROM entities)||' entities, '||(SELECT COUNT(*) FROM edges)||' edges' FROM embeddings;" 2>/dev/null || echo "database not readable"
 	@printf "  %-22s" "Open work"
-	@sqlite3 "$(APP_DIR)/delphi.db" "SELECT COUNT(*)||' tasks, '||(SELECT COUNT(*) FROM notes)||' notes' FROM tasks WHERE status != 'done';" 2>/dev/null || true
+	@sqlite3 -readonly "$(DB_PATH)" "SELECT COUNT(*)||' tasks, '||(SELECT COUNT(*) FROM notes)||' notes' FROM tasks WHERE status != 'done';" 2>/dev/null || true
 	@echo ""
 
 # --- the app ----------------------------------------------------------------
@@ -102,6 +108,13 @@ app-stop: ## Stop just the app
 	else echo "  app was not running"; fi
 
 app-restart: app-stop app ## Restart just the app
+
+# The checkout's app on a database of its own. Plain `npm start` now opens the
+# same database as the installed app, and while that one is running a second
+# launch only brings it forward; this is how to try a change without either.
+dev: ## Start the checkout's app on a separate dev database in ~/.delphi-dev
+	@mkdir -p "$(DEV_DATA)"
+	@cd "$(APP_DIR)" && DELPHI_DATA_DIR="$(DEV_DATA)" npm start
 
 # --- the model ---------------------------------------------------------------
 
@@ -134,7 +147,7 @@ reindex: ## Re-embed everything, after a model change
 	@cd "$(APP_DIR)" && npx electron -e "\
 	const {DatabaseSync}=require('node:sqlite');\
 	const e=require('$(APP_DIR)/embeddings.js');\
-	const db=new DatabaseSync('$(APP_DIR)/delphi.db');\
+	const db=new DatabaseSync('$(DB_PATH)');\
 	e.reindex(db,{force:true}).then(r=>{console.log('  '+JSON.stringify(r));process.exit(0)});" 2>/dev/null \
 	  | grep -v Warning || true
 
@@ -142,7 +155,7 @@ rebuild: ## Rebuild the knowledge graph from the notes and tasks
 	@cd "$(APP_DIR)" && npx electron -e "\
 	const {DatabaseSync}=require('node:sqlite');\
 	const o=require('$(APP_DIR)/oracle.js');\
-	const db=new DatabaseSync('$(APP_DIR)/delphi.db');\
+	const db=new DatabaseSync('$(DB_PATH)');\
 	console.log('  '+JSON.stringify(o.rebuild(db)));process.exit(0);" 2>/dev/null \
 	  | grep -v Warning || true
 
@@ -204,7 +217,7 @@ cli: ## Put the delphi command on your PATH
 # no tasks at all is taken as the wrong database rather than as every task having
 # been deleted. DRY=1 lists what would go.
 prune-logs: ## Delete Sheet run logs for tasks done over 30 days ago, or deleted
-	@logs="$(DATA_DIR)/sheets"; db="$${DELPHI_DB:-$(DATA_DIR)/delphi.db}"; \
+	@logs="$(DATA_DIR)/sheets"; db="$(DB_PATH)"; \
 	if [ ! -d "$$logs" ]; then echo "  no run logs at $$logs"; exit 0; fi; \
 	if [ ! -f "$$db" ]; then echo "  no database at $$db, nothing pruned"; exit 1; fi; \
 	total=$$(sqlite3 -readonly "$$db" "SELECT COUNT(*) FROM tasks;" 2>&1) \
@@ -223,18 +236,23 @@ prune-logs: ## Delete Sheet run logs for tasks done over 30 days ago, or deleted
 	if [ -n "$(DRY)" ]; then echo "  $$n task log folders would be pruned"; \
 	else echo "  pruned the logs of $$n tasks from $$logs"; fi
 
+# sqlite3's .backup rather than cp. The database runs in WAL mode, so recent
+# rows can still be in delphi.db-wal, and a copy of the main file alone is
+# missing them. .backup reads through the log and is safe while the app runs.
 backup: ## Copy the database somewhere safe
 	@mkdir -p "$(HOME)/backups"
-	@cp "$(APP_DIR)/delphi.db" "$(HOME)/backups/delphi-$$(date +%F-%H%M).db"
-	@echo "  saved to ~/backups/delphi-$$(date +%F-%H%M).db"
+	@db="$(DB_PATH)"; dest="$(HOME)/backups/delphi-$$(date +%F-%H%M).db"; \
+	if [ ! -f "$$db" ]; then echo "  no database at $$db"; exit 1; fi; \
+	sqlite3 -readonly "$$db" ".backup '$$dest'" && echo "  saved $$db to $$dest"
 
 doctor: ## Check everything is wired up correctly
 	@echo ""
 	@printf "  %-26s" "node"; command -v node >/dev/null && node --version || echo "MISSING"
 	@printf "  %-26s" "sqlite3"; command -v sqlite3 >/dev/null && sqlite3 --version | cut -d' ' -f1 || echo "MISSING"
 	@printf "  %-26s" "ollama"; command -v ollama >/dev/null && ollama --version 2>/dev/null | head -1 || echo "not installed (optional)"
-	@printf "  %-26s" "database"; [ -f "$(APP_DIR)/delphi.db" ] && echo "$$(du -h "$(APP_DIR)/delphi.db" | cut -f1)" || echo "MISSING"
-	@printf "  %-26s" "MCP registered"; claude mcp list 2>/dev/null | grep -q delphi && echo "yes" || echo "no, run: make mcp"
+	@printf "  %-26s" "database"; db="$(DB_PATH)"; [ -f "$$db" ] && echo "$$(du -h "$$db" | cut -f1) at $$db" || echo "MISSING at $$db"
+	@echo ""
+	@"$(NODE)" "$(APP_DIR)/bin/delphi" doctor || true
 	@echo ""
 
 mcp: ## Connect the Oracle to Claude Code and Copilot

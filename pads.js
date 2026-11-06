@@ -182,7 +182,100 @@ function statusFor(done, current) {
   return current;
 }
 
+/**
+ * Takes a task's line, and every line nested under it, out of a pad.
+ *
+ * For a move that carries the work's line to another project's pad. The block
+ * is the anchored line and the lines after it that are indented deeper, up to
+ * the first line that is not (a blank line ends it too, as it ends a markdown
+ * list), so a subtask's line travels with its parent's and prose under the
+ * next heading stays. The block comes back with the common indent removed, so
+ * it nests where it lands rather than where it was. Returns null when no line
+ * carries the anchor: nothing to cut, and nothing changed.
+ */
+function cutBlock(body, taskId) {
+  // A pad saved with Windows line endings is cut the same way and keeps them.
+  const text = String(body == null ? "" : body);
+  const crlf = text.includes("\r\n");
+  const plain = crlf ? text.replace(/\r\n/g, "\n") : text;
+  const lines = plain.split("\n");
+  // A line inside a fenced code block is an example, not the task, even when
+  // it quotes the task's anchor: the real line is the one outside the fences.
+  const fenced = new Set();
+  let open = null;
+  lines.forEach((line, i) => {
+    const m = /^\s*(```|~~~)/.exec(line);
+    if (m && (!open || m[1] === open)) { fenced.add(i); open = open ? null : m[1]; return; }
+    if (open) fenced.add(i);
+  });
+  const entry = parse(plain).find((e) => e.taskId === Number(taskId) && !fenced.has(e.index));
+  if (!entry) return null;
+  const lead = (line) => /^[ \t]*/.exec(line)[0];
+  const width = (line) => lead(line).replace(/\t/g, "  ").length;
+  const rootWidth = width(lines[entry.index]);
+  // By indentation, not by blank lines: a blank line inside the block is
+  // part of it when deeper lines follow, so a grandchild below a gap is not
+  // left behind to be filed under the old parent by the next derivation.
+  let end = entry.index + 1;
+  for (let i = end; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    if (width(lines[i]) <= rootWidth) break;
+    end = i + 1;
+  }
+  const taken = lines.slice(entry.index, end);
+  const block = taken.map((line) => (line.trim() ? lead(line).replace(/\t/g, "  ").slice(rootWidth) + line.slice(lead(line).length) : "")).join("\n");
+  const rest = [...lines.slice(0, entry.index), ...lines.slice(end)].join("\n");
+  return { body: crlf ? rest.replace(/\n/g, "\r\n") : rest, block };
+}
+
+/**
+ * Adds a block of lines to the end of a pad, under a heading when one is named.
+ *
+ * The heading is found case-insensitively and the block goes at the end of its
+ * section; a heading that is not there yet is added at the end of the pad. No
+ * heading means the very end, after a blank line, so the block never runs into
+ * the paragraph above it.
+ */
+function appendBlock(body, block, heading = null) {
+  const text = String(body == null ? "" : body);
+  const lines = text.split("\n");
+  if (heading) {
+    const wanted = String(heading).trim().toLowerCase().replace(/^#+\s*/, "");
+    let start = -1;
+    let level = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+      if (m && m[2].trim().toLowerCase() === wanted) { start = i; level = m[1].length; break; }
+    }
+    if (start >= 0) {
+      let end = lines.length;
+      for (let i = start + 1; i < lines.length; i++) {
+        const m = /^(#{1,6})\s+/.exec(lines[i]);
+        if (m && m[1].length <= level) { end = i; break; }
+      }
+      while (end > start + 1 && !lines[end - 1].trim()) end--;
+      return [...lines.slice(0, end), ...String(block).split("\n"), ...lines.slice(end)].join("\n");
+    }
+    const lead = text.trim() ? `${text.replace(/\n+$/, "")}\n\n` : "";
+    return `${lead}## ${String(heading).replace(/^#+\s*/, "")}\n\n${block}\n`;
+  }
+  const lead = text.trim() ? `${text.replace(/\n+$/, "")}\n\n` : "";
+  return `${lead}${block}\n`;
+}
+
+/**
+ * A pad's text with every task anchor taken out.
+ *
+ * For a copy of a pad, which is a copy of the document and not of the work: an
+ * anchor left in would point the copy's lines at the original's tasks, and the
+ * next derivation would either fight over them or file duplicates.
+ */
+function stripAnchors(body) {
+  return String(body == null ? "" : body).replace(/[ \t]*<!--\s*d:\d+\s*-->/g, "");
+}
+
 module.exports = {
   CHECKBOX, ANCHOR, PRIORITIES,
   parse, compose, writeLine, anchorLine, anchoredIds, statusFor, depthOf,
+  cutBlock, appendBlock, stripAnchors,
 };

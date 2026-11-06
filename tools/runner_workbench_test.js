@@ -20,6 +20,9 @@ const { spawnSync, execFileSync } = require("child_process");
 
 const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "delphi-runner-wb-")));
 process.env.DELPHI_DATA_DIR = dir;
+// An agent session carries the id of its own database, and every server this
+// starts would inherit it and refuse the temp one.
+delete process.env.DELPHI_DB_ID;
 process.env.DELPHI_DB = path.join(dir, "delphi.db");
 for (const real of [path.join(os.homedir(), "va", "delphi", "delphi.db"),
                     path.join(os.homedir(), "Library", "Application Support", "Delphi", "delphi.db")]) {
