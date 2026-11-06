@@ -11,6 +11,8 @@
  * where, is workbench.js's business; this only knows what Delphi recorded.
  */
 
+const { makeAuditor } = require("../agent/audit");
+
 const STATES = ["active", "parked", "finished", "discarded", "missing", "closing"];
 // Live is what the unique indexes count. Missing is live on purpose: it is
 // still the task's Workbench until someone picks Recreate or Forget. So is
@@ -74,9 +76,10 @@ function idOf(value, what) {
   return n;
 }
 
-function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
+function makeWorkbenchStore({ sql, actor = "agent", who = null, step = null } = {}) {
   if (typeof sql !== "function") throw new Error("makeWorkbenchStore needs a sql(query, params) function");
   const writer = String(actor || "agent");
+  const auditor = makeAuditor({ sql, who: who || { actor: writer }, step });
 
   function find(id) {
     return shape(sql(`${SELECT} WHERE w.id = :p1`, [idOf(id, "Workbench id")])[0]);
@@ -336,11 +339,19 @@ function makeWorkbenchStore({ sql, actor = "agent" } = {}) {
   // Audited against the task, as Sheet entries are: "started workbench" belongs
   // in the task's history, where someone looking for where the work went will
   // look.
+  //
+  // Marked __note, because it changed nothing in the task's row: undo has
+  // nothing to put back and steps over it, and it does not stand in the way of
+  // undoing a change to the task made before it. The folder's own safety is
+  // keep.js's, not History's.
   function audit(taskId, summary, by = null) {
     const t = sql("SELECT id, title FROM tasks WHERE id = :p1", [idOf(taskId, "task_id")])[0];
     if (!t) return;
-    sql(`INSERT INTO audit (action, entity, entity_id, summary, label)
-         VALUES ('update', 'task', :p1, :p2, :p3)`, [t.id, `${summary} (by ${by || writer})`, t.title]);
+    const [q, p] = auditor.statement({ action: "update", entity: "task", id: t.id, summary, label: t.title,
+                                       before: { __note: "workbench" },
+                                       // Named by whoever closed it, whose kind the store cannot know.
+                                       as: by ? { actor: by, actor_type: null } : null });
+    sql(q, p);
   }
 
   return { beginClosing, cancelClosing, completeClosing, busyIn, find, get, task, live, byPath, list, insert, setState, touch, repoFolders, repo, adoptRepo, reposInUse, allRepos, updateRepo, audit, actor: writer };

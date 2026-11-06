@@ -140,7 +140,10 @@ CREATE TABLE IF NOT EXISTS comments (
   ref_id       INTEGER REFERENCES comments(id) ON DELETE SET NULL,
   note_id      INTEGER REFERENCES notes(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  -- The session that wrote it, so a Sheet can say so without a join through
+  -- audit. No REFERENCES, for the reason audit.session_id has none.
+  session_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id, id);
 -- The ledger is the promoted entries, read on every claim and every get_task.
@@ -210,9 +213,21 @@ CREATE TABLE IF NOT EXISTS audit (
   before_json TEXT,                   -- null for create
   after_json  TEXT,                   -- null for delete
   undone      INTEGER NOT NULL DEFAULT 0,
-  undone_at   TEXT
+  undone_at   TEXT,
+  -- Who made it, as data rather than the " (by X)" on the end of summary, which
+  -- is all rows before these columns have. See agent/audit.js. session_id has
+  -- no REFERENCES on purpose: deleting a session must not cascade into, or
+  -- null, the History of what it did.
+  actor       TEXT,                   -- DELPHI_ACTOR, or 'you' from the window
+  actor_type  TEXT,                   -- human | agent | tool
+  session_id  INTEGER,
+  job_id      INTEGER,                -- the job that made it, when one did
+  step        TEXT                    -- one tool call or window action; its rows share it
 );
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
+-- Undo's later-change check, and the step lookups the writers make in a batch.
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit(entity, entity_id, id);
+CREATE INDEX IF NOT EXISTS idx_audit_session ON audit(session_id, id);
 
 -- Reminders.
 --

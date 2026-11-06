@@ -13,7 +13,9 @@
  *
  * - Every insert uses RETURNING. On the sqlite3 route each sql() call is its own
  *   process, so last_insert_rowid() is always 0 there.
- * - Nothing may assume a transaction spans two calls, for the same reason.
+ * - Nothing may assume a transaction spans two calls, for the same reason. An
+ *   entry and its History row go through batch() together, with the row taking
+ *   the entry's id inside the batch (agent/audit.js sheetAppend).
  *
  * Comments keep their table. An entry is a comment with a kind, so everything
  * that already reads comments (the vault, undo, the importers) keeps working.
@@ -21,6 +23,7 @@
 
 const fmt = require("./format");
 const decide = require("./decide");
+const { makeAuditor } = require("../agent/audit");
 
 const KINDS = ["say", "run", "ask", "decide", "note"];
 const NOTE_KINDS = ["decision", "gotcha", "reference", "note"];
@@ -115,10 +118,17 @@ function cleanBody(body) {
   return fmt.normaliseBody(body);
 }
 
-function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
+// batch is required on the sqlite3 route: an entry's History row takes the
+// entry's id from last_insert_rowid(), which only one process running the
+// whole batch can see. A binding sql() on one handle (db.sqlP) works without.
+function makeSheetStore({ sql, batch = null, actor = "agent", authorType = null, who = null, step = null } = {}) {
   if (typeof sql !== "function") throw new Error("makeSheetStore needs a sql(query, params) function");
   const writer = String(actor || "agent");
   const writerType = AUTHOR_TYPES.includes(authorType) ? authorType : null;
+  // who is the writer's session and job as well as its name, from whoever made
+  // the store; without one the entries carry the name alone.
+  const auditor = makeAuditor({ sql, batch, who: who || { actor: writer, actor_type: writerType }, step });
+  const sessionOf = () => auditor.who().session_id;
 
   const taskRow = (id) => sql("SELECT * FROM tasks WHERE id = :p1", [id])[0] || null;
 
@@ -132,11 +142,10 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
   // Comments are not in the audit table's entity list, so the task carries the
   // trail, as add_comment and db.createComment already do. That keeps History
   // readable: "promoted entry 812" belongs against the task, not against a row
-  // nobody can navigate to.
-  function audit(task, summary) {
-    sql(`INSERT INTO audit (action, entity, entity_id, summary, label)
-         VALUES ('update', 'task', :p1, :p2, :p3)`,
-        [task.id, `${summary} (by ${writer})`, task.title]);
+  // nobody can navigate to. Each write and its row are one batch; see
+  // agent/audit.js for the __op they carry.
+  function edit(task, entryId, summary, writes) {
+    auditor.run(auditor.sheetEdit(task, entryId, { summary }, writes));
   }
 
   function get(id) {
@@ -312,7 +321,7 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     return text;
   }
 
-  function insert({ task, kind, body, meta = null, refId = null, promote = false, author = null, authorType: type = null }) {
+  function insert({ task, kind, body, meta = null, refId = null, promote = false, author = null, authorType: type = null, summary }) {
     let ref = null;
     if (refId !== null && refId !== undefined && refId !== "") {
       ref = get(refId);
@@ -325,13 +334,13 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     }
     const who = author === null || author === undefined || author === "" ? writer : String(author);
     const resolvedType = AUTHOR_TYPES.includes(type) ? type : writerType;
-    const row = sql(
-      `INSERT INTO comments (task_id, author, body, kind, author_type, meta, promoted, ref_id)
-       VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8)
-       RETURNING id`,
-      [task.id, who, body, kind, resolvedType, meta ? JSON.stringify(meta) : null, promote ? 1 : 0, ref ? ref.id : null]
-    )[0];
-    return get(row.id);
+    const stepId = auditor.step();
+    auditor.run(auditor.sheetAppend(task, { summary, stepId }, [
+      `INSERT INTO comments (task_id, author, body, kind, author_type, meta, promoted, ref_id, session_id)
+       VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9)`,
+      [task.id, who, body, kind, resolvedType, meta ? JSON.stringify(meta) : null, promote ? 1 : 0, ref ? ref.id : null, sessionOf()],
+    ]));
+    return get(auditor.appendedId(task.id, stepId));
   }
 
   /**
@@ -353,9 +362,8 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     refuseRunMeta(kind, meta, "this entry");
     const task = requireTask(taskId);
     const text = validateBody(kind, body);
-    const entry = insert({ task, kind, body: text, meta, refId, promote, author, authorType: type });
-    audit(task, kind === "run" ? `ran ${clip(text, 60)}` : kind === "note" ? "noted" : "commented");
-    return entry;
+    return insert({ task, kind, body: text, meta, refId, promote, author, authorType: type,
+                    summary: kind === "run" ? `ran ${clip(text, 60)}` : kind === "note" ? "noted" : "commented" });
   }
 
   /**
@@ -397,25 +405,27 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
       }
     }
     const merged = meta === undefined ? before.meta : { ...(before.meta || {}), ...(meta || {}) };
-    sql(`UPDATE comments SET meta = :p1, body = :p2, updated_at = datetime('now') WHERE id = :p3`,
-        [merged ? JSON.stringify(merged) : null, text, before.id]);
-    const after = get(before.id);
 
+    // Worked out before the write, from what it will leave, so the write and
+    // its History row can be one batch.
     const wasRunning = !before.meta || before.meta.state === "running" || before.meta.state === undefined;
-    const finished = before.kind === "run" && after.meta && (after.meta.state === "ok" || after.meta.state === "fail") && wasRunning;
+    const finished = before.kind === "run" && merged && (merged.state === "ok" || merged.state === "fail") && wasRunning;
+    let summary;
     if (finished) {
-      const code = after.meta.code === null || after.meta.code === undefined ? "" : `:${after.meta.code}`;
-      audit(task, `finished ${clip(after.body, 40)}: ${after.meta.state === "ok" ? "ok" : `fail${code}`}`);
-    } else if (after.body !== before.body) {
+      const code = merged.code === null || merged.code === undefined ? "" : `:${merged.code}`;
+      summary = `finished ${clip(text, 40)}: ${merged.state === "ok" ? "ok" : `fail${code}`}`;
+    } else if (text !== before.body) {
       // The words before the edit, kept where History can show them, because
       // an edit that leaves no trace of what was there is how a finding
       // quietly disappears.
       const was = before.body.length > 2000 ? `${before.body.slice(0, 1997)}...` : before.body;
-      audit(task, `edited entry ${after.id}, which said: "${was}"`);
+      summary = `edited entry ${before.id}, which said: "${was}"`;
     } else {
-      audit(task, `edited entry ${after.id}`);
+      summary = `edited entry ${before.id}`;
     }
-    return after;
+    edit(task, before.id, summary, [[`UPDATE comments SET meta = :p1, body = :p2, updated_at = datetime('now') WHERE id = :p3`,
+                                      [merged ? JSON.stringify(merged) : null, text, before.id]]]);
+    return get(before.id);
   }
 
   function promote(id, on = true) {
@@ -425,8 +435,8 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     const before = get(id);
     const task = requireTask(before.task_id);
     const flag = on ? 1 : 0;
-    sql("UPDATE comments SET promoted = :p1, updated_at = datetime('now') WHERE id = :p2", [flag, before.id]);
-    audit(task, `${flag ? "promoted" : "unpromoted"} entry ${before.id}`);
+    edit(task, before.id, `${flag ? "promoted" : "unpromoted"} entry ${before.id}`,
+         [["UPDATE comments SET promoted = :p1, updated_at = datetime('now') WHERE id = :p2", [flag, before.id]]]);
     return get(before.id);
   }
 
@@ -458,16 +468,18 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
     body = `${body}\n\nFrom task #${task.id}, entry ${entry.id}`;
     const noteTitle = clip(title && String(title).trim() ? title : body.split("\n")[0], 80) || `Entry ${entry.id}`;
 
-    const note = sql(
-      `INSERT INTO notes (project_id, title, body, kind) VALUES (:p1, :p2, :p3, :p4)
-       RETURNING id, title, kind, project_id`,
-      [task.project_id ?? null, noteTitle, body, kind]
-    )[0];
-    sql(`UPDATE comments SET note_id = :p1, promoted = 1, updated_at = datetime('now') WHERE id = :p2`,
-        [note.id, entry.id]);
-    audit(task, `filed entry ${entry.id} as ${kind}`);
-    sql(`INSERT INTO audit (action, entity, entity_id, summary, label) VALUES ('create', 'note', :p1, :p2, :p3)`,
-        [note.id, `created (by ${writer})`, note.title]);
+    // The note, its History row, the entry pointing at it and the entry's row,
+    // in one batch: a note filed without the entry knowing is a second copy
+    // the next filing would make again.
+    const stepId = auditor.step();
+    // The note's create sits inside the entry's edit, so History reads as it
+    // always has: the filing, then the note it made.
+    auditor.run(auditor.sheetEdit(task, entry.id, { summary: `filed entry ${entry.id} as ${kind}`, stepId }, [
+      ...auditor.create("note", { summary: "created", label: noteTitle, stepId },
+        [`INSERT INTO notes (project_id, title, body, kind) VALUES (:p1, :p2, :p3, :p4)`, [task.project_id ?? null, noteTitle, body, kind]]),
+      [`UPDATE comments SET note_id = ${auditor.createdId("note", stepId)}, promoted = 1, updated_at = datetime('now') WHERE id = :p1`, [entry.id]],
+    ]));
+    const note = sql("SELECT id, title, kind, project_id FROM notes WHERE id = :p1", [auditor.created("note", stepId)])[0];
     return { entry: get(entry.id), note };
   }
 
@@ -498,9 +510,7 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
       if (/\[[A-Za-z]\]/.test(label)) throw new Error(`Option ${keys[i]} cannot contain [${keys[i]}]-style brackets.`);
       return { key: keys[i], label };
     });
-    const entry = insert({ task, kind: "ask", body: q, meta: { options: list }, author });
-    audit(task, `asked "${clip(q, 60)}"`);
-    return entry;
+    return insert({ task, kind: "ask", body: q, meta: { options: list }, author, summary: `asked "${clip(q, 60)}"` });
   }
 
   /** Answers an ask. Promoted, because a decision is what the next agent most needs. */
@@ -527,9 +537,8 @@ function makeSheetStore({ sql, actor = "agent", authorType = null } = {}) {
       task, kind: "decide",
       body: reason ? `${option.key}\n${reason}` : option.key,
       meta: { choice: option.key, label: option.label },
-      refId: askEntry.id, promote: true, author,
+      refId: askEntry.id, promote: true, author, summary: `decided ${option.key} on ${askEntry.id}`,
     });
-    audit(task, `decided ${option.key} on ${askEntry.id}`);
     return entry;
   }
 

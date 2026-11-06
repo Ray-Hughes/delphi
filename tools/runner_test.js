@@ -157,7 +157,10 @@ for (const [route, env] of [["node:sqlite", {}], ["sqlite3 binary", { DELPHI_SQL
   check(`${route}: the agent's words are the summary, verbatim`,
         comment && comment.body.split("\n")[0], `Did the thing for task ${task.id}. Quotes ' and :p1 and $& survive.`);
   check(`${route}: attributed to the runner`, comment && comment.author, `runner-${route}`);
-  const audit = db.sqlP("SELECT summary FROM audit WHERE entity = 'task' AND entity_id = :p1 ORDER BY id", [task.id]).map((r) => r.summary);
+  // The task's own changes. Its Sheet entries, the summary among them, have
+  // rows of their own (agent/audit.js sheetAppend), so they are left out here.
+  const audit = db.sqlP(`SELECT summary FROM audit WHERE entity = 'task' AND entity_id = :p1
+                           AND (before_json IS NULL OR before_json NOT LIKE '{"__op":{"kind":"sheet_%') ORDER BY id`, [task.id]).map((r) => r.summary);
   check(`${route}: claimed then done, by the runner`, audit.slice(-2),
         [`claimed by runner-${route} (by runner-${route})`, `status to done (by runner-${route})`]);
 }

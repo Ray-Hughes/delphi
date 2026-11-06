@@ -41,6 +41,7 @@ const harness = require("../harness");
 const chat = require("../sheet/chat");
 const fmt = require("../sheet/format");
 const { makeSheetStore, pidAlive } = require("../sheet/store");
+const { makeAuditor } = require("./audit");
 const launch = require("./launch");
 const binaries = require("./binaries");
 const jobs = require("./jobs");
@@ -214,6 +215,9 @@ function storeClient(store) {
 
 function createDispatcher({
   sql,
+  // Runs a list of statements as one transaction, so a task the dispatcher
+  // makes and its History row land together. db.batchP in the app.
+  batch = null,
   // workbench/workbench.js createWorkbench(...), for jobs that change code.
   benches = null,
   logDir = null,
@@ -237,7 +241,11 @@ function createDispatcher({
   log = (...parts) => console.error(...parts),
 } = {}) {
   if (typeof sql !== "function") throw new Error("createDispatcher needs a sql(query, params) function");
-  const tool = makeSheetStore({ sql, actor: "delphi", authorType: "tool" });
+  const tool = makeSheetStore({ sql, batch, actor: "delphi", authorType: "tool" });
+  // The dispatcher's own History rows are Delphi's, a tool's; a person's
+  // approval or reply is written as that person through as.
+  const auditor = makeAuditor({ sql, batch, who: { actor: "delphi", actor_type: "tool" } });
+  const typeOf = (by) => (by === "delphi" ? "tool" : by === "you" ? "human" : fmt.inferAuthorType(by));
   const live = new Map();
   let closed = false;
   let ticking = false;
@@ -257,10 +265,13 @@ function createDispatcher({
     try { onChange({ id: run.id, state: run.state, project_id: run.project_id }); } catch {}
   };
 
+  // A job's own record. Never undone (agent/audit.js BOOKKEEPING), and carries
+  // the job's id so its rows can be found by it.
   function audit(id, summary, label, by = "delphi") {
     try {
-      sql(`INSERT INTO audit (action, entity, entity_id, summary, label) VALUES ('update', 'handoff', :p1, :p2, :p3)`,
-          [Number(id), `${summary} (by ${by})`, label ? String(label).slice(0, 80) : null]);
+      auditor.run([auditor.statement({ action: "update", entity: "handoff", id: Number(id), summary,
+                                       label: label ? String(label).slice(0, 80) : null,
+                                       as: { actor: by, actor_type: typeOf(by), job_id: Number(id) } })]);
     } catch (error) { log("job audit", error.message); }
   }
 
@@ -386,7 +397,7 @@ function createDispatcher({
     if (run.state === "running" || run.state === "queued") throw new Error(`Job ${id} is ${run.state}; reply once its turn has finished.`);
     if (run.approval === "rejected") throw new Error(`Job ${id} was rejected. Ask again to start a new one.`);
     if (run.task_id) {
-      makeSheetStore({ sql, actor: by, authorType: "human" }).append({ taskId: run.task_id, kind: "say", body: text });
+      makeSheetStore({ sql, batch, actor: by, authorType: "human" }).append({ taskId: run.task_id, kind: "say", body: text });
     }
     const after = jobs.update(sql, id, { state: "queued", followup: text }, { from: run.state });
     if (!after) throw notIn(id, "finished its turn");
@@ -422,7 +433,7 @@ function createDispatcher({
     let entry = null;
     if (after.task_id) {
       if (!accepted && text) {
-        entry = makeSheetStore({ sql, actor: by, authorType: "human" }).append({ taskId: after.task_id, kind: "say", body: text, promote: true });
+        entry = makeSheetStore({ sql, batch, actor: by, authorType: "human" }).append({ taskId: after.task_id, kind: "say", body: text, promote: true });
       }
       note(after.task_id, accepted ? `Job ${id} reviewed and accepted by ${by}.` : `Job ${id} sent back by ${by}${text ? "." : ", with no note."}`);
     }
@@ -576,9 +587,16 @@ function createDispatcher({
       // The claim and status rechecked in the same statement as the take: an
       // agent's queue_next between the look and here must not leave the task
       // with two workers.
-      const took = sql(`UPDATE tasks SET queue = NULL, updated_at = datetime('now')
-                         WHERE id = :p1 AND queue = :p2 AND status NOT IN ('done', 'blocked')
-                           AND (claimed_by IS NULL OR claim_expires < datetime('now')) RETURNING id`, [t.id, t.queue])[0];
+      //
+      // The take and its History row, before and after, are one batch; the
+      // row is written only when the recheck chose the task.
+      const stepId = auditor.step();
+      const chosen = `SELECT id FROM tasks WHERE id = ${Number(t.id)} AND queue = '${String(t.queue).replace(/'/g, "''")}'
+                        AND status NOT IN ('done', 'blocked') AND (claimed_by IS NULL OR claim_expires < datetime('now'))`;
+      auditor.run(auditor.update("task", { sql: chosen }, { summary: `taken from the ${t.queue} queue`, stepId }, [
+        [`UPDATE tasks SET queue = NULL, updated_at = datetime('now') WHERE id = ${auditor.stepRowId("task", stepId)}`, []],
+      ]));
+      const took = sql("SELECT id FROM audit WHERE step = :p1 AND entity = 'task' ORDER BY id DESC LIMIT 1", [stepId])[0];
       if (!took) continue;
       const type = t.queued_by_type || "agent";
       const { state, approval } = jobs.approvalFor({ requesterType: type, autoApprove: Number(t.auto_approve) === 1 });
@@ -587,8 +605,9 @@ function createDispatcher({
         source: "queue", requestedBy: t.queued_by || null, requesterType: type, state, approval, wake: false,
         context: { queue: t.queue },
       });
-      sql(`INSERT INTO audit (action, entity, entity_id, summary, label) VALUES ('update', 'task', :p1, :p2, :p3)`,
-          [t.id, `taken from the ${t.queue} queue as job ${run.id} (by delphi)`, t.title]);
+      // Which job took it, now that there is one.
+      sql("UPDATE audit SET job_id = :p1, summary = :p2 WHERE id = :p3",
+          [run.id, `taken from the ${t.queue} queue as job ${run.id} (by delphi)`, Number(took.id)]);
       if (state === "needs_approval") note(t.id, `Job ${run.id}: queued for ${run.harness_label} by ${t.queued_by || "an unknown writer"}, waiting for a person to approve it.`);
       changed(run);
     }
@@ -704,17 +723,24 @@ function createDispatcher({
   function ensureTask(job, project) {
     if (job.task_id) return job.task_id;
     const title = firstLine(job.request, 120) || `Job ${job.id}`;
-    const row = sql(`INSERT INTO tasks (project_id, title, detail, priority, source) VALUES (:p1, :p2, :p3, 'med', :p4) RETURNING id`,
-                    [project.id, title, String(job.request), job.requested_by || "delphi"])[0];
-    sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'todo', :p2)", [row.id, job.requested_by || "delphi"]);
-    sql(`INSERT INTO audit (action, entity, entity_id, summary, label) VALUES ('create', 'task', :p1, :p2, :p3)`,
-        [row.id, `created for job ${job.id}, which had no task (by delphi)`, title]);
-    return Number(row.id);
+    const stepId = auditor.step();
+    auditor.run(auditor.create("task", { summary: `created for job ${job.id}, which had no task`, label: title, stepId },
+      [`INSERT INTO tasks (project_id, title, detail, priority, source) VALUES (:p1, :p2, :p3, 'med', :p4)`,
+       [project.id, title, String(job.request), job.requested_by || "delphi"]],
+      [[`INSERT INTO status_events (task_id, status, actor) VALUES (${auditor.createdId("task", stepId)}, 'todo', :p1)`, [job.requested_by || "delphi"]]]));
+    return auditor.created("task", stepId);
   }
 
   function startTask(taskId, actor) {
-    const t = sql("UPDATE tasks SET status = 'doing', updated_at = datetime('now') WHERE id = :p1 AND status = 'todo' RETURNING id, title", [taskId])[0];
-    if (t) sql("INSERT INTO status_events (task_id, status, actor) VALUES (:p1, 'doing', :p2)", [taskId, actor]);
+    // Recorded, before and after, which it never was: a job's start moved the
+    // task to doing with nothing in History to say so or undo it.
+    const stepId = auditor.step();
+    const took = auditor.stepRowId("task", stepId);
+    auditor.run(auditor.update("task", { sql: `SELECT id FROM tasks WHERE id = ${Number(taskId)} AND status = 'todo'` },
+      { summary: "status todo to doing, as its job started", stepId }, [
+        [`UPDATE tasks SET status = 'doing', updated_at = datetime('now') WHERE id = ${took}`, []],
+        [`INSERT INTO status_events (task_id, status, actor) SELECT id, 'doing', :p1 FROM tasks WHERE id = ${took}`, [actor]],
+      ]));
   }
 
   function sheetText(taskId) {
@@ -857,7 +883,7 @@ function createDispatcher({
       note(taskId, `Job ${job.id} is running unguarded: agent/guard.py cannot see ${label}'s commands here, and project ${project.name} allows unguarded agents.`);
     }
 
-    const client = storeClient(makeSheetStore({ sql, actor, authorType: "agent" }));
+    const client = storeClient(makeSheetStore({ sql, batch, actor, authorType: "agent", who: { actor, actor_type: "agent", job_id: job.id, session_id: job.from_session_id ?? null } }));
     const firstEntry = Number(sql("SELECT COALESCE(MAX(id), 0) AS n FROM comments", [])[0].n);
     // The binary itself, resolved once here and spawned by that path, so what
     // was checked is what runs.

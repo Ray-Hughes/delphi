@@ -23,6 +23,7 @@
  */
 
 const pads = require("../pads");
+const { makeAuditor } = require("../agent/audit");
 const { makeEvaluator, suggesterLabel, AGENT_CONFIDENCE } = require("./evaluate");
 
 // What each kind of item is, as the store needs to know it: its table, the
@@ -111,7 +112,7 @@ const ORACLE_CALL = Symbol("oracle-call");
 
 function makeItemStore({
   sql, batch = null, actor = "agent", authorType = null, settings = () => ({}),
-  derive = null, agentEvaluator = null,
+  derive = null, agentEvaluator = null, who = null, step = null,
 } = {}) {
   if (typeof sql !== "function") throw new Error("makeItemStore needs a sql(query, params) function");
   const writer = String(actor || "agent");
@@ -443,12 +444,11 @@ function makeItemStore({
 
   // --- writing ---------------------------------------------------------------------
 
-  const auditStatement = (action, entity, entityId, summary, label, before, after) => [
-    `INSERT INTO audit (action, entity, entity_id, summary, label, before_json, after_json)
-     VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7)`,
-    [action, entity, entityId, `${summary} (by ${writer})`, label ?? null,
-     before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null],
-  ];
+  // Who as well as the name: the session and job a change came from. See
+  // agent/audit.js.
+  const auditor = makeAuditor({ sql, who: who || { actor: writer, actor_type: writerType }, step });
+  const auditStatement = (action, entity, entityId, summary, label, before, after) =>
+    auditor.statement({ action, entity, id: entityId, summary, label, before, after });
   /** The newest audit row a batch just wrote. Batches return nothing, on either route. */
   const lastAudit = (entity, entityId, action) => {
     const row = sql(`SELECT id FROM audit WHERE entity = :p1 AND entity_id = :p2 AND action = :p3
@@ -456,8 +456,8 @@ function makeItemStore({
     return row ? Number(row.id) : null;
   };
   const sheetNote = (taskId, body, meta) => [
-    `INSERT INTO comments (task_id, author, author_type, kind, body, meta) VALUES (:p1, :p2, :p3, 'note', :p4, :p5)`,
-    [taskId, writer, writerType, body, meta ? JSON.stringify(meta) : null],
+    `INSERT INTO comments (task_id, author, author_type, kind, body, meta, session_id) VALUES (:p1, :p2, :p3, 'note', :p4, :p5, :p6)`,
+    [taskId, writer, writerType, body, meta ? JSON.stringify(meta) : null, auditor.who().session_id],
   ];
   const via = (ctx) => (ctx && ctx.flagId ? ` (flag ${ctx.flagId})` : "");
   const credit = (ctx) => (ctx && ctx.proposedBy ? `, proposed by ${ctx.proposedBy}` : "");
