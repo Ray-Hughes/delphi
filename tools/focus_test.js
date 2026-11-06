@@ -183,7 +183,7 @@ async function main() {
   await js("window.confirm = () => true; window.alert = () => {}; document.documentElement.setAttribute('data-motion', 'off'); 0");
 
   console.log("\nopening Focus");
-  check("the top bar has the way in", await js(`!!document.querySelector("#focus-entry .fx-entry")`), true);
+  check("the top bar has the way in", await js(`!!document.querySelector("#focus-entry .fx-enter")`), true);
   check("Cmd+K lists it", await js(`DelphiCommands.match(COMMANDS, "focus mode", state).some((c) => c.id === "focus-mode")`), true);
   await js(`document.activeElement && document.activeElement.blur(); 0`);
   key("F");
@@ -192,6 +192,8 @@ async function main() {
   check("the rest of the window is out of reach", await js(`[document.getElementById("top").inert, document.querySelector("body > .body").inert]`), [true, true]);
   check("its subtasks are there", await js(`[...document.querySelectorAll("#focus .fx-step .txt")].map((n) => n.textContent)`), [sub.title]);
   check("an agent's task is never next", await js(`[...document.querySelectorAll("#focus .fx-peek .t")].map((n) => n.textContent)`), [second.title, "Tidy the backlog"]);
+
+  check("Today names the same first task as Focus", await js(`DelphiToday.focusQueue(state.everyTask || [])[0]?.t.title`), first.title);
 
   console.log("\na subtask saves");
   await click(`#focus [data-act="sub-${sub.id}"]`);
@@ -254,6 +256,12 @@ async function main() {
   key("K", [process.platform === "darwin" ? "meta" : "control"]);
   await wait(300);
   check("Escape does not end it, and Cmd+K does not open", [await js(`!!document.getElementById("fx-brk") && DelphiFocus.isOpen()`), await js(`DelphiPalette.isOpen()`)], [true, false]);
+  const overlays = await js(`document.querySelectorAll("body > .overlay").length`);
+  key("L", [process.platform === "darwin" ? "meta" : "control"]);
+  await wait(300);
+  check("Cmd+L (Log a fact, a window listener) opens nothing behind the blur", await js(`document.querySelectorAll("body > .overlay").length`), overlays);
+  check("the break announces from a live region of its own, which is not inert",
+    await js(`(() => { const l = document.querySelector("#fx-brk .fx-live"); return Boolean(l) && l.getAttribute("aria-live") === "polite" && !l.closest("[inert]"); })()`), true);
   await js(`document.body.append(Object.assign(document.createElement("div"), { className: "late" })); 0`);
   await wait(100);
   check("something added during the break is shut out too", await js(`document.querySelector("body > .late").inert`), true);

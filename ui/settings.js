@@ -190,11 +190,15 @@ globalThis.DelphiSettingsPanel = (() => {
     const tabs = globalThis.DelphiCommands ? DelphiCommands.TABS : [];
     for (const t of tabs) rows.push({ group: "Go to", label: t.label, chord: t.chord });
     rows.push({ group: "Go to", label: "Needs you", chord: "i" });
+    // The Focus letter is a setting, so the list says the one in use.
+    const letter = String(((lent.state && lent.state().settings) || {}).focusLetter || "f");
     rows.push(
       { group: "In lists", label: "Next and previous row", plain: ["J", "K"] },
       { group: "In lists", label: "Open the row", plain: ["Enter"] },
       { group: "In lists", label: "Edit its title", plain: ["E"] },
-      { group: "In lists", label: "Focus on it (anywhere else, Focus mode on the top task)", plain: ["F"] },
+      letter === "off"
+        ? { group: "In Focus", label: "Open Focus mode: no key set, use Cmd+K", plain: [] }
+        : { group: "In Focus", label: "Open Focus mode, on the highlighted row if there is one", plain: [letter.toUpperCase()] },
       { group: "In Focus", label: "Interruption, Break, Done", plain: ["I", "B", "D"] },
       { group: "In Focus", label: "Leave Focus (not during a break)", plain: ["Esc"] },
       { group: "In Settings", label: "Search settings", keys: "CmdOrCtrl+F" },
