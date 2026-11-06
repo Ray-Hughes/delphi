@@ -63,7 +63,8 @@ const OUTSIDE_TOO = [
   "items",
   // The cost and time ledger: the window and cost_ledger do the same sums.
   "ledger",
-  // Stuck tasks and the daily brief: the window's Today and daily_brief.
+  // Stuck tasks, the daily brief and the weekly review: the window's Today,
+  // daily_brief and weekly_review.
   "today",
 ];
 

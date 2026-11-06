@@ -591,6 +591,7 @@ globalThis.DelphiToday = (() => {
       return;
     }
 
+    if (window.DelphiWeekly) { const wk = DelphiWeekly.card(); if (wk) page.append(wk); }
     if (data && data.brief) page.append(briefSection(data));
     else if (data && data.error) page.append(el("div", { className: "td-msg err", role: "alert", textContent: `The brief could not be read: ${data.error}` }));
 
