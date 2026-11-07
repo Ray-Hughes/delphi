@@ -100,10 +100,10 @@ console.log("\nblocks");
   const deep = MD.parse("text\n\n- a\n  - [ ] b\n    - [x] c")[1].items[0].children[1].items[0];
   check("a nested task keeps its source line", [deep.task.n, deep.children[1].items[0].task.n], [3, 4]);
   check("CRLF reads as LF", MD.parse("# a\r\n\r\ntext").map((b) => b.type), ["heading", "para"]);
-  // A lone CR is text, as toggleTask counts lines, so the two agree on which
-  // line a box is.
+  // A lone CR ends a line in the parser and in toggleTask alike, so the two
+  // agree on which line a box is.
   const lone = MD.parse("a\rb\n- [ ] x")[1].items[0].task.n;
-  check("a lone CR does not shift line numbers", [lone, MD.toggleTask("a\rb\n- [ ] x", lone, true)], [1, "a\rb\n- [x] x"]);
+  check("a lone CR counts as a line the same way in both", [lone, MD.toggleTask("a\rb\n- [ ] x", lone, true)], [2, "a\rb\n- [x] x"]);
 }
 
 console.log("\ninline");
@@ -121,7 +121,6 @@ console.log("\ninline");
   check("an email autolink", MD.inline("<a@b.co>")[0].href, "mailto:a@b.co");
   check("#123 is a ref", MD.inline("see #123.")[1], { t: "ref", id: 123, v: "#123" });
   check("but not a#1, &#1 or /#1", kinds("a#1 &#1 x/#1"), ["text"]);
-  check("an HTML comment is dropped", MD.inline("a <!--d:12--> b"), [{ t: "text", v: "a  b" }]);
   check("a tag is text", MD.inline("<b>x</b>"), [{ t: "text", v: "<b>x</b>" }]);
   check("a backslash escape", MD.inline("\\*not em\\*"), [{ t: "text", v: "*not em*" }]);
   check("two trailing spaces are a hard break", kinds("a  \nb"), ["text", "br", "text"]);
@@ -209,7 +208,7 @@ console.log("\nnodes");
   check("a tick names the line it came from and the text drawn", ticks.map(({ line, checked, text }) => ({ line, checked, text })), [{ line: 1, checked: true, text: "- [ ] same" }]);
   check("the boxes are enabled with onToggle", "disabled" in b1.attrs, false);
   const two = all(render("- [ ] - [ ] x", { onToggle() {} }), "input").map((b) => "disabled" in b.attrs);
-  check("of two boxes on one line, only the first is live", two, [false, true]);
+  check("a box and then box-like words on one line is one live box", two, [false]);
 
   let copied = null;
   const c = render("```\nx\n```", { copy: (t) => { copied = t; return Promise.resolve(); } });
@@ -261,7 +260,77 @@ console.log("\nthe highlighter");
   check("past the cap it is plain", HL.tokenize("x".repeat(HL.MAX + 1), "js").length, 1);
 }
 
-console.log("\nthe store: a tick by line, with two identical lines");
+console.log("\nthe review's findings");
+{
+  const types = (src) => MD.parse(src).map((b) => b.type);
+  const timed = (src) => { const t0 = Date.now(); render(src); return Date.now() - t0; };
+  check("'#', 4,000 spaces and a CR renders at once (was 25s)", timed("#" + " ".repeat(4000) + "\r") < 200, true);
+  check("and the same with LF and stray characters", timed(("#" + " ".repeat(4000) + "x\n").repeat(5)) < 200, true);
+  check("a lone '#' is text, not an empty heading", [types("#"), types("##   ##")], [["para"], ["para"]]);
+  check("'# a #' drops the closing hashes", MD.parse("# a #")[0].text, "a");
+  check("CR, CRLF and LF all end a line, in parse and toggleTask alike", [MD.linesOf("a\rb\r\nc\nd").length, MD.toggleTask("x\r- [ ] y\r\nz", 1, true)], [4, "x\r- [x] y\r\nz"]);
+  const item = MD.parse("- [x] 1. reply to legal\n- [ ] 2. file it")[0].items;
+  check("'- [x] 1. foo' is a task called '1. foo', not a nested list", item.map((it) => [it.task.checked, it.children.map((c) => c.type), it.children[0].text]), [[true, ["para"], "1. reply to legal"], [false, ["para"], "2. file it"]]);
+  check("an indented list under a task is still nested", MD.parse("- [ ] a\n  - [ ] b")[0].items[0].children.map((c) => c.type), ["para", "list"]);
+  check("only a task anchor is hidden", MD.inline("a <!--d:12--> b"), [{ t: "text", v: "a  b" }]);
+  check("any other comment is shown as text", MD.inline("a <!-- hidden from people --> b"), [{ t: "text", v: "a <!-- hidden from people --> b" }]);
+  check("Windows paths keep their backslashes", MD.inline("C:\\Users\\ray\\new"), [{ t: "text", v: "C:\\Users\\ray\\new" }]);
+  check("and regexes", MD.inline("\\d+\\.rb\\(x\\)"), [{ t: "text", v: "\\d+\\.rb\\(x\\)" }]);
+  check("an escape this renderer uses still works", MD.inline("\\*a\\* \\# \\[b\\]"), [{ t: "text", v: "*a* # [b]" }]);
+  check("src/__tests__/x stays a path", MD.inline("src/__tests__/x.js"), [{ t: "text", v: "src/__tests__/x.js" }]);
+  check("__init__ stays a dunder", MD.inline("call __init__ first"), [{ t: "text", v: "call __init__ first" }]);
+  check("__bold words__ are still bold", MD.inline("__two words__")[0].t, "strong");
+  const t = MD.parse("| a | b |\n|---|---|\n| 1 | 2 | 3 |\n| `x | y |")[0];
+  check("a table keeps extra cells, and an unpaired backtick does not swallow the row", t.rows, [["1", "2", "3"], ["`x", "y"]]);
+  check("a header and rule of different widths is still a table", types("| a | b | c |\n|---|---|\n| 1 | 2 |"), ["table"]);
+  check("mailto is a plain address only", [MD.safeHref("mailto:a.b+c@x-y.co"), MD.safeHref("mailto:a@b,c@d"), MD.safeHref("mailto:%2Fetc@x"), MD.safeHref("mailto:a@b%0D%0Abcc:c@d")], ["mailto:a.b+c@x-y.co", null, null, null]);
+  const odd = render("- [ ]\tx\n* [ ] y", { onToggle() {} });
+  check("a box toggleTask can read is live", all(odd, "input").map((b) => "disabled" in b.attrs), [false, false]);
+  const lazy = render("> - [ ] a\nlazy - [ ] b", { onToggle() {} });
+  check("a box whose line toggleTask cannot read is drawn disabled", all(lazy, "input").every((b) => b.attrs["data-line"] === "0" ? !("disabled" in b.attrs) : "disabled" in b.attrs), true);
+  check("placeTick: exact by line when the text is the one drawn", MD.placeTick("- [ ] a\n- [ ] a", { line: 1, checked: true, text: "- [ ] a", source: "- [ ] a\n- [ ] a" }), { body: "- [ ] a\n- [x] a", line: 1 });
+  check("placeTick: text added below, the same line, one of its kind: ticked", MD.placeTick("- [ ] a\n- [ ] b\nnew", { line: 0, checked: true, text: "- [ ] a", source: "- [ ] a\n- [ ] b" }), { body: "- [x] a\n- [ ] b\nnew", line: 0 });
+  check("placeTick: the line moved: refused, never placed by its words elsewhere", MD.placeTick("new\n- [ ] a\n- [ ] b", { line: 0, checked: true, text: "- [ ] a", source: "- [ ] a\n- [ ] b" }), { refused: "changed" });
+  check("placeTick: refused when the text moved and the words are on two lines", MD.placeTick("- [ ] a\n- [ ] a\nnew", { line: 1, checked: true, text: "- [ ] a", source: "- [ ] a\n- [ ] a" }), { refused: "ambiguous" });
+  check("placeTick: refused when the line is gone", MD.placeTick("x", { line: 0, checked: true, text: "- [ ] a", source: "- [ ] a" }), { refused: "changed" });
+}
+
+console.log("\nhostile input, 50KB to 100KB, against the clock");
+{
+  const cases = {
+    "[a]( x 25,000": "[a](".repeat(25000),
+    "![a]( x 20,000": "![a](".repeat(20000),
+    "[a](< x 20,000": "[a](<".repeat(20000),
+    "[a](x \" x 10,000": "[a](x \"".repeat(10000),
+    "[ x 100,000": "[".repeat(100000),
+    "[]( x 30,000": "[](".repeat(30000),
+    "<!-- x 25,000": "<!--".repeat(25000),
+    "a URL and 100,000 )": "https://a.com/" + ")".repeat(100000),
+    "a 100KB bare URL": "https://a.com/" + "y".repeat(100000),
+    "http://a x 12,000": "http://a ".repeat(12000),
+    "<a@ x 20,000": "<a@b".repeat(20000),
+    "# and 100,000 spaces": "#" + " ".repeat(100000) + "x",
+    "a fence with a 100KB info line": "```" + "a ".repeat(50000) + "`",
+    "100KB of spaces then a line break, many times": ("a" + " ".repeat(1000) + "\n").repeat(100),
+    "**a x 20,000": "**a".repeat(20000),
+    "_a x 40,000": "_a".repeat(40000),
+    "\\ x 100,000": "\\".repeat(100000),
+    "| x 100,000": "|".repeat(100000) + "\n" + "|-".repeat(30000),
+  };
+  for (const [name, src] of Object.entries(cases)) {
+    const t0 = Date.now();
+    let ok = true;
+    try { render(src); } catch { ok = false; }
+    const ms = Date.now() - t0;
+    check(`${name} (${Math.round(src.length / 1000)}KB) in ${ms}ms, under 300`, ok && ms < 300, true);
+  }
+  const t0 = Date.now();
+  HL.tokenize("[".repeat(60000), "md");
+  HL.tokenize("[a](".repeat(15000), "md");
+  check("the markdown highlighter on 60KB of '[' is quick", Date.now() - t0 < 300, true);
+}
+
+console.log("\nthe store: one transaction per tick (db.toggleLine)");
 {
   const db = require("../db");
   const project = db.createProject({ key: "md", name: "Markdown" });
@@ -269,30 +338,43 @@ console.log("\nthe store: a tick by line, with two identical lines");
   const entries = pads.parse(pad.body);
   const [first, second, third] = entries.map((e) => e.taskId);
   check("three lines, three tasks, all anchored", [entries.length, new Set([first, second, third]).size, entries.every((e) => e.taskId)], [3, 3, true]);
-  // The drawer's route for a line that is not a filed task: flip the line in
-  // the pad as stored and write it, and the derivation does the rest.
-  const lines = pad.body.split("\n");
-  const next = MD.toggleTask(pad.body, 2, true, lines[2]);
-  pad = db.writeScratchpad(pad.id, { body: next, author: "you" });
-  check("the second task is done, the first is not", [db.getTask ? null : null, statusOf(db, first), statusOf(db, second)].slice(1), ["todo", "done"]);
-  check("the anchors are where they were", pads.parse(pad.body).map((e) => e.taskId), [first, second, third]);
-  // The route for a filed task: the board's own update, whose write-back
-  // rewrites the line it is anchored to.
-  db.updateTask(first, { status: "done" });
-  pad = db.getScratchpad(pad.id);
-  check("the board's tick writes back to the first line only", pads.parse(pad.body).map((e) => e.done), [true, true, false]);
-  // Held by an agent and In progress: a pad write never drags it back to to
-  // do, and a tick finishes it, as on the board. (In review is a status a
-  // newer Delphi writes; this schema refuses it, and statusFor treats it as it
-  // treats doing, so the doing case covers it.)
+  const lines = MD.linesOf(pad.body);
+  let r = db.toggleLine("pad", pad.id, { line: 2, checked: true, text: lines[2], source: pad.body });
+  check("a tick on the second of two identical lines ticks its task", [statusOf(db, first), statusOf(db, second), r.taskId], ["todo", "done", second]);
+  check("and its line, with the anchors where they were", pads.parse(r.body).map((e) => [e.taskId, e.done]), [[first, false], [second, true], [third, false]]);
+  // An agent appends while the pad is open; the tick lands on the stored text.
+  db.appendScratchpad(pad.id, "- [ ] added by an agent");
+  const drawn = MD.linesOf(r.body);
+  r = db.toggleLine("pad", pad.id, { line: 1, checked: true, text: drawn[1], source: r.body });
+  check("a tick after an agent's append keeps the append", [r.body.includes("added by an agent"), statusOf(db, first)], [true, "done"]);
+  // Held by an agent and In progress: unticked lines never drag it back.
   db.updateTask(third, { status: "doing" });
   db.handle().prepare("UPDATE tasks SET queue = 'default', claimed_by = 'claude-code' WHERE id = ?").run(third);
   pad = db.writeScratchpad(pad.id, { body: db.getScratchpad(pad.id).body + "\nmore prose", author: "you" });
   check("a pad write leaves an agent-held task In progress", statusOf(db, third), "doing");
-  check("and its line unticked", pads.parse(pad.body)[2].done, false);
-  db.updateTask(third, { status: "done" });
-  check("ticked from the board, it is done and its line ticked", [statusOf(db, third), pads.parse(db.getScratchpad(pad.id).body)[2].done], ["done", true]);
+  const now = MD.linesOf(pad.body);
+  r = db.toggleLine("pad", pad.id, { line: 3, checked: true, text: now[3], source: pad.body });
+  check("a tick finishes it, as on the board, line and all", [statusOf(db, third), pads.parse(r.body)[2].done], ["done", true]);
   check("pads.statusFor keeps In review on an unticked line", pads.statusFor(false, "review"), "review");
+
+  // Unanchored duplicates, in a pad that files nothing.
+  const sketch = db.createScratchpad({ projectId: project.id, key: "sketch", title: "Sketch", body: "- [ ] same\n- [ ] same", derivesTasks: false });
+  db.writeScratchpad(sketch.id, { body: "added above\n- [ ] same\n- [ ] same" });
+  r = db.toggleLine("pad", sketch.id, { line: 1, checked: true, text: "- [ ] same", source: "- [ ] same\n- [ ] same" });
+  check("two unanchored identical lines in a pad that moved: refused, nothing ticked", [r.refused, db.getScratchpad(sketch.id).body], ["ambiguous", "added above\n- [ ] same\n- [ ] same"]);
+  r = db.toggleLine("pad", sketch.id, { line: 2, checked: true, text: "- [ ] same", source: "added above\n- [ ] same\n- [ ] same" });
+  check("drawn from the stored text, the exact line is ticked", r.body, "added above\n- [ ] same\n- [x] same");
+
+  // A note and a description.
+  const note = db.createNote({ projectId: project.id, title: "N", body: "- [ ] a\r\n- [ ] a\r\n" });
+  r = db.toggleLine("note", note.id, { line: 1, checked: true, text: "- [ ] a", source: "- [ ] a\n- [ ] a\n" });
+  check("a note's tick, CRLF kept", r.body, "- [ ] a\r\n- [x] a\r\n");
+  const task = db.createTask({ projectId: project.id, title: "T", detail: "- [ ] x" });
+  r = db.toggleLine("task", task.id, { line: 0, checked: true, text: "- [ ] y", source: "- [ ] y" });
+  check("a description whose line changed is refused", [r.refused, r.body], ["changed", "- [ ] x"]);
+  let threw = false;
+  try { db.toggleLine("project", 1, { line: 0, checked: true, text: "x" }); } catch { threw = true; }
+  check("only notes, descriptions and pads", threw, true);
 }
 
 function statusOf(db, id) {

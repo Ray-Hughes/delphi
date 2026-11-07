@@ -5101,7 +5101,9 @@ function padPane() {
       // After the editor has taken the stored text in, so typing not saved yet
       // (kept by the editor through a tick) survives the repaint as the draft.
       onSaved: () => setTimeout(() => {
-        state.padDraft = ed.area.value !== pad.body ? ed.area.value : null;
+        // Compared with LF endings, as the textarea has them, or a CRLF pad
+        // would always look as if it had unsaved typing.
+        state.padDraft = ed.area.value !== DelphiMarkdown.lf(pad.body) ? ed.area.value : null;
         // Typing that outlived the save was typed on top of it.
         state.padDraftBase = state.padDraft != null ? pad.body : null;
         refresh();
@@ -5113,7 +5115,7 @@ function padPane() {
     });
     // A draft from before the repaint goes in as typing, not as the stored
     // text, so the editor sees it as unsaved and the next blur writes it.
-    if (state.padDraft != null && state.padDraft !== pad.body) {
+    if (state.padDraft != null && state.padDraft !== DelphiMarkdown.lf(pad.body)) {
       ed.area.value = state.padDraft;
       ed.area.dispatchEvent(new Event("input"));
     }
@@ -5383,13 +5385,13 @@ function noteCard(n) {
 
     // A tick edits that line of the note, found by its line number and
     // checked against what was drawn, so two identical lines are two boxes.
-    const rendered = renderMarkdown(n.body, { onToggle: ({ line, checked, text }) => { noteTicks = noteTicks.then(async () => {
-      // Read fresh first, so a note an agent added to since this card was drawn
-      // is ticked as it is now, not written back over with this copy.
-      const fresh = ((await window.delphi.notes.list(n.project_id)) || []).find((x) => x.id === n.id);
-      const body = fresh ? DelphiMarkdown.toggleTask(fresh.body || "", line, checked, text) : null;
-      if (body != null) { await window.delphi.notes.update(n.id, { body }); n.body = body; }
-      else notify("That line changed since it was shown, so nothing was ticked.");
+    // Read, placed and written in one unit in the main process (db.toggleLine),
+    // so a note an agent added to since this card was drawn is ticked as it is
+    // now, never written back over with this copy.
+    const rendered = renderMarkdown(n.body, { onToggle: ({ line, checked, text, source }) => { noteTicks = noteTicks.then(async () => {
+      const r = await window.delphi.markdown.tick("note", n.id, { line, checked, text, source });
+      if (r && r.refused) notify(r.refused === "ambiguous" ? "That line is in the note twice and the note moved since it was shown, so nothing was ticked." : "That line changed since it was shown, so nothing was ticked.");
+      else if (r) n.body = r.body;
     }).catch(notifyError).then(() => refresh()); } });
     rendered.title = "Click to edit";
     // A click that ends a drag is someone selecting text to copy, not someone

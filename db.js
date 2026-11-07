@@ -2049,6 +2049,61 @@ function writeBackToPad(task, before) {
 }
 
 /**
+ * Ticks one checkbox in a note, a task's description or a pad, by its line.
+ *
+ * The read and the write are one unit (atomic, in the exports), so nothing an
+ * agent writes can land between them and be written over. The tick is placed
+ * by ui/markdown.js placeTick: exactly by line number when the text is the
+ * one the box was drawn from, else by its words when they are on one line
+ * only, else refused. In a pad that files tasks, an anchored line whose task
+ * is this pad's goes through updateTask, as a tick on the board does, and its
+ * write-back rewrites the line; any other pad line is written through
+ * writeScratchpad, whose derivation files it.
+ *
+ * Returns { body } (the text as stored now), and for a pad's task taskId and
+ * the status it had, for the Finish prompt; or { refused, body }.
+ */
+function toggleLine(entity, id, tick = {}) {
+  const md = require("./ui/markdown.js");
+  const line = Number(tick.line);
+  if (!Number.isInteger(line) || line < 0 || typeof tick.text !== "string" || typeof tick.checked !== "boolean") {
+    throw new Error("A tick needs a line number, the line's text and checked.");
+  }
+  const want = { line, checked: tick.checked, text: tick.text, source: typeof tick.source === "string" ? tick.source : null };
+  if (entity === "note" || entity === "task") {
+    const table = entity === "note" ? "notes" : "tasks";
+    const field = entity === "note" ? "body" : "detail";
+    const row = one(`SELECT ${field} AS text FROM ${table} WHERE id = :id`, { id });
+    if (!row) throw new Error(`No such ${entity}`);
+    const got = md.placeTick(row.text || "", want);
+    if (got.refused) return { refused: got.refused, body: row.text || "" };
+    if (entity === "note") updateNote(id, { body: got.body });
+    else updateTask(id, { detail: got.body });
+    return { body: got.body };
+  }
+  if (entity !== "pad") throw new Error("Ticks are for notes, descriptions and pads.");
+  const pad = getScratchpad(id);
+  if (!pad) throw new Error("No such scratchpad");
+  const got = md.placeTick(pad.body || "", want);
+  if (got.refused) return { refused: got.refused, body: pad.body || "" };
+  const anchor = pad.derives_tasks ? pads.ANCHOR.exec(md.linesOf(pad.body)[got.line] || "") : null;
+  // Only a task this pad owns: an anchor copied in from another pad is stale
+  // text, as the derivation treats it, and must not tick somebody else's.
+  const task = anchor ? one("SELECT * FROM tasks WHERE id = :id AND pad_id = :padId", { id: Number(anchor[1]), padId: pad.id }) : null;
+  if (task) {
+    const status = tick.checked ? "done" : "todo";
+    if (task.status !== status) updateTask(task.id, { status });
+    // A status that already matched writes nothing back, so the line is set
+    // here, to say what the board says.
+    const now = getScratchpad(id);
+    const entry = pads.parse(now.body).find((e) => e.taskId === task.id);
+    if (entry && entry.done !== tick.checked) writeScratchpad(id, { body: pads.writeLine(now.body, entry, { done: tick.checked }), author: "you" });
+    return { body: getScratchpad(id).body, taskId: task.id, before: task.status };
+  }
+  return { body: writeScratchpad(id, { body: got.body, author: "you" }).body };
+}
+
+/**
  * A pad's lines, each with the task behind it, for the editor to render.
  *
  * Also names the tasks the pad no longer mentions, which is the honest way to
@@ -3178,7 +3233,7 @@ const ATOMIC = [
   "createProject", "updateProject", "createTask", "updateTask", "deleteTask", "createComment",
   "setQueue", "claimNext", "releaseClaim", "completeClaim", "extendClaim", "reclaimExpired",
   "createNote", "updateNote", "deleteNote", "createScratchpad", "appendScratchpad", "patchScratchpad",
-  "deleteScratchpad", "derive", "createLink", "deleteLink", "createAlert", "createHandoff", "updateHandoff",
+  "deleteScratchpad", "derive", "toggleLine", "createLink", "deleteLink", "createAlert", "createHandoff", "updateHandoff",
   "createExternalTask", "deleteSession", "keepFolderAnswer", "giveFolder", "mergedFolderAnswer",
 ];
 
@@ -3207,7 +3262,7 @@ module.exports = {
   setQueue, queueState, claimNext, releaseClaim, completeClaim, extendClaim, reclaimExpired,
   listNotes, createNote, updateNote, deleteNote,
   listScratchpads, getScratchpad, scratchpadByKey, createScratchpad, writeScratchpad,
-  appendScratchpad, patchScratchpad, deleteScratchpad, scratchpadTasks, derive,
+  appendScratchpad, patchScratchpad, deleteScratchpad, scratchpadTasks, derive, toggleLine,
   listLinks, createLink, deleteLink,
   search, stats,
   listAudit, projectActivity, undo, undoLast,

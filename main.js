@@ -1457,6 +1457,14 @@ handle("pads:write", (id, fields) => { const r = db.writeScratchpad(id, fields);
 handle("pads:append", (id, text) => { const r = db.appendScratchpad(id, text); scheduleVaultExport(); return r; });
 handle("pads:delete", (id) => { const r = db.deleteScratchpad(id); scheduleVaultExport(); return r; });
 handle("pads:tasks", (id) => db.scratchpadTasks(id));
+// A checkbox ticked in rendered Markdown: read, placed and written in one unit
+// (db.toggleLine), never a renderer reading here and writing in a second call.
+handle("markdown:tick", (entity, id, tick) => {
+  const r = db.toggleLine(String(entity), Number(id), tick);
+  if (r && r.taskId) promptFinishIfDone(r.taskId, r.before);
+  if (r && !r.refused) scheduleVaultExport();
+  return r;
+});
 
 handle("links:list", (projectId) => db.listLinks(projectId));
 handle("links:create", (payload) => db.createLink(payload));
@@ -2302,5 +2310,5 @@ ipcMain.on("open-external", (_e, url) => {
   // http(s), and mailto for an address in a note (ui/markdown.js safeHref).
   // Nothing else: file:, javascript: and custom schemes never leave from here.
   if (typeof url !== "string") return;
-  if (/^https?:\/\//i.test(url) || /^mailto:[^\s<>"'?&]+@[^\s<>"'?&]+$/i.test(url)) shell.openExternal(url);
+  if (/^https?:\/\//i.test(url) || /^mailto:[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$/i.test(url)) shell.openExternal(url);
 });

@@ -37,13 +37,31 @@ globalThis.DelphiMarkdown = (() => {
   const MAX_BLOCK_DEPTH = 16;
   const MAX_INLINE_DEPTH = 8;
 
-  const FENCE = /^([ \t]*)(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$/;
+  // The info string is one run, split afterwards. Two quantifiers that could
+  // both take its characters made a long unclosed fence line quadratic.
+  const FENCE = /^([ \t]*)(`{3,}|~{3,})([^`]*)$/;
+  const fenceInfo = (raw) => (raw.trim().split(/\s/)[0] || "");
   const HR = /^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
   // Leading whitespace is allowed. The old renderer anchored this at column 0
   // while its paragraph loop refused any indented "# x", and the line that was
   // neither spun the window. Nothing here can do that (see the loop guard),
   // but the two still agree.
-  const HEADING = /^[ \t]*(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
+  //
+  // Read by hand past the hashes. A single regex for the text and the closing
+  // hashes had three quantifiers that could each take a space, and "#" with
+  // four thousand spaces and a stray character took 25 seconds. A heading
+  // with no words ("#" alone) is not one: it is text.
+  const HEADING_START = /^[ \t]*(#{1,6})(?=[ \t]|$)/;
+  function headingOf(t) {
+    const m = HEADING_START.exec(t);
+    if (!m) return null;
+    let text = t.slice(m[0].length).trim();
+    let e = text.length;
+    while (e > 0 && text[e - 1] === "#") e -= 1;
+    if (e === 0) text = "";
+    else if (e < text.length && (text[e - 1] === " " || text[e - 1] === "\t")) text = text.slice(0, e).trim();
+    return text ? { level: m[1].length, text } : null;
+  }
   const QUOTE = /^[ \t]*>/;
   const QUOTE_STRIP = /^[ \t]*> ?/;
   const LIST = /^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+|$)(.*)$/;
@@ -80,20 +98,22 @@ globalThis.DelphiMarkdown = (() => {
     const cells = [];
     let cur = "";
     let tick = false;
+    // A backtick with no partner is a character, not the start of a code span
+    // that swallows the rest of the row.
+    const spans = ((t.match(/`/g) || []).length % 2) === 0;
     for (let i = 0; i < t.length; i++) {
       const c = t[i];
       if (c === "\\" && t[i + 1] === "|") { cur += "|"; i += 1; continue; }
-      if (c === "`") tick = !tick;
+      if (c === "`" && spans) tick = !tick;
       if (c === "|" && !tick) { cells.push(cur.trim()); cur = ""; continue; }
       cur += c;
     }
     cells.push(cur.trim());
     return cells;
   };
-  const isTableStart = (L, i) => {
-    if (i + 1 >= L.length || !L[i].t.includes("|") || !TABLE_SEP.test(L[i + 1].t) || !L[i + 1].t.includes("-")) return false;
-    return splitCells(L[i].t).length === splitCells(L[i + 1].t).length;
-  };
+  // A pipe row over a rule, as the old renderer read it: the header and the
+  // rule need not have the same number of cells.
+  const isTableStart = (L, i) => i + 1 < L.length && L[i].t.includes("|") && L[i + 1].t.includes("-") && TABLE_SEP.test(L[i + 1].t);
   const listItemStarts = (t) => {
     const m = LIST.exec(t);
     return Boolean(m) && !HR.test(t);
@@ -101,7 +121,7 @@ globalThis.DelphiMarkdown = (() => {
   /** A line that ends a paragraph because a block starts on it. */
   const startsBlock = (L, i) => {
     const t = L[i].t;
-    return FENCE.test(t) || HR.test(t) || HEADING.test(t) || QUOTE.test(t) || (listItemStarts(t) && !blank(LIST.exec(t)[4])) || isTableStart(L, i);
+    return FENCE.test(t) || HR.test(t) || Boolean(headingOf(t)) || QUOTE.test(t) || (listItemStarts(t) && !blank(LIST.exec(t)[4])) || isTableStart(L, i);
   };
 
   // --- blocks ---------------------------------------------------------------
@@ -115,7 +135,7 @@ globalThis.DelphiMarkdown = (() => {
    * source, which never changes on the way down.
    */
   function parse(source) {
-    const lines = String(source == null ? "" : source).replace(/\r\n/g, "\n").split("\n");
+    const lines = linesOf(source);
     return blocks(lines.map((t, n) => ({ t, n })), 0);
   }
 
@@ -138,7 +158,8 @@ globalThis.DelphiMarkdown = (() => {
 
       const fence = FENCE.exec(t);
       if (fence) {
-        const [, indent, mark, info] = fence;
+        const [, indent, mark, rawInfo] = fence;
+        const info = fenceInfo(rawInfo);
         const close = new RegExp(`^[ \\t]*${mark[0] === "`" ? "`" : "~"}{${mark.length},}[ \\t]*$`);
         const body = [];
         let j = i + 1;
@@ -152,9 +173,9 @@ globalThis.DelphiMarkdown = (() => {
 
       if (HR.test(t)) { out.push({ type: "hr", n: L[i].n }); i += 1; continue; }
 
-      const heading = HEADING.exec(t);
+      const heading = headingOf(t);
       if (heading) {
-        out.push({ type: "heading", level: heading[1].length, text: (heading[2] || "").trim(), n: L[i].n });
+        out.push({ type: "heading", level: heading.level, text: heading.text, n: L[i].n });
         i += 1;
         continue;
       }
@@ -166,7 +187,8 @@ globalThis.DelphiMarkdown = (() => {
         let j = i + 2;
         while (j < L.length && !blank(L[j].t) && L[j].t.includes("|")) {
           const cells = splitCells(L[j].t);
-          rows.push(head.map((_, k) => cells[k] || ""));
+          // Short rows are padded; long ones keep their extra cells.
+          rows.push(cells.length >= head.length ? cells : head.map((_, k) => cells[k] || ""));
           j += 1;
         }
         out.push({ type: "table", head, align, rows, n: L[i].n });
@@ -261,9 +283,19 @@ globalThis.DelphiMarkdown = (() => {
       const item = { n: L[i].n, task: null, children: [] };
       if (task) {
         item.task = { checked: task[1] !== " ", n: L[i].n };
-        content[0] = { t: content[0].t.slice(task[0].length), n: content[0].n };
+        // The words after the box are the task's words, whatever they look
+        // like: "- [x] 1. reply to legal" is a task called "1. reply to
+        // legal", not a box with a numbered list in it. Prose straight after
+        // joins them; anything indented or after a blank line is read as
+        // blocks.
+        const words = [content[0].t.slice(task[0].length)];
+        let k = 1;
+        while (k < content.length && !blank(content[k].t) && indentOf(content[k].t) === 0 && !startsBlock(content, k)) { words.push(content[k].t.trim()); k += 1; }
+        const lead = words.join("\n").trim();
+        item.children = [...(lead ? [{ type: "para", text: lead, n: content[0].n }] : []), ...blocks(content.slice(k), depth + 1)];
+      } else {
+        item.children = blocks(content, depth + 1);
       }
-      item.children = blocks(content, depth + 1);
       block.items.push(item);
       i = j;
       // Blank lines between items keep the list going.
@@ -280,10 +312,21 @@ globalThis.DelphiMarkdown = (() => {
 
   // --- inline ---------------------------------------------------------------
 
-  const PUNCT = /[!-/:-@[-`{-~]/;
-  const BARE_URL = /https?:\/\/[^\s<>]+/iy;
-  const AUTOLINK = /<((?:https?:\/\/|mailto:)[^\s<>]+)>/iy;
-  const AUTOMAIL = /<([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})>/y;
+  // Only what this renderer gives a meaning to can be escaped. Everything
+  // else keeps its backslash, so C:\Users\ray and \d+\.rb read as written.
+  const ESCAPABLE = /[\\`*_~[\]<>#!|]/;
+  const UNESCAPE = /\\([\\`*_~[\]<>#!|])/g;
+  // URLs are capped: a bare URL longer than this is not one anybody clicks,
+  // and the cap is what keeps a 100KB run of one from being scanned again
+  // from every point in it.
+  const URL_MAX = 2048;
+  const BARE_URL = new RegExp(`https?:\\/\\/[^\\s<>]{1,${URL_MAX}}`, "iy");
+  const AUTOLINK = new RegExp(`<((?:https?:\\/\\/|mailto:)[^\\s<>]{1,${URL_MAX}})>`, "iy");
+  // The one comment that is hidden: a pad's task anchor. Any other comment is
+  // shown as text, so nothing in a note is visible to an agent and not to a
+  // person.
+  const ANCHOR = /<!--\s*d:\d+\s*-->/y;
+  const AUTOMAIL = /<([A-Za-z0-9._+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,8})>/y;
   const REF = /#(\d{1,9})(?![\w])/y;
 
   /**
@@ -298,15 +341,25 @@ globalThis.DelphiMarkdown = (() => {
     if (/^https?:\/\/[^/?#]/i.test(url)) return url;
     // A bare address only: no ?subject or &body, which some mail clients on
     // Windows have read as arguments.
-    if (/^mailto:[^\s<>"'?&]+@[^\s<>"'?&]+$/i.test(url)) return url;
+    if (/^mailto:[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$/i.test(url)) return url;
     return null;
   }
 
   /** A bare URL's end: trailing punctuation and an unmatched ")" are prose, not URL. */
   function trimUrl(u) {
-    let url = u.replace(/[.,;:!?'"*_~]+$/, "");
-    while (url.endsWith(")") && (url.match(/\(/g) || []).length < (url.match(/\)/g) || []).length) url = url.slice(0, -1).replace(/[.,;:!?'"*_~]+$/, "");
-    return url;
+    const punct = (c) => ".,;:!?'\"*_~".includes(c);
+    let opens = 0;
+    let closes = 0;
+    for (const c of u) { if (c === "(") opens += 1; else if (c === ")") closes += 1; }
+    // One pass from the end, counting as it goes, rather than recounting the
+    // whole URL for every ")" it drops.
+    let e = u.length;
+    for (;;) {
+      while (e > 0 && punct(u[e - 1])) e -= 1;
+      if (e > 0 && u[e - 1] === ")" && opens < closes) { closes -= 1; e -= 1; continue; }
+      break;
+    }
+    return u.slice(0, e);
   }
 
   /**
@@ -324,6 +377,15 @@ globalThis.DelphiMarkdown = (() => {
     const noClose = new Map();
     const noTicks = new Set();
     let noBracket = false;
+    // Searches that found nothing from some point find nothing from any later
+    // point either, so each is made once.
+    const noFind = new Set();
+    const find = (what, from) => {
+      if (noFind.has(what)) return -1;
+      const e = s.indexOf(what, from);
+      if (e < 0) noFind.add(what);
+      return e;
+    };
     const n = s.length;
     let i = 0;
 
@@ -346,7 +408,7 @@ globalThis.DelphiMarkdown = (() => {
       let k = from;
       while (k < n) {
         const ch = s[k];
-        if (ch === "\\") { k += 2; continue; }
+        if (ch === "\\" && ESCAPABLE.test(s[k + 1] || "")) { k += 2; continue; }
         if (ch === "`") {
           let run = 1;
           while (s[k + run] === "`") run += 1;
@@ -358,7 +420,7 @@ globalThis.DelphiMarkdown = (() => {
           let run = 1;
           while (s[k + run] === c) run += 1;
           const fits = delim.length === 1 ? run === 1 || run === 3 : run >= 2;
-          if (fits && k > from && !/\s/.test(s[k - 1]) && !(c === "_" && /\w/.test(s[k + run] || ""))) {
+          if (fits && k > from && !/\s/.test(s[k - 1]) && !(c === "_" && /[\w/]/.test(s[k + run] || ""))) {
             // "***" closing "*" or "**": the delimiter takes its own share
             // and leaves the rest inside, to close the other one.
             return run === 3 ? (delim.length === 1 ? k + 2 : k + 1) : k;
@@ -383,37 +445,42 @@ globalThis.DelphiMarkdown = (() => {
       for (; k < stop; k++) {
         const ch = s[k];
         if (ch === "\\") { k += 1; continue; }
-        if (ch === "[") level += 1;
+        // Nesting past 32 is CommonMark's own limit, and what keeps a line of
+        // "[[[[" from being scanned a thousand characters per bracket.
+        if (ch === "[") { level += 1; if (level > 32) return null; }
         else if (ch === "]") { if (!level) break; level -= 1; }
       }
       if (k >= stop) { if (stop === n && !s.includes("]", at)) noBracket = true; return null; }
       if (s[k + 1] !== "(") return null;
       let p = k + 2;
-      while (s[p] === " ") p += 1;
+      const destStop = Math.min(n, p + URL_MAX);
+      while (p < destStop && s[p] === " ") p += 1;
       let dest = "";
       if (s[p] === "<") {
-        const e = s.indexOf(">", p + 1);
-        if (e < 0 || s.slice(p + 1, e).includes("\n")) return null;
+        const e = find(">", p + 1);
+        if (e < 0 || e - p > URL_MAX || s.slice(p + 1, e).includes("\n")) return null;
         dest = s.slice(p + 1, e);
         p = e + 1;
       } else {
         let parens = 0;
         const start = p;
-        for (; p < n; p++) {
+        for (; p < destStop; p++) {
           const ch = s[p];
-          if (ch === "\\" && PUNCT.test(s[p + 1] || "")) { p += 1; continue; }
+          if (ch === "\\" && ESCAPABLE.test(s[p + 1] || "")) { p += 1; continue; }
           if (/\s/.test(ch)) break;
-          if (ch === "(") parens += 1;
+          if (ch === "(") { parens += 1; if (parens > 32) return null; }
           else if (ch === ")") { if (!parens) break; parens -= 1; }
         }
-        dest = s.slice(start, p).replace(/\\([!-/:-@[-`{-~])/g, "$1");
+        if (p >= destStop && p < n) return null;
+        dest = s.slice(start, p).replace(UNESCAPE, "$1");
       }
-      while (s[p] === " " || s[p] === "\n") p += 1;
+      const titleStop = Math.min(n, p + URL_MAX);
+      while (p < titleStop && (s[p] === " " || s[p] === "\n")) p += 1;
       let title = null;
       const q = s[p];
       if (q === '"' || q === "'" || q === "(") {
-        const e = s.indexOf(q === "(" ? ")" : q, p + 1);
-        if (e < 0) return null;
+        const e = find(q === "(" ? ")" : q, p + 1);
+        if (e < 0 || e - p > URL_MAX) return null;
         title = s.slice(p + 1, e);
         p = e + 1;
         while (s[p] === " ") p += 1;
@@ -429,11 +496,11 @@ globalThis.DelphiMarkdown = (() => {
 
       if (c === "\\" && i + 1 < n) {
         if (s[i + 1] === "\n") { flush(); out.push({ t: "br" }); i += 2; continue; }
-        if (PUNCT.test(s[i + 1])) { buf += s[i + 1]; i += 2; continue; }
+        if (ESCAPABLE.test(s[i + 1])) { buf += s[i + 1]; i += 2; continue; }
       }
 
       if (c === "\n") {
-        if (/ {2,}$/.test(buf)) { buf = buf.replace(/ +$/, ""); flush(); out.push({ t: "br" }); }
+        if (buf.endsWith("  ")) { buf = buf.replace(/ +$/, ""); flush(); out.push({ t: "br" }); }
         else buf += "\n";
         i += 1;
         continue;
@@ -453,12 +520,11 @@ globalThis.DelphiMarkdown = (() => {
       }
 
       if (c === "<") {
-        // An HTML comment is dropped: it is how a pad keeps its anchors, and
-        // what a note author meant to be invisible.
-        if (s.startsWith("<!--", i)) {
-          const e = s.indexOf("-->", i + 4);
-          if (e >= 0) { i = e + 3; continue; }
-        }
+        // A task anchor is dropped: it is how a pad line and its task stay
+        // the same thing, and it means nothing to a reader.
+        ANCHOR.lastIndex = i;
+        const anchor = ANCHOR.exec(s);
+        if (anchor) { i += anchor[0].length; continue; }
         AUTOLINK.lastIndex = i;
         let m = AUTOLINK.exec(s);
         if (m && safeHref(m[1])) { flush(); out.push({ t: "link", href: m[1], kids: [{ t: "text", v: m[1].replace(/^mailto:/i, "") }] }); i += m[0].length; continue; }
@@ -488,10 +554,14 @@ globalThis.DelphiMarkdown = (() => {
         while (s[i + run] === c) run += 1;
         const delim = c === "~" ? (run === 2 ? "~~" : null) : run >= 2 ? c + c : c;
         const after = delim ? s[i + delim.length] : "";
-        const intraword = c === "_" && i > 0 && /\w/.test(s[i - 1]);
+        // Underscores inside a word or a path are the word's: snake_case,
+        // src/__tests__/x. A whole word in double underscores is a Python
+        // dunder (__init__), not bold.
+        const intraword = c === "_" && i > 0 && /[\w/]/.test(s[i - 1]);
         if (delim && after && !/\s/.test(after) && !intraword) {
           const e = closer(i + delim.length, delim);
-          if (e >= 0) {
+          const dunder = e >= 0 && delim === "__" && /^\w+$/.test(s.slice(i + 2, e));
+          if (e >= 0 && !dunder) {
             flush();
             const tag = c === "~" ? "del" : delim.length === 2 ? "strong" : "em";
             out.push({ t: tag, kids: sub(s.slice(i + delim.length, e)) });
@@ -531,27 +601,63 @@ globalThis.DelphiMarkdown = (() => {
   // --- the source, changed by a tick ---------------------------------------
 
   /**
+   * The source's lines, as the checkboxes name them. CRLF, CR and LF all end
+   * a line, here and in toggleTask, so the two always count the same lines;
+   * and no pattern above ever sees a stray CR, which is what let a heading
+   * regex backtrack for 25 seconds.
+   */
+  const linesOf = (source) => String(source == null ? "" : source).split(/\r\n|\r|\n/);
+  /** The text with every line ending as LF, for comparing two copies. */
+  const lf = (source) => String(source == null ? "" : source).replace(/\r\n?/g, "\n");
+
+  /** Whether a line is one a tick can flip: the box toggleTask would change. */
+  const tickable = (line) => TASK_AT.test(String(line == null ? "" : line));
+
+  /**
    * The source with the checkbox on `line` set to `checked`, or null when that
    * line is not a task line, or no longer says `expect` (the text it had when
    * the checkbox was drawn). One character changes; the rest of the line, its
    * <!--d:N--> anchor included, is kept exactly, and so are the line endings.
    */
   function toggleTask(source, line, checked, expect = null) {
-    const text = String(source == null ? "" : source);
-    const lines = text.split("\n");
-    if (!Number.isInteger(line) || line < 0 || line >= lines.length) return null;
-    const cur = lines[line];
-    const bare = cur.replace(/\r$/, "");
-    if (expect != null && bare !== String(expect).replace(/\r$/, "")) return null;
-    const m = TASK_AT.exec(bare);
+    const parts = String(source == null ? "" : source).split(/(\r\n|\r|\n)/);
+    // Lines at the even places, their endings between.
+    const at2 = line * 2;
+    if (!Number.isInteger(line) || line < 0 || at2 >= parts.length) return null;
+    const cur = parts[at2];
+    if (expect != null && cur !== String(expect)) return null;
+    const m = TASK_AT.exec(cur);
     if (!m) return null;
     const at = m[1].length;
-    lines[line] = cur.slice(0, at) + (checked ? "x" : " ") + cur.slice(at + 1);
-    return lines.join("\n");
+    parts[at2] = cur.slice(0, at) + (checked ? "x" : " ") + cur.slice(at + 1);
+    return parts.join("");
   }
 
-  /** The source's lines, as the checkboxes name them. */
-  const linesOf = (source) => String(source == null ? "" : source).replace(/\r\n/g, "\n").split("\n");
+  /**
+   * Where a tick lands in the text as stored now, which may not be the text it
+   * was drawn from. Returns { body, line } or { refused: "changed" | "ambiguous" }.
+   *
+   * Unchanged since it was drawn, the line number is exact. Changed (an agent
+   * appended, a person typed elsewhere), the tick lands only where it is still
+   * certain: the same line still says the same words, and no other line
+   * says them. Two "- [ ] check the logs" in a text that moved under the tick
+   * could be either, and a line that moved could be anything; ticking the
+   * neighbour is worse than asking for the click again.
+   */
+  function placeTick(stored, { line, checked, text, source = null }) {
+    const now = String(stored == null ? "" : stored);
+    if (source != null && lf(now) === lf(source)) {
+      const body = toggleTask(now, line, checked, text);
+      return body == null ? { refused: "changed" } : { body, line };
+    }
+    const lines = linesOf(now);
+    if (lines[line] !== text) return { refused: "changed" };
+    let hits = 0;
+    for (let k = 0; k < lines.length && hits < 2; k++) if (lines[k] === text) hits += 1;
+    if (hits !== 1) return { refused: "ambiguous" };
+    const body = toggleTask(now, line, checked, text);
+    return body == null ? { refused: "changed" } : { body, line };
+  }
 
   // --- nodes ----------------------------------------------------------------
 
@@ -569,7 +675,7 @@ globalThis.DelphiMarkdown = (() => {
    */
   function render(source, opts = {}) {
     const doc = opts.document || globalThis.document;
-    const ctx = { doc, opts, lines: linesOf(source), inLink: false, live: new Set() };
+    const ctx = { doc, opts, source: lf(source), lines: linesOf(source), inLink: false, live: new Set() };
     const root = h(doc, "div", "md");
     appendBlocks(root, parse(source), ctx);
     return root;
@@ -663,17 +769,20 @@ globalThis.DelphiMarkdown = (() => {
         box.setAttribute("class", "md-check");
         box.setAttribute("data-line", String(it.task.n));
         if (it.task.checked) { box.setAttribute("checked", ""); box.checked = true; }
-        const words = lead ? lead.text.replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, " ").trim().slice(0, 140) : "";
+        const words = lead ? lead.text.replace(/<!--\s*d:\d+\s*-->/g, "").replace(/\s+/g, " ").trim().slice(0, 140) : "";
         box.setAttribute("aria-label", words || "Task");
         // "- [ ] - [ ] x" is two boxes on one line, and a tick can only name
         // the line, which toggleTask reads as its first box. So only the first
         // box on a line is live.
-        const first = !ctx.live.has(it.task.n);
+        // A box whose line toggleTask cannot read (the parser was more
+        // lenient than the line grammar) is drawn, but cannot be ticked.
+        const first = !ctx.live.has(it.task.n) && tickable(ctx.lines[it.task.n]);
         ctx.live.add(it.task.n);
         if (opts.onToggle && first) {
           const line = it.task.n;
           const text = ctx.lines[line];
-          box.addEventListener("change", () => opts.onToggle({ line, checked: Boolean(box.checked), text, box }));
+          const source = ctx.source;
+          box.addEventListener("change", () => opts.onToggle({ line, checked: Boolean(box.checked), text, source, box }));
         } else {
           box.setAttribute("disabled", "");
           box.disabled = true;
@@ -733,7 +842,7 @@ globalThis.DelphiMarkdown = (() => {
     return a;
   }
 
-  return { parse, inline, render, toggleTask, safeHref, linesOf, MAX_BLOCK_DEPTH, MAX_INLINE_DEPTH };
+  return { parse, inline, render, toggleTask, placeTick, safeHref, linesOf, lf, MAX_BLOCK_DEPTH, MAX_INLINE_DEPTH };
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = globalThis.DelphiMarkdown;
