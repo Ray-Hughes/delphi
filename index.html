@@ -16,6 +16,7 @@
 <link rel="stylesheet" href="styles/tasks.css" />
 <link rel="stylesheet" href="styles/memory.css" />
 <link rel="stylesheet" href="styles/weekly.css" />
+<link rel="stylesheet" href="styles/focus.css" />
 <link rel="stylesheet" href="styles/drawer.css" />
 <!-- pointer.css stays last: it overrides the arrow cursor everything above sets. -->
 <link rel="stylesheet" href="styles/pointer.css" />
@@ -32,6 +33,7 @@
       <div id="bar"></div>
       <span class="grow"></span>
       <div id="live"><button class="tb-live" id="tb-live" type="button" hidden></button></div>
+      <div id="focus-entry"></div>
       <div id="top-acts"></div>
       <!-- What the old search field held. app.js still reads and clears it
            around a search, and the bar writes the query into it. -->
@@ -107,6 +109,8 @@
   <script src="ui/memory.js"></script>
   <!-- The weekly review: look back, tidy, next week. Reached from Today and Cmd+K. -->
   <script src="ui/weekly.js"></script>
+  <!-- Focus mode: one task, Interruption, delegation and Break. -->
+  <script src="ui/focus.js"></script>
   <!-- The drawer: a task, a note or a pad as one document. -->
   <script src="ui/drawer.js"></script>
   <script src="app.js"></script>
