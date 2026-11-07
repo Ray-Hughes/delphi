@@ -612,9 +612,13 @@ globalThis.DelphiDrawer = (() => {
    * is saved straight away. A surface with its own route for a tick (a pad's
    * task goes through the board's update) passes toggle(tick, api).
    */
-  function editor({ label, kind, value, onSave, current = null, merge = null, placeholder = "", draftKey = null, onMode = null, preview = (s) => s, toggle = null }) {
+  function editor({ label, kind, value, onSave, current = null, merge = null, placeholder = "", draftKey = null, onMode = null, preview = (s) => s, toggle = null, tickStore = null }) {
     let mode = modeOf(kind);
-    let text = value || "";
+    // Line endings as a textarea has them. A textarea turns CRLF into LF, so a
+    // CRLF pad compared with what it was given would never look saved; every
+    // copy of the stored text is read through this before it is compared.
+    const lf = (v) => DelphiMarkdown.lf(v);
+    let text = lf(value || "");
     // The stored text this box last took. A save compares the store against
     // it (reconcile), and a write from elsewhere waits in pending while the
     // box is being typed in, to be taken on blur when nothing was typed.
@@ -716,7 +720,7 @@ globalThis.DelphiDrawer = (() => {
     };
     area.addEventListener("input", () => { restored = false; text = area.value; if (mode === "split") paintSoon(); grow(); });
     const take = (v) => {
-      saved = v == null ? "" : String(v);
+      saved = v == null ? "" : lf(v);
       remote = null;
       area.value = saved;
       text = saved;
@@ -756,7 +760,10 @@ globalThis.DelphiDrawer = (() => {
           try { const v = await current(); return v == null ? undefined : v; } catch { return undefined; }
         };
         for (let attempt = 0; attempt < 4; attempt++) {
-          const theirs = await read();
+          // Compared with LF endings, as the box has them; the store's own
+          // bytes (raw) are what the compare-and-set is asked to expect.
+          const raw = await read();
+          const theirs = raw === undefined ? undefined : lf(raw);
           if (theirs === undefined) { host.notify(`${label} could not be checked against the stored copy, so it was not saved. It is kept here.`); return "kept"; }
           const what = reconcile(saved, theirs, next);
           if (what === "same") { saved = next; remote = null; return "done"; }
@@ -777,16 +784,16 @@ globalThis.DelphiDrawer = (() => {
               // Read again: Keep mine never lands on a copy nobody saw.
               const again = await read();
               if (again === undefined) return "kept";
-              if (again !== theirs) continue;
+              if (lf(again) !== theirs) continue;
               body = m ? m.mine : next;
             }
           }
           // Written only over the copy just read (expect), where the store can
           // check it; a refusal because it moved again goes round once more.
           let stored;
-          try { stored = await onSave(body, { expect: theirs }); }
+          try { stored = await onSave(body, { expect: raw }); }
           catch (error) { if (error && error.code === "CONFLICT") continue; throw error; }
-          const now = stored == null ? body : String(stored);
+          const now = stored == null ? body : lf(stored);
           if (area.value === next) take(now);
           else {
             // Typed while it saved: what the store added (a new line's anchor)
@@ -813,7 +820,7 @@ globalThis.DelphiDrawer = (() => {
     function replace(next, tick = null) {
       // tick is the box just written to the stored text; null when nothing
       // was, so typing here is kept as it is.
-      next = next || "";
+      next = lf(next || "");
       if (area.value === saved) {
         area.value = next;
       } else if (tick) {
@@ -837,8 +844,33 @@ globalThis.DelphiDrawer = (() => {
     }
     async function tickNow(tick) {
       const api = { dirty: () => area.value !== saved, replace: (next, { ticked = true } = {}) => replace(next, ticked ? tick : null), local: () => tickLocal(tick) };
+      if (tickStore) return tickStored(tick);
       if (toggle) return toggle(tick, api);
       return tickLocal(tick);
+    }
+    const REFUSED = {
+      changed: "That line changed since it was shown, so nothing was ticked. Try again.",
+      ambiguous: "That line is in the text twice and the text moved since it was shown, so nothing was ticked. Try again.",
+    };
+    /**
+     * A tick written to the stored text in one step in the main process
+     * (db.toggleLine), never by saving this box: the stored copy is read,
+     * the line placed and written inside one transaction. What is stored
+     * after comes back and is taken in, with any typing here kept and the same
+     * box ticked in it.
+     */
+    async function tickStored(tick) {
+      const { line, checked, text: words, source } = tick;
+      let got;
+      try { got = await tickStore({ line, checked, text: words, source }); } catch (error) { host.notifyError(error); paintPreview(); return; }
+      if (!got) { paintPreview(); return; }
+      if (got.refused) {
+        replace(got.body, null);
+        host.notify(REFUSED[got.refused] || REFUSED.changed);
+        return;
+      }
+      replace(got.body, tick);
+      if (draftKey && window.DelphiRecovery && area.value === saved) DelphiRecovery.clearDraft(draftKey[0], draftKey[1]);
     }
     async function tickLocal(tick) {
       // Nothing typed here and the stored text moved (an agent wrote it): the
@@ -909,7 +941,7 @@ globalThis.DelphiDrawer = (() => {
       // A write from elsewhere: taken now when nobody is typing here, else
       // kept until blur (taken if nothing was typed) or a save (reconciled).
       update(next) {
-        const v = next == null ? "" : String(next);
+        const v = next == null ? "" : lf(next);
         if (v === saved) { remote = null; return; }
         if (document.activeElement === area || area.value !== saved) { remote = v; return; }
         take(v);
@@ -933,7 +965,6 @@ globalThis.DelphiDrawer = (() => {
    * written back over with the copy this window holds.
    */
   function padEditor(pad, { label = "Pad", kind = "pad", onSaved = null, onMode = null, value = null, draftKey = null } = {}) {
-    const ANCHOR = /<!--\s*d:(\d+)\s*-->/;
     const after = (row) => { if (row && typeof row.body === "string") pad.body = row.body; if (onSaved) onSaved(pad); return pad.body; };
     const ed = editor({
       label, kind, value: value != null ? value : pad.body || "", draftKey: draftKey || ["padbody", pad.id], onMode,
@@ -954,37 +985,13 @@ globalThis.DelphiDrawer = (() => {
         if (!row || typeof row.body !== "string") { pad.body = body; if (onSaved) onSaved(pad); return body; }
         return after(row);
       },
-      toggle: async (tick, api) => {
-        // Never through the editor's whole-body save, even with typing not
-        // saved yet: the tick is written to the pad as stored, and replace()
-        // keeps the typing here with the same box ticked in it.
-        const fresh = await window.delphi.pads.get(pad.id);
-        if (!fresh) { api.replace(pad.body, { ticked: false }); host.notify("The pad could not be read, so nothing was ticked."); return; }
-        const lines = String(fresh.body || "").split("\n");
-        if (lines[tick.line] == null || lines[tick.line].replace(/\r$/, "") !== String(tick.text).replace(/\r$/, "")) {
-          api.replace(after(fresh), { ticked: false });
-          host.notify("The pad changed since it was shown, so nothing was ticked. Try again.");
-          return;
-        }
-        const anchored = fresh.derives_tasks ? ANCHOR.exec(lines[tick.line]) : null;
-        let filed = null;
-        if (anchored) {
-          // Only a task this pad owns: an anchor copied in from another pad
-          // is stale text, as the derivation treats it, and must not tick
-          // somebody else's task.
-          const detail = await window.delphi.pads.tasks(pad.id);
-          const entry = ((detail && detail.lines) || []).find((l) => l.index === tick.line);
-          filed = entry && entry.task && entry.task.pad_id === pad.id && entry.task.id === Number(anchored[1]) ? entry.task : null;
-        }
-        if (filed) {
-          await window.delphi.tasks.update(filed.id, { status: tick.checked ? "done" : "todo" });
-          api.replace(after(await window.delphi.pads.get(pad.id)));
-        } else {
-          const next = DelphiMarkdown.toggleTask(fresh.body || "", tick.line, tick.checked, tick.text);
-          if (next == null) { api.replace(after(fresh), { ticked: false }); return; }
-          api.replace(after(await window.delphi.pads.write(pad.id, { body: next, author: "you" })));
-        }
-        host.refresh();
+      // A tick is read, placed and written in one unit in the main process
+      // (db.toggleLine): a task this pad files goes through the board's own
+      // update, any other line through the pad's write and its derivation.
+      tickStore: async (t) => {
+        const r = await window.delphi.markdown.tick("pad", pad.id, t);
+        if (r && typeof r.body === "string" && !r.refused) { pad.body = r.body; if (onSaved) onSaved(pad); host.refresh(); }
+        return r;
       },
     });
     return ed;
@@ -1662,6 +1669,11 @@ globalThis.DelphiDrawer = (() => {
         draftKey: ["desc", draftOf],
         current: async () => { const f = await window.delphi.tasks.detail(taskId); return f ? f.task.detail || "" : null; },
         onSave: async (next) => { await window.delphi.tasks.update(taskId, { detail: next }); detail.task.detail = next; flash("description saved"); paintSectionMeta(); host.refresh(); return next; },
+        tickStore: async (t) => {
+          const r = await window.delphi.markdown.tick("task", taskId, t);
+          if (r && !r.refused) { detail.task.detail = r.body; flash("description saved"); paintSectionMeta(); host.refresh(); }
+          return r;
+        },
         onMode: () => widen(),
       });
       box.textContent = "";
@@ -2586,6 +2598,11 @@ globalThis.DelphiDrawer = (() => {
       draftKey: ["notebody", n.id],
       current: async () => { const f = await fetchNote(); return f ? f.body || "" : null; },
       onSave: async (body) => { const r = await window.delphi.notes.update(n.id, { body }); n.body = r && r.body != null ? r.body : body; host.refresh(); paintLinked(); return n.body; },
+      tickStore: async (t) => {
+        const r = await window.delphi.markdown.tick("note", n.id, t);
+        if (r && !r.refused) { n.body = r.body; host.refresh(); }
+        return r;
+      },
       onMode: (m) => me.root.classList.toggle("wide", m === "split") });
     me.root.classList.toggle("wide", ed.mode() === "split");
     me.body.append(el("div", { className: "dw-sec" }, ed.node));

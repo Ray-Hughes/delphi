@@ -144,6 +144,10 @@ contextBridge.exposeInMainWorld("delphi", {
     list: (projectId) => call("locks:list", projectId),
     release: (projectId, key, holder) => call("locks:release", projectId, key, holder),
   },
+  // A checkbox in rendered Markdown: entity is "pad", "note" or "task".
+  markdown: {
+    tick: (entity, id, tick) => call("markdown:tick", entity, id, tick),
+  },
   pads: {
     list: (projectId) => call("pads:list", projectId),
     get: (id) => call("pads:get", id),
