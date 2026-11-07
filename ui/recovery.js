@@ -66,9 +66,17 @@ globalThis.DelphiRecovery = (() => {
   // --- drafts ---------------------------------------------------------------
 
   const draftKey = (kind, id) => `${DRAFT}${kind}.${id}`;
-  function saveDraft(kind, id, text) {
+  /**
+   * base, when given, is the stored text the draft was typed against. A box
+   * that holds a copy of something an agent also writes keeps it, so a draft
+   * brought back later is checked against what changed since, not written
+   * over it.
+   */
+  function saveDraft(kind, id, text, base) {
     if (text == null || !String(text).trim()) { remove(draftKey(kind, id)); return; }
-    write(draftKey(kind, id), { text: String(text), at: Date.now() });
+    const d = { text: String(text), at: Date.now() };
+    if (typeof base === "string") d.base = base;
+    write(draftKey(kind, id), d);
   }
   /**
    * The id a task's drafts are kept under: its id and its created_at, so the
@@ -123,6 +131,8 @@ globalThis.DelphiRecovery = (() => {
   }
 
   function draft(kind, id) { const d = read(draftKey(kind, id)); return d && typeof d.text === "string" ? d.text : null; }
+  /** The stored text a draft was typed against, or undefined when it was not kept. */
+  function draftBase(kind, id) { const d = read(draftKey(kind, id)); return d && typeof d.base === "string" ? d.base : undefined; }
   function clearDraft(kind, id) { remove(draftKey(kind, id)); }
 
   /** Every draft of one kind, for boxes that are only drawn when they hold something. */
@@ -264,7 +274,7 @@ globalThis.DelphiRecovery = (() => {
     host.prepend(box);
   }
 
-  return { remember, taskOpened, taskClosed, watchScroll, lastPlace, saveDraft, draft, clearDraft, draftsOf, pruneDrafts, bindDraft, showBanner,
+  return { remember, taskOpened, taskClosed, watchScroll, lastPlace, saveDraft, draft, draftBase, clearDraft, draftsOf, pruneDrafts, bindDraft, showBanner,
     taskDraftId, clearTaskDrafts, dropDraftsBefore };
 })();
 

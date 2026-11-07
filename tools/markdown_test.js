@@ -529,6 +529,16 @@ async function main() {
   await wait(150);
   check("Copy copies the code and says so", await js("[window.__copied, document.querySelector('.dw .md-copy').textContent, document.querySelector('.dw .md-live').textContent]"), ["puts :hi", "Copied", "Copied to the clipboard"]);
 
+  // A CRLF pad: the box has LF, the store CRLF. It must not look unsaved, and
+  // a save must not be refused forever by the compare-and-set.
+  const crlf = db.createScratchpad({ projectId: project.id, key: "crlf", title: "CRLF", body: "- [ ] a\r\n- [ ] b\r\n", derivesTasks: false });
+  await js("DelphiDrawer.close(); 1"); await wait(200);
+  await js(`localStorage.setItem("delphi.drawer.mode.pad", JSON.stringify("write")); DelphiDrawer.openPad(${crlf.id}).then(() => 1)`);
+  await until("!!document.querySelector('.dw textarea.dw-raw')");
+  await js("(() => { const a = document.querySelector('.dw textarea.dw-raw'); a.focus(); a.value += '- [ ] c'; a.dispatchEvent(new Event('input')); a.dispatchEvent(new Event('blur')); return 1; })()");
+  await until(`window.delphi.pads.get(${crlf.id}).then((p) => p.body.includes("- [ ] c"))`, 4000);
+  check("a CRLF pad saves through the compare-and-set", db.getScratchpad(crlf.id).body.includes("- [ ] c"), true);
+
   // The Pads tab hosts the same editor.
   await js("DelphiDrawer.close(); 1");
   await wait(200);
