@@ -301,6 +301,8 @@ console.log("\nhostile input, 50KB to 100KB, against the clock");
     "[a]( x 25,000": "[a](".repeat(25000),
     "![a]( x 20,000": "![a](".repeat(20000),
     "[a](< x 20,000": "[a](<".repeat(20000),
+    "[a](< x 20,000, one > at the end": "[a](<".repeat(20000) + ">",
+    "[a](x \" x 10,000, one quote at the end": "[a](x \"".repeat(10000).replace(/"/g, "'") + "\"",
     "[a](x \" x 10,000": "[a](x \"".repeat(10000),
     "[ x 100,000": "[".repeat(100000),
     "[]( x 30,000": "[](".repeat(30000),

@@ -377,14 +377,13 @@ globalThis.DelphiMarkdown = (() => {
     const noClose = new Map();
     const noTicks = new Set();
     let noBracket = false;
-    // Searches that found nothing from some point find nothing from any later
-    // point either, so each is made once.
-    const noFind = new Set();
+    // A search for a closing ">" or quote looks no further than a URL can
+    // be long, so "[a](<" repeated with one ">" at the very end is not a scan
+    // to the end from every one of them.
     const find = (what, from) => {
-      if (noFind.has(what)) return -1;
-      const e = s.indexOf(what, from);
-      if (e < 0) noFind.add(what);
-      return e;
+      const stop = Math.min(n, from + URL_MAX + 1);
+      for (let k = from; k < stop; k++) if (s[k] === what) return k;
+      return -1;
     };
     const n = s.length;
     let i = 0;

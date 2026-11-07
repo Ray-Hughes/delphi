@@ -2145,7 +2145,9 @@ function toggleLine(entity, id, tick = {}) {
     // A status that already matched writes nothing back, so the line is set
     // here, to say what the board says.
     const now = getScratchpad(id);
-    const entry = pads.parse(now.body).find((e) => e.taskId === task.id);
+    // The clicked line, not the first carrying this anchor: a pad with the
+    // same anchor twice must not have its other copy changed.
+    const entry = pads.parse(now.body).find((e) => e.index === got.line && e.taskId === task.id);
     if (entry && entry.done !== tick.checked) writeScratchpad(id, { body: pads.writeLine(now.body, entry, { done: tick.checked }), author: "you" });
     return { body: getScratchpad(id).body, taskId: task.id, before: task.status };
   }
