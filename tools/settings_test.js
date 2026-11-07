@@ -19,7 +19,7 @@
 // - export leaves out what only means something here, and import says why it
 //   skips what it skips;
 // - a vault folder that already holds someone's markdown is refused;
-// - every curated accent passes AA in both themes, against styles/tokens.css.
+// - every curated accent passes AA in every theme, against styles/tokens.css.
 
 const fs = require("fs");
 const os = require("os");
@@ -63,7 +63,7 @@ for (const s of schema.SETTINGS) {
   }
   if (s.danger && !(s.danger.title && s.danger.body && s.danger.confirm)) why.push("a danger needs a title, a body and a confirm");
   if (s.type === "int" && !(Number.isInteger(s.min) && Number.isInteger(s.max) && s.unit)) why.push("an int needs min, max and unit");
-  if (s.type === "enum" && !(Array.isArray(s.choices) && s.choices.some(([c]) => c === s.default))) why.push("an enum's default must be a choice");
+  if (s.type === "enum" && !(Array.isArray(s.choices) && (s.choices.some(([c]) => c === s.default) || (s.nullable && s.default === null && s.nullLabel)))) why.push("an enum's default must be a choice, or null with a nullLabel");
   const bad = throws(() => schema.check(s.key, s.default, ctxAll));
   if (bad) why.push(`its default fails its own check: ${bad}`);
   if (/[\u2013\u2014\u2212]/.test(JSON.stringify(s))) why.push("contains a dash the house rules forbid");
@@ -218,7 +218,16 @@ check("a setting nobody defined is refused by name, not dropped",
 check("one bad field and nothing is applied (the call throws before returning values)",
   throws(() => schema.apply(current, { theme: "dark", jobConcurrency: 99 }, ctxAll)), "Jobs at once must be a whole number from 1 to 8.");
 check("a switch is true or false, not a truthy string", throws(() => schema.apply(current, { scratchpadMode: "yes" }, ctxAll)), "Agents keep their working notes here is on or off: true or false.");
-check("a theme is one of three", throws(() => schema.apply(current, { theme: "sepia" }, ctxAll)), "Theme must be one of system, light, dark.");
+check("a theme is one of four", throws(() => schema.apply(current, { theme: "sepia" }, ctxAll)), "Theme must be one of system, light, paper, dark.");
+check("System's light theme is Light or Paper, and Light by default", [B.systemLight.choices.map(([c]) => c), B.systemLight.default], [["light", "paper"], "light"]);
+check("no accent picked is a value, and reads as the theme's own", [schema.check("accent", null), schema.describe("accent", null), schema.isModified("accent", null)], [null, "The theme's own", false]);
+check("the window's theme: System follows the computer into Light, or into Paper when asked, and Dark is always Dark",
+  [schema.resolvedTheme({ theme: "system" }, false), schema.resolvedTheme({ theme: "system", systemLight: "paper" }, false),
+   schema.resolvedTheme({ theme: "system", systemLight: "paper" }, true), schema.resolvedTheme({ theme: "paper" }, true), schema.resolvedTheme({ theme: "light", systemLight: "paper" }, false)],
+  ["light", "paper", "dark", "paper", "light"]);
+check("each theme wears its own accent until one is picked, and then the pick everywhere",
+  [schema.accentFor({}, "light").id, schema.accentFor({}, "paper").id, schema.accentFor({}, "dark").id, schema.accentFor({ accent: "teal" }, "paper").id],
+  ["indigo", "brass", "indigo", "teal"]);
 check("an accent is one of the curated ones", throws(() => schema.apply(current, { accent: "#ff0000" }, ctxAll)) !== null, true);
 check("text size is 12 to 16", [throws(() => schema.apply(current, { fontSize: 30 }, ctxAll)) !== null, schema.apply(current, { fontSize: "14" }, ctxAll).values.fontSize], [true, 14]);
 check("a shortcut is modifiers and one key",
@@ -359,25 +368,42 @@ fs.rmSync(tmp, { recursive: true, force: true });
 
 // --- accents ------------------------------------------------------------------------
 console.log("\naccents, against styles/tokens.css");
-const css = read("styles/tokens.css").replace(/\/\*[\s\S]*?\*\//g, "");
+const css0 = read("styles/tokens.css");
+const css = css0.replace(/\/\*[\s\S]*?\*\//g, "");
 function block(re) {
   const at = css.search(re); const open = css.indexOf("{", at); let d = 1; let i = open + 1;
   for (; i < css.length && d; i++) { if (css[i] === "{") d++; else if (css[i] === "}") d--; }
   return Object.fromEntries([...css.slice(open + 1, i - 1).matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]));
 }
 const light = block(/(^|\n):root\s*\{/);
+const paper = { ...light, ...block(/:root\[data-theme="paper"\]\s*\{/) };
 const dark = { ...light, ...block(/:root\[data-theme="dark"\]\s*\{/) };
+const soft = { ...light, ...Object.fromEntries([...((css0.match(/\/\* candidate: dark soft([\s\S]*?)end candidate \*\//) || [])[1] || "").matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()])) };
 const rgb = (hex) => { const h = hex.replace("#", ""); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); };
 const lum = ([r, g, b]) => { const f = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b); };
 const ratio = (a, b) => { const [x, y] = [lum(rgb(a)), lum(rgb(b))].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
+// The ink on every ground text sits on, white on the fill, and the fill as a
+// focus ring where it is one. Dark draws its ring in the ink (--focus-ring in
+// tokens.css), because no fill that carries white at 4.5:1 is also 3:1 on a
+// dark ground, so there the ink is held to 3:1 as the ring as well as 4.5:1 as
+// text. The Soft dark kept as a candidate is checked as if it shipped.
 const low = [];
+const ring = [];
 for (const a of schema.ACCENTS) {
-  for (const [theme, vars, [fill, ink]] of [["light", light, a.light], ["dark", dark, a.dark]]) {
-    for (const g of ["--bg", "--surface", "--raised"]) if (ratio(ink, vars[g]) < 4.5) low.push(`${a.id} ${theme} ink on ${g}: ${ratio(ink, vars[g]).toFixed(2)}`);
+  for (const [theme, vars, [fill, ink], ringIs] of [["light", light, a.light, fill0(a.light)], ["paper", paper, a.paper, fill0(a.paper)], ["dark", dark, a.dark, a.dark[1]], ["dark soft", soft, a.dark, a.dark[1]]]) {
+    for (const g of ["--bg", "--surface", "--raised", "--chrome"]) {
+      if (ratio(ink, vars[g]) < 4.5) low.push(`${a.id} ${theme} ink on ${g}: ${ratio(ink, vars[g]).toFixed(2)}`);
+      if (ratio(ringIs, vars[g]) < 3) ring.push(`${a.id} ${theme} focus ring on ${g}: ${ratio(ringIs, vars[g]).toFixed(2)}`);
+    }
     if (ratio("#FFFFFF", fill) < 4.5) low.push(`${a.id} ${theme} white on the fill: ${ratio("#FFFFFF", fill).toFixed(2)}`);
   }
 }
-check("every accent's ink reads on every ground, and white reads on its fill, in both themes", low, []);
+function fill0(pair) { return pair[0]; }
+check("every accent's ink reads on every ground, and white reads on its fill, in every theme", low, []);
+check("and its focus ring holds 3:1 on every ground, in every theme", ring, []);
+check("every accent has a pair for each theme", schema.ACCENTS.filter((a) => !["light", "paper", "dark"].every((t) => Array.isArray(a[t]) && a[t].length === 2)).map((a) => a.id), []);
+check("each theme's own accent is one of the palette", Object.values(schema.THEME_ACCENT).filter((id) => !schema.ACCENTS.some((a) => a.id === id)), []);
+check("Paper's own accent is Muster's brass", schema.accentFor({}, "paper").paper, ["#9A6A12", "#845B0E"]);
 check("the accent's choices are the palette", B.accent.choices.map(([c]) => c), schema.ACCENTS.map((a) => a.id));
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

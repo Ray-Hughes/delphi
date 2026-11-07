@@ -35,7 +35,7 @@
   font: inherit; font-size: 13px; text-align: left; }
 .mm-row:last-child { border-bottom: 0; }
 .mm-row:hover { background: var(--raised); }
-.mm-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mm-row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 .mm-row .grow { flex: 1 1 0; min-width: 8px; }
 .mm-id { flex: none; width: 40px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); }
 .mm-title { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -82,7 +82,7 @@
   border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: var(--ink); font: inherit; }
 .mm-card:last-child { border-bottom: 0; }
 .mm-card:hover { background: var(--raised); }
-.mm-card:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mm-card:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 .mm-ico { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center;
   background: var(--raised); color: var(--ink-dim); border: 1px solid var(--line-soft); }
 .mm-ico.k-gotcha { color: var(--warn-ink); }

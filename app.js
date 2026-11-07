@@ -309,14 +309,26 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
  *
  * "system" removes the attribute rather than resolving the preference here, so
  * the media query stays in charge and the window follows the system if it
- * changes while open. The other two pin it.
+ * changes while open. Light, Paper and Dark pin it.
+ *
+ * The one exception is System with "In System, light means" set to Paper.
+ * Paper has no media query of its own (styles/tokens.css), so that case is
+ * resolved here and kept current by systemDark's listener below: Paper while
+ * the computer is light, Dark while it is dark.
  */
+const systemDark = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
 function applyTheme(theme) {
-  const choice = ["light", "dark"].includes(theme) ? theme : "system";
+  const choice = ["light", "paper", "dark"].includes(theme) ? theme : "system";
   state.theme = choice;
-  if (choice === "system") document.documentElement.removeAttribute("data-theme");
-  else document.documentElement.setAttribute("data-theme", choice);
+  const root = document.documentElement;
+  const paperForLight = Boolean(state.settings && state.settings.systemLight === "paper");
+  if (choice === "system" && paperForLight) root.setAttribute("data-theme", systemDark && systemDark.matches ? "dark" : "paper");
+  else if (choice === "system") root.removeAttribute("data-theme");
+  else root.setAttribute("data-theme", choice);
+  // The light theme the toolbar's switch goes back to from Dark.
+  if (themeIs() !== "dark") state.lightTheme = themeIs();
 }
+if (systemDark) systemDark.addEventListener("change", () => { if (state.theme === "system") applyTheme("system"); });
 
 /**
  * Applies the animation choice.
@@ -6840,12 +6852,12 @@ async function renderSettings(root) {
   const appearance = el("div", { className: "setting" });
   appearance.append(el("h3", { textContent: "Appearance" }));
   appearance.append(el("p", {
-    textContent: "System follows whatever the Mac is set to and changes with it. Light and dark pin the window regardless.",
+    textContent: "System follows whatever the Mac is set to and changes with it. Light, Paper and Dark pin the window regardless.",
   }));
 
   const themes = el("div", { className: "seg", role: "group" });
   themes.setAttribute("aria-label", "Theme");
-  for (const [value, label] of [["system", "System"], ["light", "Light"], ["dark", "Dark"]]) {
+  for (const [value, label] of DelphiSettingsSchema.BY_KEY.theme.choices) {
     const button = el("button", { type: "button", textContent: label });
     button.setAttribute("aria-pressed", String(state.theme === value));
     button.onclick = async () => {
@@ -14463,9 +14475,10 @@ function focusComposer() {
 // missing from the other.
 // The places and actions themselves live in ui/commands.js, which a Node test
 // can load; this is where app.js lends them its functions.
-const themeIs = () => (state.theme === "system"
-  ? (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
-  : state.theme);
+/** "light", "paper" or "dark": the theme the window is showing now. */
+function themeIs() {
+  return DelphiSettingsSchema.resolvedTheme({ ...state.settings, theme: state.theme }, Boolean(systemDark && systemDark.matches));
+}
 /** The project Pads and Chat open from All projects: the last one open, else the default. */
 function projectFor() {
   let recent = [];
@@ -14506,7 +14519,10 @@ const shell = {
   },
   themeIs,
   toggleTheme: async () => {
-    const next = themeIs() === "dark" ? "light" : "dark";
+    // Back from Dark to whichever light theme was last on screen, so a person
+    // on Paper does not land on Light.
+    const back = state.lightTheme || (state.settings && state.settings.systemLight);
+    const next = themeIs() === "dark" ? (back === "paper" ? "paper" : "light") : "dark";
     applyTheme(next);
     render();
     try { await window.delphi.settings.set({ theme: next }); } catch (error) { notifyError(error); }
@@ -14549,7 +14565,7 @@ if (window.DelphiSettingsPanel) {
     state: () => state,
     saved: (settings, fields) => {
       state.settings = settings;
-      if ("theme" in fields) applyTheme(settings.theme);
+      if ("theme" in fields || "systemLight" in fields) applyTheme(settings.theme);
       if ("animations" in fields) applyMotion(settings.animations !== false);
       if ("noteView" in fields) state.noteView = settings.noteView;
       if ("pinnedProjects" in fields) state.pinned = readPins(settings);

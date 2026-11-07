@@ -316,9 +316,16 @@ session carries, as a floor under that, not instead of it.
 
 ## Theming
 
-Design tokens live in `:root` in `index.html`. Light is the base set. The dark set
-is declared twice on purpose: once under `@media (prefers-color-scheme: dark)`
-guarded by `:root:not([data-theme="light"])`, and once under
+Design tokens live in `:root` in `styles/tokens.css`. Light is the base set.
+Paper, a warm light theme after Muster's, is `:root[data-theme="paper"]` and is
+pinned only: System reaches it because `applyTheme` in `app.js` writes
+`data-theme="paper"` when the computer is light and "In System, light means" is
+Paper. The dark set is declared twice on purpose: once under
+`@media (prefers-color-scheme: dark)` guarded by
+`:root:not([data-theme="light"]):not([data-theme="paper"])`, and once under
 `:root[data-theme="dark"]`. That is what lets the Appearance setting pin a theme
 while "System" still follows the OS live. Components reference tokens only, so
-neither theme can end up with one theme's ink on the other's ground.
+no theme can end up with another theme's ink on its ground. Focus rings use
+`--focus-ring`, never `--accent` directly, because dark draws them in the
+accent's ink. `tools/contrast_test.js` checks every theme, including the "Soft"
+dark kept in a comment at the end of the file as a candidate.

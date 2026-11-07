@@ -29,7 +29,7 @@
 .tk-seg-b[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-1); }
 .tk-btn:focus-visible, .tk-seg-b:focus-visible, .tk-act:focus-visible, .tk-link:focus-visible, .tk-more:focus-visible,
 .tk-pill:focus-visible, .tk-st:focus-visible, .tk-check:focus-visible, .tk-sub-title:focus-visible, .tk-prop:focus-visible,
-.tk-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tk-switch:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 
 /* Quick entry: dashed until you are in it, then a solid accent edge. */
 .tk-quick-box { margin-bottom: 12px; }
@@ -68,7 +68,7 @@
 .tk-row { position: relative; display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 0 14px;
   border-bottom: 1px solid var(--line-soft); background: var(--surface); color: var(--ink); font-size: 13px; }
 .tk-row:hover { background: var(--raised); }
-.tk-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tk-row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 .tk-row.done .tk-title { color: var(--ink-faint); text-decoration: line-through; text-decoration-color: var(--line); }
 .tk-row.quiet.amber { box-shadow: inset 2px 0 0 var(--warn); }
 .tk-row.quiet.red { box-shadow: inset 2px 0 0 var(--crit); }
@@ -147,7 +147,7 @@
 .tk-edit-title[aria-invalid="true"] { border-color: var(--crit); box-shadow: 0 0 0 3px var(--crit-soft); }
 .tk-edit-sel, .tk-pop-sel { height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface);
   color: var(--ink); font: inherit; font-size: 12.5px; }
-.tk-edit-sel:focus-visible, .tk-pop-sel:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tk-edit-sel:focus-visible, .tk-pop-sel:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 
 .tk-add { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 0 14px; border-bottom: 1px solid var(--line-soft);
   background: var(--surface); color: var(--ink-faint); }
@@ -173,7 +173,7 @@
 .tk-card { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface);
   box-shadow: var(--shadow-1); color: var(--ink); font-size: 13px; }
 .tk-card:hover { border-color: color-mix(in srgb, var(--ink-faint) 45%, var(--line)); }
-.tk-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tk-card:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 .tk-card.dragging { opacity: .5; }
 .tk-card.done .tk-card-title { color: var(--ink-dim); }
 .tk-card.fresh { animation: tk-fresh-card 1.6s var(--ease) both; }

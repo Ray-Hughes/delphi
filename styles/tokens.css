@@ -3,7 +3,12 @@
    reference tokens, so neither theme can end up with one theme's ink on the
    other's ground. The values are Direction B's (the v2 design), exactly, plus
    the -ink variants it needs to pass 4.5:1 as text; tools/contrast_test.js
-   reads this file and checks every ink against every ground. */
+   reads this file and checks every ink against every ground, in every theme.
+
+   Four choices: Light (this block), Paper (a warm light theme), Dark, which is
+   declared twice below, and System. Paper has no media query of its own:
+   System reaches it because app.js applyTheme writes data-theme="paper" when
+   the computer is light and the person said light means Paper. */
 :root {
     /* Grounds. The page is the faintest grey, and what holds the work (a card,
        a panel, a menu) is white on it, which is what separates them; borders
@@ -63,7 +68,7 @@
        task stores the name and not the hex. */
     --tc-blue:   #2c6bd8;
     --tc-teal:   #0f7a80;
-    --tc-green:  #2f8757;
+    --tc-green:  #2E8455;
     --tc-amber:  #8a6a00;
     --tc-orange: #b4581f;
     --tc-red:    #c04a41;
@@ -142,107 +147,223 @@
     /* And the section that has the keyboard: ink, not the accent, so a
        person's accent choice can never take it under 3:1. */
     --ly-focus:         #0F1523;
+    /* The ring a focused control draws. The accent's own fill here, where it
+       holds 3:1 on every ground; dark points it at the accent's ink instead,
+       because no fill that carries white text at 4.5:1 is also 3:1 against a
+       dark ground. A reference, so a person's accent choice carries through. */
+    --focus-ring:       var(--accent);
     color-scheme: light;
 }
 
+/* Paper: a light theme on warm stock, after Muster's. Brass is the accent
+   until a person picks one (ui/settings.js applyLook), and the status set is
+   Muster's warm one: a green, an amber and a red that read as ink on the
+   cream rather than as lamps. Every value is checked by
+   tools/contrast_test.js like the other themes'. */
+:root[data-theme="paper"] {
+  --bg: #F3F0E8; --surface: #FBF9F4; --raised: #EBE6DA;
+  --line: #D9D2C3; --line-soft: #E4DED1;
+  --chrome: #EEEAE0; --chrome-deep: #E8E3D7;
+
+  --ink: #1C232C; --ink-dim: #4A525C; --ink-faint: #5E636A;
+
+  /* Muster's brass as the fill. As text it is 3.79:1 on the sunk ground, so
+     the ink is a step darker, the same split the other themes make. */
+  --accent: #9A6A12; --accent-ink: #845B0E;
+  --accent-soft: rgba(154, 106, 18, 0.13); --accent-line: rgba(154, 106, 18, 0.4);
+  --good: #2F6B3A; --good-ink: #2F6B3A; --good-soft: rgba(47, 107, 58, 0.1);
+  --warn: #8F5405; --warn-ink: #8F5405; --warn-soft: rgba(143, 84, 5, 0.11);
+  --crit: #A03325; --crit-ink: #A03325; --crit-soft: rgba(160, 51, 37, 0.08);
+  --btn-fg: #fff; --on-good: #fff;
+  --btn-primary: #9A6A12; --crit-fill: #A03325;
+  --glass: rgba(251, 249, 244, 0.72);
+
+  /* The light theme's task colours, each taken down just enough to hold
+     4.5:1 on the darker cream. */
+  --tc-blue:   #2863C7;
+  --tc-teal:   #0D7076;
+  --tc-green:  #28734A;
+  --tc-amber:  #806200;
+  --tc-orange: #A34F1C;
+  --tc-red:    #AE433B;
+  --tc-purple: #794ACD;
+  --tc-slate:  #5A6376;
+
+  --kind-say: #4A525C; --kind-agent: #794ACD; --kind-run: #0B6A70; --kind-ask: #7A5D00;
+  --kind-decide: #2F6B3A; --kind-note: #845B0E; --kind-ledger: #845B0E;
+  --run-ok: #2F6B3A; --run-fail: #A03325; --run-busy: #8F5405;
+  --on-decide: #fff; --scrim: rgba(28, 35, 44, 0.18);
+  --agent-claude: #d97757; --agent-codex: #3a3f47; --agent-copilot: #6e40c9;
+  --on-agent: #fff; --on-agent-codex: #fff;
+
+  --code-bg: #EFEBE1;
+  --kw: #7C3AED; --str: #047354; --key: #A64C08; --tag: #24588F;
+  --hl-com: #5E636A; --hl-num: #B4400F; --hl-add: #166534; --hl-del: #B91C1C; --hl-meta: #6D28D9;
+
+  /* Muster's warm shadow: its ink rather than black, so a lifted card reads
+     as paper on paper and not as a hole. */
+  --shadow-1: 0 1px 2px rgba(28, 35, 44, 0.06);
+  --shadow-2: 0 8px 24px rgba(28, 35, 44, 0.09), 0 1px 3px rgba(28, 35, 44, 0.07);
+  --shadow-3: 0 24px 64px rgba(28, 35, 44, 0.18), 0 2px 8px rgba(28, 35, 44, 0.09);
+  --ly-outline: #9A6A12; --ly-outline-quiet: #7F796C; --ly-focus: #1C232C;
+  --focus-ring: var(--accent);
+  color-scheme: light;
+}
+
 /* The dark set applies in two cases: when the system asks for dark and the
-   user has not overridden it, and when the user has chosen dark outright.
+   user has not pinned a light theme (Light or Paper), and when the user has
+   chosen dark outright.
 
    The declarations are repeated rather than shared, because a media query
    condition cannot be OR'd into a selector list. The two blocks have to be
    identical, which is why they are written from one source: they once were
    not, and choosing Dark in Settings painted light task colours on the dark
-   ground. */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #090D16; --surface: #111827; --raised: #151E2E;
-    --line: #1F2937; --line-soft: #172131;
-    /* The same idea as light, inverted the same way round: the frame is darker
-       than the work, not lighter. */
-    --chrome: #0D1320; --chrome-deep: #090D16;
+   ground. tools/contrast_test.js fails if they differ.
 
-    --ink: #E7EAF0; --ink-dim: #9AA4B4; --ink-faint: #657084;
+   This is "Dim": a slate ground in the spirit of GitHub's and Linear's dim
+   themes, lifted off the near black v2 first had (#090D16, #111827, #151E2E),
+   which the owner found too dark. A step lighter, "Soft", is kept at the end
+   of this file in a comment so it can be chosen from renders; contrast_test
+   checks it too, so swapping it in is a paste, not a redesign. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="paper"]) {
+    --bg: #161B24; --surface: #1C2230; --raised: #232A39;
+    --line: #2E3648; --line-soft: #262E3D;
+    /* The frame sits a step behind the work, as in light: between the page
+       and a card. */
+    --chrome: #191F2A; --chrome-deep: #161B24;
+
+    --ink: #E6E9EF; --ink-dim: #A3ADBE; --ink-faint: #7A8599;
 
     /* Violet on the dark ground, where the light theme's indigo goes muddy. */
     --accent: #8B5CF6; --accent-ink: #A78BFA;
-    --accent-soft: rgba(139, 92, 246, 0.14); --accent-line: rgba(139, 92, 246, 0.45);
-    --good: #10B981; --good-ink: #10B981; --good-soft: rgba(16, 185, 129, 0.13);
-    --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.13);
-    --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.12);
-    --btn-fg: #fff; --on-good: #090D16;
+    --accent-soft: rgba(139, 92, 246, 0.16); --accent-line: rgba(139, 92, 246, 0.45);
+    --good: #10B981; --good-ink: #10B981; --good-soft: rgba(16, 185, 129, 0.14);
+    --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.14);
+    --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.14);
+    --btn-fg: #fff; --on-good: #161B24;
     --btn-primary: #8655F6; --crit-fill: #EB1616;
-    --glass: rgba(17, 24, 39, 0.72);
+    --glass: rgba(28, 34, 48, 0.72);
 
     --tc-blue:   #7c9bff;
     --tc-teal:   #4fc4c0;
     --tc-green:  #4fb477;
     --tc-amber:  #e0b95c;
     --tc-orange: #f0925c;
-    --tc-red:    #e2685f;
+    --tc-red:    #ea7a71;
     --tc-purple: #b48bf0;
     --tc-slate:  #98a1b2;
 
-    --kind-say: #9AA4B4; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+    --kind-say: #A3ADBE; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
     --kind-decide: #4fb477; --kind-note: #A78BFA; --kind-ledger: #A78BFA;
     --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
-    --on-decide: #090D16; --scrim: rgba(3, 6, 12, 0.55);
-    --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #8a63d8;
-    --on-agent: #fff; --on-agent-codex: #090D16;
+    --on-decide: #161B24; --scrim: rgba(6, 9, 15, 0.5);
+    --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #855FCF;
+    --on-agent: #fff; --on-agent-codex: #161B24;
 
-    --code-bg: #0B111D;
+    --code-bg: #131821;
     --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
     --hl-com: #8D97A8; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
 
-    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
-    --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);
-    --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03);
-    --ly-outline: #8B5CF6; --ly-outline-quiet: #6B7690; --ly-focus: #E7EAF0;
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.25);
+    --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.03);
+    --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+    --ly-outline: #8B5CF6; --ly-outline-quiet: #7A8599; --ly-focus: #E6E9EF;
+    --focus-ring: var(--accent-ink);
     color-scheme: dark;
   }
 }
 
 :root[data-theme="dark"] {
-  --bg: #090D16; --surface: #111827; --raised: #151E2E;
-  --line: #1F2937; --line-soft: #172131;
-  /* The same idea as light, inverted the same way round: the frame is darker
-     than the work, not lighter. */
-  --chrome: #0D1320; --chrome-deep: #090D16;
+  --bg: #161B24; --surface: #1C2230; --raised: #232A39;
+  --line: #2E3648; --line-soft: #262E3D;
+  /* The frame sits a step behind the work, as in light: between the page
+     and a card. */
+  --chrome: #191F2A; --chrome-deep: #161B24;
 
-  --ink: #E7EAF0; --ink-dim: #9AA4B4; --ink-faint: #657084;
+  --ink: #E6E9EF; --ink-dim: #A3ADBE; --ink-faint: #7A8599;
 
   /* Violet on the dark ground, where the light theme's indigo goes muddy. */
   --accent: #8B5CF6; --accent-ink: #A78BFA;
-  --accent-soft: rgba(139, 92, 246, 0.14); --accent-line: rgba(139, 92, 246, 0.45);
-  --good: #10B981; --good-ink: #10B981; --good-soft: rgba(16, 185, 129, 0.13);
-  --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.13);
-  --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.12);
-  --btn-fg: #fff; --on-good: #090D16;
+  --accent-soft: rgba(139, 92, 246, 0.16); --accent-line: rgba(139, 92, 246, 0.45);
+  --good: #10B981; --good-ink: #10B981; --good-soft: rgba(16, 185, 129, 0.14);
+  --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.14);
+  --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.14);
+  --btn-fg: #fff; --on-good: #161B24;
   --btn-primary: #8655F6; --crit-fill: #EB1616;
-  --glass: rgba(17, 24, 39, 0.72);
+  --glass: rgba(28, 34, 48, 0.72);
 
   --tc-blue:   #7c9bff;
   --tc-teal:   #4fc4c0;
   --tc-green:  #4fb477;
   --tc-amber:  #e0b95c;
   --tc-orange: #f0925c;
-  --tc-red:    #e2685f;
+  --tc-red:    #ea7a71;
   --tc-purple: #b48bf0;
   --tc-slate:  #98a1b2;
 
-  --kind-say: #9AA4B4; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+  --kind-say: #A3ADBE; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
   --kind-decide: #4fb477; --kind-note: #A78BFA; --kind-ledger: #A78BFA;
   --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
-  --on-decide: #090D16; --scrim: rgba(3, 6, 12, 0.55);
-  --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #8a63d8;
-  --on-agent: #fff; --on-agent-codex: #090D16;
+  --on-decide: #161B24; --scrim: rgba(6, 9, 15, 0.5);
+  --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #855FCF;
+  --on-agent: #fff; --on-agent-codex: #161B24;
 
-  --code-bg: #0B111D;
+  --code-bg: #131821;
   --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
   --hl-com: #8D97A8; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
 
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);
-  --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03);
-  --ly-outline: #8B5CF6; --ly-outline-quiet: #6B7690; --ly-focus: #E7EAF0;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.03);
+  --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --ly-outline: #8B5CF6; --ly-outline-quiet: #7A8599; --ly-focus: #E6E9EF;
+  --focus-ring: var(--accent-ink);
   color-scheme: dark;
 }
+
+/* candidate: dark soft
+   Paste over both dark blocks to try it. It carries no comments because the
+   whole block is one.
+
+   --bg: #1E2430; --surface: #252C3A; --raised: #2C3445;
+   --line: #384156; --line-soft: #313A4C;
+   --chrome: #222835; --chrome-deep: #1E2430;
+
+   --ink: #E9ECF2; --ink-dim: #A9B3C3; --ink-faint: #828DA1;
+
+   --accent: #9A7BF8; --accent-ink: #B39DFB;
+   --accent-soft: rgba(154, 123, 248, 0.16); --accent-line: rgba(154, 123, 248, 0.45);
+   --good: #10B981; --good-ink: #2CC994; --good-soft: rgba(16, 185, 129, 0.14);
+   --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.14);
+   --crit: #EF4444; --crit-ink: #FA8585; --crit-soft: rgba(239, 68, 68, 0.14);
+   --btn-fg: #fff; --on-good: #1E2430;
+   --btn-primary: #8655F6; --crit-fill: #EB1616;
+   --glass: rgba(37, 44, 58, 0.72);
+
+   --tc-blue:   #7c9bff;
+   --tc-teal:   #4fc4c0;
+   --tc-green:  #4fb477;
+   --tc-amber:  #e0b95c;
+   --tc-orange: #f0925c;
+   --tc-red:    #EE8278;
+   --tc-purple: #b48bf0;
+   --tc-slate:  #98a1b2;
+
+   --kind-say: #A9B3C3; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+   --kind-decide: #4fb477; --kind-note: #B39DFB; --kind-ledger: #B39DFB;
+   --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
+   --on-decide: #1E2430; --scrim: rgba(6, 9, 15, 0.5);
+   --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #855FCF;
+   --on-agent: #fff; --on-agent-codex: #1E2430;
+
+   --code-bg: #1A202B;
+   --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
+   --hl-com: #9AA4B5; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
+
+   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.25);
+   --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.03);
+   --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+   --ly-outline: #8E6CF2; --ly-outline-quiet: #828DA1; --ly-focus: #E9ECF2;
+   --focus-ring: var(--accent-ink);
+   color-scheme: dark;
+   end candidate */

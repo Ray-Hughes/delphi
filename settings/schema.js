@@ -40,21 +40,27 @@
   ];
 
   // Curated accents. Each pair is a fill (buttons, dots, the current tab) and
-  // an ink (text in the accent). White on the fill and the ink on every ground
-  // reach 4.5:1 in both themes; tools/settings_test.js recomputes that from
-  // these numbers and styles/tokens.css, so a colour edited later cannot slip
-  // under AA. The first is the default, one step darker than Direction B's own
-  // #6366F1 and #8B5CF6, which carry white at 4.47 and 4.23 to 1.
+  // an ink (text in the accent), one pair per theme. White on the fill and the
+  // ink on every ground reach 4.5:1 in every theme, and the focus ring (the
+  // fill in Light and Paper, the ink in Dark) holds 3:1; tools/settings_test.js recomputes that from these numbers and
+  // styles/tokens.css, so a colour edited later cannot slip under AA. Paper's
+  // cream is darker than light's grey, so its pair is light's taken down where
+  // that needs it. The first is the default for Light and Dark, one step darker
+  // than Direction B's own #6366F1 and #8B5CF6, which carry white at 4.47 and
+  // 4.23 to 1; Brass, Muster's, is Paper's.
   const ACCENTS = [
-    { id: "indigo", label: "Indigo", light: ["#4F46E5", "#4338CA"], dark: ["#6D5EF0", "#A5B4FC"] },
-    { id: "violet", label: "Violet", light: ["#7C3AED", "#6D28D9"], dark: ["#7C4DEB", "#C4B5FD"] },
-    { id: "blue", label: "Blue", light: ["#2563EB", "#1D4ED8"], dark: ["#2F6BEA", "#93C5FD"] },
-    { id: "teal", label: "Teal", light: ["#0F766E", "#0F766E"], dark: ["#0D7C73", "#5EEAD4"] },
-    { id: "green", label: "Green", light: ["#15803D", "#166534"], dark: ["#178042", "#86EFAC"] },
-    { id: "amber", label: "Amber", light: ["#B45309", "#92400E"], dark: ["#B4560B", "#FCD34D"] },
-    { id: "rose", label: "Rose", light: ["#E11D48", "#BE123C"], dark: ["#D61F4D", "#FDA4AF"] },
-    { id: "graphite", label: "Graphite", light: ["#475569", "#334155"], dark: ["#55657B", "#CBD5E1"] },
+    { id: "indigo", label: "Indigo", light: ["#4F46E5", "#4338CA"], paper: ["#4F46E5", "#4338CA"], dark: ["#6D5EF0", "#A5B4FC"] },
+    { id: "violet", label: "Violet", light: ["#7C3AED", "#6D28D9"], paper: ["#7C3AED", "#6D28D9"], dark: ["#7C4DEB", "#C4B5FD"] },
+    { id: "blue", label: "Blue", light: ["#2563EB", "#1D4ED8"], paper: ["#2563EB", "#1D4ED8"], dark: ["#2F6BEA", "#93C5FD"] },
+    { id: "teal", label: "Teal", light: ["#0F766E", "#0F766E"], paper: ["#0F766E", "#0E716A"], dark: ["#0D7C73", "#5EEAD4"] },
+    { id: "green", label: "Green", light: ["#15803D", "#166534"], paper: ["#15803D", "#166534"], dark: ["#178042", "#86EFAC"] },
+    { id: "amber", label: "Amber", light: ["#B45309", "#92400E"], paper: ["#B45309", "#92400E"], dark: ["#B4560B", "#FCD34D"] },
+    { id: "brass", label: "Brass", light: ["#9A6A12", "#845B0E"], paper: ["#9A6A12", "#845B0E"], dark: ["#9A6A12", "#E0B95C"] },
+    { id: "rose", label: "Rose", light: ["#E11D48", "#BE123C"], paper: ["#E11D48", "#BE123C"], dark: ["#D61F4D", "#FDA4AF"] },
+    { id: "graphite", label: "Graphite", light: ["#475569", "#334155"], paper: ["#475569", "#334155"], dark: ["#55657B", "#CBD5E1"] },
   ];
+  // The accent a theme wears until a person picks one.
+  const THEME_ACCENT = { light: "indigo", paper: "brass", dark: "indigo" };
 
   // The screens Edit this page can arrange, and what History calls each. The
   // sections themselves are declared by the pages (ui/layout.js register);
@@ -86,6 +92,7 @@
    *   choices    for an enum, [[value, label], ...]
    *   min, max, unit   for an int, and rangeLabel when the bounds read better in words
    *   nullable   null (or an empty string) is a value: "use the default"
+   *   nullLabel  for a nullable enum, what null is called in the panel
    *   effect     what the main process does after saving it (main.js maps these)
    *   restart    "window" when saving it rebuilds the window; done last
    *   danger     { title, body, confirm } when turning it on needs a yes first
@@ -125,18 +132,32 @@
       // An install whose file predates the setting keeps "system":
       // main/settings.js readSettingsFile.
       key: "theme", section: "appearance", group: "Theme", type: "enum", default: "dark",
-      choices: [["system", "System"], ["light", "Light"], ["dark", "Dark"]],
+      choices: [["system", "System"], ["light", "Light"], ["paper", "Paper"], ["dark", "Dark"]],
       label: "Theme",
-      desc: "System follows the computer's setting and changes with it. Light and Dark pin the window whatever the computer says.",
+      desc: "System follows the computer's setting and changes with it. Light, Paper and Dark pin the window whatever the computer says. Paper is a warm light theme.",
       notChanged: "The menu bar or the Dock, which the system draws.",
-      synonyms: ["dark mode", "light mode", "night", "colour scheme", "color scheme", "appearance"],
+      synonyms: ["dark mode", "light mode", "night", "colour scheme", "color scheme", "appearance", "paper", "sepia", "warm", "cream"],
       effect: "theme",
     },
     {
-      key: "accent", section: "appearance", group: "Accent", type: "enum", default: "indigo",
+      // Only read while Theme is System: it is which light theme the window
+      // takes when the computer is light. Dark is always Dark.
+      key: "systemLight", section: "appearance", group: "Theme", type: "enum", default: "light",
+      choices: [["light", "Light"], ["paper", "Paper"]],
+      label: "In System, light means",
+      desc: "Which light theme System uses while the computer is in light mode. When it turns dark, Delphi turns Dark either way.",
+      notChanged: "A theme picked outright: Light, Paper and Dark ignore this.",
+      synonyms: ["system light", "follow system", "paper", "auto", "automatic", "light theme"],
+      effect: "theme",
+    },
+    {
+      // Null is "the theme's own": Indigo in Light and Dark, Brass in Paper.
+      // A value is a person's pick, and is worn in every theme.
+      key: "accent", section: "appearance", group: "Accent", type: "enum", default: null, nullable: true,
+      nullLabel: "The theme's own",
       choices: ACCENTS.map((a) => [a.id, a.label]),
       label: "Accent colour",
-      desc: "Buttons, the current tab, focus rings and selection. Every choice keeps text readable (WCAG AA) in both themes.",
+      desc: "Buttons, the current tab, focus rings and selection. Each theme has its own until you pick one, and every choice keeps text readable (WCAG AA) in every theme.",
       notChanged: "Project and task colours, which are each item's own.",
       synonyms: ["color", "colour", "highlight", "tint", "brand", "purple", "blue", "green"],
     },
@@ -704,6 +725,7 @@
     if (!s) return "";
     const v = value === undefined ? s.default : value;
     if (s.type === "bool") return v ? "On" : "Off";
+    if (s.type === "enum" && v == null && s.nullable) return s.nullLabel || "Default";
     if (s.type === "enum") return (s.choices.find(([c]) => c === v) || [v, String(v)])[1];
     if (s.type === "int") return `${v} ${s.unit}`;
     if (s.type === "harnessLimits") {
@@ -721,7 +743,25 @@
       (SECTIONS.find((x) => x.id === s.section) || {}).label].filter(Boolean).join(" \n ").toLowerCase();
   }
 
-  const api = { SECTIONS, SETTINGS, ACCENTS, BY_KEY, LAYOUT_SCREENS, LAYOUT_VERSION, LAYOUT_SIZES, check, defaults, apply, isModified, needsConfirm, exportable, importable, describe, searchText };
+  /**
+   * The theme the window is showing: "light", "paper" or "dark". System is
+   * resolved with the computer's own answer, which the caller passes in
+   * (nativeTheme in the main process, matchMedia in the window).
+   */
+  function resolvedTheme(settings, systemDark) {
+    const s = settings || {};
+    if (["light", "paper", "dark"].includes(s.theme)) return s.theme;
+    if (systemDark) return "dark";
+    return s.systemLight === "paper" ? "paper" : "light";
+  }
+
+  /** The accent a theme wears: the person's pick, or the theme's own. */
+  function accentFor(settings, theme) {
+    const s = settings || {};
+    return ACCENTS.find((a) => a.id === s.accent) || ACCENTS.find((a) => a.id === THEME_ACCENT[theme]) || ACCENTS[0];
+  }
+
+  const api = { SECTIONS, SETTINGS, ACCENTS, THEME_ACCENT, BY_KEY, resolvedTheme, accentFor, LAYOUT_SCREENS, LAYOUT_VERSION, LAYOUT_SIZES, check, defaults, apply, isModified, needsConfirm, exportable, importable, describe, searchText };
   root.DelphiSettingsSchema = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -30,7 +30,7 @@
 
 :where(.sp, .sp-dlg) :where(button) { font: inherit; color: inherit; background: none; border: 0; padding: 0; letter-spacing: inherit; }
 :where(.sp, .sp-dlg) :where(input, select) { font: inherit; color: inherit; }
-.sp :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 5px; }
+.sp :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; border-radius: 5px; }
 .sp kbd {
   display: inline-block; min-width: 18px; text-align: center; font: 500 10.5px/1 var(--mono); color: var(--ink-dim);
   border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 2px 4px; background: var(--surface);
@@ -161,7 +161,7 @@
 .sp-live .ptabs span.on { color: var(--ink); font-weight: 600; box-shadow: inset 0 -2px 0 var(--accent); }
 .sp-live .pfind { display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; border-radius: 7px; background: var(--surface); border: 1px solid var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); font-size: 12.5px; }
 
-.sp-themes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.sp-themes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
 .sp-thm { border-radius: 10px; border: 1px solid var(--line); padding: 8px; text-align: left; background: var(--surface); }
 .sp-thm[aria-checked="true"] { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .sp-thm .shot { height: 84px; border-radius: 7px; overflow: hidden; display: grid; grid-template-columns: 1fr; border: 1px solid rgba(127, 127, 127, .25); }
@@ -173,8 +173,12 @@
 .sp-thm .pane .bd i { height: 5px; border-radius: 3px; }
 .sp-thm .pane.light { background: #FAFAFA; } .sp-thm .pane.light .tb { background: #FFFFFF; border-bottom: 1px solid #E5E7EB; }
 .sp-thm .pane.light i { background: #E5E7EB; }
-.sp-thm .pane.dark { background: #090D16; } .sp-thm .pane.dark .tb { background: #111827; border-bottom: 1px solid #1F2937; }
-.sp-thm .pane.dark i { background: #1F2937; }
+/* Each card is a picture of that theme whatever theme is showing, so these
+   are its own grounds as literals, copied from styles/tokens.css. */
+.sp-thm .pane.paper { background: #F3F0E8; } .sp-thm .pane.paper .tb { background: #FBF9F4; border-bottom: 1px solid #D9D2C3; }
+.sp-thm .pane.paper i { background: #D9D2C3; }
+.sp-thm .pane.dark { background: #161B24; } .sp-thm .pane.dark .tb { background: #1C2230; border-bottom: 1px solid #2E3648; }
+.sp-thm .pane.dark i { background: #2E3648; }
 .sp-thm .pane i.a { background: var(--accent); }
 .sp-thm .cap { display: flex; align-items: center; gap: 7px; margin-top: 8px; font-weight: 600; font-size: 12.5px; }
 .sp-thm .cap .hint { font-weight: 400; color: var(--ink-faint); font-size: 11.5px; }
