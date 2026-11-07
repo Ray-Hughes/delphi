@@ -287,8 +287,8 @@ check("and redact the same", answers["node:sqlite leaky"], answers["sqlite3 bina
 check("a body a person wrote is redacted too", checkBody(`see ${SECRETS.aws}`), "see [redacted]");
 check("so is a title, made one line", checkTitle(`Fix\nfor ${SECRETS.ssn}`), "Fix for [redacted]");
 check("a look-alike hyphen or a zero-width character does not hide one", [checkBody("123\u201145\u20116789"), checkBody("AKIAIOSFODNN7\u200bEXAMPLE")], ["[redacted]", "[redacted]"]);
-check("nor does JSON, YAML or a bare bearer token", ['{"password": "x y"}', "secret: abc", "Bearer abcdefghijklmnopqrstuv"].map(redact),
-  ['{"password": [redacted]}', "secret: [redacted]", "Bearer [redacted]"]);
+check("nor does JSON, YAML or a bare bearer token", ['{"password": "x y"}', "secret: abc", "Bearer abcdefghijklmnopqrstuv", "db_password: hunter2", '{"adminPassword": "x"}', '"Authorization": "Basic dXNlcjpwYXNz"', "ssn 123.45.6789"].map(redact),
+  ['{"password": [redacted]}', "secret: [redacted]", "Bearer [redacted]", "db_password: [redacted]", '{"adminPassword": [redacted]}', '"Authorization": "[redacted]"', "ssn [redacted]"]);
 check("a body over GitHub's limit is refused", (() => { try { checkBody("x".repeat(MAX_BODY + 1)); return "no"; } catch (e) { return /at most/.test(e.message); } })(), true);
 }
 

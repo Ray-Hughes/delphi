@@ -901,9 +901,10 @@ function createWorkbench({
    */
   async function prDraft(id) {
     const wb = requireOpen(store.get(id));
-    const task = store.task(wb.task_id);
-    const prefix = naming.ticketOf(task.ref) || null;
-    const fallback = { title: prTitle(task.title, prefix) || `Task ${wb.task_id}`, body: `From Delphi task ${wb.task_id}.\n` };
+    let task = null;
+    try { task = store.task(wb.task_id); } catch { task = null; }
+    const prefix = task ? naming.ticketOf(task.ref) || null : null;
+    const fallback = { title: (task && prTitle(task.title, prefix)) || `Task ${wb.task_id}`, body: `From Delphi task ${wb.task_id}.\n` };
     if (!report) return fallback;
     let diffStat = null;
     if (typeof git.diffStat === "function") {

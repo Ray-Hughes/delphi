@@ -57,13 +57,15 @@
   const CONTEXT_SHAPES = [
     // Authorization and the headers named for a key, token, cookie or session.
     // A Cookie header's whole value goes, every pair of it.
-    [/((?:proxy-)?authorization:\s*)(?:bearer\s+|token\s+|basic\s+)?(?!\[redacted\])[^\s'"`]+/gi, `$1${R}`],
+    // As a header line or a JSON key: "Authorization": "Basic dXNl...".
+    [/((?:proxy-)?authorization["']?\s*:\s*["']?)(?:bearer\s+|token\s+|basic\s+)?(?!\[redacted\])[^\s'"`]+/gi, `$1${R}`],
     [/(\bcookie:\s*)(?!\[redacted\])[^'"`\n]+/gi, `$1${R}`],
     [/((?:x-[\w-]*)?(?:api-?key|token|secret|session)[\w-]*:\s*)(?!\[redacted\])[^\s'"`]+/gi, `$1${R}`],
     // --password value, --token=value and the like.
     [new RegExp(`(--?(?:password|passwd|token|secret|api-?key|access-?key)(?:=|\\s+))${VALUE}`, "gi"), `$1${R}`],
     // A credential in JSON, YAML or a .env line: "password": "x", secret: x.
-    [new RegExp(`(["']?\\b(?:password|passwd|pass|secret|client_?secret|token|access_?token|refresh_?token|api_?key|access_?key|private_?key)["']?\\s*[:=]\\s*)${VALUE.replace("[^\\s;\\`]+", "[^\\s,;}\\`]+")}`, "gi"), `$1${R}`],
+    // The keyword may end a longer name (db_password, adminPassword).
+    [new RegExp(`(["']?[\\w.-]*(?:password|passwd|pass|secret|token|api_?key|access_?key|private_?key)["']?\\s*[:=]\\s*)${VALUE.replace("[^\\s;\\`]+", "[^\\s,;}\\`]+")}`, "gi"), `$1${R}`],
     // A bearer token outside an Authorization header.
     [/(\bbearer\s+)(?!\[redacted\])[A-Za-z0-9._~+/-]{16,}=*/gi, `$1${R}`],
     // curl -u user:password.
@@ -81,6 +83,7 @@
   const PII_SHAPES = [
     /\b\d{3}-\d{2}-\d{4}\b/g,
     /\b\d{3} \d{2} \d{4}\b/g,
+    /\b\d{3}\.\d{2}\.\d{4}\b/g,
     /\bC[- ]?\d{7,8}\b/g,
   ];
   const PII_NEAR = /(\b(?:c-?file|file|claim|ssn|social security)\b(?:\s*(?:no\.?|number|num|#))?\s*[:#]?\s*)(\d{8,9}|\d{3}\s\d{2}\s\d{4})\b/gi;
