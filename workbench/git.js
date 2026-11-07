@@ -629,13 +629,20 @@ function gh() {
   return (ghCache = { available: true, authed, path: found });
 }
 
-/** Opens a pull request with gh, or finds the one already open for the branch. */
-async function prCreate(dir, { base, branch, title, body }) {
-  const tool = gh();
+/**
+ * Opens a pull request with gh, or finds the one already open for the branch.
+ * The body goes on stdin (--body-file -), not the command line: a description
+ * can be 65536 characters, twice what Windows allows a whole command line.
+ * Only an open pull request is reused; one closed or merged for the same
+ * branch is history, and a new one is opened. existing says which happened,
+ * because a reused one keeps its own description. tool is gh() unless a test
+ * hands it a stand-in.
+ */
+async function prCreate(dir, { base, branch, title, body }, tool = gh()) {
   if (!tool.available || !tool.authed) return { ok: false, url: null, reason: "The GitHub CLI is not installed or not signed in." };
   const { spawn } = require("child_process");
-  const runGh = (args) => new Promise((resolve) => {
-    const child = spawn(tool.path, args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GH_PROMPT_DISABLED: "1" } });
+  const runGh = (args, input = null) => new Promise((resolve) => {
+    const child = spawn(tool.path, args, { cwd: dir, stdio: [input == null ? "ignore" : "pipe", "pipe", "pipe"], env: { ...process.env, GH_PROMPT_DISABLED: "1" } });
     let out = "";
     let err = "";
     const timer = setTimeout(() => child.kill("SIGKILL"), NETWORK_TIMEOUT);
@@ -643,12 +650,17 @@ async function prCreate(dir, { base, branch, title, body }) {
     child.stderr.on("data", (d) => (err += d));
     child.on("error", (e) => { clearTimeout(timer); resolve({ ok: false, stdout: out, stderr: String(e.message) }); });
     child.on("close", (code) => { clearTimeout(timer); resolve({ ok: code === 0, stdout: out, stderr: err }); });
+    if (input != null) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(input);
+    }
   });
-  const existing = await runGh(["pr", "view", branch, "--json", "url", "--jq", ".url"]);
-  if (existing.ok && /^https?:\/\//.test(existing.stdout.trim())) return { ok: true, url: existing.stdout.trim(), reason: null };
-  const made = await runGh(["pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body || ""]);
+  // -- so a branch that starts with a dash is a branch, not an option.
+  const existing = await runGh(["pr", "view", "--json", "url,state", "--jq", "select(.state == \"OPEN\") | .url", "--", branch]);
+  if (existing.ok && /^https?:\/\//.test(existing.stdout.trim())) return { ok: true, url: existing.stdout.trim(), existing: true, reason: null };
+  const made = await runGh(["pr", "create", "--base", base, "--head", branch, "--title", title, "--body-file", "-"], body || "");
   const url = (made.stdout.match(/https?:\/\/\S+/) || [])[0];
-  if (made.ok && url) return { ok: true, url, reason: null };
+  if (made.ok && url) return { ok: true, url, existing: false, reason: null };
   return { ok: false, url: null, reason: core.reasonFrom(made, "gh could not open the pull request.") };
 }
 

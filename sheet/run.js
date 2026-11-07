@@ -91,7 +91,10 @@ async function runEntry({
   if (!logDir) throw new Error("runEntry needs a log folder");
   const workDir = path.resolve(cwd || process.cwd());
 
-  const entry = await store.append({ taskId, kind: "run", body: command, meta: { state: "running", cwd: workDir, ...runnerMeta() } });
+  // ran_by says Delphi ran this command itself, rather than an agent saying it
+  // ran one: only these runs are "passed" in a pull request (sheet/report.js),
+  // and the MCP tools refuse the key from anyone but the command line.
+  const entry = await store.append({ taskId, kind: "run", body: command, meta: { state: "running", cwd: workDir, ran_by: "delphi", ...runnerMeta() } });
   // Writes to the entry are queued, so a progress update can never land after
   // the final one and make a finished run look running again.
   let writes = Promise.resolve();

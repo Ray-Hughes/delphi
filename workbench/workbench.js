@@ -34,7 +34,7 @@ const naming = require("./naming");
 const setupMod = require("./setup");
 const defaultGit = require("./git");
 const keep = require("./keep");
-const { checkBody } = require("../sheet/report");
+const { checkBody, checkTitle, prTitle } = require("../sheet/report");
 
 // Status is asked for on every repaint of a task panel and every row of the
 // Overview, and each answer is three or four git processes. Ten seconds is
@@ -895,20 +895,23 @@ function createWorkbench({
   }
 
   /**
-   * The pull request description the Sheet writes for this Workbench's task,
-   * with the branch's diff stat against base. A draft for a person to edit:
-   * Finish shows it, and nothing posts it without them.
+   * The pull request title and description the Sheet writes for this
+   * Workbench's task, with the branch's diff stat against base. A draft for a
+   * person to edit: Finish shows both, and nothing posts them without them.
    */
-  async function prBody(id) {
+  async function prDraft(id) {
     const wb = requireOpen(store.get(id));
-    const fallback = `From Delphi task ${wb.task_id}.`;
+    let task = null;
+    try { task = store.task(wb.task_id); } catch { task = null; }
+    const prefix = task ? naming.ticketOf(task.ref) || null : null;
+    const fallback = { title: (task && prTitle(task.title, prefix)) || `Task ${wb.task_id}`, body: `From Delphi task ${wb.task_id}.\n` };
     if (!report) return fallback;
     let diffStat = null;
     if (typeof git.diffStat === "function") {
       try { diffStat = await git.diffStat(wb.path, await git.baseRef(wb.path, wb.base)); } catch { diffStat = null; }
     }
     // A Sheet the builder cannot read costs the description, never the pull request.
-    try { return report.prDescription(wb.task_id, { diffStat }); } catch { return fallback; }
+    try { return report.prDraft(wb.task_id, { diffStat, prefix }); } catch { return fallback; }
   }
 
   /**
@@ -916,34 +919,33 @@ function createWorkbench({
    * already open). Without, this only says which way it would go, so a surface
    * can label its button before anything happens.
    *
-   * body is the description a person edited. Without one it is the one the
-   * Sheet writes (prBody), and every answer carries the body that would be
-   * used, so an agent or the Finish dialog can show it before anything is
-   * opened. A pull request gh finds already open keeps its own description.
+   * title and body are what a person edited. Without them they are the ones
+   * the Sheet writes (prDraft), and every answer carries the title and body
+   * that would be used, so the Finish dialog and the command line show
+   * exactly what is sent. Both are redacted whoever wrote them. A pull
+   * request gh finds already open keeps its own.
    */
-  async function pr(id, { create: make = false, body = null } = {}) {
-    const given = checkBody(body);
+  async function pr(id, { create: make = false, body = null, title = null } = {}) {
+    const givenBody = checkBody(body);
+    const givenTitle = checkTitle(title);
     const wb = requireOpen(store.get(id));
-    const text = given === null ? await prBody(id) : given;
+    const draft = givenBody === null || givenTitle === null ? await prDraft(id) : null;
+    const text = givenBody === null ? draft.body : givenBody;
+    const head = givenTitle === null ? draft.title : givenTitle;
+    const answer = (fields) => ({ url: null, via: null, reason: null, ...fields, title: head, body: text });
     const st = await statusOf(wb, { fresh: true });
-    if (!st.hasRemoteBranch) return { url: null, via: null, body: text, reason: "Push the branch first: a pull request needs it on the remote." };
+    if (!st.hasRemoteBranch) return answer({ reason: "Push the branch first: a pull request needs it on the remote." });
     const tool = git.gh();
     let reason = null;
     if (tool.available && tool.authed) {
-      if (!make) return { url: null, via: "gh", body: text, reason: null };
-      const task = store.task(wb.task_id);
-      const ticket = naming.ticketOf(task.ref);
-      const made = await git.prCreate(wb.path, {
-        base: wb.base, branch: wb.branch,
-        title: ticket ? `${ticket} ${task.title}` : task.title,
-        body: text,
-      });
-      if (made.ok) return { url: made.url, via: "gh", body: text, reason: null };
+      if (!make) return answer({ via: "gh" });
+      const made = await git.prCreate(wb.path, { base: wb.base, branch: wb.branch, title: head, body: text });
+      if (made.ok) return answer({ url: made.url, via: "gh", existing: Boolean(made.existing) });
       reason = made.reason;
     }
     const url = git.compareUrl(await git.remoteUrl(wb.path), wb.base, wb.branch);
-    if (url) return { url, via: "compare", body: text, reason };
-    return { url: null, via: null, body: text, reason: reason || "Could not tell where this remote opens pull requests. Open one on the host's website." };
+    if (url) return answer({ url, via: "compare", reason });
+    return answer({ reason: reason || "Could not tell where this remote opens pull requests. Open one on the host's website." });
   }
 
   // ---------------------------------------------------------------------------
@@ -1606,7 +1608,7 @@ function createWorkbench({
   }
 
   return {
-    candidates, start, status, forTask, list, park, resume, update, commit, push, pr, prBody,
+    candidates, start, status, forTask, list, park, resume, update, commit, push, pr, prDraft,
     finishPlan,
     finish, markFinished, discardPlan, discard, markDiscarded, recreate, intent: intentFor, forget: forgetBench, housekeep, advanced,
     get: (id) => store.get(id), live: (taskId) => store.live(taskId),

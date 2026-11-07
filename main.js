@@ -1425,7 +1425,14 @@ handle("workbench:push", (id) => benches.push(id));
 handle("workbench:pr", (id, opts = {}) => benches.pr(id, {
   create: Boolean(opts && opts.create),
   body: opts && typeof opts.body === "string" ? opts.body : null,
+  title: opts && typeof opts.title === "string" ? opts.title : null,
 }));
+// A person keeping an entry out of every pull request and status report.
+handle("sheet:private", (id, on) => {
+  const r = sheets.update(id, { meta: { private: on !== false } });
+  scheduleVaultExport();
+  return r;
+});
 handle("report:status", (projectId, range = {}) => sheetReport.statusReport(projectId, {
   from: range && typeof range.from === "string" ? range.from : null,
   to: range && typeof range.to === "string" ? range.to : null,

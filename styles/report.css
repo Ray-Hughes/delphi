@@ -7,7 +7,7 @@
 .rp { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
 .rp-head { display: flex; align-items: baseline; gap: var(--s2); }
 .rp-head b { font-size: 12.5px; font-weight: 600; }
-.rp-hint { font-size: 12px; color: var(--ink-faint); }
+.rp-hint { font-size: 12px; color: var(--ink-dim); }
 .rp-panes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s3); }
 .rp-pane { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .rp-pane-k { font-size: 11px; font-weight: 600; color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.05em; }
@@ -31,7 +31,25 @@
 .wb-dialog .rp-preview ul { list-style: disc; }
 .wb-dialog .rp-preview ol { list-style: decimal; }
 .wb-dialog .rp-preview li { display: list-item; padding: 0; margin-bottom: 5px; font-size: inherit; }
-.rp-empty { color: var(--ink-faint); }
+.rp-empty { color: var(--ink-dim); }
+/* The title of a pull request, above its description. */
+.rp-title-row { display: flex; flex-direction: column; gap: 4px; }
+.rp-title {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--bg); color: var(--ink); font-size: 13px; outline: none;
+}
+.rp-title:focus { border-color: var(--accent); }
+/* What the text mentions that the person should look at, and what will be
+   redacted. Shown, never blocking. */
+.rp-warn {
+  display: flex; flex-direction: column; gap: 4px; padding: var(--s2) var(--s3);
+  border: 1px solid var(--warn); border-radius: var(--r-sm); background: var(--warn-soft);
+  color: var(--warn-ink); font-size: 12.5px; line-height: 1.5;
+}
+.rp-warn[hidden] { display: none; }
+.rp-warn-list { display: flex; flex-wrap: wrap; gap: 4px; }
+mark.rp-flag { background: var(--warn-soft); color: var(--warn-ink); border-bottom: 1px solid var(--warn); border-radius: 2px; padding: 0 2px; }
+.rp-warn mark.rp-flag { background: var(--surface); font-family: var(--mono); font-size: 11.5px; }
 .rp-range { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s3); font-size: 12.5px; }
 .rp-range label { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-dim); }
 .rp-date {
