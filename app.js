@@ -14701,7 +14701,14 @@ DelphiKeys.install({
   },
 });
 /** The centered view of a task, whatever taskOpenMode says: Shift+Enter and the drawer's Open full view. */
-async function openTaskFull(id) { openTaskSheet.full = true; try { await openTaskSheet(id); } finally { openTaskSheet.full = false; } }
+async function openTaskFull(id) {
+  // openTaskSheet reads the flag before its first await, so it is lowered
+  // straight after the call: an open from anywhere else meanwhile keeps the setting.
+  openTaskSheet.full = true;
+  let opening;
+  try { opening = openTaskSheet(id); } finally { openTaskSheet.full = false; }
+  await opening;
+}
 // The drawer (ui/drawer.js), lent what it draws with. It registers itself as
 // openSheet, so the live updates that reached the old panel reach it too.
 DelphiDrawer.init({

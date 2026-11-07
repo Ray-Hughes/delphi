@@ -1732,7 +1732,9 @@ globalThis.DelphiDrawer = (() => {
       const t = e.target;
       if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
       const k = e.key.toLowerCase();
-      if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); host.openFull(taskId); return; }
+      // Shift and Enter on a button is that button's; anywhere else it is the full view.
+      if (e.key === "Enter" && e.shiftKey) { if (t.closest && t.closest("button, a, [role=button]")) return; e.preventDefault(); host.openFull(taskId); return; }
+      if (e.shiftKey) return;
       const to = { 1: "todo", 2: "doing", 3: "blocked", 4: "done" }[e.key];
       if (to) { e.preventDefault(); if (statusOf() !== to) write({ status: to }, STATUS_LABEL[to].toLowerCase()); return; }
       if (k === "p") { e.preventDefault(); const b = props.querySelector("[data-act=priority]"); if (b) priorityMenu(b); return; }
