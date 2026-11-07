@@ -7,7 +7,7 @@
  * Delphi could act on, or, worse, an agent made a project for it unasked. Now
  * the server writes one discovered_folders row (via 'session') the first time
  * a session calls it from a folder no project has, and the window offers three
- * answers: add it as a new project, give it to a project that has no folder,
+ * answers: add it as a new project, add it to one or more existing projects,
  * or "Not a project", which is kept for good. Agents propose; only the window
  * applies.
  *
@@ -225,13 +225,12 @@ function pending(sql) {
 }
 
 /**
- * The projects a folder can be attached to: active ones with no folder. One
- * folder per project, so a project that has one is not offered, rather than
- * offered and then refused.
+ * The projects a folder can be added to: every active one. A folder may be
+ * several projects', so a project that has a folder already is offered too.
  */
 function attachable(sql) {
-  return sql("SELECT id, key, name FROM projects WHERE (path IS NULL OR path = '') AND status != 'archived' ORDER BY sort_order, id", [])
-    .map((p) => ({ id: num(p.id), key: p.key, name: p.name }));
+  return sql("SELECT id, key, name, path FROM projects WHERE status != 'archived' ORDER BY sort_order, id", [])
+    .map((p) => ({ id: num(p.id), key: p.key, name: p.name, has_folder: Boolean(p.path) }));
 }
 
 module.exports = {

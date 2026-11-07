@@ -95,6 +95,8 @@ const state = {
   // just the project, because returning to the right project on the wrong tab is
   // not returning.
   history: [],
+  // Where Back came from, so Forward can return. Emptied by any new move.
+  future: [],
   oracleHits: [],
   oracleEntities: [],
   oracleError: null,
@@ -454,6 +456,7 @@ async function refresh() {
     : await window.delphi.tasks.list({ projectId: null, includeDone: true });
   try { state.runs = await window.delphi.runs.list({ limit: 300 }); } catch { state.runs = []; }
   if (window.DelphiNeeds) await DelphiNeeds.load();
+  if (window.DelphiFolderList) await DelphiFolderList.load();
   render();
   reloadFlags();
 }
@@ -468,11 +471,57 @@ let lastRenderedPosition = null;
 // Chrome
 // ---------------------------------------------------------------------------
 
-/** Current position, as the thing Back restores. */
+/** Current position: the view, which is what decides whether a repaint keeps the scroll. */
 const position = () => ({ projectId: state.projectId, view: state.view, query: state.query });
 
 const samePosition = (a, b) =>
   a.projectId === b.projectId && a.view === b.view && a.query === b.query;
+
+/**
+ * A stop in Back and Forward: the position, the task open in the drawer, and
+ * where the page was scrolled and which row the keyboard was on, so going back
+ * lands exactly where you left rather than at the top of the right page.
+ */
+const drawerTask = () => (window.DelphiDrawer && DelphiDrawer.openTask ? DelphiDrawer.openTask() : null);
+function stop() {
+  const c = $("content");
+  const lit = document.querySelector("#content [data-task-id].kbd-hi");
+  return { ...position(), drawer: drawerTask(), scroll: c ? c.scrollTop : 0, lit: lit ? lit.dataset.taskId : null };
+}
+const sameStop = (a, b) => samePosition(a, b) && (a.drawer ?? null) === (b.drawer ?? null);
+const HISTORY_DEPTH = 50;
+function remember(from) {
+  state.history.push(from);
+  if (state.history.length > HISTORY_DEPTH) state.history.shift();
+  state.future = [];
+}
+// Set while Back or Forward is putting a stop back, so the moves it makes
+// are not themselves remembered.
+let travelling = false;
+
+/**
+ * Where the page was, put back after a drawer closes or Back lands: the
+ * scroll, and the row the keyboard was on. Applied now and again after the
+ * next render, because closing a drawer often repaints the page under it.
+ */
+let viewRestore = null;
+function restoreView(snap) {
+  if (!snap) return;
+  viewRestore = { scroll: Number(snap.scroll) || 0, lit: snap.lit || null, until: Date.now() + 1500 };
+  applyRestore();
+  requestAnimationFrame(applyRestore);
+}
+function applyRestore() {
+  if (!viewRestore) return;
+  if (Date.now() > viewRestore.until) { viewRestore = null; return; }
+  const c = $("content");
+  if (!c) return;
+  c.scrollTop = viewRestore.scroll;
+  if (viewRestore.lit) {
+    const row = c.querySelector(`[data-task-id="${CSS.escape(String(viewRestore.lit))}"]`);
+    if (row) { for (const n of c.querySelectorAll(".kbd-hi")) n.classList.remove("kbd-hi"); row.classList.add("kbd-hi"); }
+  }
+}
 
 /**
  * Moves to a new position, remembering the old one.
@@ -482,7 +531,7 @@ const samePosition = (a, b) =>
  * browser: nobody needs to unwind fifty steps.
  */
 function navigate(next) {
-  const from = position();
+  const from = stop();
   // A filter belongs to the trip that set it. Any other move into the task list,
   // or out of it, drops the filter rather than leaving a list quietly narrowed.
   if (next.view !== undefined) state.taskFilter = null;
@@ -505,8 +554,7 @@ function navigate(next) {
   const to = position();
   if (samePosition(from, to)) return Promise.resolve();
 
-  state.history.push(from);
-  if (state.history.length > 50) state.history.shift();
+  if (!travelling) remember(from);
   // The repaint is handed back so a caller can wait for it. The menu needs that:
   // the composer it wants to put the cursor in is created by the render and does
   // not exist in the document until this has finished.
@@ -533,14 +581,39 @@ function showTasks(filter) {
   refresh();
 }
 
-function goBack() {
-  const previous = state.history.pop();
-  if (!previous) return false;
-  state.projectId = previous.projectId;
-  state.view = previous.view;
-  state.query = previous.query;
-  $("search").value = previous.query || "";
-  refresh();
+function goBack() { return travel(state.history, state.future); }
+function goForward() { return travel(state.future, state.history); }
+
+/**
+ * One step through the stops: the newest one in `from` that is not where we
+ * are now, with where we are now kept in `to` for the way back. A stop names
+ * the drawer too, so Back from a task closes it and lands on the page it was
+ * opened from, scrolled where it was; Forward opens it again.
+ */
+async function travel(from, to) {
+  const here = stop();
+  let target = from.pop();
+  while (target && sameStop(target, here)) target = from.pop();
+  if (!target) return false;
+  to.push(here);
+  if (to.length > HISTORY_DEPTH) to.shift();
+  travelling = true;
+  try {
+    if (!samePosition(target, here)) {
+      if (openSheet) await openSheet.close();
+      await navigate({ projectId: target.projectId, view: target.view, query: target.query });
+      $("search").value = target.query || "";
+    }
+    if (target.drawer != null) {
+      if (drawerTask() !== target.drawer) await openTaskSheet(target.drawer);
+    } else if (openSheet) {
+      await openSheet.close();
+    }
+    restoreView(target);
+  } finally {
+    travelling = false;
+  }
+  render();
   return true;
 }
 
@@ -1011,8 +1084,8 @@ function renderTabs() {
 }
 
 /**
- * The breadcrumb over a view outside the six tabs: where it belongs, then its
- * own name. Hidden for every other view, whose heading already says where it is.
+ * The breadcrumb over every page but Home: Home, the project when there is
+ * one, then where you are (DelphiCommands.trail). Hidden on Home itself.
  */
 function paintCrumbs(place) {
   const box = $("crumbs");
@@ -1031,7 +1104,7 @@ function paintCrumbs(place) {
     }
     box.append(sep());
   }
-  const now = el("span", { className: "crumb-now here", textContent: place.title });
+  const now = el("span", { className: "crumb-now here", textContent: place.here });
   now.setAttribute("aria-current", "page");
   box.append(now);
 }
@@ -1076,7 +1149,7 @@ function render() {
 
   const p = currentProject();
   const place = DelphiCommands.heading(state, p ? p.name : "");
-  paintCrumbs(place);
+  paintCrumbs(DelphiCommands.trail(state, p ? p.name : ""));
   paintSearchViews();
   if (state.query) {
     $("title").textContent = "Search";
@@ -1103,6 +1176,8 @@ function render() {
   // always present but usually dead trains people to stop looking at it.
   $("back").hidden = state.history.length === 0;
   $("back").title = `Back (${isMac() ? "Command" : "Ctrl"} + [)`;
+  $("fwd").hidden = state.future.length === 0;
+  $("fwd").title = `Forward (${isMac() ? "Command" : "Ctrl"} + ])`;
 
   renderMetrics();
   paintTitleLive();
@@ -1182,6 +1257,8 @@ function render() {
   // that appends and then measures can still be growing when the promise
   // resolves.
   const restoreScroll = () => {
+    applyRestore();
+    requestAnimationFrame(applyRestore);
     if (!previousScroll || content !== $("content")) return;
     content.scrollTop = previousScroll;
     requestAnimationFrame(() => {
@@ -1383,61 +1460,16 @@ async function renderOverview(root) {
   }
   left.append(memCard.card);
 
-  // --- repositories --------------------------------------------------------
-  const addRepo = el("button", { className: "btn sm", textContent: "Add" });
-  const repoCard = card("Repositories", addRepo);
-  addRepo.onclick = async () => {
-    const path = await askText({
-      title: "Add a repository",
-      label: "Choose the folder, or paste its absolute path.",
-      placeholder: "/Users/you/code/project",
-      confirmLabel: "Add",
-      pickFolder: true,
-    });
-    if (!path) return;
-    const name = path.trim().replace(/\/+$/, "").split("/").pop();
-    await window.delphi.repos.create({
-      projectId: project.id, name, path: path.trim(),
-      isPrimary: state.repos.length === 0 ? 1 : 0,
-    });
-    refresh();
-  };
-
-  if (!state.repos.length) {
-    repoCard.body.append(emptyState("No repositories linked",
-      "Link the main repository and any helpers, so the project knows where its code lives."));
-  } else {
-    repoCard.body.remove();
-    const flush = el("div", { className: "card-body flush" });
-    state.repos.forEach((r) => {
-      const row = el("div", { className: "list-row" });
-      row.append(el("span", {
-        className: "kind" + (r.is_primary ? " decision" : ""),
-        textContent: r.is_primary ? "primary" : "helper",
-      }));
-      const acts = el("div", { className: "repo-acts" });
-      row.append(el("div", { className: "grow" },
-        el("div", { textContent: r.name }),
-        el("div", { className: "mono repo-path", textContent: r.path }),
-        // Under the path rather than beside it: three buttons beside a path in
-        // the narrow column left the path a few characters wide.
-        acts));
-      if (!r.is_primary) {
-        const mk = el("button", { className: "btn sm", textContent: "Make primary" });
-        mk.onclick = async () => { await window.delphi.repos.setPrimary(r.id); refresh(); };
-        acts.append(mk);
-      }
-      const wbSet = el("button", { className: "btn sm", textContent: "Workbench settings" });
-      wbSet.onclick = async () => { if (await repoWorkbenchSettings(r)) refresh(); };
-      acts.append(wbSet);
-      const rm = el("button", { className: "btn sm", textContent: "Remove" });
-      rm.onclick = async () => { await window.delphi.repos.remove(r.id); refresh(); };
-      acts.append(rm);
-      flush.append(row);
-    });
-    repoCard.card.append(flush);
-  }
-  right.append(repoCard.card);
+  // --- folders -------------------------------------------------------------
+  // Every folder its work is in, Home first, with the remote and branch git
+  // gave and who else works there (ui/folderlist.js). The same list as its
+  // Settings, so the two never disagree about where a project works.
+  const folderCard = card("Folders");
+  folderCard.body.remove();
+  const folderBody = el("div", { className: "card-body flush" });
+  folderCard.card.append(folderBody);
+  await DelphiFolderList.mount(folderBody, project, { onChanged: () => refresh() });
+  right.append(folderCard.card);
 
   // --- workbenches ---------------------------------------------------------
   // The tasks with a folder and branch of their own, and how each one stands.
@@ -1818,37 +1850,16 @@ function renderProjectSettings(root) {
     "What this project is called everywhere it appears: the project switcher, the title, and any task that belongs to it.",
     el("div", { className: "row" }, nameInput), nameMsg));
 
-  // --- folder ----------------------------------------------------------------
-  // The project's folder: where its jobs, runs, Workbenches and sessions work,
-  // and the one place it is written (db.js updateProject). One folder is one
-  // project's, so choosing a folder another project has is refused by name.
-  // The refusal a job gives when a project has none sends people here, so it
-  // has to be here.
-  const folderMsg = el("span", { className: "hint" });
-  const folderInput = commitOnEnter(el("input", { className: "field", value: project.path || "", placeholder: "/path/to/the/code" }));
-  folderInput.onblur = () => {
-    const live = currentProject();
-    const value = folderInput.value.trim();
-    if (!live || value === (live.path || "")) return;
-    save({ path: value || null }, folderMsg);
-  };
-  const folderPick = el("button", { className: "btn", type: "button", textContent: "Choose folder…" });
-  folderPick.onclick = async () => {
-    try {
-      const picked = await window.delphi.dialog.pickFolder("The project's folder");
-      if (!picked) return;
-      folderInput.value = picked;
-      save({ path: picked }, folderMsg);
-    } catch (error) { folderMsg.className = "err-msg"; folderMsg.textContent = error.message; }
-  };
-  const folderFacts = el("div", { className: "hint" });
-  if (project.path) {
-    folderFacts.textContent = [project.owner_repo || null, project.default_branch ? `default branch ${project.default_branch}` : null,
-      project.folder_missing ? "not on disk right now" : null].filter(Boolean).join(" · ");
-  }
-  const folderBox = settingSection("Folder",
-    "Where agents work on this project: its jobs, its runs and its sessions. A run that changes code still gets its own Workbench beside it; one that only answers reads from here. A folder belongs to one project.",
-    el("div", { className: "row" }, folderInput, folderPick), folderFacts, folderMsg);
+  // --- folders ---------------------------------------------------------------
+  // Where its jobs, runs, Workbenches and sessions work. A folder may be
+  // several projects' and a project several folders', one of them its Home
+  // (ui/folderlist.js). The refusal a job gives when a project has no folder
+  // sends people here, so it has to be here.
+  const folderList = el("div");
+  DelphiFolderList.mount(folderList, project, { onChanged: () => refresh() });
+  const folderBox = settingSection("Folders",
+    "Where agents work on this project. Home is where its jobs, runs and sessions start; a task can name another of its folders for its Workbench. Another project can share a folder: when an agent files something there without saying which project, Delphi works it out and says how.",
+    folderList);
   folderBox.id = "project-folder";
   root.append(folderBox);
 
@@ -4920,6 +4931,8 @@ function taskRow(t) {
   const body = el("div", { className: "t-body" });
   const heading = el("div", { className: "t-title", textContent: t.title });
   body.append(heading);
+  const routed = window.DelphiFolderList ? DelphiFolderList.chip("task", t) : null;
+  if (routed) body.append(routed);
 
   // A second line only when there is something worth putting on it.
   const sub = el("div", { className: "t-sub" });
@@ -8406,7 +8419,14 @@ async function removeTask(id) {
 }
 
 async function openTaskSheet(taskId) {
-  if (window.DelphiDrawer && !openTaskSheet.full && (state.settings || {}).taskOpenMode !== "centered") return DelphiDrawer.open(taskId);
+  if (window.DelphiDrawer && !openTaskSheet.full && (state.settings || {}).taskOpenMode !== "centered") {
+    // A drawer opened is a stop for Back and Forward, like a view.
+    const from = stop();
+    const opened = await DelphiDrawer.open(taskId);
+    const now = drawerTask();
+    if (!travelling && now != null && now !== from.drawer) { remember(from); render(); }
+    return opened;
+  }
   if (openSheet) await openSheet.close();
 
   let detail = await window.delphi.tasks.detail(taskId);
@@ -14356,11 +14376,13 @@ async function createProject(workspace) {
   }
 }
 $("back").onclick = () => goBack();
+$("fwd").onclick = () => goForward();
 
 // The side buttons on a mouse, which people expect to mean back and forward.
 // Bound on mouseup because Chromium fires auxclick inconsistently for these.
 window.addEventListener("mouseup", (e) => {
   if (e.button === 3) { e.preventDefault(); goBack(); }
+  else if (e.button === 4) { e.preventDefault(); goForward(); }
 });
 
 document.addEventListener("keydown", (e) => {
@@ -14369,15 +14391,21 @@ document.addEventListener("keydown", (e) => {
   // While the sheet is open it owns the keyboard apart from Escape. Navigating
   // behind it would leave it orphaned over a page it does not belong to, and
   // lose whatever was being written.
-  if (openSheet && e.key !== "Escape") {
-    if (modKey(e) && ["[", "ArrowLeft", "f"].includes(e.key)) e.preventDefault();
+  // Back and Forward work over the drawer too, since a drawer is a stop: it
+  // closes (saving, as Escape does) and the page it was opened from comes back.
+  // Not from a text box, whose Cmd+[ and Cmd+] are its own, and not over the
+  // old full panel, which is still modal.
+  const drawerOnly = openSheet && drawerTask() != null;
+  const typingNow = (() => { const t = e.target; return Boolean(t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))); })();
+  const backKey = modKey(e) && !e.shiftKey && (e.key === "[" || e.key === "ArrowLeft");
+  const forwardKey = modKey(e) && !e.shiftKey && (e.key === "]" || (e.key === "ArrowRight" && !typingNow));
+  if ((backKey || forwardKey) && (!openSheet || drawerOnly) && !(drawerOnly && typingNow)) {
+    e.preventDefault();
+    if (backKey) goBack(); else goForward();
     return;
   }
-
-  // The shortcuts macOS already uses for Back, so there is nothing new to learn.
-  if (modKey(e) && (e.key === "[" || e.key === "ArrowLeft")) {
-    e.preventDefault();
-    goBack();
+  if (openSheet && e.key !== "Escape") {
+    if (modKey(e) && ["[", "]", "ArrowLeft", "f"].includes(e.key)) e.preventDefault();
     return;
   }
 
@@ -14494,6 +14522,7 @@ const shell = {
   },
   newProject: () => createProject(),
   addFolder: () => DelphiAddFolder.open(),
+  goHome: () => goTo({ ...DelphiCommands.HOME, query: "" }),
   // The floating panel (ui/settings.js). An anchor means the old page, which
   // still holds what has not moved yet: archived projects, the AI providers.
   // It lives in the All view, so getting there leaves whichever project is open.
@@ -14586,6 +14615,14 @@ function openBar(query = "") {
 DelphiTopbar.init(shell);
 DelphiAddFolder.init({ ...shell, refresh: () => refresh(), notify: (text, o) => notify(text, o) });
 DelphiNeeds.init({ refresh: () => refresh(), notify: (text) => notify(text) });
+DelphiFolderList.init({
+  refresh: () => refresh(), notify: (text) => notify(text), notifyError: (e) => notifyError(e),
+  menu: (button, items) => keyedMenu(button, items),
+  confirm: async ({ title, lead, confirm }) => (await wbDialog({ title, lead,
+    actions: [{ label: "Cancel", value: false }, { label: confirm, value: true, kind: "primary" }], cancelValue: false })) === true,
+  repoRow: (id) => (state.repos || []).find((r) => Number(r.id) === Number(id)) || null,
+  repoSettings: (r) => repoWorkbenchSettings(r),
+});
 // Today (ui/today.js), lent the Needs you rows and the hand-off dialog rather
 // than drawing its own, so an approval looks and works the same on both pages.
 DelphiToday.init({
@@ -14687,6 +14724,9 @@ async function openTaskFull(id) {
 DelphiDrawer.init({
   state: () => state, sheet: () => openSheet, setSheet: (h) => { openSheet = h; },
   refresh, goTo, renderMarkdown, handToAgent, handoffText, itemOf, itemVerbs, itemMenu, deleteItem, fromChip,
+  routeChip: (entity, row) => DelphiFolderList.chip(entity, row),
+  restoreView: (snap) => restoreView(snap),
+  folderPicker: (detail, opts) => DelphiFolderList.picker(detail, opts),
   taskMenu, swatchRow, epicMenuItems, rowMenu, closeRowMenu, menuKeys, notify, notifyError, motionOff,
   statusOf, isOverdue, isAgent, hasColour, colourLabel, gap,
   reminderChipSpec, alertsForTask, liveAlerts, paintTaskReminders,
@@ -14723,6 +14763,10 @@ window.delphi.onMenu(async ({ action, view, theme }) => {
 
     case "back":
       goBack();
+      return;
+
+    case "forward":
+      goForward();
       return;
 
     case "theme":

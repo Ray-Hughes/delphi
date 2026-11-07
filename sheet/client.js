@@ -50,6 +50,9 @@ function openServer({
   // at a terminal is better told the server stopped answering than left
   // staring at nothing.
   timeoutMs = 0,
+  // The folder the server starts in, which is the folder it says the agent
+  // is working in (workbench/route.js). This process's own by default.
+  cwd = undefined,
 } = {}) {
   if (!fs.existsSync(server)) {
     throw new Error(`No MCP server at ${server}. Pass --server or set DELPHI_MCP_SERVER.`);
@@ -64,6 +67,7 @@ function openServer({
     stdio: ["pipe", "pipe", "pipe"],
     env: childEnv,
     detached,
+    ...(cwd ? { cwd } : {}),
   });
 
   const pending = new Map();

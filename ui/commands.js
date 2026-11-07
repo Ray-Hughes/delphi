@@ -79,6 +79,9 @@ globalThis.DelphiCommands = (() => {
     const inProject = () => app.state().projectId != null;
     const tab = (t) => ({
       id: `go-${t.id}`, group: "Go to", title: t.label, chord: t.chord, place: t.id,
+      // Today is Home: the Home control at the top left goes there, and so
+      // does G then H, which is why its letter is h.
+      ...(t.id === "today" ? { keywords: "home dashboard" } : {}),
       run: () => go(tabTarget(t.id, app.state(), app.projectFor)),
     });
     return [
@@ -125,7 +128,7 @@ globalThis.DelphiCommands = (() => {
       new: ["What's new", "What changed lately, across every project."],
     },
     project: {
-      project: ["Settings", "This project's name, folder and colour, and how agents may work in it."],
+      project: ["Settings", "This project's name, folders and colour, and how agents may work in it."],
       activity: ["History", "Every change in this project, by whom. Each one can be undone."],
       links: ["Links", "The links kept in this project."],
       queue: ["Queue", "This project's tasks waiting for an agent to pick them up."],
@@ -140,6 +143,33 @@ globalThis.DelphiCommands = (() => {
       ? { label: projectName || "This project", target: { view: "overview" } }
       : { label: "All projects", target: { projectId: null, view: "new" } };
     return { title: place[0], subtitle: place[1], crumbs: state.view === "new" && !inProject ? [{ label: "All projects", target: null }] : [home] };
+  }
+
+  /** Home: Today, across every project. The Home control and G then H go here. */
+  const HOME = { projectId: null, view: "today" };
+  const isHome = (state) => !state.query && state.projectId == null && state.view === "today";
+
+  // The words for a view the tabs and PLACES do not name.
+  const NAMES = { inbox: "Needs you", runs: "Runs", overview: "Overview", workspace: "Folder", oracle: "Search" };
+
+  /**
+   * The breadcrumb over every page but Home: Home first, then the project
+   * when there is one, then where you are. Each crumb but the last is a
+   * navigate() target. Null on Home itself, which is where every trail starts.
+   */
+  function trail(state, projectName = "") {
+    if (isHome(state)) return null;
+    const crumbs = [{ label: "Home", target: HOME }];
+    if (state.query) return { crumbs, here: "Search" };
+    const project = projectName || "This project";
+    if (state.projectId != null) {
+      if (state.view === "overview") return { crumbs, here: project };
+      crumbs.push({ label: project, target: { view: "overview" } });
+    }
+    const place = heading(state, projectName);
+    const tab = TABS.find((t) => t.id === tabOf(state) && t.id !== "today");
+    const here = place ? place.title : NAMES[state.view] || (tab ? tab.label : null) || state.view;
+    return { crumbs, here };
   }
 
   /**
@@ -175,7 +205,7 @@ globalThis.DelphiCommands = (() => {
     return hits.sort((a, b) => Number(b.title.toLowerCase().startsWith(words[0])) - Number(a.title.toLowerCase().startsWith(words[0])));
   }
 
-  return { TABS, tabOf, tabTarget, make, chord, match, heading, searchViews };
+  return { TABS, HOME, isHome, tabOf, tabTarget, make, chord, match, heading, trail, searchViews };
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = globalThis.DelphiCommands;

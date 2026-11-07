@@ -857,8 +857,9 @@ globalThis.DelphiSettingsPanel = (() => {
 
     workbenches(root) {
       root.append(...schemaGroups("workbenches"));
-      // Each project's folder: one folder, one project. Changed through
-      // folders:set, which makes the same checks Add folder does.
+      // Each project's Home folder. Changed through folders:set, which makes
+      // the same checks Add folder does; the old Home stays, linked. A
+      // project's other folders are on its own Settings, under Folders.
       const projects = (lent.state && lent.state().projects) || [];
       const rows = projects.map((p) => {
         const r = el("div", { className: "sp-prow" });
@@ -889,7 +890,7 @@ globalThis.DelphiSettingsPanel = (() => {
         }
         return r;
       });
-      const add = infoRow("Add folder as project", "A repository on this computer becomes a project, with its remote and default branch. One folder belongs to one project.",
+      const add = infoRow("Add folder as project", "A repository on this computer becomes a project, with its remote and default branch. A folder can be several projects', and a project several folders: each project's are on its Settings.",
         btn([I("folderplus", "xs"), "Add folder..."], () => { close(); if (lent.addFolder) lent.addFolder(); }));
       root.append(group("Projects and their folders", [add, ...rows]));
       root.append(group("Per repository", [infoRow("Base branch, setup command and files to copy",

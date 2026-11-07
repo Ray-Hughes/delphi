@@ -1,24 +1,22 @@
 #!/usr/bin/env node
-// One folder per project: the rule, the migration, Add folder, and the
-// shared-folder question.
+// A project's folders: the rule, the migration, and Add folder.
 //
 //   ELECTRON_RUN_AS_NODE=1 <electron> tools/folders_test.js
 //
 // - workbench/folders.js on both routes (node:sqlite binding, and the sqlite3
 //   binary with values written into the script, as the MCP server does): two
-//   projects on one folder leave one in No folder with the other's work
-//   untouched, a workspace nobody had becomes a question rather than a project,
-//   sessions keep their folder, and the unique index arrives last. Run twice,
-//   it does nothing the second time.
+//   projects on one folder both keep it, a workspace nobody had becomes a
+//   question rather than a project, sessions keep their folder, and there is
+//   no unique index. Run twice, it does nothing the second time. Slice 4's
+//   split and its reversal are tools/shared_folders_test.js's.
 // - The resolver: a project in No folder resolves nowhere, a stale primary
 //   repos row is not a second answer, a Workbench and a session's own folder
 //   win, and a folder that is not on disk is reported as missing.
-// - db.js: a folder another project has is refused in a sentence, the folder
-//   is normalised, and its repos row moves with it. Give the folder and Keep
-//   answer once, and History puts a give back.
+// - db.js: the folder is normalised, shared without a refusal, and its repos
+//   row moves with it.
 // - main/folders.js: what Add folder says about a repository, a subfolder, a
-//   worktree, a plain folder, a file, a folder that is already a project and a
-//   folderless project with the same name; create, merge, the missing flag.
+//   worktree, a plain folder, a file, a folder projects already have and a
+//   folderless project with the same name; create, the missing flag.
 // - main/backups.js: a snapshot before the migration, reusing the update's.
 
 const fs = require("fs");
@@ -158,36 +156,32 @@ async function migrationOn(name, makeRoute) {
   const did = rule.adoptFolders({ sql: r.sql, batch: r.batch, now: () => new Date("2026-11-06T12:00:00Z") });
   const paths = Object.fromEntries(r.sql("SELECT id, path FROM projects ORDER BY id", []).map((p) => [p.id, p.path]));
   check("SSNR keeps caseflow, normalised", paths[1], P);
-  check("Central Office is in No folder", paths[8], null);
+  check("Central Office keeps it too: a folder can be several projects'", paths[8], P);
   check("a project with only a workspace takes its folder", paths[3], W3);
   check("the others are as they were", [paths[2], paths[6]], [Q, null]);
-  check("one conflict, settled by what each holds", did.conflicts.map((c) => [c.folder, c.kept.id, c.moved.map((m) => m.id)]), [[P, 1, [8]]]);
-  const q = rule.conflicts(r.sql);
-  check("Needs you has the question", q.map((c) => [c.path, c.state, c.detail.kept.name, c.detail.moved[0].notes]), [[P, "new", "SSNR / MPI Person Update", 1]]);
-  check("the repos row it gave up is written down, settings and all", q[0].detail.repos.map((x) => [x.project_id, x.base_branch]), [[8, "master"]]);
-  check("and gone, so no resolver hands Central Office the folder", r.sql("SELECT COUNT(*) AS n FROM repos WHERE project_id = 8", [])[0].n, 0);
-  check("its link to the caseflow workspace is gone too", r.sql("SELECT COUNT(*) AS n FROM project_workspaces WHERE project_id = 8", [])[0].n, 0);
+  check("the shared folder is said, and nothing is asked about it", [did.shared.map((c) => [c.folder, c.ids]), r.sql("SELECT COUNT(*) AS n FROM discovered_folders WHERE via = 'conflict'", [])[0].n], [[[P, [1, 8]]], 0]);
+  check("Central Office's repos row there is its primary one, settings kept", r.sql("SELECT is_primary, base_branch FROM repos WHERE project_id = 8", []), [{ is_primary: 1, base_branch: "master" }]);
+  check("its link to the caseflow workspace stays", r.sql("SELECT COUNT(*) AS n FROM project_workspaces WHERE project_id = 8", [])[0].n, 1);
   check("Central Office keeps its note and its session", [r.sql("SELECT COUNT(*) AS n FROM notes WHERE project_id = 8", [])[0].n, r.sql("SELECT cwd FROM sessions WHERE id = 3", [])[0].cwd], [1, P]);
   check("the workspace nobody had is asked about, not made a project",
     [r.sql("SELECT via, state FROM discovered_folders WHERE path = :p1", [U])[0], r.sql("SELECT COUNT(*) AS n FROM projects", [])[0].n], [{ via: "migration", state: "new" }, 5]);
   check("a session with only a workspace gets its folder", r.sql("SELECT cwd FROM sessions WHERE id = 2", [])[0].cwd, P);
   check("each folder has its primary repos row",
-    r.sql("SELECT project_id, path FROM repos WHERE is_primary = 1 ORDER BY project_id", []).map((x) => [x.project_id, x.path]), [[1, P], [2, Q], [3, W3]]);
+    r.sql("SELECT project_id, path FROM repos WHERE is_primary = 1 ORDER BY project_id", []).map((x) => [x.project_id, x.path]), [[1, P], [2, Q], [3, W3], [8, P]]);
   check("the other workspace becomes an also-works-in folder", r.sql("SELECT path FROM repos WHERE project_id = 2 AND is_primary = 0 ORDER BY id", []).map((x) => x.path), [U, X]);
   check("a primary row at another folder is demoted where it stands, settings kept, never moved",
     r.sql("SELECT path, is_primary, setup_cmd, base_branch FROM repos WHERE project_id = 2 AND path = :p1", [U]), [{ path: U, is_primary: 0, setup_cmd: "bin/setup", base_branch: "master" }]);
   check("and the folder's own primary row is new, with nothing carried over",
     r.sql("SELECT setup_cmd, base_branch FROM repos WHERE project_id = 2 AND is_primary = 1", []), [{ setup_cmd: null, base_branch: null }]);
-  check("a moved project's session with no folder of its own keeps the folder it ran in", r.sql("SELECT cwd FROM sessions WHERE id = 4", [])[0].cwd, P);
   check("the workspace icon goes where the project had none", r.sql("SELECT icon FROM projects WHERE id = 3", [])[0].icon, "chart");
-  check("recorded, and the unique index made", [Boolean(r.sql("SELECT value FROM meta WHERE key = 'folders_adopted'", [])[0]), did.index.ok,
-    r.sql("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'idx_projects_path'", [])[0].n], [true, true, 1]);
+  check("recorded, and no unique index", [Boolean(r.sql("SELECT value FROM meta WHERE key = 'folders_adopted'", [])[0]), did.index.ok,
+    r.sql("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'idx_projects_path'", [])[0].n], [true, true, 0]);
   check("no longer needed", rule.needsAdoption(r.sql), false);
+  const repos = r.sql("SELECT COUNT(*) AS n FROM repos", [])[0].n;
   const again = rule.adoptFolders({ sql: r.sql, batch: r.batch });
-  check("a second run does nothing", [again.ran, r.sql("SELECT COUNT(*) AS n FROM repos", [])[0].n, r.sql("SELECT COUNT(*) AS n FROM discovered_folders", [])[0].n], [false, 5, 2]);
-  await rejects("the index refuses a second project on a folder", () => r.sql("UPDATE projects SET path = :p1 WHERE id = 8", [P]), /UNIQUE/);
+  check("a second run does nothing", [again.ran, r.sql("SELECT COUNT(*) AS n FROM repos", [])[0].n, r.sql("SELECT COUNT(*) AS n FROM discovered_folders", [])[0].n], [false, repos, 1]);
   check("the resolver: SSNR works in caseflow", rule.folderFor(r.sql, { projectId: 1 }).path, P);
-  check("Central Office has no folder", rule.folderFor(r.sql, { projectId: 8 }), { path: null, source: null, missing: null });
+  check("and so does Central Office", rule.folderFor(r.sql, { projectId: 8 }).path, P);
   check("changeit: its folder, then the ones it also works in", rule.projectFolders(r.sql, 2).map((f) => [f.path, f.source]), [[Q, "project"], [U, "repo"], [X, "repo"]]);
   if (r.handle) r.handle.close();
 }
@@ -205,7 +199,7 @@ async function main() {
   await migrationOn("node:sqlite", nodeRoute);
   await migrationOn("sqlite3 binary", binaryRoute);
 
-  section("a tie goes to the older project");
+  section("an empty folder is no folder");
   {
     const file = path.join(dir, "tie.db");
     const h = new sqlite.DatabaseSync(file);
@@ -219,8 +213,8 @@ async function main() {
     h.close();
     const r = nodeRoute(file);
     const did = rule.adoptFolders(r);
-    check("the older keeps it", did.conflicts[0].kept.name, "Older");
-    check("an empty folder is no folder, and the index is made", [did.index.ok, r.sql("SELECT COUNT(*) AS n FROM projects WHERE path = ''", [])[0].n], [true, 0]);
+    check("both keep the folder they share", [did.shared.length, r.sql("SELECT COUNT(*) AS n FROM projects WHERE path = :p1", [P])[0].n], [1, 2]);
+    check("an empty folder is written as none", [did.index.ok, r.sql("SELECT COUNT(*) AS n FROM projects WHERE path = ''", [])[0].n], [true, 0]);
     r.handle.close();
   }
 
@@ -229,15 +223,18 @@ async function main() {
   const db = require("../db");
   db.handle();
   section("db.js: the folder is written in one place");
-  check("a fresh database is adopted and indexed at open", [db.folderAdoption().ran, db.folderAdoption().index.ok], [true, true]);
+  check("a fresh database is adopted at open", [db.folderAdoption().ran, db.folderAdoption().index.ok], [true, true]);
   const A = mk("work", "alpha");
   const B = mk("work", "beta");
   const a = db.createProject({ key: "alpha", name: "Alpha", path: `${A}/` });
   check("created with its folder normalised", a.path, A);
   check("and its primary repos row", db.sqlP("SELECT path, is_primary FROM repos WHERE project_id = :p1", [a.id]), [{ path: A, is_primary: 1 }]);
-  await rejects("a second project on the folder is refused by name", () => db.createProject({ key: "alpha2", name: "Alpha two", path: A }), /already Alpha's project/);
+  const alpha2 = db.createProject({ key: "alpha2", name: "Alpha two", path: A });
+  check("a second project on the folder is fine", alpha2.path, A);
   const b = db.createProject({ key: "beta", name: "Beta" });
-  await rejects("so is moving one onto it", () => db.updateProject(b.id, { path: A }), /already Alpha's project/);
+  check("and so is moving one onto it", db.updateProject(b.id, { path: A }).path, A);
+  db.updateProject(b.id, { path: null });
+  db.sqlP("DELETE FROM repos WHERE project_id = :p1", [b.id]);
   db.updateProject(a.id, { path: B });
   check("changing the folder makes a primary row there and demotes the old one where it stands",
     db.sqlP("SELECT path, is_primary FROM repos WHERE project_id = :p1 ORDER BY id", [a.id]), [{ path: A, is_primary: 0 }, { path: B, is_primary: 1 }]);
@@ -264,26 +261,6 @@ async function main() {
   fs.rmSync(gone, { recursive: true });
   check("a folder that is not on disk is named as missing", rule.folderFor(db.sqlP, { projectId: g.id }), { path: null, source: null, missing: gone });
 
-  section("the shared-folder question");
-  const c = db.createProject({ key: "central", name: "Central Office hearing address (APREQ-987)" });
-  db.createNote({ projectId: c.id, title: "address", body: "b" });
-  const ask = (pathFor) => Number(db.sqlP(`INSERT INTO discovered_folders (path, via, state, project_id, detail) VALUES (:p1, 'conflict', 'new', :p2, :p3) RETURNING id`,
-    [pathFor, a.id, JSON.stringify({ kept: { id: a.id, name: a.name }, moved: [{ id: c.id, name: c.name }] })])[0].id);
-  const q1 = ask(A);
-  db.keepFolderAnswer(q1);
-  await rejects("answered once, never twice", () => db.keepFolderAnswer(q1), /answered already/);
-  db.sqlP("DELETE FROM discovered_folders WHERE id = :p1", [q1]);
-  const q2 = ask(A);
-  const stranger = db.createProject({ key: "stranger", name: "Stranger" });
-  await rejects("give only to a project that shared the folder", () => db.giveFolder(q2, stranger.id), /not one of the projects that shared/);
-  const given = db.giveFolder(q2, c.id);
-  check("give swaps the folder", [db.getProject(a.id).path, db.getProject(c.id).path, given.from], [null, A, a.id]);
-  check("and Alpha no longer resolves there", rule.folderFor(db.sqlP, { projectId: a.id }).path, null);
-  check("answered", db.sqlP("SELECT state FROM discovered_folders WHERE id = :p1", [q2])[0].state, "given");
-  const undone = db.undoLast(2);
-  check("History puts it back", [undone.undone, db.getProject(a.id).path, db.getProject(c.id).path], [2, A, null]);
-  check("and the question is asked again", db.sqlP("SELECT state FROM discovered_folders WHERE id = :p1", [q2])[0].state, "new");
-
   section("Add folder (main/folders.js)");
   const git = require("../workbench/git");
   const { createFolders, ownerRepo } = require("../main/folders");
@@ -301,8 +278,8 @@ async function main() {
   const folders = createFolders({ db, git, pick: async () => picked });
   const look = await folders.inspect(repo);
   check("a repository: its remote, branch, a name and a key",
-    [look.ok, look.isGit, look.top, look.ownerRepo, look.defaultBranch, look.suggestedName, look.suggestedKey, look.existing, look.subfolder, look.worktreeOf],
-    [true, true, repo, "department-of-veterans-affairs/caseflow-efolder", "main", "caseflow-efolder", "caseflow-efolder", null, false, null]);
+    [look.ok, look.isGit, look.top, look.ownerRepo, look.defaultBranch, look.suggestedName, look.suggestedKey, look.holders, look.subfolder, look.worktreeOf],
+    [true, true, repo, "department-of-veterans-affairs/caseflow-efolder", "main", "caseflow-efolder", "caseflow-efolder", [], false, null]);
   const sub = await folders.inspect(path.join(repo, "app", "models"));
   check("a subfolder offers the repository root", [sub.top, sub.subfolder], [repo, true]);
   const wt = await folders.inspect(tree);
@@ -325,38 +302,15 @@ async function main() {
   db.undo(createdRow);
   check("History can undo a project Add folder made: its own repos row is not held work", Boolean(db.getProject(throwaway.id)), false);
   const again = await folders.inspect(tree);
-  check("a folder that is already a project names it", again.existing, { id: made.id, name: "eFolder", archived: false });
-  await rejects("and creating it twice is refused", () => folders.create({ path: repo, name: "Again" }), /already eFolder's project/);
+  check("a folder a project has already names it", again.holders, [{ id: made.id, name: "eFolder", archived: false, home: true }]);
+  const second = await folders.create({ path: repo, name: "Second piece of work", key: "efolder-two" });
+  check("and a second project there is allowed", [second.path, rule.holders(db.sqlP, repo).map((h) => h.id)], [repo, [made.id, second.id]]);
   check("owner/repo from https too", ownerRepo("https://github.com/a/b.git"), "a/b");
   const listed = folders.listProjects();
   check("the list says which folder is missing", [listed.find((p) => p.id === g.id).folder_missing, listed.find((p) => p.id === made.id).folder_missing, listed.find((p) => p.id === made.id).owner_repo],
     [true, false, "department-of-veterans-affairs/caseflow-efolder"]);
   picked = plain;
   check("the picker's choice is inspected", (await folders.inspect(null)).top, plain);
-
-  section("merge");
-  db.createSession({ projectId: c.id, title: "co chat" });
-  db.sqlP("DELETE FROM discovered_folders WHERE id = :p1", [q2]);
-  const q3 = ask(A);
-  await rejects("merge only a project that shared the folder", async () => folders.merge(q3, stranger.id), /not one of the projects that shared/);
-  const beforeMerge = db.newestAudit();
-  const merged = folders.merge(q3, c.id);
-  check("everything moves and Central Office is archived, not deleted",
-    [merged.merged, db.sqlP("SELECT COUNT(*) AS n FROM notes WHERE project_id = :p1", [a.id])[0].n, db.sqlP("SELECT COUNT(*) AS n FROM sessions WHERE project_id = :p1", [a.id])[0].n, db.getProject(c.id).status],
-    [true, 1, 1, "archived"]);
-  check("answered as merged", db.sqlP("SELECT state FROM discovered_folders WHERE id = :p1", [q3])[0].state, "merged");
-  check("each move is in History", db.sqlP("SELECT COUNT(*) AS n FROM audit WHERE summary LIKE '%moved%' OR summary LIKE '%Moved%'", [])[0].n >= 2, true);
-  for (const id of db.auditSince(beforeMerge).reverse()) db.undo(id);
-  check("the whole merge comes undone: note, session and project back, the question open again",
-    [db.sqlP("SELECT COUNT(*) AS n FROM notes WHERE project_id = :p1", [c.id])[0].n, db.sqlP("SELECT COUNT(*) AS n FROM sessions WHERE project_id = :p1", [c.id])[0].n,
-     db.getProject(c.id).status, db.sqlP("SELECT state FROM discovered_folders WHERE id = :p1", [q3])[0].state],
-    [1, 1, "active", "new"]);
-  db.sqlP("INSERT INTO discovered_folders (path, via, state, detail) VALUES ('/not/json', 'conflict', 'given', '{not json')", []);
-  db.updateProject(c.id, { summary: "a change to undo" });
-  check("a question with an unreadable detail never stops an undo", db.undoLast(1).undone, 1);
-  const fromHere = db.newestAudit();
-  db.sqlP("INSERT INTO audit (action, entity, entity_id, summary, actor, actor_type) VALUES ('update', 'project', :p1, 'by an agent', 'claude-code:9', 'agent')", [c.id]);
-  check("an agent's row in between is not part of a window answer", db.auditSince(fromHere), []);
 
   section("a snapshot before the migration (main/backups.js)");
   const { createBackups } = require("../main/backups");

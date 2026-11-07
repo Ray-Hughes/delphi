@@ -1,4 +1,4 @@
-// The top of the window: the project switcher, the Cmd+K bar, and the tabs.
+// The top of the window: Home, the project switcher, the Cmd+K bar, and the tabs.
 //
 // Direction B has no rail and no sidebar. What the sidebar held moves here:
 // the projects into the switcher (pinned first, then recent, then by folder,
@@ -155,7 +155,7 @@ globalThis.DelphiTopbar = (() => {
       const draw = ([items, shown] = []) => { if (items) for (const p of shown) items.append(projectRow(p, state, { onPick: pick, counts })); };
       draw(group("PINNED", (state.pinned || []).map((id) => byId.get(id))));
       draw(group("RECENT", readRecent().filter((id) => id !== state.projectId).slice(0, 4).map((id) => byId.get(id))));
-      draw(group("FOLDERS", state.projects.filter((p) => p.path), "A project is a folder"));
+      draw(group("FOLDERS", state.projects.filter((p) => p.path), "By Home folder"));
       const unlinked = state.projects.filter((p) => !p.path);
       const g = group("NO FOLDER", unlinked);
       if (g.length) {
@@ -355,11 +355,28 @@ globalThis.DelphiTopbar = (() => {
     if (focused) box.querySelector(`[data-tab="${focused}"]`)?.focus({ preventScroll: true });
   }
 
+  /**
+   * Home, at the top left on every page: the mark and the word, lit on Home
+   * itself. One click from anywhere back to Today across every project, which
+   * is where G then H goes too.
+   */
+  function paintHome(state) {
+    const b = document.getElementById("home-btn");
+    if (!b) return;
+    const on = DelphiCommands.isHome(state);
+    b.classList.toggle("on", on);
+    if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+    b.title = "Home (G then H)";
+    b.setAttribute("aria-keyshortcuts", "G H");
+    b.onclick = () => { closePop(); app.goHome(); };
+  }
+
   /** On every render. Cheap, and never rebuilds an open popover. */
   function paint() {
     if (!app) return;
     const state = app.state();
     if (state.projectId !== lastProject) { noteRecent(state.projectId); lastProject = state.projectId; }
+    paintHome(state);
     paintTop();
     paintBar();
     paintActs(state);

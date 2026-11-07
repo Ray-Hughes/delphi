@@ -446,6 +446,7 @@ function buildMenu() {
       { label: "History", accelerator: "CmdOrCtrl+4", click: () => toRenderer("view", { view: "history" }) },
       { type: "separator" },
       { label: "Back", accelerator: "CmdOrCtrl+[", click: () => toRenderer("back") },
+      { label: "Forward", accelerator: "CmdOrCtrl+]", click: () => toRenderer("forward") },
       { type: "separator" },
       {
         label: "Appearance",
@@ -1988,7 +1989,7 @@ function markRestorePoints({ restored, updated, folders = null }) {
       db.sqlP("INSERT INTO restore_points (kind, label, backup_path, audit_id) VALUES (:p1, :p2, :p3, :p4)", [kind, label, file || null, auditId]);
     } catch (error) { console.error("recording a restore point", error); }
   };
-  if (folders) point("migration", "Before giving each folder one project", folders.file, folders.auditId || null);
+  if (folders) point("migration", "Before bringing the folders up to date", folders.file, folders.auditId || null);
   if (updated) point("update", `Before updating from ${updated.from || "an earlier version"} to ${updated.to}`, updated.file);
   if (restored && restored.ok) point("restore", `Before restoring ${path.basename(restored.from)}`, restored.pre);
   try {
@@ -2009,8 +2010,9 @@ function scheduleSnapshots() {
 }
 
 // ---------------------------------------------------------------------------
-// Folders: Add folder as project, a folder that moved, and the shared-folder
-// question. The rules are in workbench/folders.js and main/folders.js.
+// Folders: Add folder as project, a project's Folders list, a folder that
+// moved, and "Add this folder?". The rules are in workbench/folders.js and
+// main/folders.js.
 
 const folderTools = createFolders({
   db, git: require("./workbench/git"),
