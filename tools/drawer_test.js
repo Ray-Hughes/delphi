@@ -483,15 +483,80 @@ async function main() {
     db.appendScratchpad(pad.id, "- [ ] second agent line"); changed();
     await wait(300);
     await blur(P);
-    check("typed and appended both: it asks before writing the whole pad", await pick("Not now"), true);
-    await wait(300);
-    check("and Not now leaves the agent's line in the pad", padRow().includes("second agent line"), true);
+    await wait(800);
+    check("typed and appended both: the lines merge, with no question", [await js("!!document.querySelector('.wb-dialog')"), padRow().includes("second agent line"), padRow().includes("my prose")], [false, true, true]);
     await js("DelphiDrawer.close(); 1");
-    // Closing with the question still open asks it once more; Not now again
-    // keeps the typing as a draft and writes nothing.
-    check("closing asks once more", await pick("Not now"), true);
     await until("!document.querySelector('.dw')");
-    check("and still writes nothing over the agent", padRow().includes("second agent line"), true);
+
+    // A task the board ticked while the person edited prose: Keep mine
+    // never reopens it, because there is nothing to ask.
+    const pad2 = db.createScratchpad({ projectId: project.id, key: "tick" + Date.now() % 1000, title: "Ticks", body: "- [ ] alpha" });
+    const alphaId = db.scratchpadTasks(pad2.id).lines[0].taskId;
+    await js(`DelphiDrawer.openPad(${pad2.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad')");
+    await typeInto(P, "\nprose");
+    db.updateTask(alphaId, { status: "done" }); changed();
+    await wait(300);
+    await blur(P);
+    await wait(800);
+    check("a tick the board wrote back stays done through the person's save", [q("SELECT status FROM tasks WHERE id = :id", { id: alphaId })[0].status, /\[x\] alpha/.test(q("SELECT body FROM scratchpads WHERE id = :id", { id: pad2.id })[0].body)], ["done", true]);
+    await js("DelphiDrawer.close(); 1");
+    await until("!document.querySelector('.dw')");
+
+    // Typing while a save is on its way, then renaming the line it filed:
+    // the anchor comes into the typing, so it stays one task (probe5, S7).
+    const pad3 = db.createScratchpad({ projectId: project.id, key: "ray" + Date.now() % 1000, title: "Gamma", body: "- [ ] alpha" });
+    await js(`DelphiDrawer.openPad(${pad3.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad')");
+    await js(`(() => { const a = ${P}; a.focus(); a.value += '\\n- [ ] gamma'; a.dispatchEvent(new Event('input')); a.dispatchEvent(new FocusEvent('blur'));
+      a.value = a.value.replace('gamma', 'gamma ray') + '\\nmore'; a.dispatchEvent(new Event('input')); return 1; })()`);
+    await wait(900);
+    check("the anchor of a line saved while typing goes into the typing", await js(`/gamma ray <!--d:\\d+-->/.test(${P}.value)`), true);
+    await blur(P);
+    await wait(900);
+    const g = db.scratchpadTasks(pad3.id);
+    check("so the renamed line is one task, not two", [g.lines.length, g.dropped.length, g.lines.map((l) => (l.task && l.task.title) || l.title).filter((t) => /gamma/.test(t || ""))], [2, 0, ["gamma ray"]]);
+    await js("DelphiDrawer.close(); 1");
+    await until("!document.querySelector('.dw')");
+
+    // A draft left by Not now and a close, reopened after an agent wrote the
+    // pad: merged against the copy it was typed on, never written over it.
+    const pad4 = db.createScratchpad({ projectId: project.id, key: "dr" + Date.now() % 1000, title: "Drafts", body: "- [ ] alpha" });
+    await js(`DelphiDrawer.openPad(${pad4.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad')");
+    await js(`(() => { const a = ${P}; a.focus(); a.value = a.value.replace("alpha", "alpha first"); a.dispatchEvent(new Event('input')); return 1; })()`);
+    db.writeScratchpad(pad4.id, { body: "- [ ] alpha by an agent" }); changed();
+    await wait(300);
+    await blur(P);
+    check("both changed the same line: it asks, and Not now is where the focus is", await until(`document.activeElement && document.activeElement.textContent === "Not now"`), true);
+    check("with how many lines it touches", await js("/1 line changed on both sides/.test(document.querySelector('.wb-dialog').textContent)"), true);
+    await pick("Not now");
+    await wait(300);
+    await js("DelphiDrawer.close(); 1");
+    await pick("Not now");
+    await until("!document.querySelector('.dw')");
+    db.appendScratchpad(pad4.id, "- [ ] agent eight");
+    await js(`DelphiDrawer.openPad(${pad4.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad')");
+    check("reopened, the draft is back", await js(`${P}.value.includes("alpha first")`), true);
+    await typeInto(P, "x");
+    await blur(P);
+    check("typing on it asks again rather than writing over the agent", await pick("Not now"), true);
+    await wait(300);
+    check("and the agent's lines are still there", ["alpha by an agent", "agent eight"].map((w) => padRow.call(null) && q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body.includes(w)), [true, true]);
+    await js("DelphiDrawer.close(); 1");
+    await pick("Not now");
+    await until("!document.querySelector('.dw')");
+
+    console.log("\ncompare and set");
+    let refused = null;
+    try { db.writeScratchpad(pad4.id, { body: "nope" }, { expectBody: "not what it is" }); } catch (e) { refused = e.code; }
+    check("a pad write that expects an older body is refused with CONFLICT", refused, "CONFLICT");
+    check("and writes nothing", q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body.includes("agent eight"), true);
+    const nowBody = q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body;
+    db.writeScratchpad(pad4.id, { body: nowBody + "\nok" }, { expectBody: nowBody });
+    check("one that expects the body it has is written", q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body.endsWith("\nok"), true);
+    check("through the window too", await js(`window.delphi.pads.write(${pad4.id}, { body: "x" }, { expectBody: "stale" }).then(() => "written", (e) => e.code)`), "CONFLICT");
   }
 
   const nNote = db.createNote({ projectId: project.id, title: "Shared note", body: "one" });
@@ -549,6 +614,11 @@ async function main() {
   await js("DelphiDrawer.close(); 1"); await wait(300);
 
   console.log("\nthe pure rules");
+  const ML = (b, t, m) => js(`DelphiDrawer.mergeLines(${JSON.stringify(b)}, ${JSON.stringify(t)}, ${JSON.stringify(m)})`);
+  check("merge: an agent's new line and the person's new line both stay", (await ML("a", "a\nagent", "a\nmine")).text, "a\nagent\nmine");
+  check("merge: different lines changed on each side", (await ML("a\nb\nc", "a\nB\nc", "a\nb\nC")).text, "a\nB\nC");
+  check("merge: the same line changed on both sides is a clash", (await ML("x", "y", "z")).conflicts, 1);
+  check("merge: a tick from theirs on a line the person renamed", (await ML("- [ ] a <!--d:1-->", "- [x] a <!--d:1-->", "- [ ] a two <!--d:1-->")).text, "- [x] a two <!--d:1-->");
   check("reconcile: untouched and unmoved writes nothing", await js(`DelphiDrawer.reconcile("a", "a", "a")`), "none");
   check("reconcile: untouched and moved takes theirs", await js(`DelphiDrawer.reconcile("a", "b", "a")`), "take");
   check("reconcile: typed and unmoved writes", await js(`DelphiDrawer.reconcile("a", "a", "c")`), "write");

@@ -1774,6 +1774,11 @@ function listNotes(projectId) {
   );
 }
 
+/** One note by id, with no project scope: the drawer reads the note it shows. */
+function getNote(id) {
+  return one("SELECT * FROM notes WHERE id = :id", { id }) || null;
+}
+
 function createNote({ projectId, title, body = "", kind = "note" }) {
   const r = run(
     `INSERT INTO notes (project_id, title, body, kind) VALUES (:projectId, :title, :body, :kind)`,
@@ -1896,8 +1901,15 @@ function createScratchpad({ projectId, title, body = "", key = null, author = nu
  * never be half in step. That matters more here than anywhere else in this file:
  * the failure would be silent, and the thing left behind would be a board that
  * disagrees with the document everybody is reading.
+ *
+ * opts.expectBody: write only if the pad's body is still exactly this, and
+ * refuse with code CONFLICT (details.body is the body now) if it moved. A
+ * window holding a copy of a whole pad passes the copy it began from, so an
+ * agent's append or a status the board wrote back into a line, landed in
+ * between, is never written over: compare and set, inside the same unit as
+ * the write.
  */
-function writeScratchpad(id, fields = {}) {
+function writeScratchpad(id, fields = {}, { expectBody } = {}) {
   const allowed = ["title", "body", "author", "pinned", "derives_tasks", "session_id"];
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getScratchpad(id);
@@ -1907,6 +1919,15 @@ function writeScratchpad(id, fields = {}) {
   // The audit row is inside the unit too, after the derive, so its after is
   // the body with the derive's anchors in it: the state undo compares against.
   return atomic(() => {
+    if (expectBody !== undefined && expectBody !== null) {
+      const now = one("SELECT body, updated_at FROM scratchpads WHERE id = :id", { id });
+      if (!now || String(now.body) !== String(expectBody)) {
+        const error = new Error("This pad changed since it was read, so nothing was written.");
+        error.code = "CONFLICT";
+        error.details = { body: now ? now.body : null, updated_at: now ? now.updated_at : null };
+        throw error;
+      }
+    }
     run(
       `UPDATE scratchpads SET ${sets.map((k) => `${k} = :${k}`).join(", ")},
        updated_at = datetime('now') WHERE id = :id`,
@@ -3254,7 +3275,7 @@ module.exports = {
   commentByExternalKey, createExternalComment, updateExternalComment, deleteTask,
   taskDetail, listComments, createComment, deleteComment, statusEvents, subtasks,
   setQueue, queueState, claimNext, releaseClaim, completeClaim, extendClaim, reclaimExpired,
-  listNotes, createNote, updateNote, deleteNote,
+  listNotes, getNote, createNote, updateNote, deleteNote,
   listScratchpads, getScratchpad, scratchpadByKey, createScratchpad, writeScratchpad,
   appendScratchpad, patchScratchpad, deleteScratchpad, scratchpadTasks, derive,
   listLinks, createLink, deleteLink,
