@@ -82,6 +82,7 @@ const read = (p) => fs.readFileSync(p, "utf8");
 const reachedBy = (repo, sha) => git(repo, "for-each-ref", "--contains", sha, "--format=%(refname)").split("\n").filter(Boolean);
 
 let repos = 0;
+const made = [];
 function makeRepo(name, { remote = true } = {}) {
   const app = path.join(dir, "code", `${name}`);
   if (remote) {
@@ -99,7 +100,24 @@ function makeRepo(name, { remote = true } = {}) {
   if (remote) git(app, "push", "-q", "origin", "main");
   write(path.join(app, ".env"), "SECRET=from-main\n");
   const project = db.createProject({ key: `s${++repos}`, name: `Safety ${repos}`, path: app });
+  made.push(fs.realpathSync(app));
   return { app: fs.realpathSync(app), project };
+}
+// Housekeeping visits every repository that ever had a Workbench, about eight
+// git calls each, and the later sections run it dozens of times over thirty
+// repositories: most of this file's git calls were housekeeping looking at
+// earlier sections' finished repositories, and under load that alone took it
+// past test_all's cap. Each such section first unplugs the repositories before
+// it (renamed aside, as a disk taken away), which housekeeping passes over
+// with a stat and no git at all. The sections that follow never look in an
+// earlier one's repository, so no check loses anything it was asserting; the
+// ones named in keepers are left plugged in because a later section does.
+function unplugEarlier(...keepers) {
+  const kept = new Set(keepers.map((r) => r.app));
+  for (const app of made.splice(0)) {
+    if (kept.has(app)) { made.push(app); continue; }
+    if (exists(app)) fs.renameSync(app, `${app}.unplugged`);
+  }
 }
 
 const sheets = makeSheetStore({ sql: db.sqlP, actor: "tester", authorType: "human" });
@@ -510,6 +528,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
+  unplugEarlier(victim);
   section("G5 M. A removal never stops half way: the folder is moved aside, recorded, then deleted");
   {
     const r = makeRepo("g5ro");
@@ -583,6 +602,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
+  unplugEarlier(victim);
   section("G5 low");
   {
     const r = makeRepo("g5low");
@@ -642,6 +662,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
+  unplugEarlier(victim);
   section("G6 1. A process that dies after the move is finished by housekeeping, from the manifest");
   {
     const W = require("../workbench/workbench");
@@ -687,6 +708,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
+  unplugEarlier(victim);
   section("G6 3. The changed check skips only what git ignores");
   {
     const W = require("../workbench/workbench");
@@ -711,6 +733,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
+  unplugEarlier(victim);
   section("G6 low 1. What counts as running in the folder");
   {
     const r = makeRepo("g6busy");
@@ -732,6 +755,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
+  unplugEarlier(victim);
   section("G7. A manifest is a hint: housekeeping acts only on what the row and git confirm");
   {
     const W = require("../workbench/workbench");
@@ -824,6 +848,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
+  unplugEarlier(victim);
   section("G8. Only the row's intent lets housekeeping finish a Finish or Discard");
   {
     const W = require("../workbench/workbench");
@@ -901,6 +926,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
+  unplugEarlier(victim);
   section("G9. Every closing row has a way out");
   {
     const W = require("../workbench/workbench");
@@ -971,6 +997,7 @@ async function main() {
     check("delphi status says Being put away, once", [/Being put away/.test(out.stdout), /closing, /.test(out.stdout)], [true, false]);
   }
 
+  unplugEarlier(victim);
   await viaServer();
   fs.rmSync(dir, { recursive: true, force: true });
   console.log(`\n${checks - failures}/${checks} checks passed`);
@@ -1039,20 +1066,26 @@ async function main() {
 
     section("8. Two processes starting the same task at once");
     const tally = {};
-    for (let trial = 0; trial < 8; trial++) {
-      const r = makeRepo(`race${trial}`);
-      const t = task(r.project, `race ${trial}`);
-      db.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
-      const mk = (n) => openServer({ actor: `agent:${n}`, env: { DELPHI_BRANCH_PREFIX: "ray" }, clientName: "test", warn: () => {} });
-      const a = mk(1);
-      const b = mk(2);
-      await a.start();
-      await b.start();
-      const callIt = (c) => c.call("workbench_start", { task_id: t.id, run_setup: false }).then((x) => `created=${x.created}`, (e) => `ERR ${e.message}`);
-      const pair = await Promise.all([callIt(a), new Promise((res) => setTimeout(res, trial * 20)).then(() => callIt(b))]);
-      const rows = db.handle().prepare("SELECT COUNT(*) AS n FROM workbenches WHERE task_id = ?").get(t.id).n;
-      const key = `${pair.sort().join(" | ")} rows=${rows}`;
-      tally[key] = (tally[key] || 0) + 1;
+    // The same two server processes for every trial: what races is the two
+    // processes' Start of one task, which each trial's new repository and task
+    // give afresh. Starting a pair per trial only added sixteen launches.
+    const mk = (n) => openServer({ actor: `agent:${n}`, env: { DELPHI_BRANCH_PREFIX: "ray" }, clientName: "test", warn: () => {} });
+    const a = mk(1);
+    const b = mk(2);
+    await a.start();
+    await b.start();
+    try {
+      for (let trial = 0; trial < 8; trial++) {
+        const r = makeRepo(`race${trial}`);
+        const t = task(r.project, `race ${trial}`);
+        db.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        const callIt = (c) => c.call("workbench_start", { task_id: t.id, run_setup: false }).then((x) => `created=${x.created}`, (e) => `ERR ${e.message}`);
+        const pair = await Promise.all([callIt(a), new Promise((res) => setTimeout(res, trial * 20)).then(() => callIt(b))]);
+        const rows = db.handle().prepare("SELECT COUNT(*) AS n FROM workbenches WHERE task_id = ?").get(t.id).n;
+        const key = `${pair.sort().join(" | ")} rows=${rows}`;
+        tally[key] = (tally[key] || 0) + 1;
+      }
+    } finally {
       a.close();
       b.close();
     }

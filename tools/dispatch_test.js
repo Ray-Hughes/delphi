@@ -112,11 +112,15 @@ const fixture = (name, lines) => {
   return file;
 };
 
+// The three jobs that must overlap meet here: none finishes until all three
+// have started, so a dispatcher that ran them one after another would hold
+// the first for the whole bound and fail the overlap check.
+const barrier = path.join(dir, "barrier");
 const claudeDo = fixture("claude_do.jsonl", [
   { type: "system", subtype: "init", cwd: "{{CWD}}", session_id: "sess-claude-1" },
   { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "tu1", name: "Bash", input: { command: "ls" } }] }, session_id: "sess-claude-1" },
   { type: "user", message: { content: [{ tool_use_id: "tu1", type: "tool_result", content: "README.md", is_error: false }] } },
-  { fake: "sleep", ms: 1500 },
+  { fake: "barrier", dir: barrier, n: 3, ms: 60000 },
   { fake: "write", file: "work.txt", text: "claude" },
   { type: "assistant", message: { id: "m2", content: [{ type: "tool_use", id: "tu2", name: "Write", input: { file_path: "work.txt" } }] } },
   { type: "assistant", message: { id: "m3", content: [{ type: "text", text: "Wrote work.txt from Claude." }] } },
@@ -126,7 +130,7 @@ const codexDo = fixture("codex_do.jsonl", [
   { type: "thread.started", thread_id: "thread-codex-1" },
   { type: "item.started", item: { id: "i1", type: "command_execution", command: "bash -lc ls", status: "in_progress" } },
   { type: "item.completed", item: { id: "i1", type: "command_execution", command: "bash -lc ls", aggregated_output: "README.md\n", exit_code: 0, status: "completed" } },
-  { fake: "sleep", ms: 1500 },
+  { fake: "barrier", dir: barrier, n: 3, ms: 60000 },
   { fake: "write", file: "work.txt", text: "codex" },
   { type: "item.completed", item: { id: "i2", type: "file_change", changes: [{ path: "work.txt", kind: "add" }], status: "completed" } },
   { type: "item.completed", item: { id: "i3", type: "agent_message", text: "Wrote work.txt from Codex." } },
@@ -135,7 +139,7 @@ const codexDo = fixture("codex_do.jsonl", [
 const copilotDo = fixture("copilot_do.jsonl", [
   { type: "tool.execution_start", data: { toolCallId: "c1", toolName: "bash", arguments: { command: "ls" } } },
   { type: "tool.execution_complete", data: { toolCallId: "c1", success: true, result: { content: "README.md\n<exited with exit code 0>" } } },
-  { fake: "sleep", ms: 1500 },
+  { fake: "barrier", dir: barrier, n: 3, ms: 60000 },
   { fake: "write", file: "work.txt", text: "copilot" },
   { type: "assistant.message", data: { messageId: "a1", content: "Wrote work.txt from Copilot.", outputTokens: 7 } },
   { type: "result", sessionId: "cop-sess-1", exitCode: 0, usage: { premiumRequests: 1.5, totalApiDurationMs: 900 } },
@@ -214,7 +218,17 @@ const makeDispatcher = (extra = {}) => createDispatcher({
   sql: db.sqlP, benches, logDir, dbPath: process.env.DELPHI_DB, settings: () => settings, hourlyLimit: 1000,
   onChange: (c) => changes.push(c), onFinished: (r) => finished.push(r.id), log: () => {}, ...extra,
 });
-const d = makeDispatcher();
+let d = makeDispatcher();
+// Every dispatcher in one process reads the same handoffs table, and each
+// create, approve, reply or finished job arms a pass 20ms later. A second
+// dispatcher left open after its section, or the main one left open during
+// another's, starts jobs that were never its own the moment the test awaits
+// anything. Each extra dispatcher is retired when its section ends, and the
+// main one while another needs the table to itself.
+async function retire(x) {
+  await x.idle();
+  x.shutdown("its test section ended");
+}
 const person = makeSheetStore({ sql: db.sqlP, actor: "you", authorType: "human" });
 const entriesOf = (taskId) => person.read(taskId, { mode: "full", n: 500 }).entries;
 
@@ -447,6 +461,7 @@ async function main() {
   fresh.tick();
   check("and it is not run again", [fresh.running().length, fresh.get(rj.id).state, runsOf(rj.id).length], [0, "failed", 0]);
   db.sqlP("UPDATE handoffs SET state = 'stopped', status = 'cancelled' WHERE id = :p1", [elsewhere.id]);
+  await retire(fresh);
 
   // ------------------------------------------------------------------------------------
   section("a project with no folder is refused, saying what to set");
@@ -473,6 +488,9 @@ async function main() {
   check("code is never changed outside a Workbench", /runs only in its task's own Workbench.*no git repository/.test(d.get(pj.id).reply), true);
 
   section("the hourly loop breaker");
+  // The agent's job below is written by the server while this awaits it, and
+  // d, with its limit of 1000, would start that and the person's job alike.
+  await retire(d);
   const tight = makeDispatcher({ hourlyLimit: 1 });
   const hp = tight.create({ projectId: project.id, harness: "codex", request: "a person's, held", kind: "ask" });
   db.sqlP("UPDATE projects SET auto_approve = 1 WHERE id = :p1", [project.id]);
@@ -482,6 +500,8 @@ async function main() {
   check("a person's job waits and says why", [tight.get(hp.id).state, /^Waiting: 1 jobs finished/.test(tight.get(hp.id).last_activity)], ["queued", true]);
   check("an agent's is stopped, since that is how a loop shows", [tight.get(ha.job_id).state, /Delphi stopped this one/.test(tight.get(ha.job_id).reply)], ["failed", true]);
   tight.stop(hp.id);
+  await retire(tight);
+  d = makeDispatcher();
 
   section("an answer from an agent is not a person's");
   setFixture("claude-code", claudeSlowAsk, claudeResumed);
@@ -636,7 +656,7 @@ async function main() {
   await waitFor("the second turn", () => quick.get(oj.id).state === "done", 15000);
   check("and the job ends with the new turn's own word", quick.get(oj.id).reply, "second turn done");
   try { process.kill(Number(fs.readFileSync(orphanPid, "utf8")), "SIGKILL"); } catch {}
-  await quick.idle();
+  await retire(quick);
 
   section("guards");
   const unguardedProject = db.createProject({ key: "strict", name: "Strict", path: cloneOf("strict") });
@@ -645,6 +665,7 @@ async function main() {
   const gj = noGuard.create({ projectId: unguardedProject.id, harness: "claude-code", request: "edit", taskId: gt.id, kind: "do" });
   await waitFor("refused", () => (noGuard.tick(), noGuard.get(gj.id).state === "failed"));
   check("Claude Code without the guard is refused unless the project allows it", /guard\.py is not installed.*turn on "Allow agents without Delphi's safety guard" in project Strict's settings/.test(noGuard.get(gj.id).reply), true);
+  await retire(noGuard);
   const ct = db.createTask({ projectId: unguardedProject.id, title: "copilot?" });
   const cj = d.create({ projectId: unguardedProject.id, harness: "copilot", request: "edit", taskId: ct.id, kind: "do" });
   await waitFor("refused", () => (d.tick(), d.get(cj.id).state === "failed"));

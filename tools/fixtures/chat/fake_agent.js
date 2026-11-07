@@ -16,6 +16,9 @@
 // waits N ms, and {"fake":"write","file":F,"text":T} writes T to F in the folder
 // it runs in, the way an agent's edit would. {"fake":"orphan","pidfile":P} leaves
 // a grandchild outside its process group holding stdout open.
+// {"fake":"barrier","dir":D,"n":N,"ms":M} leaves a mark in D and waits until N
+// agents have, or M ms pass: a proof that N ran at once which holds however
+// slowly the machine starts them, where a fixed sleep only holds when it is quick.
 
 const fs = require("fs");
 
@@ -50,6 +53,14 @@ const started = Date.now();
   for (const line of lines) {
     if (line.includes('"fake":"sleep"')) {
       await new Promise((r) => setTimeout(r, JSON.parse(line).ms || 0));
+      continue;
+    }
+    if (line.includes('"fake":"barrier"')) {
+      const b = JSON.parse(line);
+      fs.mkdirSync(b.dir, { recursive: true });
+      fs.writeFileSync(require("path").join(b.dir, String(process.pid)), "");
+      const until = Date.now() + (b.ms || 60000);
+      while (fs.readdirSync(b.dir).length < b.n && Date.now() < until) await new Promise((r) => setTimeout(r, 20));
       continue;
     }
     if (line.includes('"fake":"write"')) {

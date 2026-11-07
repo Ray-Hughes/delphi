@@ -457,19 +457,42 @@ async function route(name, env) {
     ["signedout", /not signed in\. Run copilot once/, {}],
     ["crash", /exit code 3[\s\S]*something broke/, {}],
     ["hang", /did not answer within 1 seconds/, { timeout_seconds: 1 }],
-    ["grandchild", /did not answer within 1 seconds/, { timeout_seconds: 1 }],
   ]) {
     client = await open({ FAKE_COPILOT: mode });
     try {
-      const began = Date.now();
       await rejects(`${mode}`, client.call("second_opinion", { request: "r", project: "second", ...extra }), pattern);
       check(`${mode}: the MCP file is gone`, fs.existsSync(readLog().mcp.file), false);
-      if (mode === "grandchild") {
-        check("grandchild: the call ends in good time", Date.now() - began < 9000, true);
-        const kid = Number(fs.readFileSync(logFile + ".kid", "utf8"));
-        check("grandchild: what it started is stopped too", await gone(kid), true);
-      }
     } finally { client.close(); }
+  }
+  // The grandchild case proves something only if the time limit lands after
+  // the fake has started what holds the pipe, and the limit's clock starts at
+  // spawn. On a loaded machine the fake's own start can take longer than one
+  // second, so it was stopped before it had a grandchild and the case failed,
+  // or read the pid file the other route left. So the pid file is cleared
+  // first and the case is tried again with twice the limit until the fake got
+  // that far, up to a bound no machine that can run the suite needs.
+  {
+    const kidFile = logFile + ".kid";
+    let kid = null;
+    for (let limit = 1; !kid && limit <= 32; limit *= 2) {
+      fs.rmSync(kidFile, { force: true });
+      client = await open({ FAKE_COPILOT: "grandchild" });
+      try {
+        const began = Date.now();
+        await rejects(`grandchild (a ${limit}s limit)`, client.call("second_opinion", { request: "r", project: "second", timeout_seconds: limit }),
+          new RegExp(`did not answer within ${limit} seconds`));
+        // A pid file caught half written reads as 0, which is no pid at all.
+        const read = fs.existsSync(kidFile) ? Number(fs.readFileSync(kidFile, "utf8")) : 0;
+        if (!Number.isInteger(read) || read <= 0) continue;
+        kid = read;
+        check("grandchild: the MCP file is gone", fs.existsSync(readLog().mcp.file), false);
+        // The limit, the three seconds between SIGTERM and SIGKILL, and the
+        // two after that the answer waits on a pipe held open, with room.
+        check("grandchild: the call ends in good time", Date.now() - began < limit * 1000 + 8000, true);
+        check("grandchild: what it started is stopped too", await gone(kid), true);
+      } finally { client.close(); }
+    }
+    check("grandchild: the fake started one within some limit", Number.isInteger(kid) && kid > 0, true);
   }
   client = await open({ FAKE_COPILOT: "plain" });
   try {

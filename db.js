@@ -511,6 +511,9 @@ function undo(auditId) {
     // change made since. See agent/audit.js makeUndoRules.
     const refused = undoRules().refusal(entry);
     if (refused) throw new Error(refused);
+    // A task's row before the reversal, so its pad line can follow it below.
+    const taskWas = entry.entity === "task" && entry.action === "update"
+      ? one("SELECT * FROM tasks WHERE id = :id", { id: entry.entity_id }) : null;
     try {
       applyUndo(entry);
     } catch (error) {
@@ -527,6 +530,13 @@ function undo(auditId) {
     // Inside the same transaction as the restore, for the reason writeScratchpad
     // gives: half a sync is worse than none.
     if (entry.entity === "scratchpad" && entry.action !== "delete") deriveInPlace(entry.entity_id);
+    // And the other way: a status, title, owner or priority put back on a task
+    // written in a pad goes to its line, as updateTask sends it. Otherwise the
+    // line stays ticked over a task that is open again, and the next derive
+    // reads the tick and closes it a second time. writeBackToPad compares the
+    // row as it was a moment ago with the row now, so it touches only this
+    // task's line and only the fields the undo changed.
+    if (taskWas) writeBackToPad(one("SELECT * FROM tasks WHERE id = :id", { id: entry.entity_id }), taskWas);
     // A folder put back takes its primary repos row with it, as setting it
     // did: the row at that folder (demoted when the folder changed, never
     // moved) is the primary one again.
