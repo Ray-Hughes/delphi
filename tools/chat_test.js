@@ -242,7 +242,11 @@ async function main() {
     const ran = delphi(["run", String(task.id), "--", "echo", "hi"]);
     check("delphi run worked", ran.status, 0);
     const byRun = (await read(task.id)).filter((e) => e.kind === "run").pop();
-    const missing = Object.keys(byRun.meta).filter((k) => !(k in ls.meta));
+    // ran_by is the one key a chat command must not carry: it marks a command
+    // Delphi's own runner ran, and a chat entry records what the agent ran, so
+    // a PR description can never count an agent's run as a verified pass.
+    const missing = Object.keys(byRun.meta).filter((k) => !(k in ls.meta) && k !== "ran_by");
+    check("a chat command never claims Delphi ran it", "ran_by" in ls.meta, false);
     check("a chat command carries every key a delphi run one does", missing, []);
     const text = (await person.call("sheet_read", { task_id: task.id, mode: "full" })).text;
     check("and formats the same way", text.includes(`$ ls  {id:${ls.id} by:${actor} ok dur:`), true);
