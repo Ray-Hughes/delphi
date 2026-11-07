@@ -563,7 +563,9 @@ globalThis.DelphiDrawer = (() => {
         // "Keep mine" never lands on a copy nobody saw.
         for (let round = 0; what === "conflict" && round < 3; round++) {
           const pick = await chooseCopy(label);
-          if (pick === "theirs") { if (area.value === next) take(theirs); else { saved = theirs; remote = null; } return "done"; }
+          // Theirs, chosen: the box shows it, even over words typed while the
+          // question was open, or the next blur would write them over it.
+          if (pick === "theirs") { take(theirs); return "done"; }
           if (pick !== "mine") return "kept";
           const again = await read();
           if (again === undefined) return "kept";
@@ -725,7 +727,12 @@ globalThis.DelphiDrawer = (() => {
       // What comes back is the pad with the anchors the derive wrote into new
       // lines, and the box takes it, so the next save keeps them and a renamed
       // line stays the same task.
-      onSave: async (body) => after(await window.delphi.pads.write(pad.id, { body, author: "you" })),
+      onSave: async (body) => {
+        const row = await window.delphi.pads.write(pad.id, { body, author: "you" });
+        // No body back means no anchors to take: keep what was sent.
+        if (!row || typeof row.body !== "string") { pad.body = body; if (onSaved) onSaved(pad); return body; }
+        return after(row);
+      },
       toggle: async (tick, api) => {
         // Never through the editor's whole-body save, even with typing not
         // saved yet: the tick is written to the pad as stored, and replace()
@@ -840,8 +847,9 @@ globalThis.DelphiDrawer = (() => {
         try {
           const next = area.value.trim();
           if (!next || next === String(base).trim() || !touched) return;
-          let theirs = base;
-          try { const got = await fetch(); if (got != null) theirs = got; } catch {}
+          let theirs;
+          try { theirs = await fetch(); } catch { return; }
+          if (theirs == null) return;
           const what = reconcile(base, theirs, next);
           if (what === "same") { base = next; touched = false; return; }
           if (what === "conflict") {
@@ -1014,8 +1022,9 @@ globalThis.DelphiDrawer = (() => {
             return;
           }
           if (!titleTouched) return;
-          let theirs = detail.task.title;
-          try { const fresh = await window.delphi.tasks.detail(taskId); if (fresh) theirs = fresh.task.title; } catch {}
+          let theirs;
+          // Unreadable means not written: the draft stays.
+          try { const fresh = await window.delphi.tasks.detail(taskId); if (!fresh) return; theirs = fresh.task.title; } catch { return; }
           const what = reconcile(titleFrom, theirs, next);
           if (what === "same") { titleFrom = next; detail.task.title = next; return; }
           if (what === "conflict") {
@@ -1249,6 +1258,7 @@ globalThis.DelphiDrawer = (() => {
       const subs = ordered(detail.subtasks, store.get(orderKey, []));
       // Never in the middle of an input method's composition: a rebuild would end it.
       if ((holding || (inAdd && composingAdd)) && !force) return;
+      if (force) composingAdd = false;
       const focusedId = box.contains(document.activeElement) ? document.activeElement.closest("[data-sub]")?.dataset.sub : null;
       const focusedAct = focusedId ? document.activeElement.dataset.act : null;
       box.textContent = "";
@@ -2410,6 +2420,7 @@ globalThis.DelphiDrawer = (() => {
             nameKeep.update(f.title);
             ed.update(f.body || "");
             n = { ...n, ...f };
+            handle.note = n;
             paintLinked();
           } while (noteAgain);
         } finally { noteLive = false; }
@@ -2448,7 +2459,8 @@ globalThis.DelphiDrawer = (() => {
     // Title and body save apart. The body is the whole pad, so its save is
     // checked against the stored pad (reconcile) and never puts an older copy
     // over an agent's append or a status the board wrote back into a line.
-    const save = async () => { await nameKeep.save(); if (ed) await ed.commit(); };
+    let padGone = false;
+    const save = async () => { if (padGone) return; await nameKeep.save(); if (ed) await ed.commit(); };
     const me = frame({ label: `Pad ${pad.key || pad.id}: ${pad.title}`, onClose: save });
     cur = me;
     me.root.classList.add("dw-pad");
@@ -2529,7 +2541,7 @@ globalThis.DelphiDrawer = (() => {
             let f = null;
             try { f = await window.delphi.pads.get(pad.id); } catch { return; }
             if (host.sheet() !== handle) return;
-            if (!f) { host.notify("This pad was deleted. Restore it from History."); await me.close(); return; }
+            if (!f) { padGone = true; host.notify("This pad was deleted. Restore it from History."); await me.close(); return; }
             nameKeep.update(f.title);
             ed.update(f.body || "");
             Object.assign(pad, { derives_tasks: f.derives_tasks, pinned: f.pinned, updated_at: f.updated_at });

@@ -5100,7 +5100,12 @@ function padPane() {
       value: state.padDraft != null && state.padDraftBase != null ? state.padDraftBase : null,
       // After the editor has taken the stored text in, so typing not saved yet
       // (kept by the editor through a tick) survives the repaint as the draft.
-      onSaved: () => setTimeout(() => { state.padDraft = ed.area.value !== pad.body ? ed.area.value : null; refresh(); }),
+      onSaved: () => setTimeout(() => {
+        state.padDraft = ed.area.value !== pad.body ? ed.area.value : null;
+        // Typing that outlived the save was typed on top of it.
+        state.padDraftBase = state.padDraft != null ? pad.body : null;
+        refresh();
+      }),
     });
     ed.area.addEventListener("input", () => {
       if (state.padDraft == null) state.padDraftBase = pad.body;
