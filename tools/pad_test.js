@@ -259,6 +259,21 @@ check("an anchor quoted in a code fence is not the line cut",
 check("Windows line endings are cut and kept",
   pads.cutBlock("- [ ] p <!--d:1-->\r\n  - [ ] c <!--d:2-->\r\n  - [ ] s <!--d:3-->\r\n", 2), { body: "- [ ] p <!--d:1-->\r\n  - [ ] s <!--d:3-->\r\n", block: "- [ ] c <!--d:2-->" });
 
+section("Windows line endings");
+// A pad saved with CRLF ends files its tasks like any other: the \r is not
+// part of a line's words, and a line written back keeps it.
+{
+  const crlf = pads.parse("- [ ] x\r\n- [x] y <!--d:4-->\r\nend");
+  check("CRLF checkbox lines are tasks", crlf.map((e) => [e.title, e.done, e.taskId]), [["x", false, null], ["y", true, 4]]);
+  check("a CRLF line written back keeps its \\r",
+    pads.writeLine("- [ ] x\r\n- [ ] y\r\nend", pads.parse("- [ ] x\r\n- [ ] y\r\nend")[1], { done: true }), "- [ ] x\r\n- [x] y\r\nend");
+  const p = db.createProject({ key: "crlf", name: "CRLF" });
+  const pad = db.createScratchpad({ projectId: p.id, title: "Windows", body: "- [ ] one\r\n- [ ] two\r\nend" });
+  const got = db.scratchpadTasks(pad.id).lines.map((l) => (l.task && l.task.title) || l.title);
+  check("a CRLF pad files its tasks", got, ["one", "two"]);
+  check("and keeps its line ends", db.getScratchpad(pad.id).body.split("\r\n").length, 3);
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 fs.rmSync(dir, { recursive: true, force: true });
 process.exit(failures ? 1 : 0);

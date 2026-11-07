@@ -611,6 +611,60 @@ async function main() {
     await js("DelphiDrawer.close(); 1");
     await until("!document.querySelector('.dw')");
 
+    // An agent moved a subtask under another task while the person edited
+    // prose (probe9 L3): the move stands.
+    const pad7 = db.createScratchpad({ projectId: project.id, key: "mv" + Date.now() % 1000, title: "Move", body: "- [ ] A\n  - [ ] C\n- [ ] B\nprose" });
+    const lines7 = db.scratchpadTasks(pad7.id).lines;
+    const cId = lines7.find((l) => (l.task && l.task.title) === "C").taskId;
+    const bId = lines7.find((l) => (l.task && l.task.title) === "B").taskId;
+    await js(`DelphiDrawer.openPad(${pad7.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad')");
+    await js(`(() => { const a = ${P}; a.focus(); a.value = a.value.replace("prose", "prose mine"); a.dispatchEvent(new Event('input')); return 1; })()`);
+    { const b = padOf(pad7.id).split("\n"); db.writeScratchpad(pad7.id, { body: [b[0], b[2], b[1], b[3]].join("\n") }); }
+    changed();
+    await wait(300);
+    check("the agent's move put C under B", q("SELECT parent_id FROM tasks WHERE id = :id", { id: cId })[0].parent_id, bId);
+    await blur(P);
+    await wait(900);
+    check("and the person's save keeps it there, with the person's prose", [q("SELECT parent_id FROM tasks WHERE id = :id", { id: cId })[0].parent_id, padOf(pad7.id).includes("prose mine")], [bId, true]);
+    await js("DelphiDrawer.close(); 1");
+    await until("!document.querySelector('.dw')");
+
+    // The agent adds a checkbox in the very words the person just typed
+    // (probe9 L4): one line, one task, with the agent's anchor.
+    const pad8 = db.createScratchpad({ projectId: project.id, key: "tw" + Date.now() % 1000, title: "Twins", body: "- [ ] base" });
+    await js(`DelphiDrawer.openPad(${pad8.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad')");
+    await typeInto(P, "\n- [ ] same thing");
+    db.appendScratchpad(pad8.id, "- [ ] same thing"); changed();
+    await wait(300);
+    await blur(P);
+    await wait(900);
+    const t8 = db.scratchpadTasks(pad8.id);
+    check("a checkbox both sides typed is one task", [padOf(pad8.id).split("\n").filter((l) => /same thing/.test(l)).length, t8.lines.length, t8.dropped.length], [1, 2, 0]);
+    await js("DelphiDrawer.close(); 1");
+    await until("!document.querySelector('.dw')");
+
+    console.log("\nthe write lock");
+    {
+      const { DatabaseSync } = require("node:sqlite");
+      const other = new DatabaseSync(process.env.DELPHI_DB);
+      other.exec("PRAGMA busy_timeout = 0");
+      other.exec("BEGIN IMMEDIATE");
+      const before = padOf(pad8.id);
+      const t0 = Date.now();
+      let a1 = null;
+      try { db.writeScratchpad(pad8.id, { body: before + "\nx" }, { expectBody: before }); a1 = "written"; } catch (e) { a1 = e.code; }
+      let a2 = null;
+      try { db.toggleLine("pad", pad8.id, { line: 0, checked: true, text: before.split("\n")[0] }); a2 = "written"; } catch (e) { a2 = e.code; }
+      const took = Date.now() - t0;
+      other.exec("ROLLBACK");
+      other.close();
+      check("a compare and set while another process holds the lock is CONFLICT", a1, "CONFLICT");
+      check("and so is a tick", a2, "CONFLICT");
+      check("both answered in well under a second, not a five second freeze", took < 1500, true);
+    }
+
     console.log("\ncompare and set");
     let refused = null;
     const was4 = q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body;
@@ -693,6 +747,17 @@ async function main() {
   check("merge: prose above a renamed new task, with its anchor carried", (await ML("- [ ] a <!--d:1-->\n- [ ] g", "- [ ] a <!--d:1-->\n- [ ] g <!--d:9-->", "- [ ] a <!--d:1-->\nsome prose\n- [ ] g ray")).text, "- [ ] a <!--d:1-->\nsome prose\n- [ ] g ray <!--d:9-->");
   check("merge: the same new line added on both sides is kept once", (await ML("a", "a\nsame", "a\nsame")).text, "a\nsame");
   check("merge: a new line both added, beside other new lines", (await ML("a", "a\nsame\nagent", "a\nsame\nmine")).text, "a\nsame\nagent\nmine");
+  check("merge: a line that replaced a task is a new line, never a rename of it", (await ML("- [x] old <!--d:5-->\n- [ ] keep <!--d:6-->", "- [x] old <!--d:5-->\n- [ ] keep <!--d:6-->\n- [ ] agent <!--d:7-->", "- [ ] brand new\n- [ ] keep <!--d:6-->")).text, "- [ ] brand new\n- [ ] keep <!--d:6-->\n- [ ] agent <!--d:7-->");
+  check("merge: and a task the agent ticked is kept, not given the new words", (await ML("- [ ] old <!--d:5-->\n- [ ] keep <!--d:6-->", "- [x] old <!--d:5-->\n- [ ] keep <!--d:6-->", "- [ ] brand new\n- [ ] keep <!--d:6-->")).text, "- [x] old <!--d:5-->\n- [ ] brand new\n- [ ] keep <!--d:6-->");
+  check("merge: an agent's re-parent stands while the person renames another line", (await ML("- [ ] A <!--d:1-->\n  - [ ] C <!--d:3-->\n- [ ] B <!--d:2-->", "- [ ] A <!--d:1-->\n- [ ] B <!--d:2-->\n  - [ ] C <!--d:3-->", "- [ ] A mine <!--d:1-->\n  - [ ] C <!--d:3-->\n- [ ] B <!--d:2-->")).text, "- [ ] A mine <!--d:1-->\n- [ ] B <!--d:2-->\n  - [ ] C <!--d:3-->");
+  check("merge: an indent the agent changed is structure, kept with the person's words", (await ML("- [ ] A <!--d:1-->\n- [ ] C <!--d:3-->", "- [ ] A <!--d:1-->\n  - [ ] C <!--d:3-->", "- [ ] A <!--d:1-->\n- [ ] C mine <!--d:3-->")).text, "- [ ] A <!--d:1-->\n  - [ ] C mine <!--d:3-->");
+  check("merge: a checkbox both typed is one line, with the agent's anchor", (await ML("- [ ] base", "- [ ] base <!--d:1-->\n- [ ] same thing <!--d:2-->", "- [ ] base\n- [ ] same thing")).text, "- [ ] base <!--d:1-->\n- [ ] same thing <!--d:2-->");
+  check("merge: an agent's version reworded again is marked once", (await ML("- [ ] a <!--d:1-->\nx", "- [ ] a <!--d:1-->\n> (agent's version) old edited", "- [ ] a <!--d:1-->\n> (agent's version) old mine")).text.includes("(agent's version) (agent's version)"), false);
+  {
+    const L = Array.from({ length: 2000 }, (_, i) => `prose line ${i}`);
+    const r = (await ML(L.join("\n"), L.slice(1).concat([L[0]]).join("\n"), L.map((x, i) => (i === 1000 ? `${x} mine` : x)).join("\n"))).text.split("\n");
+    check("merge: a 2,000 line pad with one line moved and one edited: each once", [r.length, r.filter((x) => x === "prose line 1000").length, r.filter((x) => x === "prose line 1000 mine").length, r[r.length - 1]], [2000, 0, 1, "prose line 0"]);
+  }
   check("merge: CRLF and LF read as the same lines", (await ML("- [ ] a\r\n- [ ] b", "- [ ] a <!--d:1-->\r\n- [ ] b <!--d:2-->", "- [ ] a\r\n- [ ] b changed")).text, "- [ ] a <!--d:1-->\n- [ ] b changed <!--d:2-->");
   {
     const big = Array.from({ length: 2000 }, (_, i) => `- [ ] t${i} <!--d:${i + 1}-->`);

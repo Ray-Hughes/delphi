@@ -296,7 +296,9 @@ function atomic(fn) {
 function busyAsConflict(error) {
   // node:sqlite names its errors ERR_SQLITE_ERROR, with the SQLite code (5,
   // SQLITE_BUSY) in errcode; the binary route only has the words.
-  const busy = error && (error.errcode === 5 || /SQLITE_BUSY|database is locked/i.test(String(error.message || error)));
+  // 5 is SQLITE_BUSY and 517 SQLITE_BUSY_SNAPSHOT (a WAL reader whose
+  // snapshot went stale before it could write).
+  const busy = error && (error.errcode === 5 || error.errcode === 517 || /SQLITE_BUSY|database is locked/i.test(String(error.message || error)));
   if (busy && error.code !== "CONFLICT") {
     const c = new Error("Something else was writing the database at the same moment, so nothing was written.");
     c.code = "CONFLICT";
@@ -316,11 +318,22 @@ function busyAsConflict(error) {
  * transaction holds. A lock not got in busy_timeout is CONFLICT, which a
  * caller that merges answers by reading again.
  */
+// How long a compare and set waits for the write lock before it says
+// CONFLICT. Short, because node:sqlite waits on the main process's thread and
+// every window's call waits with it; the drawer reads and retries instead.
+const LOCK_WAIT_MS = 250;
+const BUSY_WAIT_MS = 5000;
+
 function immediate(fn) {
   return function immediately(...args) {
     const conn = open();
     if (conn.isTransaction) return atomic(fn).apply(this, args);
-    try { conn.exec("BEGIN IMMEDIATE"); } catch (error) { throw busyAsConflict(error); }
+    try {
+      conn.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS}`);
+      conn.exec("BEGIN IMMEDIATE");
+    } catch (error) { throw busyAsConflict(error); }
+    // Back to open()'s wait, and never a second error over the first.
+    finally { try { conn.exec(`PRAGMA busy_timeout = ${BUSY_WAIT_MS}`); } catch {} }
     try {
       const result = fn.apply(this, args);
       conn.exec("COMMIT");
@@ -3373,7 +3386,7 @@ const ATOMIC = [
   "createProject", "updateProject", "createTask", "updateTask", "deleteTask", "createComment",
   "setQueue", "claimNext", "releaseClaim", "completeClaim", "extendClaim", "reclaimExpired",
   "createNote", "updateNote", "deleteNote", "createScratchpad", "appendScratchpad", "patchScratchpad",
-  "deleteScratchpad", "derive", "toggleLine", "createLink", "deleteLink", "createAlert", "createHandoff", "updateHandoff",
+  "deleteScratchpad", "derive", "createLink", "deleteLink", "createAlert", "createHandoff", "updateHandoff",
   "createExternalTask", "deleteSession", "keepFolderAnswer", "giveFolder", "mergedFolderAnswer",
 ];
 
