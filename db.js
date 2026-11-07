@@ -294,7 +294,10 @@ function atomic(fn) {
 
 /** A refusal to say "it moved, read it again", for a write that could not take the lock. */
 function busyAsConflict(error) {
-  if (error && !error.code && /SQLITE_BUSY|database is locked/i.test(String(error.message || error))) {
+  // node:sqlite names its errors ERR_SQLITE_ERROR, with the SQLite code (5,
+  // SQLITE_BUSY) in errcode; the binary route only has the words.
+  const busy = error && (error.errcode === 5 || /SQLITE_BUSY|database is locked/i.test(String(error.message || error)));
+  if (busy && error.code !== "CONFLICT") {
     const c = new Error("Something else was writing the database at the same moment, so nothing was written.");
     c.code = "CONFLICT";
     c.details = { busy: true };

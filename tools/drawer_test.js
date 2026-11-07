@@ -691,6 +691,8 @@ async function main() {
   check("merge: a line the agent deleted and the person did not touch stays deleted", (await ML("- [ ] a <!--d:1-->\n- [ ] b <!--d:2-->\n- [ ] c <!--d:3-->", "- [ ] a <!--d:1-->\n- [ ] c <!--d:3-->", "- [ ] a edited <!--d:1-->\n- [ ] b <!--d:2-->\n- [ ] c <!--d:3-->")).text, "- [ ] a edited <!--d:1-->\n- [ ] c <!--d:3-->");
   check("merge: a line the person deleted but the agent ticked is kept", (await ML("- [ ] a <!--d:1-->\n- [ ] b <!--d:2-->", "- [ ] a <!--d:1-->\n- [x] b <!--d:2-->", "- [ ] a <!--d:1-->")).text, "- [ ] a <!--d:1-->\n- [x] b <!--d:2-->");
   check("merge: prose above a renamed new task, with its anchor carried", (await ML("- [ ] a <!--d:1-->\n- [ ] g", "- [ ] a <!--d:1-->\n- [ ] g <!--d:9-->", "- [ ] a <!--d:1-->\nsome prose\n- [ ] g ray")).text, "- [ ] a <!--d:1-->\nsome prose\n- [ ] g ray <!--d:9-->");
+  check("merge: the same new line added on both sides is kept once", (await ML("a", "a\nsame", "a\nsame")).text, "a\nsame");
+  check("merge: a new line both added, beside other new lines", (await ML("a", "a\nsame\nagent", "a\nsame\nmine")).text, "a\nsame\nagent\nmine");
   check("merge: CRLF and LF read as the same lines", (await ML("- [ ] a\r\n- [ ] b", "- [ ] a <!--d:1-->\r\n- [ ] b <!--d:2-->", "- [ ] a\r\n- [ ] b changed")).text, "- [ ] a <!--d:1-->\n- [ ] b changed <!--d:2-->");
   {
     const big = Array.from({ length: 2000 }, (_, i) => `- [ ] t${i} <!--d:${i + 1}-->`);

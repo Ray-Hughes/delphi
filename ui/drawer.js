@@ -426,9 +426,21 @@ globalThis.DelphiDrawer = (() => {
     // lines can be placed after their neighbours.
     const out = [];          // [{ text, fromT: index in T or -1 }]
     const placedT = new Set();
+    // A new line both sides added with the same words is one line, kept where
+    // the person put it, with the agent's lines after it following it.
+    const twinOf = new Map();  // M index -> T index
+    {
+      const tNew = new Map();
+      T.forEach((t, j) => { if (tOf[j] < 0) { if (!tNew.has(t)) tNew.set(t, []); tNew.get(t).push(j); } });
+      M.forEach((m, j) => {
+        if (mOf[j] >= 0) return;
+        const list = tNew.get(m);
+        if (list && list.length) { const tj = list.shift(); twinOf.set(j, tj); placedT.add(tj); }
+      });
+    }
     M.forEach((m, j) => {
       const i = mOf[j];
-      if (i < 0) { out.push({ text: m, fromT: -1 }); return; }
+      if (i < 0) { out.push({ text: m, fromT: twinOf.has(j) ? twinOf.get(j) : -1 }); return; }
       const tj = tByBase.get(i);
       if (tj == null) {
         // The agent removed it. Gone, if the person left it as it was;
@@ -462,7 +474,17 @@ globalThis.DelphiDrawer = (() => {
       inResult.add(j);
     });
     const result = [];
-    const chain = (p) => { for (const j of after.get(p) || []) { result.push(T[j]); chain(j); } };
+    // Without recursion, so a long run of the agent's new lines cannot run
+    // out of stack.
+    const chain = (p) => {
+      const stack = [...(after.get(p) || [])].reverse();
+      while (stack.length) {
+        const j = stack.pop();
+        result.push(T[j]);
+        const next = after.get(j);
+        if (next) for (let k = next.length - 1; k >= 0; k--) stack.push(next[k]);
+      }
+    };
     chain(-1);
     for (const o of out) {
       result.push(o.text);
@@ -907,7 +929,7 @@ globalThis.DelphiDrawer = (() => {
           }
         }
         // What is stored now waits, as any write from elsewhere does.
-        if (next !== saved) remote = next;
+        remote = next !== saved ? next : null;
       }
       text = area.value;
       if (mode !== "write") paintPreview();
