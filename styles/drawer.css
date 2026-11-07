@@ -21,7 +21,7 @@
 .dw.wide { width: 760px; }
 .dw:focus { outline: none; }
 .dw button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
-.dw button:focus-visible, .dw [tabindex]:focus-visible, .dw select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: var(--r); }
+.dw button:focus-visible, .dw [tabindex]:focus-visible, .dw select:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; border-radius: var(--r); }
 .dw .grow { flex: 1; min-width: 0; }
 .dw .mono { font-family: var(--mono); letter-spacing: 0; }
 .dw kbd { font: 500 10.5px/1 var(--mono); color: var(--ink-faint); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 2px 4px; background: var(--surface); }
@@ -63,7 +63,7 @@
 .dw-title-btn { all: unset; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; cursor: text; border-radius: 4px; }
 .dw-title.view.plain .dw-title-btn { -webkit-line-clamp: 4; }
 /* Inset, because the clamp's overflow would cut an outline drawn outside. */
-.dw-title-btn:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
+.dw-title-btn:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--focus-ring); }
 .dw-title.view { cursor: text; }
 .dw-title.view:hover { background: var(--raised); box-shadow: 0 0 0 4px var(--raised); }
 .dw-title:focus { box-shadow: 0 0 0 2px var(--accent-line); }

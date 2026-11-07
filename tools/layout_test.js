@@ -510,13 +510,14 @@ function contrast() {
     return Object.fromEntries([...css.slice(open + 1, i - 1).matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)].map(([, k, v]) => [k, v.trim()]));
   };
   const light = block(/(^|\n):root\s*\{/);
-  const darkMedia = block(/:root:not\(\[data-theme="light"\]\)\s*\{/);
+  const darkMedia = block(/:root:not\(\[data-theme="light"\]\):not\(\[data-theme="paper"\]\)\s*\{/);
+  const paper = block(/:root\[data-theme="paper"\]\s*\{/);
   const darkPinned = block(/:root\[data-theme="dark"\]\s*\{/);
   const rgb = (hex) => { const h = String(hex).replace("#", ""); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); };
   const lum = ([r, g, b]) => { const f = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b); };
   const ratio = (a, b) => { const [x, y] = [lum(rgb(a)), lum(rgb(b))].sort((p, q2) => q2 - p); return (x + 0.05) / (y + 0.05); };
   check("both dark blocks carry the same outline tokens", [darkMedia["--ly-outline"], darkMedia["--ly-outline-quiet"]], [darkPinned["--ly-outline"], darkPinned["--ly-outline-quiet"]]);
-  for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinned }]]) {
+  for (const [theme, vars] of [["light", light], ["paper", { ...light, ...paper }], ["dark", { ...light, ...darkPinned }]]) {
     for (const token of ["--ly-outline", "--ly-outline-quiet"]) {
       for (const ground of ["--bg", "--surface", "--raised"]) {
         const r = ratio(vars[token], vars[ground]);

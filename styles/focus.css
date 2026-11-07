@@ -88,7 +88,7 @@
   margin: 10px 0 18px; font-family: var(--display); font-size: 30px; font-weight: 600;
   letter-spacing: -0.02em; line-height: 1.2; text-wrap: balance; outline: none;
 }
-.fx-title:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.fx-title:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 4px; }
 .fx-dim { color: var(--ink-dim); }
 
 .fx-why { border: 1px solid var(--line-soft); background: var(--surface); border-radius: var(--r-lg); padding: 12px 14px 13px; }

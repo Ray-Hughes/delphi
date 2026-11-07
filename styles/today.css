@@ -41,7 +41,7 @@
   font: inherit; font-size: 13px; text-align: left; }
 .td-row:last-child { border-bottom: 0; }
 .td-row:hover { background: var(--raised); }
-.td-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.td-row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 .td-row .grow { flex: 1 1 0; min-width: 8px; }
 .td-id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); flex: none; letter-spacing: 0; }
 .td-row .td-id { width: 40px; }

@@ -68,7 +68,7 @@ globalThis.DelphiCommands = (() => {
    *   projectFor()       the project Pads and Chat open from All projects
    *   newTask(), newNote(), newProject(), addFolder(), openSettings(), toggleTheme(),
    *   undoLast(), openSwitcher(), openTask(id), scrollTop()
-   *   themeIs()          "dark" or "light", as the window is showing it now
+   *   themeIs()          "dark", "light" or "paper", as the window is showing it now
    */
   // The platform's spelling of a shortcut, from ui/core.js in the window. A
   // test that loads this file alone gets the Mac's.

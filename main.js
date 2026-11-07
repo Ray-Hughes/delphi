@@ -150,9 +150,8 @@ function saveSettings() {
   settingsMain.writeSettingsFile(SETTINGS_PATH, settings);
 }
 
-/** Whether dark tokens are the ones currently in force. */
-const darkNow = () =>
-  settings.theme === "dark" || (settings.theme !== "light" && nativeTheme.shouldUseDarkColors);
+/** "light", "paper" or "dark": whose tokens are in force now. */
+const themeNow = () => settingsSchema.resolvedTheme(settings, nativeTheme.shouldUseDarkColors);
 
 /**
  * Colours for the Windows window control overlay.
@@ -162,10 +161,12 @@ const darkNow = () =>
  * so a stylesheet cannot reach them, and a mismatch shows as a block of the wrong
  * colour in the corner of the title bar.
  */
-const overlay = () =>
-  darkNow()
-    ? { color: "#171b23", symbolColor: "#98a1b2", height: 46 }
-    : { color: "#ffffff", symbolColor: "#5a6376", height: 46 };
+const OVERLAY = {
+  light: { color: "#ffffff", symbolColor: "#5a6376", height: 46 },
+  paper: { color: "#FBF9F4", symbolColor: "#4A525C", height: 46 },
+  dark: { color: "#1C2230", symbolColor: "#A3ADBE", height: 46 },
+};
+const overlay = () => OVERLAY[themeNow()] || OVERLAY.light;
 
 /**
  * Window chrome, which is the one place the two platforms cannot share a setting.
@@ -192,7 +193,9 @@ function createWindow() {
     minHeight: 560,
     show: !panel && !SMOKE,        // a normal app opens; a panel waits for the key
     icon: path.join(__dirname, "assets", "mark-64.png"),
-    backgroundColor: darkNow() ? "#0f1217" : "#f4f6f9",
+    // The page's --bg, so the frame painted before the page loads is the
+    // colour the page will be.
+    backgroundColor: { light: "#FAFAFA", paper: "#F3F0E8", dark: "#161B24" }[themeNow()] || "#FAFAFA",
     ...chromeFor(panel),
     // In panel mode it floats over the work and cannot be full screened, because
     // a full screen panel is just a window with extra rules.
@@ -449,8 +452,8 @@ function buildMenu() {
       { type: "separator" },
       {
         label: "Appearance",
-        submenu: ["system", "light", "dark"].map((choice) => ({
-          label: choice[0].toUpperCase() + choice.slice(1),
+        submenu: settingsSchema.BY_KEY.theme.choices.map(([choice, label]) => ({
+          label,
           type: "radio",
           checked: settings.theme === choice,
           click: () => setTheme(choice),

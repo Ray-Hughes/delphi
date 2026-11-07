@@ -16,7 +16,7 @@
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
   ::-webkit-scrollbar-thumb:hover { background: var(--ink-faint); background-clip: content-box; }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
+  :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; border-radius: var(--r-sm); }
   /* The two global motion levers: the system preference, and the app's own
      Animation setting, which the renderer expresses as data-motion on the root.
      The declarations are duplicated because a media query condition cannot be
@@ -677,7 +677,7 @@
   }
   .pad-row:hover { background: var(--raised); }
   .pad-row.on { background: var(--accent-soft); border-color: var(--accent); }
-  .pad-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .pad-row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
   .pad-row-t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pad-row-m { font-size: 11.5px; color: var(--ink-faint); margin-top: 1px; }
 
@@ -1967,7 +1967,7 @@
   .wb-row-title { font-size: 13.5px; color: var(--ink); }
   .wb-row-open { display: block; max-width: 100%; border: 0; background: none; padding: 0; text-align: left; cursor: default; font: inherit; font-size: 13.5px; color: var(--ink); }
   .wb-row-open:hover { color: var(--accent-ink); }
-  .wb-row-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
+  .wb-row-open:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; border-radius: var(--r-sm); }
   .wb-row-sub { display: flex; align-items: center; gap: var(--s2); margin-top: 2px; min-width: 0; }
   .wb-row-sub .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wb-flag { flex: 0 0 auto; font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; padding: 1px 6px; border-radius: 4px; color: var(--run-ok); border: 1px solid color-mix(in srgb, var(--run-ok) 50%, transparent); }
@@ -2790,7 +2790,7 @@
   .fold-row .car { width: 12px; color: var(--ink-faint); transition: transform 120ms ease; display: inline-block; text-align: center; }
   .fold-row.open .car { transform: rotate(90deg); }
   .fold-row .grow { flex: 1; }
-  .fold-row:focus-visible, .sb-proj:focus-visible, .nav .proj:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .fold-row:focus-visible, .sb-proj:focus-visible, .nav .proj:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
   .sb-kids { margin: 0 0 4px 22px; border-left: 1px solid var(--line-soft); padding-left: 4px; }
   /* The open project drawn under a folded More projects. Set a little apart
      and tagged, so it does not read as the last row of the group above. */
@@ -2821,8 +2821,8 @@
   /* Archived sessions, shown on request: faint, with Restore always in view. */
   .gs.sess.archived .gs-txt { opacity: .6; }
   .srow-btn.restore { width: auto; padding: 0 6px; font-size: 11px; align-self: center; border: 1px solid var(--line); }
-  .srow-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; color: var(--ink); }
-  .gs.sub:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .srow-btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; color: var(--ink); }
+  .gs.sub:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
   /* A sentence in a menu where an item would be, saying why it is not there. */
   .ctx-note { max-width: 240px; padding: 6px 10px; font-size: 11.5px; line-height: 1.4; color: var(--ink-dim); white-space: normal; }
   .sidebar-foot.home { display: flex; gap: 6px; }
@@ -3265,7 +3265,7 @@
     content: ""; width: 8px; height: 8px; border-radius: 99px; background: var(--accent);
   }
   .pk-row input:disabled, .pk-opts input:disabled, .evo input:disabled { opacity: .35; }
-  .pk-row input:focus-visible, .pk-opts input:focus-visible, .evo input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .pk-row input:focus-visible, .pk-opts input:focus-visible, .evo input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .pk-opts label input { margin-top: 2px; }
   .evo input { margin-top: 2px; }
 

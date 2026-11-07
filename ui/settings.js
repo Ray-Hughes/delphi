@@ -83,8 +83,9 @@ globalThis.DelphiSettingsPanel = (() => {
    *
    * The accent is written as a stylesheet rather than as properties on the
    * root, because each theme needs its own pair and "System" switches between
-   * them live: the same three selectors styles/tokens.css uses, later in the
-   * document, so they win at equal specificity. --btn-primary (white text's
+   * them live: the same selectors styles/tokens.css uses, later in the
+   * document, so they win at equal specificity. With no accent picked, each
+   * theme wears its own (SS.accentFor): Brass on Paper, Indigo elsewhere. --btn-primary (white text's
    * ground) is the fill itself, which every curated fill passes 4.5:1 under. From the schema's palette only,
    * never from the value as stored, so nothing typed into settings.json can
    * carry CSS of its own in.
@@ -92,14 +93,15 @@ globalThis.DelphiSettingsPanel = (() => {
   function applyLook(settings) {
     const s = settings || {};
     const root = document.documentElement;
-    const a = SS.ACCENTS.find((x) => x.id === s.accent) || SS.ACCENTS[0];
+    const pick = (theme) => SS.accentFor(s, theme);
     let tag = document.getElementById("delphi-accent");
     if (!tag) { tag = document.createElement("style"); tag.id = "delphi-accent"; document.head.append(tag); }
     const vars = ([fill, ink], dark) =>
       `--accent: ${fill}; --accent-ink: ${ink}; --btn-primary: ${fill}; --accent-soft: ${alpha(fill, dark ? 0.16 : 0.10)}; --accent-line: ${alpha(fill, dark ? 0.5 : 0.38)};`;
-    tag.textContent = `:root { ${vars(a.light, false)} }\n`
-      + `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { ${vars(a.dark, true)} } }\n`
-      + `:root[data-theme="dark"] { ${vars(a.dark, true)} }`;
+    tag.textContent = `:root { ${vars(pick("light").light, false)} }\n`
+      + `:root[data-theme="paper"] { ${vars(pick("paper").paper, false)} }\n`
+      + `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]):not([data-theme="paper"]) { ${vars(pick("dark").dark, true)} } }\n`
+      + `:root[data-theme="dark"] { ${vars(pick("dark").dark, true)} }`;
     if (s.density && s.density !== "comfortable" && SS.BY_KEY.density.choices.some(([c]) => c === s.density)) root.dataset.density = s.density;
     else delete root.dataset.density;
     const size = Number(s.fontSize);
@@ -674,6 +676,7 @@ globalThis.DelphiSettingsPanel = (() => {
       const dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
       const cards = el("div", { className: "sp-themes", role: "radiogroup" });
       cards.setAttribute("aria-label", "Theme");
+      const lightKind = val("systemLight") === "paper" ? "paper" : "light";
       const pane = (kind) => el("div", { className: `pane ${kind}` },
         el("div", { className: "tb" }, el("i", { className: "a" }), el("i")),
         el("div", { className: "bd" }, el("i", { style: "width:80%" }), el("i", { style: "width:55%" }), el("i", { className: "a", style: "width:40%" }), el("i", { style: "width:66%" })));
@@ -684,8 +687,8 @@ globalThis.DelphiSettingsPanel = (() => {
         b.dataset.v = v;
         b.tabIndex = on || (!theme.choices.some(([c]) => c === val("theme")) && v === theme.choices[0][0]) ? 0 : -1;
         b.append(
-          el("div", { className: `shot${v === "system" ? " half" : ""}` }, ...(v === "system" ? [pane("light"), pane("dark")] : [pane(v)])),
-          el("div", { className: "cap" }, el("span", { className: "sp-radio" }), label, v === "system" ? el("span", { className: "hint", textContent: `Now ${dark ? "dark" : "light"}` }) : null));
+          el("div", { className: `shot${v === "system" ? " half" : ""}` }, ...(v === "system" ? [pane(lightKind), pane("dark")] : [pane(v)])),
+          el("div", { className: "cap" }, el("span", { className: "sp-radio" }), label, v === "system" ? el("span", { className: "hint", textContent: `Now ${dark ? "dark" : lightKind}` }) : null));
         b.onclick = () => save({ theme: v });
         cards.append(b);
       }
@@ -693,19 +696,26 @@ globalThis.DelphiSettingsPanel = (() => {
       const swatches = el("div", { className: "sp-swatches", role: "radiogroup" });
       swatches.setAttribute("aria-label", "Accent colour");
       const ids = SS.ACCENTS.map((a) => a.id);
+      // The theme on screen now, so the dots are the fills it would paint, and
+      // with nothing picked the theme's own accent shows as the chosen one.
+      const showing = SS.resolvedTheme({ ...P.settings, theme: val("theme"), systemLight: val("systemLight") }, dark);
+      const current = SS.accentFor({ accent: val("accent") }, showing).id;
       for (const a of SS.ACCENTS) {
-        const on = val("accent") === a.id;
-        const fill = document.documentElement.dataset.theme === "dark" || (document.documentElement.dataset.theme !== "light" && dark) ? a.dark[0] : a.light[0];
-        const aa = Math.min(ratioOnWhite(a.light[0]), ratioOnWhite(a.dark[0]));
-        const b = el("button", { className: "sp-sw", type: "button", role: "radio", title: `${a.label}: white text on it is ${aa.toFixed(1)} to 1 or better in both themes` });
+        const on = current === a.id;
+        const fill = a[showing][0];
+        const aa = Math.min(ratioOnWhite(a.light[0]), ratioOnWhite(a.paper[0]), ratioOnWhite(a.dark[0]));
+        const b = el("button", { className: "sp-sw", type: "button", role: "radio", title: `${a.label}: white text on it is ${aa.toFixed(1)} to 1 or better in every theme` });
         b.setAttribute("aria-checked", String(on));
         b.dataset.v = a.id;
-        b.tabIndex = on || (!ids.includes(val("accent")) && a.id === ids[0]) ? 0 : -1;
+        b.tabIndex = on ? 0 : -1;
         b.append(el("span", { className: "sw-dot", style: `background:${fill}` }, on ? I("check", "sm") : null), a.label, el("span", { className: "aa", textContent: `AA ${aa.toFixed(1)}` }));
         b.onclick = () => save({ accent: a.id });
         swatches.append(b);
       }
-      swatches.onkeydown = (e) => arrowRadio(e, ids, val("accent"), (x) => save({ accent: x }), "accent");
+      swatches.onkeydown = (e) => arrowRadio(e, ids, current, (x) => save({ accent: x }), "accent");
+      // A pick is worn in every theme, so the way back to each theme wearing
+      // its own (Brass on Paper) has to be said out loud.
+      if (val("accent") != null) swatches.append(btn("Use each theme's own", () => save({ accent: null })));
       const size = SS.BY_KEY.fontSize;
       const slider = el("div", { className: "sp-range" });
       const input = el("input", { type: "range", min: String(size.min), max: String(size.max), step: "1", value: String(val("fontSize")) });
@@ -719,10 +729,10 @@ globalThis.DelphiSettingsPanel = (() => {
       for (let n = size.min; n <= size.max; n++) ticks.append(n === Number(val("fontSize")) ? el("b", { textContent: String(n) }) : el("span", { textContent: String(n) }));
       slider.append(input, ticks);
       root.append(
-        group("Theme", [row(theme, { block: true, controlEl: cards })]),
+        group("Theme", [row(theme, { block: true, controlEl: cards }), row(SS.BY_KEY.systemLight)]),
         group("Accent", [row(SS.BY_KEY.accent, { block: true, controlEl: swatches })]),
         group("Text and spacing", [row(SS.BY_KEY.density), row(size, { controlEl: slider })]),
-        ...schemaGroups("appearance", { except: ["theme", "accent", "density", "fontSize"] }));
+        ...schemaGroups("appearance", { except: ["theme", "systemLight", "accent", "density", "fontSize"] }));
     },
 
     shortcuts(root) {
