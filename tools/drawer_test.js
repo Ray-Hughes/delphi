@@ -429,6 +429,43 @@ async function main() {
   check("asked, Take theirs", await pick("Take theirs"), true);
   await until(`${D}.value === "E by an agent"`);
   check("keeps the agent's text and shows it", [detailOf(dTask.id), await js(`${D}.value`)], ["E by an agent", "E by an agent"]);
+  // A preview tick while the description holds typing after Not now
+  // (probe8): the next blur still asks, and the agent's words stay.
+  await js("DelphiDrawer.close(); 1"); await wait(300);
+  const dtk = db.createTask({ projectId: project.id, title: "Tick probe", detail: "- [ ] box\nA" });
+  await js(`localStorage.setItem("delphi.drawer.mode.task", JSON.stringify("split")); 1`);
+  await openTask(dtk.id);
+  await typeInto(D, "").then(() => js(`(() => { const a = ${D}; a.value = a.value.replace("A", "A mine"); a.dispatchEvent(new Event('input')); return 1; })()`));
+  db.updateTask(dtk.id, { detail: "- [ ] box\nC by agent" }); changed();
+  await wait(300);
+  await blur(D);
+  check("description typed while an agent wrote: it asks", await pick("Not now"), true);
+  await wait(300);
+  await js("(() => { const b = document.querySelector('.dw [data-fold=description] .dw-prev input.md-check:not([disabled])'); b.checked = true; b.dispatchEvent(new Event('change')); return 1; })()");
+  await wait(900);
+  check("the tick lands on the stored text", detailOf(dtk.id), "- [x] box\nC by agent");
+  await typeInto(D, ".");
+  await blur(D);
+  check("and the next save still asks, rather than writing over the agent", await pick("Not now"), true);
+  await wait(300);
+  check("so the agent's words stay", detailOf(dtk.id), "- [x] box\nC by agent");
+  await js("DelphiDrawer.close(); 1");
+  check("closing asks once more", await pick("Not now"), true);
+  await until("!document.querySelector('.dw')");
+  db.updateTask(dtk.id, { detail: "- [x] box\nD by agent" });
+  await openTask(dtk.id);
+  check("reopened, the draft is back", await js(`${D}.value.includes("A mine")`), true);
+  await typeInto(D, "!");
+  await blur(D);
+  check("typing on it asks again rather than writing over the agent", await pick("Not now"), true);
+  await wait(300);
+  check("and the agent's words are still there", detailOf(dtk.id), "- [x] box\nD by agent");
+  await js("DelphiDrawer.close(); 1");
+  await pick("Not now");
+  await until("!document.querySelector('.dw')");
+  await js(`localStorage.setItem("delphi.drawer.mode.task", JSON.stringify("write")); 1`);
+  await openTask(dTask.id);
+
   const T = "document.querySelector('.dw textarea.dw-title')";
   const titleOf = (id) => q("SELECT title FROM tasks WHERE id = :id", { id })[0].title;
   await js("document.querySelector('.dw .dw-title-btn').click(); 1");
@@ -519,40 +556,67 @@ async function main() {
     await js("DelphiDrawer.close(); 1");
     await until("!document.querySelector('.dw')");
 
-    // A draft left by Not now and a close, reopened after an agent wrote the
-    // pad: merged against the copy it was typed on, never written over it.
-    const pad4 = db.createScratchpad({ projectId: project.id, key: "dr" + Date.now() % 1000, title: "Drafts", body: "- [ ] alpha" });
+    // One line reworded on both sides: nothing to choose, both are kept.
+    const padOf = (id) => q("SELECT body FROM scratchpads WHERE id = :id", { id })[0].body;
+    const pad4 = db.createScratchpad({ projectId: project.id, key: "dr" + Date.now() % 1000, title: "Both", body: "- [ ] alpha\nprose" });
     await js(`DelphiDrawer.openPad(${pad4.id}).then(() => 1)`);
     await until("!!document.querySelector('.dw.dw-pad')");
-    await js(`(() => { const a = ${P}; a.focus(); a.value = a.value.replace("alpha", "alpha first"); a.dispatchEvent(new Event('input')); return 1; })()`);
-    db.writeScratchpad(pad4.id, { body: "- [ ] alpha by an agent" }); changed();
+    await js(`(() => { const a = ${P}; a.focus(); a.value = a.value.replace("prose", "prose MINE"); a.dispatchEvent(new Event('input')); return 1; })()`);
+    { const cur = padOf(pad4.id); db.writeScratchpad(pad4.id, { body: cur.replace("prose", "prose THEIRS") + "\n- [ ] agent line" }); }
+    changed();
     await wait(300);
     await blur(P);
-    check("both changed the same line: it asks, and Not now is where the focus is", await until(`document.activeElement && document.activeElement.textContent === "Not now"`), true);
-    check("with how many lines it touches", await js("/1 line changed on both sides/.test(document.querySelector('.wb-dialog').textContent)"), true);
-    await pick("Not now");
-    await wait(300);
+    await wait(900);
+    const b4 = padOf(pad4.id);
+    check("a pad reworded on both sides asks nothing", await js("!!document.querySelector('.wb-dialog')"), false);
+    check("keeps the person's line, then the agent's marked under it, and the agent's new line", [b4.includes("prose MINE"), b4.includes("> (agent's version) prose THEIRS"), b4.includes("agent line")], [true, true, true]);
+    check("and says so", await js("/both versions are kept/.test((document.querySelector('.wb-toast') || {}).textContent || '')"), true);
+
+    // A preview tick while the box holds typing the store has not taken
+    // (probe8): the base moves only by the tick, so the next save still
+    // merges with the agent's write rather than writing over it.
+    await js(`localStorage.setItem("delphi.drawer.mode.pad", JSON.stringify("split")); 1`);
     await js("DelphiDrawer.close(); 1");
-    await pick("Not now");
     await until("!document.querySelector('.dw')");
-    db.appendScratchpad(pad4.id, "- [ ] agent eight");
-    await js(`DelphiDrawer.openPad(${pad4.id}).then(() => 1)`);
-    await until("!!document.querySelector('.dw.dw-pad')");
-    check("reopened, the draft is back", await js(`${P}.value.includes("alpha first")`), true);
-    await typeInto(P, "x");
-    await blur(P);
-    check("typing on it asks again rather than writing over the agent", await pick("Not now"), true);
+    const pad5 = db.createScratchpad({ projectId: project.id, key: "tk" + Date.now() % 1000, title: "Tick while typing", body: "- [ ] one\nprose" });
+    await js(`DelphiDrawer.openPad(${pad5.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad .dw-prev input.md-check')");
+    await js(`(() => { const a = ${P}; a.focus(); a.value = a.value.replace("prose", "prose MINE"); a.dispatchEvent(new Event('input')); return 1; })()`);
+    { const cur = padOf(pad5.id); db.writeScratchpad(pad5.id, { body: cur.replace("prose", "prose THEIRS") + "\n- [ ] agent line" }); }
+    changed();
     await wait(300);
-    check("and the agent's lines are still there", ["alpha by an agent", "agent eight"].map((w) => padRow.call(null) && q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body.includes(w)), [true, true]);
+    await js("(() => { const b = document.querySelector('.dw-pad .dw-prev input.md-check:not([disabled])'); b.checked = true; b.dispatchEvent(new Event('change')); return 1; })()");
+    await wait(900);
+    await typeInto(P, ".");
+    await blur(P);
+    await wait(900);
+    const b5 = padOf(pad5.id);
+    check("a tick on a pad with unsaved typing, then a save, keeps the agent's words and line", [b5.includes("THEIRS"), b5.includes("agent line"), b5.includes("MINE"), /- \[x\] one/.test(b5)], [true, true, true, true]);
     await js("DelphiDrawer.close(); 1");
-    await pick("Not now");
+    await until("!document.querySelector('.dw')");
+    await js(`localStorage.setItem("delphi.drawer.mode.pad", JSON.stringify("write")); 1`);
+
+    // A line inserted above a new task while it saves, then the task renamed
+    // (the reviewer's case): the task keeps its anchor, so it stays one task.
+    const pad6 = db.createScratchpad({ projectId: project.id, key: "ab" + Date.now() % 1000, title: "Above", body: "- [ ] alpha" });
+    await js(`DelphiDrawer.openPad(${pad6.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad')");
+    await js(`(() => { const a = ${P}; a.focus(); a.value += '\\n- [ ] gamma'; a.dispatchEvent(new Event('input')); a.dispatchEvent(new FocusEvent('blur'));
+      a.value = a.value.replace('- [ ] gamma', 'some prose\\n- [ ] gamma ray'); a.dispatchEvent(new Event('input')); return 1; })()`);
+    await wait(900);
+    await blur(P);
+    await wait(900);
+    const g6 = db.scratchpadTasks(pad6.id);
+    check("prose put above a task while it saved, then a rename: still one task", [g6.lines.length, g6.dropped.length, g6.lines.filter((l) => /gamma/.test((l.task && l.task.title) || l.title || "")).length], [2, 0, 1]);
+    await js("DelphiDrawer.close(); 1");
     await until("!document.querySelector('.dw')");
 
     console.log("\ncompare and set");
     let refused = null;
+    const was4 = q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body;
     try { db.writeScratchpad(pad4.id, { body: "nope" }, { expectBody: "not what it is" }); } catch (e) { refused = e.code; }
     check("a pad write that expects an older body is refused with CONFLICT", refused, "CONFLICT");
-    check("and writes nothing", q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body.includes("agent eight"), true);
+    check("and writes nothing", q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body, was4);
     const nowBody = q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body;
     db.writeScratchpad(pad4.id, { body: nowBody + "\nok" }, { expectBody: nowBody });
     check("one that expects the body it has is written", q("SELECT body FROM scratchpads WHERE id = :id", { id: pad4.id })[0].body.endsWith("\nok"), true);
@@ -619,6 +683,21 @@ async function main() {
   check("merge: different lines changed on each side", (await ML("a\nb\nc", "a\nB\nc", "a\nb\nC")).text, "a\nB\nC");
   check("merge: the same line changed on both sides is a clash", (await ML("x", "y", "z")).conflicts, 1);
   check("merge: a tick from theirs on a line the person renamed", (await ML("- [ ] a <!--d:1-->", "- [x] a <!--d:1-->", "- [ ] a two <!--d:1-->")).text, "- [x] a two <!--d:1-->");
+  check("merge: a line the person moved keeps the agent's tick", (await ML("- [ ] a <!--d:1-->\n- [ ] b <!--d:2-->", "- [ ] a <!--d:1-->\n- [x] b <!--d:2-->", "- [ ] b <!--d:2-->\n- [ ] a <!--d:1-->")).text, "- [x] b <!--d:2-->\n- [ ] a <!--d:1-->");
+  check("merge: the agent's new line next to a clash comes after the agent's version", (await ML("- [ ] a <!--d:1-->", "- [ ] a theirs <!--d:1-->\n- [ ] agent new", "- [ ] a mine <!--d:1-->")).text, "- [ ] a mine <!--d:1-->\n> (agent's version) a theirs\n- [ ] agent new");
+  check("merge: a reordered copy of a line keeps its anchor once", (await ML("- [ ] a <!--d:1-->\n- [ ] b <!--d:2-->", "- [ ] a <!--d:1-->\n- [ ] b <!--d:2-->", "- [ ] b <!--d:2-->\n- [ ] a <!--d:1-->\n- [ ] a copy <!--d:1-->")).text, "- [ ] b <!--d:2-->\n- [ ] a <!--d:1-->\n- [ ] a copy");
+  check("merge: identical lines, the agent removed one, the person edits the other", (await ML("- [ ] t <!--d:1-->\n- [ ] t <!--d:2-->", "- [ ] t <!--d:2-->", "- [ ] t <!--d:1-->\n- [ ] t edited <!--d:2-->")).text, "- [ ] t edited <!--d:2-->");
+  check("merge: identical unanchored lines the agent filed and ticked", (await ML("- [ ] t\n- [ ] t", "- [ ] t <!--d:7-->\n- [x] t <!--d:8-->", "- [ ] t\n- [ ] t\nmore")).text, "- [ ] t <!--d:7-->\n- [x] t <!--d:8-->\nmore");
+  check("merge: a line the agent deleted and the person did not touch stays deleted", (await ML("- [ ] a <!--d:1-->\n- [ ] b <!--d:2-->\n- [ ] c <!--d:3-->", "- [ ] a <!--d:1-->\n- [ ] c <!--d:3-->", "- [ ] a edited <!--d:1-->\n- [ ] b <!--d:2-->\n- [ ] c <!--d:3-->")).text, "- [ ] a edited <!--d:1-->\n- [ ] c <!--d:3-->");
+  check("merge: a line the person deleted but the agent ticked is kept", (await ML("- [ ] a <!--d:1-->\n- [ ] b <!--d:2-->", "- [ ] a <!--d:1-->\n- [x] b <!--d:2-->", "- [ ] a <!--d:1-->")).text, "- [ ] a <!--d:1-->\n- [x] b <!--d:2-->");
+  check("merge: prose above a renamed new task, with its anchor carried", (await ML("- [ ] a <!--d:1-->\n- [ ] g", "- [ ] a <!--d:1-->\n- [ ] g <!--d:9-->", "- [ ] a <!--d:1-->\nsome prose\n- [ ] g ray")).text, "- [ ] a <!--d:1-->\nsome prose\n- [ ] g ray <!--d:9-->");
+  check("merge: CRLF and LF read as the same lines", (await ML("- [ ] a\r\n- [ ] b", "- [ ] a <!--d:1-->\r\n- [ ] b <!--d:2-->", "- [ ] a\r\n- [ ] b changed")).text, "- [ ] a <!--d:1-->\n- [ ] b changed <!--d:2-->");
+  {
+    const big = Array.from({ length: 2000 }, (_, i) => `- [ ] t${i} <!--d:${i + 1}-->`);
+    const t0 = Date.now();
+    await ML(big.join("\n"), big.slice().reverse().join("\n"), big.map((l, i) => (i % 50 === 0 ? l.replace(" <!--", " edited <!--") : l)).join("\n"));
+    check("merge: 2,000 lines reversed by an agent while 40 are edited, well under a second", Date.now() - t0 < 1000, true);
+  }
   check("reconcile: untouched and unmoved writes nothing", await js(`DelphiDrawer.reconcile("a", "a", "a")`), "none");
   check("reconcile: untouched and moved takes theirs", await js(`DelphiDrawer.reconcile("a", "b", "a")`), "take");
   check("reconcile: typed and unmoved writes", await js(`DelphiDrawer.reconcile("a", "a", "c")`), "write");

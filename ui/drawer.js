@@ -247,46 +247,74 @@ globalThis.DelphiDrawer = (() => {
     });
   }
 
-  // --- merging a pad, line by line ------------------------------------------
+  // --- merging a pad, by identity -------------------------------------------
+  //
+  // A pad line that files a task carries <!--d:N-->, and that anchor is the
+  // line's identity: whatever moved, was reworded or was ticked, the same N is
+  // the same line. Lines are matched by it first, and only lines with no
+  // anchor the base knows are matched by their words, then by kind within the
+  // gap they sit in. Three rounds of matching by position alone lost or
+  // doubled work; an id cannot be confused with a neighbour.
+  //
+  // The rules a merge keeps, on every path:
+  //   - nothing an agent wrote is deleted, unticked or overwritten: a line
+  //     both sides reworded keeps both, the person's then the agent's under
+  //     it, unanchored and marked, for the person to settle by editing;
+  //   - an agent's new lines are always kept, near where the agent put them;
+  //   - a line ticked on either side stays ticked;
+  //   - an anchor appears at most once, and only on a checkbox line.
 
   const ANCHOR_RE = /\s*<!--\s*d:(\d+)\s*-->/;
   const TICK_RE = /^(\s*[-*+] \[)([ xX])(\])/;
   const anchorOf = (line) => { const m = ANCHOR_RE.exec(line); return m ? m[0] : ""; };
+  const anchorId = (line) => { const m = ANCHOR_RE.exec(line); return m ? m[1] : null; };
   const unanchored = (line) => line.replace(ANCHOR_RE, "");
   const tickOf = (line) => { const m = TICK_RE.exec(line); return m ? m[2].toLowerCase() === "x" : null; };
   const setTick = (line, on) => line.replace(TICK_RE, (_, a, _b, c) => `${a}${on ? "x" : " "}${c}`);
   const untick = (line) => line.replace(TICK_RE, (_, a, _b, c) => `${a} ${c}`);
+  /** A line's words: without its anchor or the state of its box. */
+  const keyOf = (line) => untick(unanchored(line)).replace(/\s+$/, "");
+  const AGENT_MARK = "(agent's version)";
+  /** The agent's side of a clash, as prose: no box and no anchor, so it files nothing. */
+  const agentVersion = (line) => {
+    const words = unanchored(line).replace(TICK_RE, "").replace(/^\s*[-*+]\s+/, "").trim();
+    const indent = (/^\s*/.exec(line) || [""])[0];
+    return `${indent}> ${AGENT_MARK} ${words}`;
+  };
 
   /**
-   * One line changed on both sides, merged when the two changes are of
-   * different kinds: the store only added an anchor (the derive filing it),
-   * or only flipped its box (the board writing a status back), while the
-   * person changed the words. Null when both changed the same thing.
+   * One line as both sides left it. Returns { lines, clash }: the merged line
+   * (and under it the agent's version, when both reworded it).
    */
   function mergeLine(b, t, m) {
-    if (t === b) return m;
-    if (m === b || m === t) return t;
-    let out = m;
-    if (unanchored(t) === unanchored(b)) {
-      // Theirs only filed it: the person's words, with its anchor.
-      return anchorOf(m) ? m : `${unanchored(m)}${anchorOf(t)}`;
-    }
+    if (t === b || t === m) return { lines: [m], clash: false };
+    if (m === b) return { lines: [t], clash: false };
+    const kb = keyOf(b);
+    const kt = keyOf(t);
+    const km = keyOf(m);
+    const both = kt !== kb && km !== kb && kt !== km;
+    let line = unanchored(kt !== kb && km === kb ? t : m);
     const tb = tickOf(b);
     const tt = tickOf(t);
-    if (tb != null && tt != null && tb !== tt && untick(unanchored(t)) === untick(unanchored(b)) && tickOf(m) === tb) {
-      // Theirs only ticked (or unticked) it: the person's words, its box.
-      out = setTick(m, tt);
-      if (!anchorOf(out) && anchorOf(t)) out = `${out}${anchorOf(t)}`;
-      return out;
+    const tm = tickOf(m);
+    if (tickOf(line) != null) {
+      // Each side's change to the box stands; both changed it, ticked wins.
+      const on = tt === tb ? tm : tm === tb ? tt : Boolean(tt || tm);
+      line = setTick(line, Boolean(on));
     }
-    return null;
+    const anchor = anchorOf(m) || anchorOf(t);
+    if (anchor && tickOf(line) != null) line = `${line}${anchor}`;
+    return both ? { lines: [line, agentVersion(t)], clash: true } : { lines: [line], clash: false };
   }
 
-  /** The longest common run of lines, as pairs of indexes, for a three-way merge. */
+  /**
+   * Pairs of indexes of equal keys, longest run first: a common prefix and
+   * suffix are taken for nothing, and only the middle is compared, by a map
+   * when it is large, so a 2,000 line pad with a few changes stays quick.
+   */
   function matchLines(a, b) {
     const n = a.length;
     const m = b.length;
-    // Trimmed ends first, so a long pad with one change costs little.
     let lo = 0;
     while (lo < n && lo < m && a[lo] === b[lo]) lo++;
     let hiA = n;
@@ -296,7 +324,7 @@ globalThis.DelphiDrawer = (() => {
     for (let i = 0; i < lo; i++) pairs.push([i, i]);
     const rows = hiA - lo;
     const cols = hiB - lo;
-    if (rows && cols) {
+    if (rows && cols && rows * cols <= 250000) {
       const L = Array.from({ length: rows + 1 }, () => new Uint32Array(cols + 1));
       for (let i = rows - 1; i >= 0; i--) {
         for (let j = cols - 1; j >= 0; j--) {
@@ -310,111 +338,149 @@ globalThis.DelphiDrawer = (() => {
         else if (L[i + 1][j] >= L[i][j + 1]) i++;
         else j++;
       }
+    } else if (rows && cols) {
+      // Large: each line to the next unused equal line after the last match.
+      const at = new Map();
+      for (let j = lo; j < hiB; j++) { const k = b[j]; if (!at.has(k)) at.set(k, []); at.get(k).push(j); }
+      let last = lo - 1;
+      for (let i = lo; i < hiA; i++) {
+        const list = at.get(a[i]);
+        if (!list) continue;
+        while (list.length && list[0] <= last) list.shift();
+        if (list.length) { last = list.shift(); pairs.push([i, last]); }
+      }
     }
     for (let k = 0; k < n - hiA; k++) pairs.push([hiA + k, hiB + k]);
     return pairs;
   }
 
-  /** A line without what the store adds to it (an anchor) or flips in it (a box). */
-  const keyOf = (line) => untick(unanchored(line)).replace(/\s+$/, "");
-
-  /** Theirs' anchor and box, put on a line whose words the person changed. */
-  function decorate(m, b, t) {
-    let out = m;
-    const tb = tickOf(b);
-    const tt = tickOf(t);
-    if (tb != null && tt != null && tb !== tt && tickOf(out) === tb) out = setTick(out, tt);
-    if (anchorOf(t) && !anchorOf(out) && !anchorOf(b)) out = `${out}${anchorOf(t)}`;
-    return out;
+  /**
+   * Which base line each line of a side is, by id: the anchor when the base
+   * has it, else the words, else the kind of line within the gap it sits in
+   * (a checkbox line pairs with a checkbox line). Returns an array of base
+   * indexes (or -1 for a line the base does not have) for the side's lines.
+   */
+  function identify(B, X) {
+    const baseById = new Map();
+    B.forEach((line, i) => { const id = anchorId(line); if (id != null && !baseById.has(id)) baseById.set(id, i); });
+    const of = new Array(X.length).fill(-1);
+    const used = new Set();
+    const seen = new Set();
+    X.forEach((line, j) => {
+      const id = anchorId(line);
+      if (id == null || !baseById.has(id) || seen.has(id)) return;
+      seen.add(id);
+      of[j] = baseById.get(id);
+      used.add(of[j]);
+    });
+    // The rest by their words, in order.
+    const bRest = B.map((line, i) => i).filter((i) => !used.has(i) && !(anchorId(B[i]) != null && seen.has(anchorId(B[i]))));
+    const xRest = X.map((line, j) => j).filter((j) => of[j] < 0);
+    const pairs = matchLines(bRest.map((i) => keyOf(B[i])), xRest.map((j) => keyOf(X[j])));
+    for (const [p, q] of pairs) { of[xRest[q]] = bRest[p]; used.add(bRest[p]); }
+    // Then by kind, within each gap between lines already placed.
+    const placedAt = [];
+    X.forEach((_, j) => { if (of[j] >= 0) placedAt.push(j); });
+    let prevB = -1;
+    let from = 0;
+    const gaps = [...placedAt, X.length];
+    for (const stop of gaps) {
+      const nextB = stop < X.length ? of[stop] : B.length;
+      if (nextB > prevB) {
+        const bs = [];
+        for (let i = prevB + 1; i < nextB; i++) if (!used.has(i)) bs.push(i);
+        const xs = [];
+        for (let j = from; j < stop; j++) if (of[j] < 0) xs.push(j);
+        for (const i of bs) {
+          const box = tickOf(B[i]) != null;
+          const k = xs.findIndex((j) => (tickOf(X[j]) != null) === box && !(box && anchorId(X[j]) != null && anchorId(X[j]) !== anchorId(B[i]) && baseById.has(anchorId(X[j]))));
+          if (k >= 0) { of[xs[k]] = i; used.add(i); xs.splice(k, 1); }
+        }
+      }
+      if (stop < X.length) { prevB = Math.max(prevB, of[stop]); from = stop + 1; }
+    }
+    return of;
   }
 
   /**
-   * A three-way merge of a pad, by lines: base is the copy the person began
-   * from, theirs the pad as stored now, mine the box. Lines are matched by
-   * their words, so a line the store only filed (an anchor) or the board only
-   * ticked still lines up. Lines changed on one side only come from that
-   * side, both sides' new lines are kept, and an anchor or a tick from theirs
-   * is put on the person's version of the line. Returns { text, mine,
-   * conflicts, lines, tasks }: text leaves each real clash as theirs, mine as
-   * the person's (never with a box theirs ticked put back to empty), and lines
-   * and tasks say how much the clashes touch.
+   * A three-way merge of a pad. base is the copy the person began from,
+   * theirs the pad as stored now, mine the box. The result follows the
+   * person's order, with the agent's new lines placed after the line they
+   * followed in the agent's copy. Returns { text, mine, conflicts, lines,
+   * tasks }; mine is text (there is no other side to take), conflicts the
+   * number of lines kept twice, tasks how many of them file a task.
    */
   function mergeLines(base, theirs, mine) {
-    const B = String(base).split("\n");
-    const T = String(theirs).split("\n");
-    const M = String(mine).split("\n");
-    const bt = new Map(matchLines(B.map(keyOf), T.map(keyOf)));
-    const bm = new Map(matchLines(B.map(keyOf), M.map(keyOf)));
-    const outT = [];
-    const outM = [];
+    const B = lfSplit(base);
+    const T = lfSplit(theirs);
+    const M = lfSplit(mine);
+    const tOf = identify(B, T);
+    const mOf = identify(B, M);
+    const tByBase = new Map();
+    tOf.forEach((i, j) => { if (i >= 0) tByBase.set(i, j); });
+    const mByBase = new Map();
+    mOf.forEach((i, j) => { if (i >= 0) mByBase.set(i, j); });
     let conflicts = 0;
-    let lines = 0;
     const tasks = new Set();
-    const same = (x, y) => x.length === y.length && x.every((v, k) => v === y[k]);
-    const clash = (t, m) => {
-      conflicts++;
-      lines += Math.max(t.length, m.length, 1);
-      for (const line of [...t, ...m]) { const a = ANCHOR_RE.exec(line); if (a) tasks.add(a[1]); }
-      outT.push(...t);
-      const ticked = new Set();
-      for (const line of t) { const a = ANCHOR_RE.exec(line); if (a && tickOf(line)) ticked.add(a[1]); }
-      outM.push(...m.map((line) => { const a = ANCHOR_RE.exec(line); return a && ticked.has(a[1]) && tickOf(line) === false ? setTick(line, true) : line; }));
-    };
-    let ib = 0;
-    let it = 0;
-    let im = 0;
-    const flush = (be, te, me) => {
-      const b = B.slice(ib, be);
-      const t = T.slice(it, te);
-      const m = M.slice(im, me);
-      const both = (x) => { outT.push(...x); outM.push(...x); };
-      // Where each base line went in x, by its words, or null if any is gone.
-      const covers = (x) => {
-        const pairs = matchLines(b.map(keyOf), x.map(keyOf));
-        return pairs.length === b.length ? pairs.map(([, j]) => j) : null;
-      };
-      // One side only added lines (and filed or ticked); the other changed
-      // lines in place: walk the base, the added lines where they were added.
-      const weave = (adds, at, edits, addsIsTheirs) => {
-        const out = [];
-        let from = 0;
-        for (let k = 0; k < b.length; k++) {
-          out.push(...adds.slice(from, at[k]));
-          const one = addsIsTheirs ? mergeLine(b[k], adds[at[k]], edits[k]) : mergeLine(b[k], edits[k], adds[at[k]]);
-          if (one == null) return null;
-          out.push(one);
-          from = at[k] + 1;
-        }
-        out.push(...adds.slice(from));
-        return out;
-      };
-      let woven = null;
-      if (same(t, b)) both(m);
-      else if (same(m, b) || same(m, t)) both(t);
-      else if (!b.length) both(same(t, m) ? t : [...t, ...m]);
-      else if (b.length === t.length && b.length === m.length && (woven = b.map((line, k) => mergeLine(line, t[k], m[k]))).every((x) => x != null)) both(woven);
-      else if (m.length === b.length && covers(t) && (woven = weave(t, covers(t), m, true))) both(woven);
-      else if (t.length === b.length && covers(m) && (woven = weave(m, covers(m), t, false))) both(woven);
-      else if (t.length === b.length && t.every((line, k) => keyOf(line) === keyOf(b[k])) && m.length >= b.length) {
-        // Theirs only filed or ticked these lines; the person rewrote them.
-        both(m.map((line, k) => (k < b.length ? decorate(line, b[k], t[k]) : line)));
-      } else clash(t, m);
-      ib = be; it = te; im = me;
-    };
-    for (let k = 0; k < B.length; k++) {
-      if (!bt.has(k) || !bm.has(k)) continue;
-      // A line both sides kept, by its words: everything before it is one run.
-      flush(k, bt.get(k), bm.get(k));
-      const t = T[bt.get(k)];
-      const m = M[bm.get(k)];
-      const one = mergeLine(B[k], t, m);
-      if (one == null) clash([t], [m]);
-      else { outT.push(one); outM.push(one); }
-      ib = k + 1; it = bt.get(k) + 1; im = bm.get(k) + 1;
+    // Each line of the result, keyed by where it came from, so the agent's
+    // lines can be placed after their neighbours.
+    const out = [];          // [{ text, fromT: index in T or -1 }]
+    const placedT = new Set();
+    M.forEach((m, j) => {
+      const i = mOf[j];
+      if (i < 0) { out.push({ text: m, fromT: -1 }); return; }
+      const tj = tByBase.get(i);
+      if (tj == null) {
+        // The agent removed it. Gone, if the person left it as it was;
+        // kept, if the person changed it.
+        if (m !== B[i]) out.push({ text: m, fromT: -1 });
+        return;
+      }
+      placedT.add(tj);
+      const r = mergeLine(B[i], T[tj], m);
+      if (r.clash) { conflicts++; const id = anchorId(T[tj]) || anchorId(m); if (id) tasks.add(id); }
+      // The agent's next lines go after the agent's version, not between.
+      r.lines.forEach((text, k) => out.push({ text, fromT: k === r.lines.length - 1 ? tj : -1 }));
+    });
+    // The agent's lines the person's copy does not have: new ones, and base
+    // lines the person removed but the agent changed since (ticked, reworded).
+    // Each goes after the line it followed in the agent's copy.
+    const after = new Map();   // T index (or -1 for the top) -> T indexes placed after it
+    const inResult = new Set(placedT);
+    T.forEach((t, j) => {
+      if (placedT.has(j)) return;
+      const i = tOf[j];
+      if (i >= 0) {
+        const b = B[i];
+        const onlyFiled = keyOf(t) === keyOf(b) && tickOf(t) === tickOf(b);
+        if (t === b || onlyFiled) return;
+      }
+      let prev = j - 1;
+      while (prev >= 0 && !inResult.has(prev)) prev--;
+      if (!after.has(prev)) after.set(prev, []);
+      after.get(prev).push(j);
+      inResult.add(j);
+    });
+    const result = [];
+    const chain = (p) => { for (const j of after.get(p) || []) { result.push(T[j]); chain(j); } };
+    chain(-1);
+    for (const o of out) {
+      result.push(o.text);
+      if (o.fromT >= 0) chain(o.fromT);
     }
-    flush(B.length, T.length, M.length);
-    return { text: outT.join("\n"), mine: outM.join("\n"), conflicts, lines, tasks: tasks.size };
+    // An anchor once, on a checkbox line: a later copy loses it.
+    const ids = new Set();
+    const final = result.map((line) => {
+      const id = anchorId(line);
+      if (id == null) return line;
+      if (ids.has(id) || tickOf(line) == null) return unanchored(line);
+      ids.add(id);
+      return line;
+    });
+    const text = final.join("\n");
+    return { text, mine: text, conflicts, lines: conflicts, tasks: tasks.size };
   }
+  const lfSplit = (v) => String(v == null ? "" : v).replace(/\r\n?/g, "\n").split("\n");
 
   /** What the composer will post, read from its mode and any prefix typed. */
   function composed(raw, mode, { openAsk = null, where = "" } = {}) {
@@ -768,15 +834,15 @@ globalThis.DelphiDrawer = (() => {
           const what = reconcile(saved, theirs, next);
           if (what === "same") { saved = next; remote = null; return "done"; }
           let body = next;
+          let kept2 = 0;
           if (what === "conflict") {
-            // A pad merges by lines (merge), so an agent's new lines and the
-            // board's ticks stay; only a line both sides changed is asked
-            // about, and Keep mine never puts a ticked box back to empty.
+            // A pad merges by identity (mergeLines): nothing the agent wrote
+            // is lost, a line both sides reworded is kept twice for the person
+            // to settle, so there is nothing to choose, only something to say.
             const m = merge && saved !== UNKNOWN ? merge(saved, theirs, next) : null;
-            if (m && !m.conflicts) body = m.text;
+            if (m) { body = m.text; kept2 = m.conflicts; }
             else {
-              const words = m ? `${m.lines} ${m.lines === 1 ? "line" : "lines"} changed on both sides${m.tasks ? `, touching ${m.tasks} ${m.tasks === 1 ? "task" : "tasks"}` : ""}.` : "";
-              const pick = await chooseCopy(label, words);
+              const pick = await chooseCopy(label);
               // Theirs, chosen: the box shows it, even over words typed while
               // the question was open, or the next blur would write them over it.
               if (pick === "theirs") { take(theirs); return "done"; }
@@ -785,7 +851,7 @@ globalThis.DelphiDrawer = (() => {
               const again = await read();
               if (again === undefined) return "kept";
               if (lf(again) !== theirs) continue;
-              body = m ? m.mine : next;
+              body = next;
             }
           }
           // Written only over the copy just read (expect), where the store can
@@ -794,6 +860,7 @@ globalThis.DelphiDrawer = (() => {
           try { stored = await onSave(body, { expect: raw }); }
           catch (error) { if (error && error.code === "CONFLICT") continue; throw error; }
           const now = stored == null ? body : lf(stored);
+          if (kept2) host.notify(`${kept2} ${kept2 === 1 ? "line was" : "lines were"} edited on both sides; both versions are kept, the agent's marked ${AGENT_MARK} under yours.`);
           if (area.value === next) take(now);
           else {
             // Typed while it saved: what the store added (a new line's anchor)
@@ -823,14 +890,25 @@ globalThis.DelphiDrawer = (() => {
       next = lf(next || "");
       if (area.value === saved) {
         area.value = next;
-      } else if (tick) {
-        // Somebody typed while the tick was saving. Their text stays, with the
-        // same box ticked in it, so the save their blur makes cannot untick it.
-        const local = DelphiMarkdown.toggleTask(area.value, tick.line, tick.checked, tick.text);
-        if (local != null) area.value = local;
+        saved = next;
+        remote = null;
+      } else {
+        if (tick) {
+          // Somebody typed while the tick was saving. Their text stays, with the
+          // same box ticked in it, so the save their blur makes cannot untick it.
+          const local = DelphiMarkdown.toggleTask(area.value, tick.line, tick.checked, tick.text);
+          if (local != null) area.value = local;
+          // The base moves by the tick only, never to the stored text: the
+          // stored text may hold an agent's write this box has not taken, and
+          // a base set to it would let the next blur write over it unasked.
+          if (saved !== UNKNOWN) {
+            const got = DelphiMarkdown.placeTick(saved, { line: tick.line, checked: tick.checked, text: tick.text });
+            if (got && got.body != null) saved = got.body;
+          }
+        }
+        // What is stored now waits, as any write from elsewhere does.
+        if (next !== saved) remote = next;
       }
-      saved = next;
-      remote = null;
       text = area.value;
       if (mode !== "write") paintPreview();
       grow();
@@ -938,6 +1016,9 @@ globalThis.DelphiDrawer = (() => {
     paint();
     return {
       node: wrap, area, commit, mode: () => mode,
+      // The stored text this box's typing was begun on (null if not known),
+      // for a surface that carries the typing across a repaint (the Pads tab).
+      base: () => (saved === UNKNOWN ? null : saved),
       // A write from elsewhere: taken now when nobody is typing here, else
       // kept until blur (taken if nothing was typed) or a save (reconciled).
       update(next) {
@@ -980,6 +1061,8 @@ globalThis.DelphiDrawer = (() => {
       // Compare and set: written only if the pad is still the copy the save
       // was checked against, else CONFLICT and the editor reads and merges again.
       onSave: async (body, { expect } = {}) => {
+        // A pad written with CRLF line ends keeps them; the box works in LF.
+        if (typeof expect === "string" && expect.includes("\r\n")) body = body.replace(/\r?\n/g, "\r\n");
         const row = await window.delphi.pads.write(pad.id, { body, author: "you" }, expect != null ? { expectBody: expect } : undefined);
         // No body back means no anchors to take: keep what was sent.
         if (!row || typeof row.body !== "string") { pad.body = body; if (onSaved) onSaved(pad); return body; }

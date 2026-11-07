@@ -293,6 +293,43 @@ function atomic(fn) {
   };
 }
 
+/** A refusal to say "it moved, read it again", for a write that could not take the lock. */
+function busyAsConflict(error) {
+  if (error && !error.code && /SQLITE_BUSY|database is locked/i.test(String(error.message || error))) {
+    const c = new Error("Something else was writing the database at the same moment, so nothing was written.");
+    c.code = "CONFLICT";
+    c.details = { busy: true };
+    return c;
+  }
+  return error;
+}
+
+/**
+ * Like atomic, but the write lock is taken before anything is read: BEGIN
+ * IMMEDIATE, not a savepoint, which reads under a shared lock and only asks
+ * for the write lock at its first write. A compare and set must read and
+ * write under the one lock, or another process (an agent through the MCP
+ * server) can write between the compare and the set. Inside a transaction
+ * already (undo, another unit) it nests as a savepoint, under the lock that
+ * transaction holds. A lock not got in busy_timeout is CONFLICT, which a
+ * caller that merges answers by reading again.
+ */
+function immediate(fn) {
+  return function immediately(...args) {
+    const conn = open();
+    if (conn.isTransaction) return atomic(fn).apply(this, args);
+    try { conn.exec("BEGIN IMMEDIATE"); } catch (error) { throw busyAsConflict(error); }
+    try {
+      const result = fn.apply(this, args);
+      conn.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { conn.exec("ROLLBACK"); } catch {}
+      throw busyAsConflict(error);
+    }
+  };
+}
+
 // Describes an update in words, so the audit list is readable without diffing
 // two blobs of JSON. Status changes are called out because they are the ones
 // people undo.
@@ -1909,7 +1946,12 @@ function createScratchpad({ projectId, title, body = "", key = null, author = nu
  * between, is never written over: compare and set, inside the same unit as
  * the write.
  */
-function writeScratchpad(id, fields = {}, { expectBody } = {}) {
+function writeScratchpad(id, fields = {}, opts = {}) {
+  // With a compare, under the write lock from the first read.
+  if (opts && opts.expectBody != null) return immediate(() => writePad(id, fields, opts))();
+  return writePad(id, fields, opts);
+}
+function writePad(id, fields = {}, { expectBody } = {}) {
   const allowed = ["title", "body", "author", "pinned", "derives_tasks", "session_id"];
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
   if (!sets.length) return getScratchpad(id);
@@ -2134,6 +2176,9 @@ function writeBackToPad(task, before) {
  * the status it had, for the Finish prompt; or { refused, body }.
  */
 function toggleLine(entity, id, tick = {}) {
+  return immediate(() => toggleLineNow(entity, id, tick))();
+}
+function toggleLineNow(entity, id, tick = {}) {
   const md = require("./ui/markdown.js");
   const line = typeof tick.line === "number" ? tick.line : NaN;
   if (!Number.isInteger(line) || line < 0 || typeof tick.text !== "string" || typeof tick.checked !== "boolean") {
