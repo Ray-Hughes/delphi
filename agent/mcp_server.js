@@ -613,14 +613,18 @@ const RUNNER_KEYS = ["ran_by"];
  * the result of a run it marks. A courtesy like CLI_CLIENT itself, not a
  * boundary: it stops an agent dressing up its own report as Delphi's.
  */
-function refuseRunnerMeta(meta, entryId = null) {
-  if (CLI_CLIENT || !meta || typeof meta !== "object") return;
-  const named = RUNNER_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(meta, k));
+function refuseRunnerMeta(meta, entryId = null, body = undefined) {
+  if (CLI_CLIENT) return;
+  const given = meta && typeof meta === "object" ? meta : {};
+  const named = RUNNER_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(given, k));
   if (named.length) throw new Error(`${named.join(" and ")} is written by Delphi's own runner only. Report a command you ran with state, code and dur_ms.`);
   if (entryId == null) return;
   const before = sheets.get(entryId);
   const ranByDelphi = before.kind === "run" && before.meta && before.meta.ran_by === "delphi";
-  const result = ["state", "code", "exit"].filter((k) => Object.prototype.hasOwnProperty.call(meta, k));
+  // The command too: a new command under Delphi's result would be a pass
+  // for something nobody ran.
+  const result = ["state", "code", "exit"].filter((k) => Object.prototype.hasOwnProperty.call(given, k));
+  if (body !== undefined && body !== null) result.push("command");
   if (ranByDelphi && result.length) throw new Error(`Entry ${before.id} was run by Delphi, so its ${result.join(", ")} is Delphi's to write. Run the command again for a new result.`);
 }
 
@@ -1612,7 +1616,7 @@ const TOOLS = {
     run: (a) => {
       let entry = null;
       if (a.meta !== undefined || a.body !== undefined || a.promote === undefined) {
-        refuseRunnerMeta(a.meta, a.id);
+        refuseRunnerMeta(a.meta, a.id, a.body);
         entry = sheets.update(a.id, { meta: a.meta, body: a.body });
       }
       if (a.promote !== undefined) entry = sheets.promote(a.id, a.promote === true);

@@ -265,7 +265,7 @@ for (const [route, sql] of [["node:sqlite", db.sqlP], ["sqlite3 binary", binaryS
   check("done in the range, no #N to link a GitHub issue", has(st, `## Done\n\n- Retry uploads (task ${task.id})\n`), true);
   check("in progress", has(st, `## In progress now\n\n- Still going (task ${doing.id})\n`), true);
   check("decisions, with their task", has(st, `- **Which retry strategy?** exponential. simpler to reason about (task ${task.id}, Retry uploads)`), true);
-  check("runs counted, private ones too, and who ran them", has(st, "## Checks\n\n8 runs passed and 4 failed, across 2 tasks. Delphi ran 4; agents reported the other 8."), true);
+  check("runs counted, private ones too, and who ran them", has(st, "## Checks\n\n- Delphi ran 4 runs: 4 passed, 0 failed.\n- Agents reported 8 runs: 4 passing, 4 failing.\n- Across 2 tasks.\n"), true);
   check("open questions now, on open tasks only", [has(st, `## Open questions now\n\n`), has(st, `- Which region first? (task ${doing.id}, Still going)`), has(st, "Ship behind a flag?")], [true, true, false]);
   check("no secret in the status report either", Object.values(SECRETS).filter((v) => has(st, v.replace(/^file number /, ""))), []);
   check("the cost, called an estimate", has(st, "## Cost (estimate)\n\nEstimate from Delphi's ledger"), true);
@@ -286,6 +286,9 @@ check("and the same status report", answers["node:sqlite status"], answers["sqli
 check("and redact the same", answers["node:sqlite leaky"], answers["sqlite3 binary leaky"]);
 check("a body a person wrote is redacted too", checkBody(`see ${SECRETS.aws}`), "see [redacted]");
 check("so is a title, made one line", checkTitle(`Fix\nfor ${SECRETS.ssn}`), "Fix for [redacted]");
+check("a look-alike hyphen or a zero-width character does not hide one", [checkBody("123\u201145\u20116789"), checkBody("AKIAIOSFODNN7\u200bEXAMPLE")], ["[redacted]", "[redacted]"]);
+check("nor does JSON, YAML or a bare bearer token", ['{"password": "x y"}', "secret: abc", "Bearer abcdefghijklmnopqrstuv"].map(redact),
+  ['{"password": [redacted]}', "secret: [redacted]", "Bearer [redacted]"]);
 check("a body over GitHub's limit is refused", (() => { try { checkBody("x".repeat(MAX_BODY + 1)); return "no"; } catch (e) { return /at most/.test(e.message); } })(), true);
 }
 
@@ -323,7 +326,7 @@ async function workbenches() {
   check("with no body, gh is given the Sheet's draft", [auto.url, sent[0] && sent[0].body === draft, auto.body === draft], ["https://example.invalid/pr/1", true, true]);
   check("and the drafted title", sent[0] && sent[0].title, "ABC-12 Wire the PR body");
   await benches.pr(wb.id, { create: true, body: "Edited by hand.\n\n- one change <!-- kept -->", title: "A title of my own" });
-  check("with a title and body, gh is given exactly them", [sent[1] && sent[1].title, sent[1] && sent[1].body], ["A title of my own", "Edited by hand.\n\n- one change <!-- kept -->"]);
+  check("with a title and body, gh is given them, less what nobody would see", [sent[1] && sent[1].title, sent[1] && sent[1].body], ["A title of my own", "Edited by hand.\n\n- one change "]);
   await benches.pr(wb.id, { create: true, body: "key AKIAIOSFODNN7EXAMPLE", title: "SSN 123-45-6789" });
   check("but a secret a person typed is still redacted", [sent[2].title, sent[2].body], ["SSN [redacted]", "key [redacted]"]);
   sent.splice(1, 2);
@@ -366,6 +369,7 @@ process.stdout.write("https://example.invalid/pull/9\\n");
     await rejects("an agent cannot write the runner's keys", () => agent.call("sheet_append", { task_id: empty.id, kind: "run", body: "npm test", meta: { state: "ok", ran_by: "delphi" } }), /Delphi's own runner/);
     const ranHere = s.append({ taskId: empty.id, kind: "run", body: "npm run lint", meta: { state: "fail", code: 1, ran_by: "delphi" } });
     await rejects("nor change the result of a run Delphi ran", () => agent.call("sheet_update", { id: ranHere.id, meta: { state: "ok", code: 0 } }), /run by Delphi/);
+    await rejects("nor its command", () => agent.call("sheet_update", { id: ranHere.id, body: "npm run other" }), /run by Delphi/);
     const own = await agent.call("sheet_append", { task_id: empty.id, kind: "run", body: "npm run own", meta: { state: "ok", code: 0, runner_pid: 1, runner_host: "h" } });
     check("its own report is still taken, with the pid delphi chat records", own.meta.state, "ok");
   } finally {

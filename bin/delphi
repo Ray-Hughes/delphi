@@ -290,7 +290,7 @@ const warn = (text) => process.stderr.write(`delphi: ${text}\n`);
 
 const scrub = require("../sheet/scrub");
 // GitHub's limit on a description, the one sheet/report.js checks.
-const MAX_PR_BODY = require("../sheet/report").MAX_BODY;
+const { MAX_BODY: MAX_PR_BODY, MAX_TITLE: MAX_PR_TITLE } = require("../sheet/report");
 
 /** Text fit for a terminal: no escape sequences or other invisible characters. */
 const terminalSafe = (text) => scrub.strip(String(text == null ? "" : text));
@@ -409,9 +409,18 @@ async function finishFlow(client, taskId) {
         const edited = editDraft(draft);
         if (edited) { draft = edited; showDraft(draft); } else warn("The editor did not finish; the draft above is unchanged.");
       }
+      // Redacted here before any trim, so a cut can never split a secret
+      // into halves its pattern no longer matches. A trim is shown again.
+      draft = { title: scrub.scrub(draft.title).replace(/\s+/g, " ").trim(), body: scrub.scrub(draft.body) };
+      let trimmed = false;
+      if (draft.title.length > MAX_PR_TITLE) { draft.title = `${draft.title.slice(0, MAX_PR_TITLE - 3)}...`; trimmed = true; }
       if (draft.body.length > MAX_PR_BODY) {
-        draft = { ...draft, body: `${draft.body.slice(0, MAX_PR_BODY - 200).trimEnd()}\n\n(Trimmed to fit GitHub's limit; the full text is on the task's Sheet.)\n` };
-        warn(`The description was over ${MAX_PR_BODY} characters, GitHub's limit, so it was trimmed. Edit it in $EDITOR to choose what goes.`);
+        draft.body = `${draft.body.slice(0, MAX_PR_BODY - 200).trimEnd()}\n\n(Trimmed to fit GitHub's limit; the full text is on the task's Sheet.)\n`;
+        trimmed = true;
+      }
+      if (trimmed) {
+        warn(`The title or description was over GitHub's limit (${MAX_PR_TITLE} and ${MAX_PR_BODY} characters), so it was trimmed. This is what would be sent:`);
+        showDraft(draft);
       }
       if (await yes("Open a pull request with gh, with this title and description?")) {
         const made = await client.call("workbench_pr", { task_id: taskId, create: true, title: draft.title, body: draft.body });

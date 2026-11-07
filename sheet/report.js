@@ -104,7 +104,7 @@ const oneLine = (text) => quiet(clean(text).replace(/\s+/g, " ").trim());
  */
 function plainLine(line) {
   if (/^\s{0,3}#{1,6}(\s|$)/.test(line)) return line.replace("#", "\\#");
-  if (/^\s{0,3}(=+|-{2,})\s*$/.test(line)) return line.replace(/[=-]/, (c) => `\\${c}`);
+  if (/^\s{0,3}(=+|-+)\s*$/.test(line)) return line.replace(/[=-]/, (c) => `\\${c}`);
   return line;
 }
 
@@ -357,9 +357,12 @@ function makeReport({ sql } = {}) {
     // Private runs are counted, their commands never shown, so a private
     // failure cannot make the numbers look better than they were.
     const ran = rows.filter((r) => r.kind === "run" && inRange(r.created_at) && ["ok", "fail"].includes(metaOf(r).state));
-    const okRuns = ran.filter((r) => passedRun(metaOf(r))).length;
-    const failRuns = ran.length - okRuns;
-    const ranByDelphi = ran.filter((r) => byRunner(metaOf(r))).length;
+    // Delphi's runs pass or fail; an agent's runs are reported passing or
+    // failing, counted apart so its word is never added to Delphi's.
+    const tally = (list) => { const ok = list.filter((r) => passedRun(metaOf(r))).length; return { ok, fail: list.length - ok, n: list.length }; };
+    const mine = tally(ran.filter((r) => byRunner(metaOf(r))));
+    const theirs = tally(ran.filter((r) => !byRunner(metaOf(r))));
+    const runs = (n) => `${n} ${n === 1 ? "run" : "runs"}`;
     const openDone = new Set(tasks.filter((t) => t.status === "done").map((t) => Number(t.id)));
     const open = sheet.open.filter((a) => !openDone.has(Number(a.task_id)));
     const cost = costLine(safely(() => ledger.between({ since: u.since, until: u.until, projectId: pid }).totals));
@@ -378,8 +381,11 @@ function makeReport({ sql } = {}) {
         const [head, ...rest] = decisionLines(d.ask, d.decision);
         return [`${head} (${ref(d.decision.task_id)})`, ...rest];
       })),
-      ...section("Checks", ran.length ? [`${okRuns} ${okRuns === 1 ? "run" : "runs"} passed and ${failRuns} failed, across ${tasksRan} ${tasksRan === 1 ? "task" : "tasks"}. `
-        + `${ranByDelphi === ran.length ? "Delphi ran all of them." : `Delphi ran ${ranByDelphi}; agents reported the other ${ran.length - ranByDelphi}.`}`] : []),
+      ...section("Checks", ran.length ? [
+        ...(mine.n ? [`- Delphi ran ${runs(mine.n)}: ${mine.ok} passed, ${mine.fail} failed.`] : []),
+        ...(theirs.n ? [`- Agents reported ${runs(theirs.n)}: ${theirs.ok} passing, ${theirs.fail} failing.`] : []),
+        `- Across ${tasksRan} ${tasksRan === 1 ? "task" : "tasks"}.`,
+      ] : []),
       ...section("Open questions now", open.map((a) => `- ${oneLine(a.body)} (${ref(a.task_id)})`)),
       ...section("Cost (estimate)", cost ? [cost] : []),
     ];
@@ -392,22 +398,23 @@ function makeReport({ sql } = {}) {
 
 /**
  * A body for gh, or a sentence saying why not. null means none was given.
- * What a person wrote is redacted too: the rule is that a secret never
- * leaves, not that Delphi's own draft has none. Their comments, dashes and
- * layout are theirs and stay as they are.
+ * What a person wrote is stripped and redacted too: the rule is that nothing
+ * unseen and no secret leaves, not that Delphi's own draft has none. Their
+ * words and layout are theirs and stay; an HTML comment does not, since
+ * GitHub would not show it either.
  */
 function checkBody(body) {
   if (body === null || body === undefined) return null;
   if (typeof body !== "string") throw new Error("body must be text.");
   if (body.length > MAX_BODY) throw new Error(`The description is ${body.length} characters; GitHub takes at most ${MAX_BODY}. Shorten it.`);
-  return scrub.redact(body).text;
+  return scrub.redact(scrub.strip(body)).text;
 }
 
 /** A title for gh, the same way: one line, redacted, within GitHub's limit. */
 function checkTitle(title) {
   if (title === null || title === undefined) return null;
   if (typeof title !== "string") throw new Error("title must be text.");
-  const text = scrub.redact(title.replace(/[\r\n]+/g, " ")).text.trim();
+  const text = scrub.redact(scrub.strip(title).replace(/\s+/g, " ")).text.trim();
   if (!text) throw new Error("A pull request needs a title.");
   if (text.length > MAX_TITLE) throw new Error(`The title is ${text.length} characters; GitHub takes at most ${MAX_TITLE}.`);
   return text;
