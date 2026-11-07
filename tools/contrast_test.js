@@ -166,5 +166,29 @@ for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinne
   }
 }
 
+// Edit this page: the dashed outline, a hidden section's, and the focus ring,
+// each at least 3:1 (WCAG non-text) on every ground in both themes. The ring
+// is its own token, not the accent, so no accent choice can take it under.
+for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinned }]]) {
+  console.log(`\n${theme}: Edit this page's outlines and focus ring, at least 3:1`);
+  for (const token of ["--ly-outline", "--ly-outline-quiet", "--ly-focus"]) {
+    for (const ground of GROUNDS) {
+      const a = rgb(resolve(vars, token));
+      const b = rgb(resolve(vars, ground));
+      const r = a && b ? ratio(a, b) : 0;
+      check(`${token} on ${ground}: ${r.toFixed(2)}:1`, r >= 3, `${resolve(vars, token)} on ${resolve(vars, ground)}`);
+    }
+  }
+  const ring = rgb(resolve(vars, "--ly-focus"));
+  const dashed = rgb(resolve(vars, "--ly-outline"));
+  const apart = ring && dashed ? ratio(ring, dashed) : 0;
+  check(`the focus ring stands apart from the dashed outline: ${apart.toFixed(2)}:1`, apart >= 3, `${resolve(vars, "--ly-focus")} against ${resolve(vars, "--ly-outline")}`);
+}
+{
+  const layoutCss = fs.readFileSync(path.join(__dirname, "..", "styles", "layout.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  console.log("\nEdit this page: focus is drawn in its own token");
+  check(".ly-cell:focus-visible uses --ly-focus with an offset", /\.ly-cell:focus-visible \{[^}]*outline: 2px solid var\(--ly-focus\); outline-offset: 3px/.test(layoutCss));
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

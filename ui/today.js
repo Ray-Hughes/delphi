@@ -37,7 +37,7 @@ globalThis.DelphiToday = (() => {
       { id: "main", label: "Body", sections: [
         { id: "weekly", label: "Weekly review", empty: "The weekly review card shows here on its day." },
         { id: "brief", label: "While you were away", empty: "The brief shows here once agents have done something." },
-        { id: "needs", label: "Needs you" },
+        { id: "needs", label: "Needs you", empty: "Needs you shows here when an agent is waiting on you." },
         { id: "banner", label: "No movement banner", empty: "The no movement banner shows here when a task has sat too long." },
         { id: "day", label: "Your day", sizes: ["half", "two-thirds", "full"] },
         { id: "quiet", label: "Gone quiet", empty: "Gone quiet shows here when a task has had no movement for 3 days." },
@@ -642,7 +642,7 @@ globalThis.DelphiToday = (() => {
 
     const needsBox = el("div", { className: "td-part" });
     needsSection(needsBox);
-    parts.needs = needsBox;
+    parts.needs = needsBox.childNodes.length ? needsBox : null;
 
     const stuckList = (data && data.stuck) || [];
     const stuckById = new Map(stuckList.map((x) => [x.id, x]));

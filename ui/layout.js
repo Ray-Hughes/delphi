@@ -316,6 +316,7 @@
     if (drag) dragEnd(false);
     const L = here ? editing.draft : effective(spec, rows, projectId).layout;
     if (here) {
+      noteFocus();
       page.classList.add("ly-editing");
       page.append(editBar(spec, projectId));
     } else {
@@ -384,7 +385,7 @@
     c.append(tools, body, strip);
     paintCell(spec, c, L);
 
-    c.addEventListener("focus", () => { if (editing) editing.focusId = id; });
+    c.addEventListener("focus", () => { if (editing) editing.focusKey = `cell:${id}`; });
     c.addEventListener("keydown", (e) => onKey(e, spec, id));
     c.addEventListener("pointerdown", (e) => dragStart(e, spec, c));
     return c;
@@ -415,7 +416,9 @@
    * asked of main, so a keypress costs a few DOM moves.
    */
   function change(next, id, words) {
-    if (!editing) return;
+    // Every edit goes through here (keys, drags, the tools, Reset this page,
+    // Save for), so one check holds them all while a save is in flight.
+    if (!editing || editing.saving) return;
     const spec = registry.get(editing.screen);
     editing.draft = next;
     const page = document.querySelector(`.ly-page.ly-editing[data-ly-screen="${editing.screen}"]`);
@@ -446,18 +449,37 @@
     change(setHidden(spec, editing.draft, id, hide), id, `${s.label} ${hide ? "hidden" : "shown"}. ${describe(spec, setHidden(spec, editing.draft, id, hide), id)}.`);
   }
 
+  /**
+   * After a repaint while editing (an agent's write), the focus goes back to
+   * whatever had it, a section or one of the bar's buttons, by its key: never
+   * from the bar onto a section. Only a fresh edit starts on the first section.
+   */
   function refocus(page) {
     if (!editing || !page.isConnected) return;
     const a = document.activeElement;
     if (a && a !== document.body && document.contains(a)) return;
-    const target = (editing.focusId && page.querySelector(`.ly-cell[data-ly-id="${editing.focusId}"]`)) || page.querySelector(".ly-cell");
+    const key = editing.focusKey;
+    const target = !key ? page.querySelector(".ly-cell")
+      : key.startsWith("cell:") ? page.querySelector(`.ly-cell[data-ly-id="${key.slice(5)}"]`)
+      : page.querySelector(`.ly-bar [data-ly-act="${key}"]`);
     if (target) target.focus({ preventScroll: true });
+  }
+
+  /** Out of edit mode, the focus lands on the way back in rather than on nothing. */
+  function focusEntry() {
+    setTimeout(() => {
+      const b = document.getElementById("ly-entry");
+      const a = document.activeElement;
+      if (b && !b.hidden && (!a || a === document.body || !document.contains(a))) b.focus({ preventScroll: true });
+    }, 0);
   }
 
   // -- the keyboard -----------------------------------------------------------
 
   function onKey(e, spec, id) {
     if (!editing || e.target !== e.currentTarget) return;
+    // While a save is on its way nothing changes the draft, but Tab still moves.
+    if (editing.saving) { if (e.key !== "Tab") { e.preventDefault(); e.stopPropagation(); } return; }
     const key = e.key;
     const mod = e.metaKey || e.ctrlKey;
     let handled = true;
@@ -492,7 +514,7 @@
   // -- dragging -----------------------------------------------------------------
 
   function dragStart(e, spec, c) {
-    if (!editing || e.button !== 0 || (e.target.closest && e.target.closest("button"))) return;
+    if (!editing || editing.saving || e.button !== 0 || (e.target.closest && e.target.closest("button"))) return;
     drag = { spec, cell: c, id: c.dataset.lyId, area: c.parentElement, x0: e.clientX, y0: e.clientY, active: false, index: null };
     try { c.setPointerCapture(e.pointerId); } catch {}
     c.addEventListener("pointermove", dragMove);
@@ -570,6 +592,8 @@
     return b;
   };
 
+  const act = (key, b) => { b.dataset.lyAct = key; return b; };
+
   function editBar(spec, projectId) {
     const bar = el("div", { className: "ly-bar" });
     bar.setAttribute("role", "toolbar");
@@ -578,11 +602,11 @@
       el("span", { className: "ly-bar-t" }, I("sliders", "sm"), el("span", { textContent: `Editing ${spec.label}` })),
       el("span", { className: "ly-bar-hint", textContent: "Drag a section within its area, or Tab to one: arrows move it, Shift and arrows resize, H hides, R resets, Esc cancels." }),
       el("span", { className: "grow" }),
-      btn("Cancel", "btn sm", () => cancel()),
-      btn("Done", "btn sm primary ly-done", () => done()));
+      act("cancel", btn("Cancel", "btn sm", () => cancel())),
+      act("done", btn("Done", "btn sm primary ly-done", () => done())));
     const presets = el("div", { className: "ly-presets" }, el("span", { className: "ly-bar-k", textContent: "Presets" }));
     for (const p of spec.presets || []) {
-      const b = btn(p.label, "ly-preset", () => applyPreset(spec.id, p.id));
+      const b = act(`preset-${p.id}`, btn(p.label, "ly-preset", () => applyPreset(spec.id, p.id)));
       if (p.desc) b.title = p.desc;
       b.dataset.preset = p.id;
       presets.append(b);
@@ -595,14 +619,19 @@
       for (const [target, label] of [[null, "All projects"], [projectId, `Only ${name}`]]) {
         const b = btn(label, "", () => setTarget(spec, target));
         b.dataset.target = target == null ? "all" : "project";
+        act(`scope-${b.dataset.target}`, b);
         seg.append(b);
       }
       second.append(el("span", { className: "ly-bar-k", textContent: "Save for" }), seg);
     }
     second.append(el("span", { className: "grow" }),
-      btn("Reset this page", "btn sm ly-reset-page", () => resetPage()),
-      btn("Reset everything", "btn sm ly-reset-all", () => resetEverything()));
+      act("reset-page", btn("Reset this page", "btn sm ly-reset-page", () => resetPage())),
+      act("reset-all", btn("Reset everything", "btn sm ly-reset-all", () => resetEverything())));
     bar.append(top, second);
+    bar.addEventListener("focusin", (e) => {
+      const k = e.target.closest && e.target.closest("[data-ly-act]");
+      if (editing && k) editing.focusKey = k.dataset.lyAct;
+    });
     setTimeout(paintBarState, 0);
     return bar;
   }
@@ -643,8 +672,24 @@
     b.onclick = () => start(spec.id, projectId);
   }
 
+  /**
+   * What has the focus on the editing page, by key, read while it is still
+   * there, so refocus can put it back on the new page. Not left to focus
+   * events alone, which a window without the system's focus does not send.
+   */
+  function noteFocus() {
+    if (!editing || typeof document === "undefined") return;
+    const a = document.activeElement;
+    if (!a || !a.closest || !a.closest(".ly-page.ly-editing")) return;
+    const bar = a.closest("[data-ly-act]");
+    const cellOf = a.closest(".ly-cell[data-ly-id]");
+    if (bar) editing.focusKey = bar.dataset.lyAct;
+    else if (cellOf) editing.focusKey = `cell:${cellOf.dataset.lyId}`;
+  }
+
   /** From MOUNTS, before the page draws: the entry hides unless a mount shows it again. */
   function paint(state) {
+    noteFocus();
     const b = typeof document !== "undefined" ? document.getElementById("ly-entry") : null;
     if (b) b.hidden = true;
     mounted = null;
@@ -670,7 +715,7 @@
     if (!spec) return;
     const target = defaultTarget(spec, projectId);
     const now = effective(spec, rows, projectId).layout;
-    editing = { screen, projectId: projectId ?? null, target, draft: now, start: now, focusId: null };
+    editing = { screen, projectId: projectId ?? null, target, draft: now, start: now, focusKey: null, saving: false };
     document.addEventListener("keydown", onEscape, true);
     if (app) app.repaint();
     announce(`Editing ${spec.label}. Tab to a section; arrows move it, Shift and arrows resize it, H hides it. Done saves, Esc cancels.`);
@@ -684,14 +729,18 @@
 
   function cancel() {
     if (!editing) return;
+    // A Done already on its way to main is not taken back by an Esc that
+    // arrives before the answer: what is saved and what the page says agree.
+    if (editing.saving) { announce("Saving the layout."); return; }
     stopEditing();
     if (app) app.repaint();
+    focusEntry();
     announce("Edit cancelled. Nothing was changed.");
   }
 
   /** Switching who Done saves for. An untouched draft follows to that scope's own layout. */
   function setTarget(spec, target) {
-    if (!editing) return;
+    if (!editing || editing.saving) return;
     const untouched = same(spec, editing.draft, editing.start);
     editing.target = target;
     if (untouched) {
@@ -719,7 +768,7 @@
   }
 
   async function done() {
-    if (!editing) return;
+    if (!editing || editing.saving) return;
     const spec = registry.get(editing.screen);
     const { target, draft } = editing;
     const stored = storedFor(spec, target);
@@ -728,17 +777,22 @@
     // so Done on an untouched page never writes an override nobody made.
     const inherited = target == null ? defaults(spec) : effective(spec, rows, null).layout;
     const unchanged = same(spec, stored || inherited, draft);
+    const was = editing;
+    was.saving = true;
     try {
       if (!unchanged) await save(spec, target, toStore(spec, target, draft), null);
     } catch (error) {
+      was.saving = false;
       if (app) app.notify(`The layout was not saved: ${errText(error)}`, { error: true });
       return;
     }
-    stopEditing();
+    was.saving = false;
+    if (editing === was) stopEditing();
     if (app) {
       app.repaint();
       if (!unchanged) app.notify("Layout saved. History can undo it.");
     }
+    focusEntry();
     announce(unchanged ? "Nothing changed." : "Layout saved.");
   }
 
@@ -746,7 +800,7 @@
   async function applyPreset(screen, id) {
     const spec = registry.get(screen);
     const p = spec && (spec.presets || []).find((x) => x.id === id);
-    if (!p) return;
+    if (!p || (editing && editing.saving)) return;
     const projectId = editing ? editing.projectId : (mounted ? mounted.projectId : null);
     const target = editing ? editing.target : defaultTarget(spec, projectId);
     const L = preset(spec, id);
@@ -755,16 +809,22 @@
       // Already what this scope draws: nothing to save, and nothing for History.
       stopEditing();
       if (app) { app.repaint(); app.notify(`${spec.label} already looks like ${p.label}.`); }
+      focusEntry();
       return;
     }
+    const was = editing;
+    if (was) was.saving = true;
     try {
       await save(spec, target, value, `${p.label} preset`);
     } catch (error) {
+      if (was) was.saving = false;
       if (app) app.notify(`The ${p.label} layout was not applied: ${errText(error)}`, { error: true });
       return;
     }
+    if (was) was.saving = false;
     stopEditing();
     if (app) { app.repaint(); app.notify(`${p.label} layout applied. History can undo it.`); }
+    focusEntry();
     announce(`${p.label} layout applied.`);
   }
 
@@ -785,10 +845,12 @@
   }
 
   async function resetEverything() {
+    if (editing && editing.saving) return;
     if (!confirm("Reset the layout of every page, for every project? Each one is in History and can be undone there.")) return;
     try { rows = await window.delphi.layout.resetAll(); } catch (error) { if (app) app.notify(errText(error), { error: true }); return; }
     stopEditing();
     if (app) { app.repaint(); app.notify("Every page is back to its own layout. History can undo it."); }
+    focusEntry();
     announce("Every page's layout was reset.");
   }
 

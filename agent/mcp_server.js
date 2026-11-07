@@ -383,10 +383,15 @@ for (const failure of MIGRATED.errors) {
 }
 // The History table's entity list, widened the way the app widens it, so an
 // agent on a database the app has not opened since the upgrade writes rows
-// the app can read. One batch, so on the binary route it is one process and
-// one transaction. A failure leaves the old table exactly as it was.
+// the app can read. On node:sqlite the plan is made inside the transaction,
+// as the app makes it. On the binary route each statement is its own process,
+// so the plan is read first and checks, as its first statement inside the
+// one-script transaction, that the table is still the one it read. Either way
+// a failure leaves the old table exactly as it was.
 try {
-  schemaLater.widenAudit((statement) => DATABASE.query(statement), (statements) => DATABASE.batch(statements));
+  const q = (statement) => DATABASE.query(statement);
+  if (DATABASE.kind === "node:sqlite") schemaLater.widenAuditLocked(q);
+  else schemaLater.widenAudit(q, (statements) => DATABASE.batch(statements));
 } catch (error) {
   process.stderr.write(`delphi: could not widen the History table (${error.message})\n`);
 }
