@@ -3,7 +3,8 @@
 // G then a letter goes to a place (ui/commands.js says which letter is which):
 // the second key has to come within 1.5 seconds, or the G is forgotten. In a
 // list, J and K move a highlight down and up the tasks, Enter opens the one
-// highlighted, and E opens it to edit its title. F (or whichever key the
+// highlighted (Shift and Enter in the view taskOpenMode does not choose), and
+// E opens it to edit its title. F (or whichever key the
 // focusLetter setting names) opens Focus mode, on the highlighted row's task when
 // there is one; ui/focus.js decides, through app.singleKey, so this file never
 // needs to know the setting.
@@ -90,7 +91,7 @@ globalThis.DelphiKeys = (() => {
       // control's own, whatever row the keyboard last stopped on.
       const focus = document.activeElement;
       if (focus && focus !== document.body && !row.contains(focus)) return;
-      const how = e.key === "Enter" ? "open" : key === "e" ? "edit" : null;
+      const how = e.key === "Enter" ? (e.shiftKey ? "full" : "open") : key === "e" ? "edit" : null;
       if (how) { e.preventDefault(); app.openTask(Number(row.dataset.taskId), how); }
     });
   }
