@@ -220,7 +220,7 @@ body.panel .top-row { padding-left: 12px; }
 }
 .home-btn:hover { background: var(--raised); border-color: var(--line); }
 .home-btn.on { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-ink); }
-.home-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.home-btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 @media (max-width: 600px) { .home-btn .home-label { display: none; } .home-btn { padding: 0 3px; } .home-btn .top-mark { display: block; } }
 
 /* Forward, beside Back in the page head, when there is somewhere to go. */
