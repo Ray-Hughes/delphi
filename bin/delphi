@@ -361,8 +361,11 @@ async function finishFlow(client, taskId) {
   if (person) {
     const pr = await client.call("workbench_pr", { task_id: taskId });
     if (pr.via === "gh") {
-      if (await yes("Open a pull request with gh?")) {
-        const made = await client.call("workbench_pr", { task_id: taskId, create: true });
+      // The description the Sheet wrote, shown before the question, and the
+      // same text passed back, so what goes to GitHub is what was read here.
+      if (pr.body) say(`\nThe pull request description:\n\n${pr.body.replace(/^/gm, "  ")}`);
+      if (await yes("Open a pull request with gh, with this description?")) {
+        const made = await client.call("workbench_pr", { task_id: taskId, create: true, ...(pr.body ? { body: pr.body } : {}) });
         if (made.url) say(`Pull request: ${made.url}`);
         else if (made.reason) warn(made.reason);
       }

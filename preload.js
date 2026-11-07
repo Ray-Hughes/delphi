@@ -76,6 +76,7 @@ contextBridge.exposeInMainWorld("delphi", {
     update: (id) => call("workbench:update", id),
     commit: (id, message) => call("workbench:commit", id, message),
     push: (id) => call("workbench:push", id),
+    // opts: { create, body }. Every answer carries the body that would be used.
     pr: (id, opts) => call("workbench:pr", id, opts),
     // opts: { confirm } with the token from finishPlan, or from an IGNORED
     // refusal's details, once a person has said those exact files can go.
@@ -88,6 +89,10 @@ contextBridge.exposeInMainWorld("delphi", {
     forget: (id) => call("workbench:forget", id),
     list: (opts) => call("workbench:list", opts),
     advanced: (id) => call("workbench:advanced", id),
+  },
+  // A project's status over local dates { from, to }, as Markdown to edit and copy.
+  report: {
+    status: (projectId, range) => call("report:status", projectId, range),
   },
   notes: {
     list: (projectId) => call("notes:list", projectId),
