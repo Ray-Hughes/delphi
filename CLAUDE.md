@@ -203,9 +203,12 @@ No external scripts, no CDN, no `eval`. Build DOM nodes rather than assigning
 `innerHTML` for anything that came from the database.
 
 **The audit table has a CHECK constraint** on `entity`: `task`, `note`,
-`project`, `link`, `scratchpad`, `session` and `handoff`. Adding to that list
-means editing `schema.sql` *and* `widenAuditEntities` in `db.js`, which rebuilds
-the table on an existing database because a CHECK cannot be altered. Sheet and
+`project`, `link`, `scratchpad`, `session`, `handoff` and `layout`. Adding to
+that list means editing `schema.sql` *and* `AUDIT_ENTITIES` in
+`agent/schema_later.js`, whose `widenAudit` rebuilds the table on an existing
+database because a CHECK cannot be altered. The app (through `db.js`) and the
+server run the same rebuild, copying columns by name so a column added later is
+never dropped. Sheet and
 Workbench writes are recorded as an `update` on their `task`, which is where
 History shows them anyway, so they needed no widening. Every write through the
 MCP server records an audit row attributed to `DELPHI_ACTOR`, which is what makes
