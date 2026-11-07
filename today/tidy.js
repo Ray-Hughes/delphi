@@ -6,7 +6,8 @@
  * Shared by the app (main/tidy.js) and the MCP server (tidy_suggestions,
  * read only), the today/brief.js pattern: SQL text handed a sql(query,
  * params) function in the server's :p1 style, one statement per call. It
- * requires only its neighbours and sheet/report.js's redactor, so it loads
+ * requires only its neighbours and sheet/scrub.js, the redactor the PR
+ * description uses, so it loads
  * under a plain Node from Resources/ beside the server.
  *
  * The model's answer is data from outside, and the titles it was shown are
@@ -17,7 +18,9 @@
  * a person then approves, denies or edits. Agents never apply one.
  */
 
-const report = require("../sheet/report");
+// One redactor for everything that leaves this computer, shared with the PR
+// description, so a shape taught to one is caught by the other.
+const shared = require("../sheet/scrub");
 
 const ACTIONS = ["park", "drop", "done", "move", "due", "merge", "split"];
 const DENIAL_DAYS = 30;
@@ -52,7 +55,7 @@ function scrub(text) {
     .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]|\udb40[\udc00-\udc7f]/g, "")
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ")
     .replace(/<<<|>>>/g, "<< <");
-  return report.redact(plain)
+  return shared.scrub(plain)
     .replace(/\b\d{3}[- ]?\d{2}[- ]?\d{4}\b/g, "[redacted]")
     .replace(/\b[Cc][- ]?\d{3}[- ]?\d{3}[- ]?\d{2,3}\b/g, "[redacted]")
     .replace(/\b[Cc][- ]?\d{7,9}\b/g, "[redacted]")
