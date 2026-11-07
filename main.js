@@ -2039,7 +2039,10 @@ require("./main/today").register(handle, { today });
 today.watch(app);
 // The weekly review (today/weekly.js), and its Park, Drop and objectives.
 const weeklyMain = require("./main/weekly");
-weeklyMain.register(handle, { weekly: weeklyMain.createWeekly({ db, sheets, after: () => scheduleVaultExport() }) });
+const weeklyApi = weeklyMain.createWeekly({ db, sheets, after: () => scheduleVaultExport() });
+weeklyMain.register(handle, { weekly: weeklyApi });
+// Suggest tidy (today/tidy.js): a model's suggestions, applied only on a person's Approve.
+require("./main/tidy").register(handle, { tidy: require("./main/tidy").createTidy({ db, weeklyApi, sheets, settings: () => settings }) });
 // Focus mode: delegation that always waits for approval, and the break notice.
 require("./main/focus").register(handle, { dispatcher, Notification });
 

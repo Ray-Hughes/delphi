@@ -69,7 +69,7 @@ globalThis.DelphiWeekly = (() => {
     if (statusLoading || (status && Date.now() - statusAt < 60000)) return;
     statusLoading = true;
     window.delphi.weekly.status().then((s) => {
-      const changed = !status || status.savedThisWeek !== s.savedThisWeek;
+      const changed = !status || status.savedThisWeek !== s.savedThisWeek || status.ended !== s.ended;
       status = s;
       statusAt = Date.now();
       if (changed && app && app.repaint) app.repaint();
@@ -77,16 +77,44 @@ globalThis.DelphiWeekly = (() => {
   }
 
   /**
-   * The card Today shows on the review day, until the objectives are saved or
-   * you say not today. Null on every other day, and when the setting is off.
+   * Which card Today shows, from the setting, the day, the week's row in the
+   * database and whether a review was started here and closed without ending:
+   * "offer" on the review day, "resume" on any day while one is in progress,
+   * and nothing once the week is finished or ended. Pure, for the tests.
    */
+  function cardState({ enabled, reviewDay: today, status: st, draft: started }) {
+    if (!enabled) return null;
+    if (st && st.ended) return null;
+    if (started) return "resume";
+    if (!today) return null;
+    if (st && st.savedThisWeek) return null;
+    return "offer";
+  }
+
   function card() {
-    if (!app || settings().weeklyReviewEnabled === false || !isReviewDay()) return null;
+    if (!app) return null;
     loadStatus();
-    if (!status || status.savedThisWeek) return null;
-    if (store.get("skipped", null) === localDay()) return null;
-    const box = el("section", { className: "wk-card", role: "region" });
+    if (!status) return null;
+    // A draft from a week that has since rolled over is let go.
+    if (draft && draft.week && status.week && draft.week !== status.week) draft = null;
+    const state = cardState({ enabled: settings().weeklyReviewEnabled !== false, reviewDay: isReviewDay(), status, draft: Boolean(draft) });
+    if (!state) return null;
+    if (state === "offer" && store.get("skipped", null) === localDay()) return null;
+    const box = el("section", { className: `wk-card${state === "resume" ? " resume" : ""}`, role: "region" });
     box.setAttribute("aria-label", "Weekly review");
+    if (state === "resume") {
+      const words = el("div", { className: "wk-card-t" },
+        el("div", { className: "wk-kicker", textContent: "In progress" }),
+        el("b", { textContent: "Weekly review in progress." }),
+        el("div", { className: "wk-card-s", textContent: "Resume where you left off, or End it: finish it, or end it without saving." }));
+      const resume = withIcon("right", "Resume", "btn primary");
+      resume.onclick = () => open({ step: draft && draft.step ? draft.step : "look" });
+      const end = button("End", "btn sm");
+      end.title = "Finish the review, or end it without saving";
+      end.onclick = () => { open({ step: draft && draft.step ? draft.step : "look" }); askEnd(); };
+      box.append(el("span", { className: "wk-card-i" }, I("today")), words, el("div", { className: "wk-card-a" }, end, resume));
+      return box;
+    }
     const words = el("div", { className: "wk-card-t" },
       el("div", { className: "wk-kicker", textContent: `It is ${reviewDay()[0].toUpperCase()}${reviewDay().slice(1)}` }),
       el("b", { textContent: "Weekly review" }),
@@ -140,25 +168,33 @@ globalThis.DelphiWeekly = (() => {
     scrim.append(box);
     scrim.onmousedown = (e) => { if (e.target === scrim) close(); };
     scrim.addEventListener("keydown", onKey);
-    P = { scrim, box, head, body, foot, returnTo, step, focusNext: null, links: 0, data: null, error: null, picks: [], carry: [], acted: new Map(), rowMsg: new Map(), dropping: null, busy: false, saved: null, saveMsg: null, projectId: null, own: "" };
+    P = { scrim, box, head, body, foot, returnTo, step, focusNext: null, links: 0, data: null, error: null, picks: [], carry: [], acted: new Map(), rowMsg: new Map(), dropping: null, busy: false, saved: null, saveMsg: null, projectId: null, own: "",
+      tidy: { cards: null, applied: new Map(), editing: null, edit: null, busy: false, msg: null, source: null, fallback: null, cardMsg: new Map() }, ending: false, endMsg: null };
+    // A draft from a week that has rolled over is let go here too, for Cmd+K.
+    if (draft && draft.week && status && status.week && draft.week !== status.week) draft = null;
     if (draft) Object.assign(P, draft);
+    P.week = (draft && draft.week) || (status && status.week) || null;
     P.busy = inflight;
     document.body.append(scrim);
     paint();
     box.querySelector(".wk-x").focus();
     load();
+    loadTidy();
   }
 
   function close() {
     if (!P) return;
     const back = P.returnTo;
-    const changed = P.acted.size || P.saved;
+    const changed = P.acted.size || P.saved || P.tidy.applied.size;
     // After a save the picks are spent, but what was Parked or Dropped keeps
     // its Undo for the next time the panel opens.
-    draft = P.saved ? { acted: P.acted } : { picks: P.picks, own: P.own, projectId: P.projectId, acted: P.acted };
+    const week = P.week || (status && status.week) || null;
+    draft = P.saved ? { acted: P.acted, tidy: P.tidy, step: P.step, week } : { picks: P.picks, own: P.own, projectId: P.projectId, acted: P.acted, tidy: P.tidy, step: P.step, week };
+    status = null;
     P.scrim.remove();
     P = null;
-    if (changed) { status = null; if (app && app.refresh) app.refresh(); }
+    // Today's card changes either way: it now offers Resume or End.
+    if (changed) { if (app && app.refresh) app.refresh(); } else if (app && app.repaint) app.repaint();
     if (back && back.isConnected && typeof back.focus === "function") back.focus({ preventScroll: true });
   }
 
@@ -176,13 +212,15 @@ globalThis.DelphiWeekly = (() => {
     e.stopPropagation();
     if (e.key === "Escape") {
       e.preventDefault();
+      if (P.ending) { P.ending = false; P.endMsg = null; P.focusNext = "end"; paint(); return; }
+      if (P.tidy.editing != null) { P.focusNext = `tedit-${P.tidy.editing}`; P.tidy.editing = null; paint(); return; }
       if (P.dropping != null) { P.focusNext = `drop-${P.dropping}`; P.dropping = null; paint(); return; }
       close();
       return;
     }
     // Focus stays inside the panel, which is modal.
     if (e.key === "Tab") {
-      const items = [...P.box.querySelectorAll("button, input, select, [tabindex='0']")].filter((n) => !n.disabled && n.offsetParent !== null);
+      const items = [...P.box.querySelectorAll("button, input, select, [tabindex='0']")].filter((n) => !n.disabled && n.offsetParent !== null && !n.closest("[inert]"));
       if (!items.length) return;
       const first = items[0], last = items[items.length - 1];
       if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
@@ -193,13 +231,19 @@ globalThis.DelphiWeekly = (() => {
   /** Repaints the panel, putting focus back on the same control when it is still there. */
   function paint() {
     if (!P) return;
-    const was = P.focusNext || (document.activeElement && P.box.contains(document.activeElement) ? document.activeElement.dataset.wk : null);
+    let was = P.focusNext || (document.activeElement && P.box.contains(document.activeElement) ? document.activeElement.dataset.wk : null);
+    // While the End choice is up, focus stays in it whatever finished behind.
+    if (P.ending && !(was && was.startsWith("end-"))) was = "end-keep";
     P.focusNext = null;
     P.links = 0;
     const scroll = P.body.scrollTop;
     paintHead();
     P.body.replaceChildren(...bodyOf());
     paintFoot();
+    const old = P.box.querySelector(".wk-end");
+    if (old) old.remove();
+    for (const n of [P.head, P.body, P.foot]) n.inert = Boolean(P.ending);
+    if (P.ending) P.box.append(endChoice());
     P.body.scrollTop = scroll;
     if (was) { const n = P.box.querySelector(`[data-wk="${CSS.escape(was)}"]`); if (n) n.focus({ preventScroll: true }); }
   }
@@ -243,7 +287,12 @@ globalThis.DelphiWeekly = (() => {
       done.onclick = () => close();
       kids.push(done);
     }
-    P.foot.replaceChildren(el("span", { className: "wk-keys" }, el("kbd", { textContent: "Esc" }), " close"), ...kids);
+    const end = button("End review", "btn sm");
+    end.dataset.wk = "end";
+    end.title = "Finish the review, or end it without saving";
+    end.setAttribute("aria-haspopup", "dialog");
+    end.onclick = () => askEnd();
+    P.foot.replaceChildren(el("span", { className: "wk-keys" }, el("kbd", { textContent: "Esc" }), " close"), end, ...kids);
   }
 
   function bodyOf() {
@@ -484,8 +533,391 @@ globalThis.DelphiWeekly = (() => {
     return wrap;
   }
 
+  // ---------------------------------------------------------------------------
+  // Ending the review
+
+  function askEnd() {
+    if (!P) return;
+    P.ending = true;
+    P.endMsg = null;
+    P.focusNext = "end-keep";
+    paint();
+  }
+
+  /** The End choice: Finish, End without saving, or Keep it open, which has the focus. */
+  function endChoice() {
+    const n = P.picks.length;
+    // Finish saves three to five; any other count cannot be saved, so it says so first.
+    const short = n > 0 && (n < MIN() || n > MAX());
+    const box = el("div", { className: "wk-end", role: "alertdialog" });
+    box.setAttribute("aria-modal", "true");
+    box.setAttribute("aria-labelledby", "wk-end-t");
+    box.setAttribute("aria-describedby", "wk-end-d");
+    const fin = el("button", { className: "wk-end-o", type: "button" }, el("b", { textContent: "Finish review" }),
+      el("span", { textContent: short ? `${plural(n, "objective is", "objectives are")} picked; saving needs ${MIN()} to ${MAX()}. Change the picks in Next week, or end without saving.`
+        : n ? `Saves your ${plural(n, "objective", "objectives")} and marks this week reviewed.` : "Marks this week reviewed. No objectives are picked, so none are saved." }));
+    fin.dataset.wk = "end-finish";
+    fin.disabled = inflight || short;
+    fin.onclick = () => endAs("reviewed");
+    const skip = el("button", { className: "wk-end-o", type: "button" }, el("b", { textContent: "End without saving" }),
+      el("span", { textContent: n ? `Lets go of ${plural(n, "picked objective", "picked objectives")}. You can undo this for a moment.` : "Marks this week skipped. You can undo this for a moment." }));
+    skip.dataset.wk = "end-skip";
+    skip.disabled = inflight;
+    skip.onclick = () => endAs("skipped");
+    const keep = button("Keep it open", "btn sm primary");
+    keep.dataset.wk = "end-keep";
+    keep.onclick = () => { P.ending = false; P.endMsg = null; P.focusNext = "end"; paint(); };
+    box.append(el("h3", { id: "wk-end-t", textContent: "End the weekly review?" }),
+      el("p", { id: "wk-end-d", className: "wk-dim", textContent: "Anything you approved in Tidy stays done. Suggestions you have not approved are dropped." }),
+      fin, skip);
+    if (P.endMsg) box.append(el("div", { className: "wk-msg err", role: "alert", textContent: P.endMsg }));
+    box.append(el("div", { className: "wk-end-a" }, keep));
+    return box;
+  }
+
+  async function endAs(state) {
+    if (inflight || !P) return;
+    const mine = P;
+    inflight = true;
+    mine.busy = true;
+    paint();
+    const was = { picks: mine.picks, own: mine.own, projectId: mine.projectId, week: mine.week || (status && status.week) || null };
+    try {
+      const r = await window.delphi.weekly.end({ state, projectId: chosenProject(), objectives: mine.picks.map((p) => ({ text: p.text })) });
+      // Ended: the panel goes, and with it the draft, so Cmd+K starts afresh.
+      draft = null;
+      status = null;
+      if (P === mine) { P.scrim.remove(); P = null; }
+      const back = mine.returnTo && mine.returnTo.isConnected ? mine.returnTo : document.getElementById("content");
+      if (back && typeof back.focus === "function") { if (back.id === "content" && back.tabIndex < 0) back.tabIndex = -1; back.focus({ preventScroll: true }); }
+      if (app && app.refresh) app.refresh();
+      if (state === "reviewed") toast(r.note ? `Weekly review finished. ${plural(was.picks.length, "objective", "objectives")} saved.` : "Weekly review finished.", r.receipt, null);
+      else toast("Weekly review ended without saving.", r.receipt, was);
+    } catch (error) {
+      if (P === mine) { mine.endMsg = errOf(error); }
+      else if (app) app.notify(errOf(error));
+    } finally {
+      inflight = false;
+      mine.busy = false;
+      if (P) { P.busy = false; paint(); }
+    }
+  }
+
+  /** A note at the bottom of the window with Undo, which puts the week back and, for an End without saving, the picks. */
+  function toast(text, receipt, restore) {
+    for (const t of document.querySelectorAll(".wk-toast")) t.remove();
+    const box = el("div", { className: "wk-toast", role: "status" }, el("span", { textContent: text }));
+    const undo = button("Undo", "btn sm");
+    undo.dataset.wk = "toast-undo";
+    undo.onclick = async () => {
+      undo.disabled = true;
+      try {
+        await window.delphi.weekly.undo({ receipt });
+        if (restore) draft = { ...restore, acted: new Map(), step: "next", week: restore.week };
+        status = null;
+        box.remove();
+        if (app && app.refresh) app.refresh();
+      } catch (error) {
+        box.replaceChildren(el("span", { textContent: errOf(error) }));
+        box.setAttribute("role", "alert");
+      }
+    };
+    const x = el("button", { className: "wk-x", type: "button", title: "Dismiss" }, I("x", "sm"));
+    x.setAttribute("aria-label", "Dismiss");
+    x.onclick = () => box.remove();
+    box.append(undo, x);
+    document.body.append(box);
+    // Twenty seconds, and never while the pointer or the focus is on it.
+    const later = () => setTimeout(() => { if (!box.isConnected) return; if (box.matches(":hover, :focus-within")) later(); else box.remove(); }, 20000);
+    later();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Suggest tidy
+
+  const ACTION_WORDS = { park: "Park", drop: "Drop", done: "Mark done", move: "Move", due: "Set due date", merge: "Merge", split: "Split" };
+
+  async function loadTidy() {
+    const mine = P;
+    if (!mine || mine.tidy.cards) return;
+    try { const list = await window.delphi.tidy.list(); if (P === mine && !mine.tidy.cards) { mine.tidy.cards = list; paint(); } } catch {}
+  }
+
+  // Asking can take a minute or two; End and the rest stay usable meanwhile.
+  let suggesting = false;
+  async function runSuggest() {
+    if (suggesting || inflight || !P) return;
+    const mine = P;
+    suggesting = true;
+    mine.tidy.busy = true;
+    mine.tidy.msg = null;
+    paint();
+    try {
+      const r = await window.delphi.tidy.suggest();
+      // Cards already applied stay listed with their Undo; the new ones follow.
+      const kept = [...mine.tidy.applied.values()].map((a) => a.card).filter((c) => !r.suggestions.some((x) => x.id === c.id));
+      mine.tidy.cards = [...kept, ...r.suggestions];
+      mine.tidy.source = r.source;
+      mine.tidy.fallback = r.fallback || r.note || null;
+      mine.tidy.cardMsg = new Map();
+      if (P === mine) mine.focusNext = r.suggestions.length ? `tapprove-${r.suggestions[0].id}` : "suggest";
+    } catch (error) {
+      mine.tidy.msg = errOf(error);
+    } finally {
+      suggesting = false;
+      mine.tidy.busy = false;
+      if (P) paint();
+    }
+  }
+
+  /** One card's Approve (with the edit when Edit is open). Resolves true when applied. */
+  async function approveCard(c, edits = null) {
+    const mine = P;
+    try {
+      const r = await window.delphi.tidy.approve(c.id, edits);
+      mine.tidy.applied.set(c.id, { receipt: r.receipt, card: c, action: r.action });
+      mine.tidy.cardMsg.delete(c.id);
+      if (mine.tidy.editing === c.id) mine.tidy.editing = null;
+      return true;
+    } catch (error) {
+      mine.tidy.cardMsg.set(c.id, errOf(error));
+      return false;
+    }
+  }
+
+  async function approveOne(c, edits = null) {
+    if (inflight) return;
+    const mine = P;
+    inflight = true;
+    mine.tidy.busy = true;
+    paint();
+    try { if (await approveCard(c, edits)) mine.focusNext = `tundo-${c.id}`; } finally {
+      inflight = false;
+      mine.tidy.busy = false;
+      settled(mine);
+      if (P === mine) load(); else if (P) paint();
+    }
+  }
+
+  /** Approve all shown: the visible open cards, one by one, each its own Undo. */
+  async function approveAll() {
+    if (inflight) return;
+    const mine = P;
+    const shown = openCards(mine);
+    inflight = true;
+    mine.tidy.busy = true;
+    paint();
+    let ok = 0;
+    try {
+      for (const c of shown) {
+        // Closed or ended meanwhile: the rest are not applied behind the person's back.
+        if (P !== mine) break;
+        if (await approveCard(c)) ok++;
+        if (P === mine) paint();
+      }
+      mine.tidy.msg = ok === shown.length ? null : `${ok} of ${shown.length} applied; the others say why.`;
+      mine.focusNext = "suggest";
+    } finally {
+      inflight = false;
+      mine.tidy.busy = false;
+      settled(mine);
+      if (P === mine) load(); else if (P) paint();
+    }
+  }
+
+  async function denyCard(c) {
+    if (inflight) return;
+    const mine = P;
+    inflight = true;
+    try {
+      await window.delphi.tidy.deny(c.id);
+      mine.tidy.cards = mine.tidy.cards.filter((x) => x.id !== c.id);
+      mine.tidy.msg = null;
+      mine.focusNext = "suggest";
+    } catch (error) { mine.tidy.cardMsg.set(c.id, errOf(error)); } finally {
+      inflight = false;
+      if (P) paint();
+    }
+  }
+
+  async function undoCard(sid) {
+    if (inflight) return;
+    const mine = P;
+    const a = mine.tidy.applied.get(sid);
+    if (!a) return;
+    inflight = true;
+    mine.tidy.busy = true;
+    paint();
+    try {
+      const r = await window.delphi.tidy.undo({ receipt: a.receipt });
+      mine.tidy.applied.delete(sid);
+      // A newer run already offers the same thing, so this card is not reopened.
+      if (r && r.reopened === false) mine.tidy.cards = (mine.tidy.cards || []).filter((c) => c.id !== sid);
+      mine.focusNext = r && r.reopened === false ? "suggest" : `tapprove-${sid}`;
+    } catch (error) { mine.tidy.cardMsg.set(sid, errOf(error)); } finally {
+      inflight = false;
+      mine.tidy.busy = false;
+      settled(mine);
+      if (P === mine) load(); else if (P) paint();
+    }
+  }
+
+  const openCards = (p) => (p.tidy.cards || []).filter((c) => !p.tidy.applied.has(c.id));
+
+  function startEdit(c) {
+    const d = c.detail || {};
+    P.tidy.editing = c.id;
+    P.tidy.edit = { action: c.action, project_id: d.project_id || null, due: d.due || "", merge_into: d.merge_into || "", subtasks: (d.subtasks || []).join("\n"), reason: c.reason || "" };
+    P.focusNext = `taction-${c.id}`;
+    paint();
+  }
+
+  /** The inline controls Edit opens: action, then only the fields that action takes, then the reason. */
+  function editor(c) {
+    const e = P.tidy.edit;
+    const box = el("div", { className: "wk-tedit" });
+    const field = (label, control) => el("label", { className: "wk-tf" }, el("span", { textContent: label }), control);
+    const action = el("select", { className: "wk-sel" });
+    action.dataset.wk = `taction-${c.id}`;
+    for (const a of Object.keys(ACTION_WORDS)) action.append(el("option", { value: a, textContent: ACTION_WORDS[a], selected: a === e.action }));
+    action.onchange = () => { e.action = action.value; P.focusNext = `taction-${c.id}`; paint(); };
+    box.append(field("Action", action));
+    if (e.action === "move") {
+      const sel = el("select", { className: "wk-sel" });
+      sel.dataset.wk = `tproject-${c.id}`;
+      sel.append(el("option", { value: "", textContent: "Choose a project" }));
+      for (const p of livingProjects()) if (Number(p.id) !== Number(c.project_id)) sel.append(el("option", { value: String(p.id), textContent: p.name, selected: Number(p.id) === Number(e.project_id) }));
+      sel.onchange = () => { e.project_id = sel.value ? Number(sel.value) : null; };
+      box.append(field("To project", sel));
+    }
+    if (e.action === "due") {
+      const d = el("input", { className: "wk-in", type: "date", value: e.due || "" });
+      d.dataset.wk = `tdue-${c.id}`;
+      d.oninput = () => { e.due = d.value; };
+      box.append(field("Due", d));
+    }
+    if (e.action === "merge") {
+      const m = el("input", { className: "wk-in", type: "number", min: "1", value: String(e.merge_into || ""), placeholder: "Task number to keep" });
+      m.dataset.wk = `tmerge-${c.id}`;
+      m.oninput = () => { e.merge_into = m.value ? Number(m.value) : ""; };
+      box.append(field("Into task #", m));
+    }
+    if (e.action === "split") {
+      const t = el("textarea", { className: "wk-in wk-ta", rows: 4, value: e.subtasks, placeholder: "One subtask per line, 2 to 5" });
+      t.dataset.wk = `tsplit-${c.id}`;
+      t.oninput = () => { e.subtasks = t.value; };
+      box.append(field("Subtasks", t));
+    }
+    const r = el("input", { className: "wk-in", type: "text", value: e.reason, maxLength: 300, placeholder: "Why, kept on its Sheet" });
+    r.dataset.wk = `treason-${c.id}`;
+    r.oninput = () => { e.reason = r.value; };
+    box.append(field("Reason", r));
+    const go = button("Approve as edited", "btn sm primary");
+    go.dataset.wk = `tsave-${c.id}`;
+    go.disabled = P.tidy.busy;
+    go.onclick = () => approveOne(c, {
+      action: e.action, reason: e.reason, project_id: e.project_id, due: e.due || undefined,
+      merge_into: e.merge_into === "" ? undefined : e.merge_into,
+      subtasks: e.action === "split" ? e.subtasks.split("\n").map((x) => x.trim()).filter(Boolean) : undefined,
+    });
+    const no = button("Cancel", "btn sm ghost");
+    no.dataset.wk = `tcancel-${c.id}`;
+    no.onclick = () => { P.tidy.editing = null; P.focusNext = `tedit-${c.id}`; paint(); };
+    box.append(el("div", { className: "wk-acts" }, go, no));
+    return box;
+  }
+
+  function actionLine(c, action = c.action) {
+    const d = c.detail || {};
+    switch (action) {
+      case "move": return `Move to ${d.project || "another project"}`;
+      case "due": return `Due ${d.due}`;
+      case "merge": return `Merge into #${d.merge_into}${d.merge_title ? ` ${d.merge_title}` : ""}`;
+      case "split": return `Split into ${(d.subtasks || []).length}: ${(d.subtasks || []).join("; ")}`;
+      default: return ACTION_WORDS[action] || action;
+    }
+  }
+
+  function tidyCard(c) {
+    const applied = P.tidy.applied.get(c.id);
+    const box = el("div", { className: `wk-sug${applied ? " applied" : ""}` });
+    const top = el("div", { className: "wk-row bare" }, taskLink(c.task_id, c.title));
+    if (c.project_name) top.append(el("span", { className: "wk-proj", textContent: c.project_name }));
+    top.append(el("span", { className: "grow" }), el("span", { className: `wk-src ${c.source === "rule" ? "rule" : ""}`, textContent: c.source === "rule" ? "Rule" : c.source }));
+    const what = el("div", { className: "wk-sug-a" }, el("b", { textContent: actionLine(c, applied ? applied.action : c.action) }));
+    if (c.reason) what.append(el("span", { className: "wk-dim", textContent: ` ${c.reason}` }));
+    box.append(top, what);
+    const acts = el("div", { className: "wk-acts" });
+    if (applied) {
+      acts.append(el("span", { className: "wk-done", textContent: "Applied" }));
+      const u = button("Undo");
+      u.dataset.wk = `tundo-${c.id}`;
+      u.disabled = P.tidy.busy;
+      u.onclick = () => undoCard(c.id);
+      acts.append(u);
+      box.append(acts);
+    } else if (P.tidy.editing === c.id) {
+      box.append(editor(c));
+    } else {
+      const ok = button("Approve", "btn sm primary");
+      ok.dataset.wk = `tapprove-${c.id}`;
+      ok.disabled = P.tidy.busy;
+      ok.onclick = () => approveOne(c);
+      const no = button("Deny");
+      no.dataset.wk = `tdeny-${c.id}`;
+      no.title = "Not offered again for this task for 30 days";
+      no.disabled = P.tidy.busy;
+      no.onclick = () => denyCard(c);
+      const ed = button("Edit", "btn sm ghost");
+      ed.dataset.wk = `tedit-${c.id}`;
+      ed.disabled = P.tidy.busy;
+      ed.onclick = () => startEdit(c);
+      acts.append(ok, no, ed);
+      box.append(acts);
+    }
+    const msg = P.tidy.cardMsg.get(c.id);
+    if (msg) box.append(el("div", { className: "wk-msg err", role: "alert", textContent: msg }));
+    return box;
+  }
+
+  function suggestSection() {
+    const t = P.tidy;
+    const head = el("div", { className: "wk-sugbar" });
+    const go = withIcon("sparkle", t.busy && !t.cards ? "Asking..." : t.cards && t.cards.length ? "Suggest again" : "Suggest tidy", "btn sm");
+    go.dataset.wk = "suggest";
+    go.disabled = t.busy || inflight || suggesting;
+    go.title = "Ask for a suggestion on each stale or idle task. Nothing changes until you approve it.";
+    go.onclick = () => runSuggest();
+    head.append(go);
+    const shown = openCards(P);
+    if (shown.length > 1) {
+      const all = button(`Approve all ${shown.length} shown`, "btn sm primary");
+      all.dataset.wk = "approve-all";
+      all.disabled = t.busy;
+      all.onclick = () => approveAll();
+      head.append(all);
+    }
+    head.append(el("span", { className: "grow" }));
+    if (t.source) head.append(el("span", { className: "wk-dim", textContent: t.source === "rule" ? "From the rules" : `From ${t.source}` }));
+    const nodes = [head];
+    if (t.fallback) nodes.push(el("div", { className: "wk-msg warn", role: "status", textContent: t.fallback }));
+    if (t.msg) nodes.push(el("div", { className: "wk-msg err", role: "alert", textContent: t.msg }));
+    const cards = t.cards || [];
+    if (cards.length) {
+      const box = el("div", { className: "wk-sugs" });
+      for (const c of cards) box.append(tidyCard(c));
+      nodes.push(box);
+    } else if (t.cards) {
+      nodes.push(quiet(t.source ? "No suggestions: nothing here has an obvious next step." : "Suggest tidy asks for one action per stale or idle task: park, drop, done, move, a due date, merge or split. You approve, deny or edit each."));
+    }
+    const sends = settings().tidyIncludeDetails === true
+      ? "Task numbers, titles, status, ages, projects and descriptions (scrubbed) are sent"
+      : "Only task numbers, titles, status, ages and projects are sent";
+    return section("Suggestions", cards.length ? openCards(P).length : null, sends, ...nodes);
+  }
+
   function tidy(d) {
-    const out = [];
+    const out = [suggestSection()];
     // What was Parked or Dropped from here stays listed with its Undo, even
     // after a reload no longer finds it stale.
     const listed = new Set(d.tidy.stale.map((x) => x.id));
@@ -732,5 +1164,5 @@ globalThis.DelphiWeekly = (() => {
     ];
   }
 
-  return { init, open, close, card, commands, isOpen: () => Boolean(P), isReviewDay };
+  return { init, open, close, card, cardState, commands, isOpen: () => Boolean(P), isReviewDay, askEnd };
 })();

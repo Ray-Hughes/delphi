@@ -226,6 +226,9 @@ const TABLES = {
   // A page's arrangement from Edit this page, so a layout change is one undo
   // away like any other. Only the window writes these.
   layout: "layouts",
+  // The weekly review's finished or skipped week, so ending a review is one
+  // undo away. Only the window writes these (main/weekly.js).
+  review: "weekly_reviews",
 };
 
 const rowOf = (entity, id) =>
@@ -462,6 +465,36 @@ const saveLayout = atomic(function saveLayout({ screen, projectId = null, layout
   const after = one("SELECT * FROM layouts WHERE id = :id", { id: row.id });
   record({ action: "update", entity: "layout", entityId: row.id, summary, label, before: row, after });
   return { changed: true, id: row.id };
+});
+
+/**
+ * Marks a week of the weekly review as reviewed or skipped, with the History
+ * row that lets it be undone. One row per week: ending it again changes the
+ * row rather than adding a second. Returns the row.
+ */
+const markWeeklyReview = atomic(function markWeeklyReview({ week, state, noteId = null }) {
+  if (!/^\d{4}-\d\d-\d\d$/.test(String(week))) throw new Error("A review week is its Monday, YYYY-MM-DD.");
+  if (!["reviewed", "skipped"].includes(state)) throw new Error("A review is reviewed or skipped.");
+  const audit = one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit'");
+  const allowed = schemaLater.auditEntitiesIn(audit && audit.sql);
+  if (allowed && !allowed.includes("review")) {
+    throw new Error("The review cannot be recorded on this database yet: its History table could not be updated when Delphi opened it. Restart Delphi, and if this stays, run delphi doctor.");
+  }
+  const words = state === "reviewed" ? "finished the weekly review" : "ended the weekly review without saving";
+  const label = `Weekly review, week of ${week}`;
+  const row = one("SELECT * FROM weekly_reviews WHERE week = :week", { week });
+  if (!row) {
+    const r = run("INSERT INTO weekly_reviews (week, state, note_id) VALUES (:week, :state, :noteId)", { week, state, noteId });
+    const after = one("SELECT * FROM weekly_reviews WHERE id = :id", { id: Number(r.lastInsertRowid) });
+    record({ action: "create", entity: "review", entityId: after.id, summary: words, label, after });
+    return after;
+  }
+  // A note saved before is kept when this end saves none.
+  run("UPDATE weekly_reviews SET state = :state, note_id = COALESCE(:noteId, note_id), updated_at = datetime('now') WHERE id = :id",
+      { state, noteId, id: row.id });
+  const after = one("SELECT * FROM weekly_reviews WHERE id = :id", { id: row.id });
+  record({ action: "update", entity: "review", entityId: row.id, summary: words, label, before: row, after });
+  return after;
 });
 
 /**
@@ -3406,7 +3439,7 @@ module.exports = {
   listLinks, createLink, deleteLink,
   search, stats,
   listAudit, projectActivity, undo, undoLast,
-  listLayouts, saveLayout, resetAllLayouts,
+  listLayouts, saveLayout, resetAllLayouts, markWeeklyReview,
   recentItems,
   dueAlerts, dueTimers, listAlerts, createAlert, updateAlert, deleteAlert,
   markFired, snoozeAlert, actOnAlert,

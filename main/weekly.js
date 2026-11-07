@@ -93,27 +93,55 @@ function createWeekly({ db, sheets, after = () => {}, clock = () => Date.now() }
     return weekly.review(sql, { now: clock(), projectId, days });
   }
 
-  /** The Today card's one question, without running the whole review. */
-  // Whether the objectives a save now would write already exist: the same
-  // week rule review() uses for saved_this_week.
+  /**
+   * The Today card's question: has the week a review now would plan for been
+   * ended, finished or skipped, and are its objectives saved. Read from the
+   * weekly_reviews row and the week's note, never from the window's storage.
+   */
   function status() {
     const week = weekly.objectivesWeek(clock());
     const row = sql(`SELECT updated_at FROM notes WHERE kind = 'decision' AND title = :p1 ORDER BY id LIMIT 1`,
       [`${weekly.OBJECTIVES_TITLE}${week}`])[0];
-    return { week, savedAt: row ? brief.stamp(row.updated_at) : null, savedThisWeek: Boolean(row) };
+    // Guarded: a database whose migration could not add the table still has a Today.
+    let ended = null;
+    try { ended = sql("SELECT state, updated_at FROM weekly_reviews WHERE week = :p1", [week])[0] || null; } catch {}
+    return {
+      week, savedAt: row ? brief.stamp(row.updated_at) : null, savedThisWeek: Boolean(row),
+      ended: ended ? ended.state : null, endedAt: ended ? brief.stamp(ended.updated_at) : null,
+    };
   }
 
-  /** Park: back to To do, off the stale list, and History can undo it. */
-  function park(taskId) {
+  /**
+   * One change to one task, the shape Park, Drop and every tidy action share:
+   * check the task under the write lock, write, and hand back a receipt for
+   * exactly the rows written. check(t) throws to refuse; write(t) writes.
+   */
+  function act(taskId, kind, check, write) {
     const out = locked(() => {
       const t = taskOf(taskId);
-      if (t.status === "todo") throw new Error(`#${t.id} is already in To do.`);
-      return { t, rows: wrote(() => db.updateTask(t.id, { status: "todo" })) };
+      if (check) check(t);
+      return { t, rows: wrote(() => write(t)) };
     });
     done();
     // The receipt only once the rows are committed: a rolled back write's ids
     // would be handed out again to the next writer.
-    return receipt(out.t.id, out.t.status, "park", out.rows);
+    return receipt(out.t.id, out.t.status, kind, out.rows);
+  }
+
+  /**
+   * Park: back to To do, off the stale list, and History can undo it. A note
+   * (Suggest tidy's, with who suggested it in its meta) goes on the Sheet in
+   * the same transaction when one is given.
+   */
+  function park(taskId, { note = null, meta = null, check = null, also = null } = {}) {
+    return act(taskId, "park", (t) => {
+      if (t.status === "todo") throw new Error(`#${t.id} is already in To do.`);
+      if (check) check(t);
+    }, (t) => {
+      if (note) sheets.append({ taskId: t.id, kind: "note", meta, body: note });
+      db.updateTask(t.id, { status: "todo" });
+      if (also) also(t);
+    });
   }
 
   /**
@@ -122,19 +150,17 @@ function createWeekly({ db, sheets, after = () => {}, clock = () => Date.now() }
    * look back counts; the words are for people and may be edited. Note and
    * status are one transaction, so a status that cannot be set leaves no note.
    */
-  function drop(taskId, why = "") {
+  function drop(taskId, why = "", { meta = null, check = null, also = null } = {}) {
     const reason = String(why || "").replace(/\s+/g, " ").trim().slice(0, 500);
-    const out = locked(() => {
-      const t = taskOf(taskId);
+    return act(taskId, "drop", (t) => {
       if (t.status === "done") throw new Error(`#${t.id} is already done.`);
-      return { t, rows: wrote(() => {
-        sheets.append({ taskId: t.id, kind: "note", meta: { ...DROP_META },
-          body: reason ? `${DROP_PREFIX}: ${reason}` : `${DROP_PREFIX}, not finished.` });
-        db.updateTask(t.id, { status: "done" });
-      }) };
+      if (check) check(t);
+    }, (t) => {
+      sheets.append({ taskId: t.id, kind: "note", meta: { ...(meta || {}), ...DROP_META },
+        body: reason ? `${DROP_PREFIX}: ${reason}` : `${DROP_PREFIX}, not finished.` });
+      db.updateTask(t.id, { status: "done" });
+      if (also) also(t);
     });
-    done();
-    return receipt(out.t.id, out.t.status, "drop", out.rows);
   }
 
   /** Undoes what a Park or Drop wrote, by its receipt: all of it, or none of it. */
@@ -158,36 +184,71 @@ function createWeekly({ db, sheets, after = () => {}, clock = () => Date.now() }
     return out;
   }
 
-  /**
-   * Next week's objectives, as a decision note in one project. Three to five,
-   * the Sunsama number: fewer is not a plan, more is a backlog.
-   */
-  function save({ projectId, objectives }) {
-    const pid = Number(projectId);
-    if (!Number.isInteger(pid) || !sql("SELECT id FROM projects WHERE id = :p1", [pid])[0]) throw new Error("Pick the project the objectives are kept in.");
+  /** The objectives as given, cleaned, or a sentence saying why not. */
+  function objectivesOf(objectives) {
     const list = (Array.isArray(objectives) ? objectives : [])
       .map((o) => ({ text: String((o && o.text) || "").replace(/\s+/g, " ").trim().slice(0, 200) }))
       .filter((o) => o.text);
     if (list.length < weekly.OBJECTIVES_MIN || list.length > weekly.OBJECTIVES_MAX) {
       throw new Error(`Pick ${weekly.OBJECTIVES_MIN} to ${weekly.OBJECTIVES_MAX} objectives; ${list.length} ${list.length === 1 ? "is" : "are"} picked.`);
     }
-    const now = clock();
-    const week = weekly.objectivesWeek(now);
+    return list;
+  }
+
+  /**
+   * The week's note, inside the caller's lock. One note per week: saving again
+   * (a second review, a save that landed after the panel closed) rewrites
+   * that week's note, wherever it is kept, rather than leaving two that disagree.
+   */
+  function writeNote(pid, list, week, now) {
+    if (!Number.isInteger(pid) || !sql("SELECT id FROM projects WHERE id = :p1", [pid])[0]) throw new Error("Pick the project the objectives are kept in.");
     const title = `${weekly.OBJECTIVES_TITLE}${week}`;
     const text = weekly.objectivesBody(list, { week, on: weekly.localDate(now) });
-    // One note per week: saving again (a second review, a save that landed
-    // after the panel closed) rewrites that week's note, wherever it is kept,
-    // rather than leaving two that disagree.
-    const note = locked(() => {
-      const had = sql(`SELECT id FROM notes WHERE kind = 'decision' AND title = :p1 ORDER BY id LIMIT 1`, [title])[0];
-      if (had) return { ...db.updateNote(Number(had.id), { body: text }), updated: true };
-      return { ...db.createNote({ projectId: pid, kind: "decision", title, body: text }), updated: false };
-    });
+    const had = sql(`SELECT id FROM notes WHERE kind = 'decision' AND title = :p1 ORDER BY id LIMIT 1`, [title])[0];
+    if (had) return { ...db.updateNote(Number(had.id), { body: text }), updated: true };
+    return { ...db.createNote({ projectId: pid, kind: "decision", title, body: text }), updated: false };
+  }
+
+  /**
+   * Next week's objectives, as a decision note in one project. Three to five,
+   * the Sunsama number: fewer is not a plan, more is a backlog.
+   */
+  function save({ projectId, objectives }) {
+    const list = objectivesOf(objectives);
+    const now = clock();
+    const note = locked(() => writeNote(Number(projectId), list, weekly.objectivesWeek(now), now));
     done();
     return note;
   }
 
-  return { view, status, park, drop, undo, save };
+  /**
+   * End the review. "reviewed" saves the objectives when any are picked (three
+   * to five, or it refuses and nothing is written) and marks the week
+   * finished; "skipped" marks it ended without saving. Either way Today's card
+   * goes until the next review day, and either is one Undo away: the receipt
+   * covers the note and the week's row together. Open Suggest tidy cards are
+   * dropped, never applied; what was already approved stays.
+   */
+  function end({ state, projectId = null, objectives = [] } = {}) {
+    if (!["reviewed", "skipped"].includes(state)) throw new Error("End the review as finished or skipped.");
+    const picked = (Array.isArray(objectives) ? objectives : []).filter((o) => o && String(o.text || "").trim());
+    const list = state === "reviewed" && picked.length ? objectivesOf(picked) : null;
+    const now = clock();
+    const week = weekly.objectivesWeek(now);
+    const out = locked(() => {
+      let note = null;
+      const rows = wrote(() => {
+        if (list) note = writeNote(Number(projectId), list, week, now);
+        db.markWeeklyReview({ week, state, noteId: note ? note.id : null });
+        sql("UPDATE tidy_suggestions SET state = 'dropped', decided_at = datetime('now') WHERE state = 'open'", []);
+      });
+      return { note, rows };
+    });
+    done();
+    return { ...receipt(null, null, state, out.rows), week, state, note: out.note };
+  }
+
+  return { view, status, act, park, drop, undo, save, end, locked };
 }
 
 function register(handle, { weekly: w }) {
@@ -197,6 +258,7 @@ function register(handle, { weekly: w }) {
   handle("weekly:drop", (taskId, why) => w.drop(taskId, why));
   handle("weekly:undo", (what) => w.undo(what || {}));
   handle("weekly:save", (payload) => w.save(payload || {}));
+  handle("weekly:end", (payload) => w.end(payload || {}));
 }
 
 module.exports = { createWeekly, register };

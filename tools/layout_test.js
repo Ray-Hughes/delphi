@@ -174,7 +174,7 @@ check("an entity a newer Delphi allowed stays allowed", (() => {
   schemaLater.widenAudit((s) => t.prepare(s).all(), (list) => { for (const s of list) t.prepare(s).run(); });
   const sql = t.prepare("SELECT sql FROM sqlite_master WHERE name = 'audit'").get().sql;
   return [schemaLater.auditEntitiesIn(sql).slice(-2), t.prepare("SELECT entity, note FROM audit").get(), t.prepare("SELECT dflt_value FROM pragma_table_info('audit') WHERE name = 'note'").get().dflt_value];
-})(), [["layout", "future_kind"], { entity: "future_kind", note: "two  spaces" }, "'two  spaces'"]);
+})(), [[schemaLater.AUDIT_ENTITIES[schemaLater.AUDIT_ENTITIES.length - 1], "future_kind"], { entity: "future_kind", note: "two  spaces" }, "'two  spaces'"]);
 check("a quoted column's CHECK is still read", schemaLater.auditEntitiesIn(`CREATE TABLE "audit" ("entity" TEXT CHECK ("entity" IN ('task', 'note')))`), ["task", "note"]);
 
 function findSqlite() {
