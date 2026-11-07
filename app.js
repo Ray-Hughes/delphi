@@ -337,157 +337,23 @@ function applyMotion(on) {
 // ---------------------------------------------------------------------------
 
 /**
- * Renders the markdown subset the notes actually contain.
- *
- * Agents write these notes, and they write headings, tables, fenced code,
- * lists and links. Nothing here is a general markdown implementation; it is
- * the smallest thing that renders our own notes faithfully.
- *
- * Everything is built as DOM nodes rather than assembled into innerHTML. The
- * content is our own, but a renderer that pastes strings into the document is
- * one imported note away from being an injection point, and the page runs with
- * a strict CSP precisely so that cannot happen.
+ * Markdown as nodes, through the one renderer (ui/markdown.js), with what this
+ * window lends it: links leave through the main process, #123 opens the task
+ * when this window knows it, and code is copied with the clipboard every other
+ * Copy here uses. opts.onToggle makes the checkboxes live (see ui/drawer.js
+ * editor); without it they are drawn and cannot be ticked.
  */
-function inlineMarkdown(text) {
-  const out = [];
-  // Emphasis may not be flanked by spaces, so arithmetic and shell globs in a
-  // note ("2 * 3 * 4") are left alone rather than silently italicised.
-  const pattern = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*(?!\s)[^*\n]*?(?<!\s)\*)|(\[[^\]]+\]\([^)\s]+\))/g;
-  let last = 0;
-  let match;
-  while ((match = pattern.exec(text))) {
-    if (match.index > last) out.push(document.createTextNode(text.slice(last, match.index)));
-    const token = match[0];
-    if (token.startsWith("`")) {
-      out.push(el("code", { textContent: token.slice(1, -1) }));
-    } else if (token.startsWith("**")) {
-      out.push(el("strong", { textContent: token.slice(2, -2) }));
-    } else if (token.startsWith("*")) {
-      out.push(el("em", { textContent: token.slice(1, -1) }));
-    } else {
-      const split = token.indexOf("](");
-      const href = token.slice(split + 2, -1);
-      const link = el("a", { textContent: token.slice(1, split), href: "#", title: href });
-      // Only http(s) leaves the app, and it leaves through the main process
-      // rather than navigating this window.
-      link.onclick = (e) => {
-        e.preventDefault();
-        if (/^https?:\/\//i.test(href)) window.delphi.openExternal(href);
-      };
-      out.push(link);
-    }
-    last = pattern.lastIndex;
-  }
-  if (last < text.length) out.push(document.createTextNode(text.slice(last)));
-  return out;
-}
-
-const isTableSeparator = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes("-");
-const splitRow = (line) => line.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((c) => c.trim());
-
-function renderMarkdown(source) {
-  const root = el("div", { className: "md" });
-  const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-    // Where this pass started. Every branch below is supposed to consume at
-    // least one line, and the one that stopped doing so locked the window hard
-    // enough to need a force quit. A renderer for text people paste in should
-    // degrade to an ugly paragraph, never to a spin, so the guarantee is made
-    // structural at the bottom of the loop rather than trusted to each branch.
-    const started = i;
-
-    if (!line.trim()) { i += 1; continue; }
-
-    // Fenced code. An unterminated fence runs to the end rather than throwing
-    // away the rest of the note.
-    const fence = line.match(/^\s*```(\w*)\s*$/);
-    if (fence) {
-      const body = [];
-      i += 1;
-      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { body.push(lines[i]); i += 1; }
-      i += 1;
-      root.append(el("pre", {}, el("code", { textContent: body.join("\n") })));
-      continue;
-    }
-
-    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { root.append(el("hr")); i += 1; continue; }
-
-    // Leading whitespace is allowed, and has to be, because the paragraph loop
-    // below refuses any line matching /^\s*#{1,6}\s/. When this pattern was
-    // anchored at column 0 the two disagreed about indented headings: an
-    // indented "# text" was not a heading, was not any other block, and was
-    // rejected by the paragraph loop, so i never advanced and the outer while
-    // spun forever on that one line. A single line of " # x" hung the window.
-    const heading = line.match(/^\s*(#{1,6})\s+(.*)$/);
-    if (heading) {
-      const level = Math.min(heading[1].length, 3);
-      root.append(el(`h${level}`, {}, inlineMarkdown(heading[2].trim())));
-      i += 1;
-      continue;
-    }
-
-    // Table: a pipe row followed by a dash rule.
-    if (line.includes("|") && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
-      const table = el("table");
-      const head = el("tr");
-      splitRow(line).forEach((cell) => head.append(el("th", {}, inlineMarkdown(cell))));
-      table.append(el("thead", {}, head));
-      const tbody = el("tbody");
-      i += 2;
-      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
-        const tr = el("tr");
-        splitRow(lines[i]).forEach((cell) => tr.append(el("td", {}, inlineMarkdown(cell))));
-        tbody.append(tr);
-        i += 1;
-      }
-      table.append(tbody);
-      root.append(el("div", { className: "table-wrap" }, table));
-      continue;
-    }
-
-    if (/^\s*>\s?/.test(line)) {
-      const body = [];
-      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { body.push(lines[i].replace(/^\s*>\s?/, "")); i += 1; }
-      root.append(el("blockquote", {}, ...inlineMarkdown(body.join(" "))));
-      continue;
-    }
-
-    const bullet = /^\s*[-*+]\s+/;
-    const numbered = /^\s*\d+[.)]\s+/;
-    if (bullet.test(line) || numbered.test(line)) {
-      const ordered = numbered.test(line);
-      const marker = ordered ? numbered : bullet;
-      const list = el(ordered ? "ol" : "ul");
-      while (i < lines.length && marker.test(lines[i])) {
-        list.append(el("li", {}, inlineMarkdown(lines[i].replace(marker, ""))));
-        i += 1;
-      }
-      root.append(list);
-      continue;
-    }
-
-    // Paragraph: runs until a blank line or the start of another block.
-    const para = [];
-    while (
-      i < lines.length && lines[i].trim() &&
-      !/^\s*(#{1,6}\s|>|```)/.test(lines[i]) &&
-      !bullet.test(lines[i]) && !numbered.test(lines[i]) &&
-      !/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])
-    ) { para.push(lines[i].trim()); i += 1; }
-    if (para.length) root.append(el("p", {}, ...inlineMarkdown(para.join(" "))));
-
-    // Nothing above took the line. Render it as a paragraph and move on, so an
-    // unforeseen combination costs one oddly formatted line instead of the app.
-    if (i === started) {
-      root.append(el("p", {}, ...inlineMarkdown(line.trim())));
-      i += 1;
-    }
-  }
-
-  return root;
+function renderMarkdown(source, opts = {}) {
+  return DelphiMarkdown.render(source, {
+    openExternal: (url) => window.delphi.openExternal(url),
+    refTitle: (id) => {
+      const t = (state.everyTask || []).find((x) => x.id === id) || (state.tasks || []).find((x) => x.id === id);
+      return t ? t.title || true : null;
+    },
+    onRef: (id) => openTaskSheet(id),
+    copy: (text) => navigator.clipboard.writeText(text),
+    ...opts,
+  });
 }
 
 /** "3 days ago" reads faster than a timestamp when scanning activity. */
@@ -5220,23 +5086,26 @@ function padPane() {
 
   // --- body ----------------------------------------------------------------
   if (state.padRaw) {
-    const box = el("textarea", {
-      className: "pad-source",
-      value: state.padDraft != null ? state.padDraft : pad.body,
-      spellcheck: false,
+    // The drawer's own editor, Write, Preview and Split, so a pad edits the
+    // same way here and there. Its mode is remembered for this tab apart from
+    // the drawer's. Saved on blur rather than per keystroke: every write
+    // re-reads the board from the pad, and doing that on each character would
+    // file a task for every prefix of a line somebody was still typing.
+    const ed = DelphiDrawer.padEditor(pad, {
+      label: "Markdown", kind: "pad-tab",
+      // After the editor has taken the stored text in, so typing not saved yet
+      // (kept by the editor through a tick) survives the repaint as the draft.
+      onSaved: () => setTimeout(() => { state.padDraft = ed.area.value !== pad.body ? ed.area.value : null; refresh(); }),
     });
-    box.oninput = () => { state.padDraft = box.value; };
-    // On blur rather than per keystroke. Every write re-reads the board from the
-    // pad, and doing that on each character would file a task for every prefix
-    // of a line somebody was still typing.
-    box.onblur = async () => {
-      if (state.padDraft == null || state.padDraft === pad.body) return;
-      const body = state.padDraft;
-      state.padDraft = null;
-      await window.delphi.pads.write(pad.id, { body, author: "you" });
-      refresh();
-    };
-    pane.append(box);
+    ed.area.addEventListener("input", () => { state.padDraft = ed.area.value; });
+    // A draft from before the repaint goes in as typing, not as the stored
+    // text, so the editor sees it as unsaved and the next blur writes it.
+    if (state.padDraft != null && state.padDraft !== pad.body) {
+      ed.area.value = state.padDraft;
+      ed.area.dispatchEvent(new Event("input"));
+    }
+    ed.node.classList.add("pad-ed");
+    pane.append(ed.node);
     pane.append(el("div", { className: "hint", textContent:
       "The <!--d:123--> markers are how a line and its task stay the same thing. Edit around them." }));
     return pane;
@@ -5345,6 +5214,10 @@ function padLine(entry) {
 
   return row;
 }
+
+// Ticks on the Memory cards, one at a time, so two quick ones cannot each
+// read the note and the second write over the first.
+let noteTicks = Promise.resolve();
 
 function renderNotes(root) {
   const title = el("input", { className: "field", placeholder: "New memory note title, then Enter" });
@@ -5495,12 +5368,23 @@ function noteCard(n) {
     edit.onclick = () => { state.editingNoteId = n.id; refresh(); };
     head.insertBefore(edit, expand);
 
-    const rendered = renderMarkdown(n.body);
+    // A tick edits that line of the note, found by its line number and
+    // checked against what was drawn, so two identical lines are two boxes.
+    const rendered = renderMarkdown(n.body, { onToggle: ({ line, checked, text }) => { noteTicks = noteTicks.then(async () => {
+      // Read fresh first, so a note an agent added to since this card was drawn
+      // is ticked as it is now, not written back over with this copy.
+      const fresh = ((await window.delphi.notes.list(n.project_id)) || []).find((x) => x.id === n.id);
+      const body = fresh ? DelphiMarkdown.toggleTask(fresh.body || "", line, checked, text) : null;
+      if (body != null) { await window.delphi.notes.update(n.id, { body }); n.body = body; }
+      else notify("That line changed since it was shown, so nothing was ticked.");
+    }).catch(notifyError).then(() => refresh()); } });
     rendered.title = "Click to edit";
     // A click that ends a drag is someone selecting text to copy, not someone
     // asking to edit. Swapping in a textarea there would drop the selection they
-    // just made, which is the whole reason they clicked.
-    rendered.onclick = () => {
+    // just made, which is the whole reason they clicked. A checkbox, a link or
+    // Copy is a click on that, not on the note.
+    rendered.onclick = (e) => {
+      if (e.target.closest("a, button, input, label")) return;
       const selection = window.getSelection();
       if (selection && !selection.isCollapsed) return;
       state.editingNoteId = n.id;
