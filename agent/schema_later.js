@@ -596,11 +596,31 @@ function auditEntitiesIn(createSql) {
 const quoteName = (name) => `"${String(name).replace(/"/g, '""')}"`;
 
 /**
+ * What a plan was made from, as one string SQLite can compute itself: the
+ * table's stored SQL, its columns in order, and every index and trigger on it.
+ * The plan reads it before anything else and its first statement checks it
+ * again inside the transaction, so a plan made from a table another process
+ * has changed since (a column added, an index made) fails instead of
+ * rebuilding from the old shape and dropping what was added.
+ */
+const AUDIT_SHAPE = "(SELECT COALESCE((SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit'), '')) || char(31) || " +
+  "(SELECT COALESCE(group_concat(name, ','), '') FROM (SELECT name FROM pragma_table_info('audit') ORDER BY cid)) || char(31) || " +
+  "(SELECT COALESCE(group_concat(sql, char(30)), '') FROM (SELECT sql FROM sqlite_master WHERE tbl_name = 'audit' " +
+  "AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name))";
+const auditShape = (query) => String(((query(`SELECT ${AUDIT_SHAPE} AS shape`) || [])[0] || {}).shape ?? "");
+const sqlText = (text) => `'${String(text).replace(/'/g, "''")}'`;
+
+/**
  * The statements that rebuild audit with the full entity list, or [] when the
  * table already allows every one, or does not exist. Only reads, so a test can
  * look at what would run without running it.
+ *
+ * Run inside the transaction where the route allows it (widenAuditLocked).
+ * Where it cannot (the server's sqlite3 binary, a process per statement), the
+ * shape check at the top of the plan is what keeps a stale plan from running.
  */
 function auditRebuildPlan(query) {
+  const shape = auditShape(query);
   const table = (query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit'") || [])[0];
   if (!table || !table.sql) return [];
   const allowed = auditEntitiesIn(table.sql);
@@ -629,14 +649,20 @@ function auditRebuildPlan(query) {
   // comes back too: dropping the table takes them with it.
   const attached = (query("SELECT sql FROM sqlite_master WHERE tbl_name = 'audit' AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name") || [])
     .map((r) => String(r.sql));
+  // Changed while it was being read: the reads above may not agree with each
+  // other, so nothing is planned from them.
+  if (auditShape(query) !== shape) throw new Error("the History table changed while the widening was reading it");
   return [
+    // A CHECK on a scratch table is how a plain statement fails on a
+    // condition, the same way on every route: the transaction stops there and
+    // the old table is never dropped.
+    "CREATE TEMP TABLE IF NOT EXISTS audit_rebuilt_check (ok INTEGER NOT NULL CHECK (ok = 1))",
+    // The table is still the one this plan was made from.
+    `INSERT INTO audit_rebuilt_check (ok) SELECT ${AUDIT_SHAPE} = ${sqlText(shape)}`,
     "DROP TABLE IF EXISTS audit_rebuilt",
     `CREATE TABLE audit_rebuilt (\n  ${definitions.join(",\n  ")}\n)`,
     `INSERT INTO audit_rebuilt (${names}) SELECT ${names} FROM audit`,
-    // A copy that came out short stops here, inside the transaction, so the
-    // old table is never dropped. A CHECK on a scratch table is how a plain
-    // statement fails on a condition, the same way on both routes.
-    "CREATE TEMP TABLE IF NOT EXISTS audit_rebuilt_check (ok INTEGER NOT NULL CHECK (ok = 1))",
+    // A copy that came out short stops here.
     "INSERT INTO audit_rebuilt_check (ok) SELECT (SELECT COUNT(*) FROM audit_rebuilt) = (SELECT COUNT(*) FROM audit) " +
       "AND (SELECT COALESCE(MAX(id), 0) FROM audit_rebuilt) = (SELECT COALESCE(MAX(id), 0) FROM audit)",
     "DROP TABLE audit_rebuilt_check",
@@ -648,21 +674,60 @@ function auditRebuildPlan(query) {
 
 /**
  * Widens audit.entity to AUDIT_ENTITIES when it is narrower, as one
- * transaction. Idempotent without a migrations table: the guard is the stored
- * CHECK itself, so once it names every entity there is nothing to do.
+ * transaction, for a route with no connection of its own to hold (the
+ * server's sqlite3 binary, where a batch is one script in one process).
+ * Idempotent without a migrations table: the guard is the stored CHECK
+ * itself, so once it names every entity there is nothing to do.
+ *
+ * The script turns legacy_alter_table on first. Since SQLite 3.26 a rename
+ * re-checks every view and every trigger on other tables, and one that names
+ * audit (a person's own view, a trigger on notes that writes History) fails it
+ * with "no such table" between the drop and the rename, which would roll this
+ * back on every launch. The legacy rename checks nothing and rewrites nothing,
+ * which is right here: the new table takes the old name, so every reference
+ * to it by name is already correct. The process ends with the script, so
+ * nothing needs putting back.
  *
  * @param query  one statement per call, as for apply()
- * @param batch  statements as one transaction; db.js and the server each
- *               have one, on every route
+ * @param batch  statements as one transaction
  */
 function widenAudit(query, batch) {
   const plan = auditRebuildPlan(query);
   if (!plan.length) return { ran: false, statements: 0 };
-  batch(plan);
+  batch(["PRAGMA legacy_alter_table = ON", ...plan]);
   return { ran: true, statements: plan.length };
+}
+
+/**
+ * The same for a route that holds one connection (db.js, the server on
+ * node:sqlite): the plan is made inside BEGIN IMMEDIATE, so nothing can change
+ * the table between reading it and rebuilding it, and legacy_alter_table is
+ * on for the rename (see widenAudit) and put back as it was, whatever happens.
+ *
+ * @param query  one statement per call, on the connection that will run them
+ */
+function widenAuditLocked(query) {
+  const pragma = (name) => Number(((query(`PRAGMA ${name}`) || [])[0] || {})[name]);
+  const legacyWas = pragma("legacy_alter_table") === 1;
+  try {
+    if (!legacyWas) query("PRAGMA legacy_alter_table = ON");
+    query("BEGIN IMMEDIATE");
+    try {
+      const plan = auditRebuildPlan(query);
+      if (!plan.length) { query("ROLLBACK"); return { ran: false, statements: 0 }; }
+      for (const statement of plan) query(statement);
+      query("COMMIT");
+      return { ran: true, statements: plan.length };
+    } catch (error) {
+      try { query("ROLLBACK"); } catch {}
+      throw error;
+    }
+  } finally {
+    if (!legacyWas) { try { query("PRAGMA legacy_alter_table = OFF"); } catch {} }
+  }
 }
 
 module.exports = {
   LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, apply, addLaterColumns, hasTable, columnsOf, allColumns,
-  AUDIT_ENTITIES, AUDIT_COLUMNS, auditEntitiesIn, auditRebuildPlan, widenAudit,
+  AUDIT_ENTITIES, AUDIT_COLUMNS, auditEntitiesIn, auditRebuildPlan, widenAudit, widenAuditLocked,
 };

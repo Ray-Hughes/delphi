@@ -78,7 +78,9 @@
   padding: 34px 10px 10px; border-radius: var(--r-lg); background: var(--bg);
   outline: 1.5px dashed var(--ly-outline); outline-offset: 0; cursor: grab; touch-action: none;
 }
-.ly-editing .ly-cell:focus-visible { outline: 2px solid var(--accent); }
+/* Focus is its own colour, solid and set off from the edge, so it never reads
+   as the dashed resting outline and holds 3:1 whatever accent is chosen. */
+.ly-editing .ly-cell:focus-visible { outline: 2px solid var(--ly-focus); outline-offset: 3px; }
 .ly-tools { position: absolute; top: 8px; left: 10px; right: 8px; display: flex; align-items: center; gap: 4px; height: 20px; }
 .ly-tools .grow { flex: 1 1 0; }
 .ly-tag { display: inline-flex; align-items: center; gap: 7px; min-width: 0; font-size: 12px; font-weight: 600; color: var(--ink); white-space: nowrap; }

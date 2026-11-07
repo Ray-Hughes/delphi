@@ -210,6 +210,13 @@ INSERT INTO audit (id, at, action, entity, entity_id, summary, label, before_jso
   (8, '2026-01-03 10:00:00', 'update', 'scratchpad', 4, 'wrote to the pad', 'Plan', '{"body":"a"}', '{"body":"b"}', 0, 'codex:9', 'agent', 9, NULL, 's8', NULL),
   (41, '2026-01-04 10:00:00', 'create', 'handoff', 2, 'job queued', NULL, NULL, '{}', 0, 'delphi', 'tool', NULL, 2, 's41', 2);
 UPDATE audit SET kept_flag = 'special' WHERE id = 8;
+-- A person's own view over History, and a trigger elsewhere that writes it.
+-- Since SQLite 3.26 a rename re-checks both, and without legacy_alter_table
+-- each would block the widening on every launch.
+CREATE VIEW recent_history AS SELECT id, summary FROM audit ORDER BY id DESC;
+CREATE TRIGGER notes_history_test AFTER INSERT ON notes BEGIN
+  INSERT INTO audit (action, entity, entity_id, summary) VALUES ('create', 'note', new.id, 'note by trigger');
+END;
 `;
 function oldDatabase(file, { leftover = false } = {}) {
   guardPath(file);
@@ -238,6 +245,13 @@ function provenWidened(label, file) {
     try { execFileSync(SQLITE, [file, "INSERT INTO audit (action, entity, entity_id, summary) VALUES ('update', 'layout', 1, 'Layout changed'); DELETE FROM audit WHERE entity = 'layout';"]); return true; } catch { return false; }
   })(), true);
   check(`${label}: the integrity check passes`, q(file, "PRAGMA integrity_check")[0].integrity_check, "ok");
+  check(`${label}: a view over audit still reads`, q(file, "SELECT COUNT(*) AS n FROM recent_history")[0].n, OLD.length);
+  check(`${label}: and a trigger on notes still writes History`, (() => {
+    execFileSync(SQLITE, [file, "INSERT INTO notes (id, project_id, title, body) VALUES (900, 1, 't', 'b');"]);
+    const wrote = q(file, "SELECT summary FROM audit WHERE entity = 'note' AND entity_id = 900").map((r) => r.summary);
+    execFileSync(SQLITE, [file, "DELETE FROM notes WHERE id = 900; DELETE FROM audit WHERE entity = 'note' AND entity_id = 900;"]);
+    return wrote;
+  })(), ["note by trigger"]);
 }
 
 // The server, on each route. Started twice: the second start is the
@@ -286,6 +300,89 @@ section("a short copy stops before anything is dropped");
   db.close();
   check("the batch is refused by the row check", /CHECK constraint failed/.test(refused || ""), true);
   check("and the old table is untouched", [allAudit(file), schemaLater.auditEntitiesIn(auditSql(file)).includes("layout")], [OLD, false]);
+}
+
+// The binary route plans first and runs later, as one script. Another process
+// that adds a column, or an index, in between must stop the plan, not lose
+// what it added: the plan's first statement checks the table is still the one
+// it read.
+section("a plan made before another process changed the table does not run");
+for (const [what, change, survives] of [
+  ["a column", "ALTER TABLE audit ADD COLUMN added_meanwhile TEXT DEFAULT 'mine'", "SELECT COUNT(*) AS n FROM pragma_table_info('audit') WHERE name = 'added_meanwhile'"],
+  ["an index", "CREATE INDEX idx_audit_meanwhile ON audit(step)", "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'idx_audit_meanwhile'"],
+]) {
+  const file = path.join(dir, `stale-${what.replace(/ /g, "-")}`, "delphi.db");
+  oldDatabase(file);
+  const a = new DatabaseSync(file);
+  const plan = schemaLater.auditRebuildPlan((st) => a.prepare(st).all());
+  const b = new DatabaseSync(file);
+  b.exec(change);
+  b.close();
+  let refused = null;
+  a.exec("BEGIN IMMEDIATE");
+  try { for (const st of ["PRAGMA legacy_alter_table = ON", ...plan]) a.prepare(st).all(); a.exec("COMMIT"); } catch (error) { refused = String(error.message); a.exec("ROLLBACK"); }
+  a.close();
+  check(`${what} added mid-way: the stale plan is refused`, /CHECK constraint failed/.test(refused || ""), true);
+  check(`${what} added mid-way: it is still there, and every row`, [q(file, survives)[0].n, allAudit(file).length], [1, OLD.length]);
+}
+
+// The routes that hold a connection plan inside BEGIN IMMEDIATE: a second
+// connection cannot change the table between the plan and the rebuild, and
+// whatever it added before is planned for.
+section("db.js and the server on node:sqlite plan inside the lock");
+{
+  const file = path.join(dir, "locked", "delphi.db");
+  oldDatabase(file);
+  const a = new DatabaseSync(file);
+  const b = new DatabaseSync(file);
+  b.exec("PRAGMA busy_timeout = 0");
+  let blocked = null;
+  let addedFirst = false;
+  const query = (st) => {
+    if (st === "BEGIN IMMEDIATE" && !addedFirst) { addedFirst = true; b.exec("ALTER TABLE audit ADD COLUMN added_first TEXT DEFAULT 'kept too'"); }
+    const out = a.prepare(st).all();
+    if (st === "BEGIN IMMEDIATE") { try { b.exec("ALTER TABLE audit ADD COLUMN added_during TEXT"); blocked = false; } catch (error) { blocked = String(error.message); } }
+    return out;
+  };
+  const result = schemaLater.widenAuditLocked(query);
+  b.close();
+  check("it widened", [result.ran, schemaLater.auditEntitiesIn(auditSql(file)).includes("layout")], [true, true]);
+  check("a second connection could not change the table mid-way", /locked|busy/i.test(blocked || ""), true);
+  check("a column added just before was planned for, with its value", q(file, "SELECT added_first FROM audit WHERE id = 3"), [{ added_first: "kept too" }]);
+  check("legacy_alter_table is back as it was", Number(a.prepare("PRAGMA legacy_alter_table").get().legacy_alter_table), 0);
+  a.close();
+}
+
+// A widening that fails does not stop the app opening, and a layout save then
+// says why in a sentence. A History table whose summary was once nullable and
+// holds a NULL cannot be copied into the canonical one, which is such a case.
+async function failedWidening() {
+  section("a widening that fails leaves the app working");
+  const file = path.join(dir, "broken", "delphi.db");
+  oldDatabase(file);
+  execFileSync(SQLITE, [file, `DROP VIEW recent_history; DROP TRIGGER notes_history_test; DROP TABLE audit;
+    CREATE TABLE audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL DEFAULT (datetime('now')), action TEXT NOT NULL,
+      entity TEXT NOT NULL CHECK (entity IN ('task', 'note', 'project', 'link', 'scratchpad', 'session', 'handoff')),
+      entity_id INTEGER, summary TEXT, label TEXT, before_json TEXT, after_json TEXT, undone INTEGER NOT NULL DEFAULT 0, undone_at TEXT,
+      actor TEXT, actor_type TEXT, session_id INTEGER, job_id INTEGER, step TEXT);
+    INSERT INTO audit (action, entity, entity_id, summary) VALUES ('create', 'task', 1, NULL);`]);
+  const script = path.join(dir, "broken", "open.js");
+  fs.writeFileSync(script, `
+    const db = require(${JSON.stringify(path.join(ROOT, "db.js"))});
+    const out = { projects: db.listProjects().length, layouts: db.listLayouts().length };
+    const handlers = new Map();
+    require(${JSON.stringify(path.join(ROOT, "main", "settings.js"))}).registerLayouts((n, f) => handlers.set(n, f), { db, projectName: () => "P" });
+    try { handlers.get("layout:save")({ screen: "today", layout: { v: 1, hidden: ["brief"] } }); out.saved = true; } catch (e) { out.error = e.message; }
+    console.log(JSON.stringify(out));`);
+  let out = "";
+  let stderr = "";
+  try {
+    out = execFileSync(process.execPath, [script], { encoding: "utf8", env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", DELPHI_DB: guardPath(file), DELPHI_DATA_DIR: path.dirname(file) }, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (error) { out = String(error.stdout || ""); stderr = String(error.stderr || error.message); }
+  const got = (() => { try { return JSON.parse(out.trim().split("\n").pop()); } catch { return { crashed: stderr.slice(0, 300) }; } })();
+  check("the app opens, and the migrations after it ran (the layouts table is there)", [got.projects > 0, got.layouts], [true, 0]);
+  check("a layout save says why, in a sentence", /Layouts cannot be saved on this database yet/.test(got.error || ""), true);
+  check("and the History table is as it was", [q(file, "SELECT COUNT(*) AS n FROM audit")[0].n, schemaLater.auditEntitiesIn(auditSql(file)).includes("layout")], [1, false]);
 }
 
 // --- db.js, main/settings.js and undo ------------------------------------------
@@ -360,15 +457,20 @@ async function viaApp() {
   check("a screen that is not a page is refused", Boolean(throws(() => call("layout:save", { screen: "settings", layout: null }))), true);
   check("a project on a page with one layout for all is refused", /one layout for every project/.test(throws(() => call("layout:save", { screen: "today", projectId: legacy, layout: null })) || ""), true);
   check("a project that does not exist is refused", /No project 999/.test(throws(() => call("layout:save", { screen: "tasks", projectId: 999, layout: null })) || ""), true);
+  check("true is not project 1", /No project true/.test(throws(() => call("layout:save", { screen: "tasks", projectId: true, layout: null })) || ""), true);
   check("a layout of the wrong shape is refused", Boolean(throws(() => call("layout:save", { screen: "today", layout: { v: "one", regions: [] } }))), true);
   check("a note is plain and short", (() => { call("layout:save", { screen: "today", layout: dragged, note: `x\u0007y ${"z".repeat(200)}` }); return top().label.length <= "Today: ".length + 60 && !/\u0007/.test(top().label); })(), true);
 
   section("a project deleted and put back keeps its layout");
   const own = stored("tasks", legacy);
+  const ownEntry = db.listAudit(100).find((e) => e.entity === "layout" && !e.undone && /^Tasks in Legacy project/.test(e.label || ""));
   db.deleteProject(legacy, { tasks: "keep" });
   check("the delete takes its rows", db.listLayouts().filter((r) => r.project_id === legacy), []);
+  check("undoing that layout's change now is refused, by name", /went with the project "Legacy project".*Undo that delete first/.test(throws(() => db.undo(ownEntry.id)) || ""), true);
+  check("and is not marked undone", db.listAudit(200).find((e) => e.id === ownEntry.id).undone, 0);
   db.undo(db.listAudit(5).find((e) => e.entity === "project" && e.action === "delete").id);
   check("and the undo brings them back", stored("tasks", legacy), own);
+  check("under the same id, so the layout's own change can be undone now", (() => { db.undo(ownEntry.id); return db.listAudit(300).find((e) => e.id === ownEntry.id).undone; })(), 1);
 }
 
 // --- the outline's contrast ------------------------------------------------------
@@ -415,6 +517,7 @@ function contrast() {
     await serverOn("server node:sqlite", {});
     await serverOn("server sqlite3 binary", { DELPHI_SQLITE_ROUTE: "binary" });
     await serverOn("server sqlite3 binary, leftover scratch table", { DELPHI_SQLITE_ROUTE: "binary" });
+    await failedWidening();
     await viaApp();
   } catch (error) {
     failures++;
