@@ -141,6 +141,59 @@ function register(handle, { settings, context, dialog, info, version, documents,
 }
 
 /**
+ * Edit this page's handlers. Layouts are rows in the database, not
+ * settings.json (the `layouts` entry in settings/schema.js says so), because
+ * a change has to be in History and undoable like any other.
+ *
+ * Everything the window sends is checked here before db.js stores it: the
+ * screen is one settings/schema.js lists, a project is one that exists and
+ * only on a screen that may have one, and the layout has the shape check()
+ * accepts. What History calls the change is built here too, from the
+ * schema's words, so the window cannot write any label it likes.
+ *
+ * @param db           db.js: listLayouts, saveLayout, resetAllLayouts
+ * @param projectName  id => the project's name, or null when there is none
+ */
+function registerLayouts(handle, { db, projectName }) {
+  const screenOf = (id) => schema.LAYOUT_SCREENS.find((s) => s.id === id) || null;
+  const labelOf = (screen, projectId) => {
+    const s = screenOf(screen);
+    const name = s ? s.label : String(screen);
+    if (!s || !s.scoped) return name;
+    if (projectId == null) return `${name}, all projects`;
+    return `${name} in ${projectName(projectId) || `project ${projectId}`}`;
+  };
+  // A preset's name or a reset's kind, from the window: plain words, short.
+  const noteOf = (note) => {
+    if (note == null || note === "") return "";
+    const t = String(note).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+    return t.slice(0, 60);
+  };
+
+  handle("layout:list", () => db.listLayouts());
+  handle("layout:save", (args) => {
+    const { screen, projectId = null, layout = null, note = null } = args || {};
+    const s = screenOf(screen);
+    if (!s) throw new Error(`Delphi has no page called "${screen}" to lay out.`);
+    let pid = null;
+    if (projectId != null) {
+      pid = Number(projectId);
+      if (!s.scoped) throw new Error(`${s.label} has one layout for every project.`);
+      if (!Number.isInteger(pid) || pid <= 0 || !projectName(pid)) throw new Error(`No project ${projectId}.`);
+    }
+    const value = schema.check("layouts", layout);
+    const words = noteOf(note);
+    const label = labelOf(s.id, pid) + (words ? `: ${words}` : "");
+    db.saveLayout({ screen: s.id, projectId: pid, layout: value, summary: value == null ? "Layout reset" : "Layout changed", label });
+    return db.listLayouts();
+  });
+  handle("layout:resetAll", () => {
+    db.resetAllLayouts({ summary: "Layout reset", labelOf: (row) => `${labelOf(row.screen, row.project_id)}: everything reset` });
+    return db.listLayouts();
+  });
+}
+
+/**
  * settings.json, written so a crash or a full disk mid-write never leaves half
  * a file: a temporary file beside it, flushed to the disk, then renamed over
  * the old one, which the filesystem does in one step.
@@ -229,4 +282,4 @@ function readSettingsFile(file, defaults, { now = () => new Date(), pid = proces
   return { settings, write: false, broken: null, protect: false };
 }
 
-module.exports = { vaultFolderProblem, makeContext, register, writeSettingsFile, readSettingsFile, sweepTemps, VAULT_SCAN_LIMIT, VAULT_MARKER };
+module.exports = { vaultFolderProblem, makeContext, register, registerLayouts, writeSettingsFile, readSettingsFile, sweepTemps, VAULT_SCAN_LIMIT, VAULT_MARKER };

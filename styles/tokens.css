@@ -134,6 +134,11 @@
 
     /* One curve for everything that moves: quick out, soft landing. */
     --ease: cubic-bezier(.2, .8, .2, 1);
+    /* Edit this page's dashed outlines: a section, and a hidden one. Not the
+       accent, which a person can change, because these must hold 3:1 against
+       every ground (WCAG non-text contrast); tools/layout_test.js checks. */
+    --ly-outline:       #6366F1;
+    --ly-outline-quiet: #7C8494;
     color-scheme: light;
 }
 
@@ -188,6 +193,7 @@
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);
     --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03);
+    --ly-outline: #8B5CF6; --ly-outline-quiet: #6B7690;
     color-scheme: dark;
   }
 }
@@ -234,5 +240,6 @@
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);
   --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03);
+  --ly-outline: #8B5CF6; --ly-outline-quiet: #6B7690;
   color-scheme: dark;
 }

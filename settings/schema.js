@@ -56,6 +56,22 @@
     { id: "graphite", label: "Graphite", light: ["#475569", "#334155"], dark: ["#55657B", "#CBD5E1"] },
   ];
 
+  // The screens Edit this page can arrange, and what History calls each. The
+  // sections themselves are declared by the pages (ui/layout.js register);
+  // this is the list the main process accepts a save for, and `scoped` says
+  // whether a project may have its own. tools/layout_test.js checks every
+  // screen ui/layout.js registers is here, and the other way round.
+  const LAYOUT_SCREENS = [
+    { id: "today", label: "Today", scoped: false },
+    { id: "tasks", label: "Tasks", scoped: true },
+    { id: "runs", label: "Runs", scoped: false },
+  ];
+  // The newest layout JSON this build writes. A newer one is read leniently,
+  // never refused: ui/layout.js takes what it understands from it.
+  const LAYOUT_VERSION = 1;
+  // How wide a section may be, as twelfths of its region.
+  const LAYOUT_SIZES = ["third", "half", "two-thirds", "full"];
+
   /*
    * One entry per setting. The fields:
    *   key        the settings.json name
@@ -79,6 +95,9 @@
    *              an export leaves it out
    *   scope      "machine": settings.json. Per-project settings live on the
    *              project row and are linked from the panel, not listed here.
+   *   store      "database" for one kept in the database rather than in
+   *              settings.json: defaults(), apply() and exports leave it out,
+   *              and its own handlers check it with check() before saving.
    */
   const SETTINGS = [
     // --- General -----------------------------------------------------------
@@ -350,6 +369,17 @@
       effect: "scheduler",
     },
 
+    // --- Kept in the database ----------------------------------------------
+    {
+      // Rows in the layouts table, one per screen and scope, so a change is in
+      // History and can be undone; never settings.json. Named here so the one
+      // list of settings knows the key and its shape. See ui/layout.js.
+      key: "layouts", section: null, internal: true, store: "database", type: "layout", default: null, nullable: true, portable: false,
+      label: "Page layouts",
+      desc: "How each page's sections are arranged, from Edit this page: shown or hidden, in what order, and how wide.",
+      synonyms: ["layout", "edit this page", "sections", "arrange", "customise", "customize"],
+    },
+
     // --- Kept by the app itself --------------------------------------------
     {
       key: "pinnedProjects", section: null, internal: true, type: "projectList", default: [],
@@ -524,6 +554,35 @@
       }
       return v;
     },
+    // A page's layout, as ui/layout.js writes it. Only the shape is checked
+    // here: which sections a screen has is the page's to say, and an id it no
+    // longer has is ignored when read, never refused, so a layout saved by an
+    // older or newer Delphi still loads. Bounded, because it goes into one row.
+    layout(s, v) {
+      if (!isPlain(v)) fail(s, "A layout is an object.");
+      const text = JSON.stringify(v);
+      if (text.length > 8000) fail(s, "That layout is too big to be one page's.");
+      const ver = v.v;
+      if (!Number.isInteger(ver) || ver < 1 || ver > 1000) fail(s, "A layout says which version it is (v), as a whole number.");
+      const ID = /^[a-z][a-z0-9-]{0,39}$/;
+      const regions = v.regions == null ? {} : v.regions;
+      if (!isPlain(regions)) fail(s, "A layout's regions are an object of region to section ids.");
+      for (const [region, ids] of Object.entries(regions)) {
+        if (!ID.test(region)) fail(s, `"${region}" is not a region id.`);
+        if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string" && ID.test(id))) fail(s, `Region ${region} must list section ids.`);
+      }
+      const hidden = v.hidden == null ? [] : v.hidden;
+      if (!Array.isArray(hidden) || !hidden.every((id) => typeof id === "string" && ID.test(id))) fail(s, "A layout's hidden sections are a list of ids.");
+      const sizes = v.sizes == null ? {} : v.sizes;
+      if (!isPlain(sizes)) fail(s, "A layout's sizes are an object of section to size.");
+      for (const [id, size] of Object.entries(sizes)) {
+        if (!ID.test(id)) fail(s, `"${id}" is not a section id.`);
+        // A newer version may have sizes this one does not; it is read leniently
+        // by ui/layout.js, so only this version's own layouts are held to the list.
+        if (ver <= LAYOUT_VERSION && !LAYOUT_SIZES.includes(size)) fail(s, `${size} is not a size: ${LAYOUT_SIZES.join(", ")}.`);
+      }
+      return clone(v);
+    },
     // A path, and only ever the one app:dataInfo reported: anything else would
     // acknowledge a notice nobody was shown.
     checkoutNotice(s, v, ctx) {
@@ -549,7 +608,7 @@
 
   /** The defaults, as a fresh object each time so nobody shares a list by accident. */
   function defaults() {
-    return Object.fromEntries(SETTINGS.map((s) => [s.key, clone(s.default)]));
+    return Object.fromEntries(SETTINGS.filter((s) => s.store !== "database").map((s) => [s.key, clone(s.default)]));
   }
 
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -567,7 +626,16 @@
   function apply(current, fields, ctx = {}) {
     if (!isPlain(fields)) throw new Error("Settings are saved as an object of setting name to value.");
     const values = {};
-    for (const [key, value] of Object.entries(fields)) values[key] = check(key, value, ctx);
+    for (const [key, value] of Object.entries(fields)) {
+      // Refused by name: settings.json is not where it lives, and a write
+      // there would seem to save and then never be read.
+      if (has(key) && BY_KEY[key].store === "database") {
+        const e = new Error(`${BY_KEY[key].label} are kept in the database and saved from the page itself, not from Settings.`);
+        e.key = key;
+        throw e;
+      }
+      values[key] = check(key, value, ctx);
+    }
     const changed = SETTINGS
       .filter((s) => s.key in values && !same(values[s.key], current ? current[s.key] : undefined))
       .sort((a, b) => Number(Boolean(a.restart)) - Number(Boolean(b.restart)))
@@ -653,7 +721,7 @@
       (SECTIONS.find((x) => x.id === s.section) || {}).label].filter(Boolean).join(" \n ").toLowerCase();
   }
 
-  const api = { SECTIONS, SETTINGS, ACCENTS, BY_KEY, check, defaults, apply, isModified, needsConfirm, exportable, importable, describe, searchText };
+  const api = { SECTIONS, SETTINGS, ACCENTS, BY_KEY, LAYOUT_SCREENS, LAYOUT_VERSION, LAYOUT_SIZES, check, defaults, apply, isModified, needsConfirm, exportable, importable, describe, searchText };
   root.DelphiSettingsSchema = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

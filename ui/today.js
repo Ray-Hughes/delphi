@@ -22,6 +22,36 @@
 
 globalThis.DelphiToday = (() => {
   const I = (name, size) => DelphiIcons.icon(name, size);
+
+  // Edit this page (ui/layout.js): Today's sections, by the ids its layouts
+  // name. Never renamed: a stored layout finds a section by its id, and one it
+  // does not find is dropped. The capture line is the top of the page and
+  // everything else its body, declared in the order Today has always drawn
+  // them, so a person with no layout sees the page as it was.
+  const LAYOUT = {
+    id: "today", label: "Today",
+    regions: [
+      { id: "top", label: "Top", sections: [
+        { id: "capture", label: "Quick capture", sizes: ["half", "two-thirds", "full"] },
+      ] },
+      { id: "main", label: "Body", sections: [
+        { id: "weekly", label: "Weekly review", empty: "The weekly review card shows here on its day." },
+        { id: "brief", label: "While you were away", empty: "The brief shows here once agents have done something." },
+        { id: "needs", label: "Needs you" },
+        { id: "banner", label: "No movement banner", empty: "The no movement banner shows here when a task has sat too long." },
+        { id: "day", label: "Your day", sizes: ["half", "two-thirds", "full"] },
+        { id: "quiet", label: "Gone quiet", empty: "Gone quiet shows here when a task has had no movement for 3 days." },
+      ] },
+    ],
+    presets: [
+      { id: "default", label: "Default", desc: "Every section, in Today's own order.", layout: {} },
+      { id: "focus", label: "Focus", desc: "Just the capture line and your day, Focus mode's own order.",
+        layout: { regions: { main: ["day", "needs", "banner", "brief", "weekly", "quiet"] }, hidden: ["weekly", "brief", "needs", "banner", "quiet"] } },
+      { id: "triage", label: "Triage", desc: "What waits on you and what went quiet first, side by side, then your day.",
+        layout: { regions: { main: ["needs", "quiet", "banner", "day", "brief", "weekly"] }, sizes: { needs: "half", quiet: "half" } } },
+    ],
+  };
+  if (globalThis.DelphiLayout) DelphiLayout.register(LAYOUT);
   let app = null;
 
   let data = null;
@@ -581,9 +611,12 @@ globalThis.DelphiToday = (() => {
     const s = app.state();
     const tasks = s.everyTask || [];
     const page = el("div", { className: "td-page" });
-    page.append(capture());
 
     if (!tasks.length && !(data && data.stuck && data.stuck.length)) {
+      // Not arranged: there is nothing yet for a layout to put in order, so
+      // an edit of it in progress ends here rather than holding the Esc key.
+      if (window.DelphiLayout) DelphiLayout.leave("today");
+      page.append(capture());
       // The first run: nothing filed anywhere yet.
       const first = el("div", { className: "td-first" });
       first.append(el("div", { className: "td-first-i" }, I("today")),
@@ -598,16 +631,23 @@ globalThis.DelphiToday = (() => {
       return;
     }
 
-    if (window.DelphiWeekly) { const wk = DelphiWeekly.card(); if (wk) page.append(wk); }
-    if (data && data.brief) page.append(briefSection(data));
-    else if (data && data.error) page.append(el("div", { className: "td-msg err", role: "alert", textContent: `The brief could not be read: ${data.error}` }));
+    // Each section built as before, then arranged by the page's layout
+    // (ui/layout.js): shown or hidden, in the person's order, at their width.
+    // Null is a section with nothing to show today.
+    const parts = { capture: capture() };
+    parts.weekly = window.DelphiWeekly ? DelphiWeekly.card() || null : null;
+    if (data && data.brief) parts.brief = briefSection(data);
+    else if (data && data.error) parts.brief = el("div", { className: "td-msg err", role: "alert", textContent: `The brief could not be read: ${data.error}` });
+    else parts.brief = null;
 
-    needsSection(page);
+    const needsBox = el("div", { className: "td-part" });
+    needsSection(needsBox);
+    parts.needs = needsBox;
 
     const stuckList = (data && data.stuck) || [];
     const stuckById = new Map(stuckList.map((x) => [x.id, x]));
     const hidden = new Set(store.get("bannerOff", []));
-    if (data && data.banner && !hidden.has(bannerKey(data.banner))) page.append(banner(data));
+    parts.banner = data && data.banner && !hidden.has(bannerKey(data.banner)) ? banner(data) : null;
 
     const queue = focusQueue(tasks);
     const day = section("Your day", queue.length, "Yours or nobody's, in Focus order: priority, then due date, then oldest");
@@ -624,16 +664,18 @@ globalThis.DelphiToday = (() => {
     } else {
       day.append(el("div", { className: "td-quiet-line", textContent: "Nothing is due and nothing is in progress for you. Pick something from Tasks, or capture one above." }));
     }
-    page.append(day);
+    parts.day = day;
 
+    parts.quiet = null;
     if (stuckList.length) {
       const quiet = section("Gone quiet", stuckList.length, "No movement in 3 days or more, or due within a day. Blocked work stays amber; to-do is never counted.");
       quiet.id = "today-quiet";
       const box = el("div", { className: "td-box" });
       for (const st of stuckList) box.append(taskRow(st, { stuck: st }));
       quiet.append(box);
-      page.append(quiet);
+      parts.quiet = quiet;
     }
+    page.append(window.DelphiLayout ? DelphiLayout.mount("today", parts) : el("div", {}, ...Object.values(parts).filter(Boolean)));
     root.append(page);
   }
 
@@ -666,5 +708,5 @@ globalThis.DelphiToday = (() => {
   /** A task's stuck mark, for any other surface that wants to draw it. */
   const stuckOf = (id) => ((data && data.stuck) || []).find((x) => x.id === Number(id)) || null;
 
-  return { init, render, paint, load, commands, stuckOf, focusQueue, parseCapture };
+  return { init, render, paint, load, commands, stuckOf, focusQueue, parseCapture, LAYOUT };
 })();

@@ -47,6 +47,7 @@ const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
 console.log("\nthe schema");
 const sections = new Set(schema.SECTIONS.map((s) => s.id));
 const keys = schema.SETTINGS.map((s) => s.key);
+const B0 = () => schema.BY_KEY;
 check("keys are unique", keys.length, new Set(keys).size);
 const ctxAll = { projectExists: () => true, checkoutDbIgnored: null };
 const broken = [];
@@ -84,7 +85,20 @@ const known = new Set([...effectsBlock.matchAll(/^  (\w+): /gm)].map((m) => m[1]
 check("every effect an entry names, main.js can run",
   [...new Set(schema.SETTINGS.map((s) => s.effect).filter(Boolean))].filter((e) => !known.has(e)), []);
 check("the window rebuild waits for the reply to go", /window: \(\) => setTimeout\(/.test(effectsBlock), true);
-check("defaults() has every key, and only them", Object.keys(schema.defaults()).sort(), [...keys].sort());
+// Every key but the ones kept in the database (layouts), which settings.json
+// never holds; apply() refuses those by name.
+const fileKeys = schema.SETTINGS.filter((s) => s.store !== "database").map((s) => s.key);
+check("defaults() has every settings.json key, and only them", Object.keys(schema.defaults()).sort(), [...fileKeys].sort());
+check("layouts is a schema entry, kept in the database", [B0().layouts.store, B0().layouts.internal], ["database", true]);
+check("and settings:set refuses it by name rather than writing it to settings.json",
+  /kept in the database/.test(throws(() => schema.apply(schema.defaults(), { layouts: { v: 1 } })) || ""), true);
+check("a layout's shape is checked", [
+  throws(() => schema.check("layouts", "not an object")) != null,
+  throws(() => schema.check("layouts", { v: 1, regions: { main: ["Not An Id"] } })) != null,
+  throws(() => schema.check("layouts", { v: 1, sizes: { day: "huge" } })) != null,
+  throws(() => schema.check("layouts", { v: 1, regions: { main: ["day", "needs"] }, hidden: ["brief"], sizes: { day: "half" } })),
+  throws(() => schema.check("layouts", { v: 7, sizes: { day: "huge" }, extra: true })),
+  schema.check("layouts", null)], [true, true, true, null, null, null]);
 check("defaults() hands out fresh lists", schema.defaults().pinnedProjects === schema.defaults().pinnedProjects, false);
 
 // Bounds the dispatcher and the server also enforce.

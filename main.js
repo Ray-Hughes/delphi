@@ -2301,6 +2301,9 @@ settingsMain.register(handle, {
   },
 });
 
+// Edit this page: layouts are rows, checked against the schema, each change in History.
+settingsMain.registerLayouts(handle, { db, projectName: (id) => { const p = db.getProject(id); return p ? p.name : null; } });
+
 // The older call, kept for the old Settings page: the same checks as any other
 // field, through the one path.
 handle("settings:setHotkey", (accelerator) => setSettings({ hotkey: accelerator }));

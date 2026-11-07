@@ -253,7 +253,28 @@ globalThis.DelphiTasks = (() => {
     return parts[0].slice(0, 1).toUpperCase() + parts[0].slice(1, 2).toLowerCase();
   }
 
-  const pure = { STATUSES, PRIORITIES, PROPS, GROUPS, ORDERS, DEFAULTS, statusOf, parseQuick, baseOf, editPatch, pillOf,
+  // Edit this page (ui/layout.js): the toolbar and quick entry are the top of
+  // the page, the list its body. The list cannot be hidden, since it is the
+  // page. Scoped, so a project can keep its own arrangement over the global one.
+  const LAYOUT = {
+    id: "tasks", label: "Tasks", scoped: true,
+    regions: [
+      { id: "top", label: "Top", sections: [
+        { id: "toolbar", label: "Filter and display", sizes: ["half", "two-thirds", "full"] },
+        { id: "quick", label: "Quick entry", sizes: ["half", "two-thirds", "full"] },
+      ] },
+      { id: "body", label: "List", sections: [{ id: "list", label: "Task list", keep: true, sizes: ["full"] }] },
+    ],
+    presets: [
+      { id: "default", label: "Default", desc: "The filter, then quick entry, then the list.", layout: {} },
+      { id: "focus", label: "Focus", desc: "Just quick entry and the list.", layout: { hidden: ["toolbar"] } },
+      { id: "compact", label: "Compact", desc: "Quick entry and the filter side by side, over the list.",
+        layout: { regions: { top: ["quick", "toolbar"] }, sizes: { quick: "half", toolbar: "half" } } },
+    ],
+  };
+  if (globalThis.DelphiLayout) DelphiLayout.register(LAYOUT);
+
+  const pure = { STATUSES, PRIORITIES, PROPS, GROUPS, ORDERS, DEFAULTS, LAYOUT, statusOf, parseQuick, baseOf, editPatch, pillOf,
     toggleSub, dropPatch, normalise, arrange, columns, matches, ageDays, initials };
   if (typeof document === "undefined") return { pure };
 
@@ -1249,10 +1270,13 @@ globalThis.DelphiTasks = (() => {
     const lit = listBox && listBox.querySelector(".kbd-hi");
     const litId = lit ? lit.dataset.taskId : null;
     const mode = modeOf(s);
+    // A filter nobody can see would leave the list short with no way to tell
+    // why, so hiding the toolbar (Edit this page) lets go of it.
+    if (filterText && window.DelphiLayout && !DelphiLayout.shown("tasks", "toolbar", s.projectId ?? null)) filterText = "";
     const page = el("div", { className: "tk-page" });
-    page.append(toolbar(s, mode), quick(s));
     listBox = el("div", { className: "tk-body" });
-    page.append(listBox);
+    const parts = { toolbar: toolbar(s, mode), quick: quick(s), list: listBox };
+    page.append(window.DelphiLayout ? DelphiLayout.mount("tasks", parts, { projectId: s.projectId ?? null }) : el("div", {}, parts.toolbar, parts.quick, listBox));
     root.append(page);
     repaintList();
     if (litId) listBox.querySelector(`[data-task-id="${litId}"]`)?.classList.add("kbd-hi");
