@@ -379,6 +379,21 @@
       notChanged: "Which week the review covers, or the daily brief.",
       synonyms: ["day", "weekday", "friday", "sunday", "when"],
     },
+    {
+      key: "tidySuggester", section: "brief", group: "Suggest tidy", type: "enum", default: "auto",
+      choices: [["auto", "Best available"], ["claude", "Claude Code"], ["local", "Local model"], ["rules", "Rules only"]],
+      label: "Who suggests tidying",
+      desc: "Best available asks Claude Code if it is signed in, then a local model through Ollama, then falls back to plain rules. Every suggestion waits for you to approve, deny or edit it.",
+      notChanged: "What is sent, which the next setting decides, or anything applied: a suggestion changes nothing until you approve it.",
+      synonyms: ["tidy", "suggest", "ai", "model", "ollama", "claude", "cleanup", "clean up"],
+    },
+    {
+      key: "tidyIncludeDetails", section: "brief", group: "Suggest tidy", type: "bool", default: false,
+      label: "Include task details in Suggest tidy",
+      desc: "Off sends only each task's number, title, status, age, subtask counts and project. On adds its description, with anything that looks like a secret, a Social Security number or a file number taken out first.",
+      notChanged: "Sheets, run output and notes, which are never sent.",
+      synonyms: ["privacy", "description", "details", "send", "share", "redact"],
+    },
 
     // --- Advanced ----------------------------------------------------------
     {

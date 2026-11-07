@@ -587,6 +587,8 @@ const { makeItemStore, inProject } = require("../items/store");
 const todayBrief = require("../today/brief");
 // The weekly review, shared with the window's (main/weekly.js). Read only here.
 const weeklyReview = require("../today/weekly");
+// Suggest tidy's open suggestions, read only: only a person in the window decides one.
+const tidySuggest = require("../today/tidy");
 const ITEM_AUTHOR_TYPE = AUTHOR_TYPE || sheetFormat.inferAuthorType(ACTOR);
 const itemStore = makeItemStore({
   sql, batch, actor: ACTOR, authorType: ITEM_AUTHOR_TYPE, settings: () => readSettings(),
@@ -2792,6 +2794,26 @@ const TOOLS = {
     run: (a) => {
       const full = weeklyReview.review(sql, { projectId: resolveProjectId(a), days: a.days || 7 });
       return a.detail === "full" ? full : weeklyReview.compact(full, { budget: a.budget || 1200 });
+    },
+  },
+
+  // Suggest tidy's open suggestions (today/tidy.js). Read only, and there is
+  // no tool that approves, denies or applies one: that is a person's, in the
+  // window, the same rule as flags.
+  tidy_suggestions: {
+    description: "The weekly review's open Suggest tidy suggestions (park, drop, done, move, due, merge, split), each with its reason and who suggested it. Read only; a person approves them in the window.",
+    schema: {
+      type: "object",
+      properties: {
+        project_id: { type: "number" },
+        project: { type: "string" },
+        budget: { type: "number" },
+        detail: { type: "string", enum: ["brief", "full"] },
+      },
+    },
+    run: (a) => {
+      const list = schemaLater.hasTable((s) => DATABASE.query(s), "tidy_suggestions") ? tidySuggest.open(sql, { projectId: resolveProjectId(a) }) : [];
+      return a.detail === "full" ? { suggestions: list } : tidySuggest.compact(list, { budget: a.budget || 800 });
     },
   },
 };

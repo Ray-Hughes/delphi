@@ -278,6 +278,28 @@ const LATER_TABLES = [
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 )`],
+  // The weekly review's finished or skipped weeks, and Suggest tidy's
+  // suggestions. See schema.sql.
+  ["weekly_reviews", `CREATE TABLE IF NOT EXISTS weekly_reviews (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  week        TEXT NOT NULL UNIQUE,
+  state       TEXT NOT NULL CHECK (state IN ('reviewed', 'skipped')),
+  note_id     INTEGER REFERENCES notes(id) ON DELETE SET NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+)`],
+  ["tidy_suggestions", `CREATE TABLE IF NOT EXISTS tidy_suggestions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id      TEXT NOT NULL,
+  task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  action      TEXT NOT NULL,
+  detail      TEXT,
+  reason      TEXT,
+  source      TEXT NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'approved', 'denied', 'dropped')),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  decided_at  TEXT
+)`],
 ];
 
 // [name, table, columns the index needs, statement]. The columns are checked
@@ -329,6 +351,8 @@ const LATER_INDEXES = [
   // global, and a UNIQUE index counts NULLs as distinct, hence the COALESCE.
   ["idx_layouts_scope", "layouts", ["screen", "project_id"],
    "CREATE UNIQUE INDEX IF NOT EXISTS idx_layouts_scope ON layouts(screen, COALESCE(project_id, 0))"],
+  ["idx_tidy_task_action", "tidy_suggestions", ["task_id", "action", "state"],
+   "CREATE INDEX IF NOT EXISTS idx_tidy_task_action ON tidy_suggestions(task_id, action, state)"],
 ];
 
 /**
@@ -557,7 +581,7 @@ function apply(query) {
 // old table gave it.
 
 /** Every entity History may name. schema.sql's CHECK lists the same, in this order. */
-const AUDIT_ENTITIES = ["task", "note", "project", "link", "scratchpad", "session", "handoff", "layout"];
+const AUDIT_ENTITIES = ["task", "note", "project", "link", "scratchpad", "session", "handoff", "layout", "review"];
 const quoteList = (list) => list.map((e) => `'${e}'`).join(", ");
 
 /** The audit table as schema.sql declares it, column by column. */

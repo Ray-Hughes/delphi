@@ -202,13 +202,14 @@ CREATE TABLE IF NOT EXISTS audit (
   id          INTEGER PRIMARY KEY,
   at          TEXT NOT NULL DEFAULT (datetime('now')),
   action      TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete')),
-  -- Widened for scratchpads and the agent coordination rows, then for layouts.
+  -- Widened for scratchpads and the agent coordination rows, then for layouts,
+  -- then for the weekly review's finished or skipped week.
   -- An existing database cannot get this by ALTER TABLE, so db.js
   -- widenAuditEntities rebuilds the table when it finds a narrower constraint,
   -- through agent/schema_later.js widenAudit. Adding a value here means adding
   -- it to AUDIT_ENTITIES there too; tools/layout_test.js checks they agree.
   entity      TEXT NOT NULL CHECK (entity IN ('task', 'note', 'project', 'link',
-                                              'scratchpad', 'session', 'handoff', 'layout')),
+                                              'scratchpad', 'session', 'handoff', 'layout', 'review')),
   entity_id   INTEGER,
   summary     TEXT NOT NULL,          -- human readable, e.g. "marked done"
   label       TEXT,                   -- what it was, so the list reads without a join
@@ -932,3 +933,35 @@ CREATE TABLE IF NOT EXISTS layouts (
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_layouts_scope ON layouts(screen, COALESCE(project_id, 0));
+
+-- The weekly review, one row per week it plans for (the Monday, YYYY-MM-DD):
+-- finished with or without objectives, or ended without saving. Today's card
+-- reads it, and it is a History entity ('review') so either can be undone.
+-- AUTOINCREMENT for the reason layouts gives. agent/schema_later.js holds the
+-- same text.
+CREATE TABLE IF NOT EXISTS weekly_reviews (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  week        TEXT NOT NULL UNIQUE,
+  state       TEXT NOT NULL CHECK (state IN ('reviewed', 'skipped')),
+  note_id     INTEGER REFERENCES notes(id) ON DELETE SET NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- What Suggest tidy offered, one row per suggestion, and what became of it.
+-- A denial is remembered here for 30 days per task and action, so the same
+-- suggestion is not offered again the next time. Only the window decides one;
+-- the MCP server reads them (tidy_suggestions) and never writes.
+CREATE TABLE IF NOT EXISTS tidy_suggestions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id      TEXT NOT NULL,
+  task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  action      TEXT NOT NULL,
+  detail      TEXT,
+  reason      TEXT,
+  source      TEXT NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'approved', 'denied', 'dropped')),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  decided_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tidy_task_action ON tidy_suggestions(task_id, action, state);

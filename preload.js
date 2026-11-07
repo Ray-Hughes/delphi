@@ -266,7 +266,9 @@ contextBridge.exposeInMainWorld("delphi", {
     pickFolder: (title, options) => call("dialog:pickFolder", title, options),
   },
   // The weekly review: the review, the Today card's question, Park, Drop, Undo (by receipt) and the objectives.
-  weekly: { view: (opts) => call("weekly:view", opts || {}), status: () => call("weekly:status"), park: (id) => call("weekly:park", id), drop: (id, why) => call("weekly:drop", id, why), undo: (what) => call("weekly:undo", what), save: (payload) => call("weekly:save", payload) },
+  weekly: { view: (opts) => call("weekly:view", opts || {}), status: () => call("weekly:status"), park: (id) => call("weekly:park", id), drop: (id, why) => call("weekly:drop", id, why), undo: (what) => call("weekly:undo", what), save: (payload) => call("weekly:save", payload), end: (payload) => call("weekly:end", payload) },
+  // Suggest tidy: ask, list, and a person's Approve (with edits), Deny and Undo.
+  tidy: { suggest: () => call("tidy:suggest"), list: () => call("tidy:list"), approve: (id, edits) => call("tidy:approve", id, edits || null), deny: (id) => call("tidy:deny", id), undo: (what) => call("tidy:undo", what) },
   // The cost and time ledger (main/ledger.js). Read only.
   ledger: {
     forTask: (taskId) => call("ledger:forTask", taskId),

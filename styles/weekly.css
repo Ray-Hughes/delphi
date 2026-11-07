@@ -179,3 +179,49 @@
   .wk-card { flex-wrap: wrap; }
   .wk-dropform { padding-left: 14px; flex-wrap: wrap; }
 }
+
+/* Ending the review: the Today card while one is in progress, the End
+   choice over the panel, and the note with Undo it leaves. */
+.wk-card.resume { border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+  background: linear-gradient(100deg, var(--warn-soft), transparent 70%), var(--surface); }
+.wk-card.resume .wk-kicker { color: var(--warn-ink); }
+.wk-card.resume .wk-card-i { background: var(--warn-soft); color: var(--warn-ink); }
+.wk { position: relative; }
+.wk-end { position: absolute; z-index: 2; right: 16px; bottom: 58px; width: min(380px, calc(100% - 32px));
+  padding: 16px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-3);
+  animation: wk-in 120ms var(--ease); }
+.wk-end h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; color: var(--ink); }
+.wk-end p { margin: 0 0 12px; line-height: 1.45; }
+.wk-end-o { display: block; width: 100%; margin-top: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r);
+  background: var(--surface); color: var(--ink-dim); font: inherit; font-size: 12.5px; text-align: left; }
+.wk-end-o b { display: block; color: var(--ink); font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.wk-end-o:hover:not(:disabled) { background: var(--raised); border-color: var(--ink-faint); }
+.wk-end-o:disabled { opacity: .5; }
+.wk-end-a { display: flex; justify-content: flex-end; margin-top: 12px; }
+.wk-end .wk-msg { padding: 8px 0 0; }
+.wk-toast { position: fixed; z-index: 80; left: 50%; bottom: 24px; transform: translateX(-50%); display: flex; align-items: center; gap: 10px;
+  max-width: calc(100vw - 32px); padding: 8px 8px 8px 14px; border: 1px solid var(--line); border-radius: var(--r-lg);
+  background: var(--surface); color: var(--ink); box-shadow: var(--shadow-3); font-size: 13px; }
+
+/* Suggest tidy: the bar, then one card per suggestion. */
+.wk-sugbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.wk-sugs { display: grid; gap: 8px; }
+.wk-sug { padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-1); }
+.wk-sug.applied { border-color: color-mix(in srgb, var(--good) 35%, var(--line)); background: linear-gradient(90deg, var(--good-soft), transparent 60%), var(--surface); }
+.wk-sug .wk-row.bare { gap: 10px; }
+.wk-sug-a { margin: 6px 0 8px; font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }
+.wk-sug-a b { font-weight: 600; }
+.wk-sug .wk-acts { justify-content: flex-start; }
+.wk-sug .wk-msg { padding: 6px 0 0; }
+.wk-src { flex: none; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 99px; color: var(--accent-ink); background: var(--accent-soft); white-space: nowrap; }
+.wk-src.rule { color: var(--ink-dim); background: var(--raised); }
+.wk-msg.warn { color: var(--warn-ink); padding: 0 0 8px; }
+.wk-tedit { display: grid; gap: 8px; margin-top: 4px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: var(--r); }
+.wk-tf { display: grid; grid-template-columns: 110px minmax(0, 1fr); align-items: center; gap: 10px; font-size: 12px; color: var(--ink-dim); }
+.wk-tf .wk-in, .wk-tf .wk-sel { width: 100%; max-width: none; }
+.wk-ta { height: auto; padding: 6px 9px; resize: vertical; font: inherit; font-size: 12.5px; }
+
+@media (max-width: 760px) {
+  .wk-tf { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .wk-sugbar { flex-wrap: wrap; }
+}

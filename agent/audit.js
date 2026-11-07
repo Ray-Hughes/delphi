@@ -27,12 +27,12 @@
 // error that also stopped undoLast dead.
 // A layout is a page's arrangement (Edit this page); only the window writes
 // one, and undo puts back the JSON it held.
-const TABLES = { task: "tasks", note: "notes", project: "projects", link: "links", scratchpad: "scratchpads", layout: "layouts" };
+const TABLES = { task: "tasks", note: "notes", project: "projects", link: "links", scratchpad: "scratchpads", layout: "layouts", review: "weekly_reviews" };
 const BOOKKEEPING = ["handoff", "session"];
 // A session can only be moved (items/store.js never copies or associates
 // one), and undoLast() selects exactly that.
 const ITEM_OPS = ["move"];
-const LABELS = { task: "title", note: "title", project: "name", link: "label", scratchpad: "title", layout: "screen" };
+const LABELS = { task: "title", note: "title", project: "name", link: "label", scratchpad: "title", layout: "screen", review: "week" };
 
 // Columns a later write may change without that being a change anyone made to
 // the item. updated_at moves on every write; the rest are the pad sync's
