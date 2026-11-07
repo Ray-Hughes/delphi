@@ -393,7 +393,9 @@ globalThis.DelphiDrawer = (() => {
     area.addEventListener("input", () => { text = area.value; if (mode === "split") paintPreview(); grow(); });
     let inflight = null;
     const commit = async () => {
-      if (inflight) await inflight;
+      // Waits out a save already going, refused or not, so one text is never
+      // sent twice and a refusal does not throw out of the next caller.
+      while (inflight) { try { await inflight; } catch {} }
       if (area.value === saved) return;
       const next = area.value;
       // Marked saved only once it is, so a refused write is tried again on
@@ -488,7 +490,7 @@ globalThis.DelphiDrawer = (() => {
     // Enter and Escape end an edit with focus back on the title, never on the page.
     area.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === "Escape") {
-        // Escape puts back what was there before the edit, then leaves.
+        // Escape cancels: the task's saved title comes back, and the draft goes.
         if (e.key === "Escape") { e.stopPropagation(); if (revert) area.value = revert(); }
         e.preventDefault();
         area.blur();
@@ -626,10 +628,22 @@ globalThis.DelphiDrawer = (() => {
     let titleSaving = null;
     async function saveTitle() {
       const next = title.value.trim();
-      if (!next || next === detail.task.title) return;
+      // Untouched since the task last gave it its words: nothing to save, and
+      // saving would write an old title over a rename that arrived meanwhile.
+      if (!next || title.value === titleFrom || next === detail.task.title) {
+        // Typed back to what it was: nothing to keep for recovery either.
+        if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
+        return;
+      }
       if (titleSaving) return titleSaving;
       titleSaving = (async () => {
-        try { await window.delphi.tasks.update(taskId, { title: next }); detail.task.title = next; host.refresh(); }
+        try {
+          await window.delphi.tasks.update(taskId, { title: next });
+          detail.task.title = next;
+          titleFrom = next;
+          if (document.activeElement !== title) title.value = next;
+          host.refresh();
+        }
         catch (error) { host.notifyError(error); }
         if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
         titleSaving = null;

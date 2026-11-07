@@ -62,7 +62,8 @@
    would count the button as one line. */
 .dw-title-btn { all: unset; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; cursor: text; border-radius: 4px; }
 .dw-title.view.plain .dw-title-btn { -webkit-line-clamp: 4; }
-.dw-title-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Inset, because the clamp's overflow would cut an outline drawn outside. */
+.dw-title-btn:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
 .dw-title.view { cursor: text; }
 .dw-title.view:hover { background: var(--raised); box-shadow: 0 0 0 4px var(--raised); }
 .dw-title:focus { box-shadow: 0 0 0 2px var(--accent-line); }
