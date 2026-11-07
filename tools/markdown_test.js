@@ -279,6 +279,12 @@ console.log("\nthe review's findings");
   check("an escape this renderer uses still works", MD.inline("\\*a\\* \\# \\[b\\]"), [{ t: "text", v: "*a* # [b]" }]);
   check("src/__tests__/x stays a path", MD.inline("src/__tests__/x.js"), [{ t: "text", v: "src/__tests__/x.js" }]);
   check("an escaped parenthesis in a link destination", MD.inline("[a](https://x.dev/\\(1\\))")[0].href, "https://x.dev/(1)");
+  check("a backslash ending a line of prose is a hard break", MD.inline("a\\\nb").map((t) => t.t), ["text", "br", "text"]);
+  check("a backslash ending a path is kept", MD.inline("%USERPROFILE%\\.copilot\\hooks\\\nnext"), [{ t: "text", v: "%USERPROFILE%\\.copilot\\hooks\\\nnext" }]);
+  check("a UNC path keeps both its backslashes", MD.inline("\\\\server\\share\\"), [{ t: "text", v: "\\\\server\\share\\" }]);
+  check("four backslashes are two escaped ones, even before a word", MD.inline("\\\\\\\\x"), [{ t: "text", v: "\\\\x" }]);
+  check("inside a word, a run of backslashes escapes as usual", MD.inline("a\\\\\\x"), [{ t: "text", v: "a\\\\x" }]);
+  check("a well-formed table rule is still one", MD.parse("| a | b |\n| :-- | --: |\n| 1 | 2 |")[0].type, "table");
   check("__init__ stays a dunder", MD.inline("call __init__ first"), [{ t: "text", v: "call __init__ first" }]);
   check("__bold words__ are still bold", MD.inline("__two words__")[0].t, "strong");
   const t = MD.parse("| a | b |\n|---|---|\n| 1 | 2 | 3 |\n| `x | y |")[0];
@@ -318,6 +324,10 @@ console.log("\nhostile input, 50KB to 100KB, against the clock");
     "**a x 20,000": "**a".repeat(20000),
     "_a x 40,000": "_a".repeat(40000),
     "\\ x 100,000": "\\".repeat(100000),
+    "a table rule, 80,000 spaces and a stray character": "| a | b |\n|-" + " ".repeat(80000) + "x",
+    "the same without the leading pipe": "a | b\n-" + " ".repeat(80000) + "x|",
+    "100,000 spaces before a line break": "a" + " ".repeat(100000) + "\nb",
+    "trailing spaces before 100 line breaks": ("x" + " ".repeat(1000) + "\n").repeat(100),
     "| x 100,000": "|".repeat(100000) + "\n" + "|-".repeat(30000),
   };
   for (const [name, src] of Object.entries(cases)) {

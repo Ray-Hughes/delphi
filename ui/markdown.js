@@ -66,7 +66,17 @@ globalThis.DelphiMarkdown = (() => {
   const QUOTE_STRIP = /^[ \t]*> ?/;
   const LIST = /^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+|$)(.*)$/;
   const TASK = /^\[([ xX])\](?:[ \t]+|$)/;
-  const TABLE_SEP = /^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
+  // A table's rule: cells of dashes with optional colons, between pipes.
+  // Read cell by cell rather than by one pattern, whose space runs on both
+  // sides of every pipe made a rule with a long run of spaces and one stray
+  // character take seconds.
+  const TABLE_SEP = {
+    test(line) {
+      if (line.length > 20000) return false;
+      const cells = line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
+      return cells.every((c) => /^:?-+:?$/.test(c.trim()));
+    },
+  };
   // The checkbox of a task line, wherever the line nests: inside quotes and
   // after a bullet or a number. Group 1 runs up to the character a tick flips.
   const TASK_AT = /^((?:[ \t]*>)*[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+\[)[ xX]\]/;
@@ -496,12 +506,35 @@ globalThis.DelphiMarkdown = (() => {
       const c = s[i];
 
       if (c === "\\" && i + 1 < n) {
-        if (s[i + 1] === "\n") { flush(); out.push({ t: "br" }); i += 2; continue; }
-        if (ESCAPABLE.test(s[i + 1])) { buf += s[i + 1]; i += 2; continue; }
+        // A backslash at a line's end is a hard break, unless it ends a path
+        // (%USERPROFILE%\.copilot\hooks\, \\server\share\), which keeps it.
+        if (s[i + 1] === "\n") {
+          let w = i - 1;
+          while (w >= 0 && s[w] !== " " && s[w] !== "\t" && s[w] !== "\n" && !/[\\/:%]/.test(s[w])) w -= 1;
+          const path = w >= 0 && /[\\/:%]/.test(s[w]);
+          if (!path) { flush(); out.push({ t: "br" }); i += 2; continue; }
+          buf += "\\";
+          i += 1;
+          continue;
+        }
+        // Two backslashes starting a word, then a letter or digit, are a UNC path
+        // (\\server\share), not an escaped backslash, so both are kept. Only at
+        // a word's start, so a run of them inside a word escapes as usual.
+        const unc = s[i + 1] === "\\" && /[A-Za-z0-9]/.test(s[i + 2] || "") && (i === 0 || /[\s("'`]/.test(s[i - 1]));
+        if (ESCAPABLE.test(s[i + 1]) && !unc) { buf += s[i + 1]; i += 2; continue; }
+        if (unc) { buf += "\\\\"; i += 2; continue; }
       }
 
       if (c === "\n") {
-        if (buf.endsWith("  ")) { buf = buf.replace(/ +$/, ""); flush(); out.push({ t: "br" }); }
+        if (buf.endsWith("  ")) {
+          // Walked back by index: a regex for trailing spaces is retried from
+          // every space in a long run, which took seconds on 100KB.
+          let e = buf.length;
+          while (e > 0 && buf[e - 1] === " ") e -= 1;
+          buf = buf.slice(0, e);
+          flush();
+          out.push({ t: "br" });
+        }
         else buf += "\n";
         i += 1;
         continue;
