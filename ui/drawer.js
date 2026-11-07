@@ -2181,6 +2181,9 @@ globalThis.DelphiDrawer = (() => {
         if (parked) f.append(wbButton("Resume", "", () => wbDo(async () => { await window.delphi.workbench.resume(wb.id); flash("resumed"); })));
         else f.append(wbButton("Park", "", () => wbDo(async () => { await window.delphi.workbench.park(wb.id); flash("parked"); }), "Put it aside; the folder and branch stay"),
           wbButton("Finish", "", () => host.wb.finish(wb.id, taskId, { title: detail.task.title, after: reload }), "Save, share and put the folder away. The branch is kept."));
+        // The draft Finish will offer, readable before Finish: the dialog is
+        // ui/report.js's, so the drawer carries only the button.
+        if (host.wb.describe) f.append(wbButton("PR description", "", () => host.wb.describe(wb.id, taskId), "The pull request description the Sheet writes, to read and copy", "pr-describe"));
         const showing = wbAdv && wbAdv.id === wb.id;
         const more = el("button", { className: "dw-ib", type: "button", title: "More Workbench actions" });
         more.setAttribute("aria-label", "More Workbench actions");

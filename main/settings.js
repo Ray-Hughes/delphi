@@ -177,8 +177,9 @@ function registerLayouts(handle, { db, projectName }) {
     if (!s) throw new Error(`Delphi has no page called "${screen}" to lay out.`);
     let pid = null;
     if (projectId != null) {
-      pid = Number(projectId);
       if (!s.scoped) throw new Error(`${s.label} has one layout for every project.`);
+      // A number or its digits, nothing Number() would coerce: true is not project 1.
+      pid = (typeof projectId === "number" || (typeof projectId === "string" && /^\d+$/.test(projectId))) ? Number(projectId) : NaN;
       if (!Number.isInteger(pid) || pid <= 0 || !projectName(pid)) throw new Error(`No project ${projectId}.`);
     }
     const value = schema.check("layouts", layout);

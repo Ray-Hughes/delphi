@@ -108,21 +108,20 @@ function holdFolderAdoption(hold) { folderGate = () => !hold; }
  */
 function widenAuditEntities(db) {
   const query = (statement) => db.prepare(statement).all();
-  if (!schemaLater.auditRebuildPlan(query).length) return;
-  // foreign_keys cannot be changed inside a transaction, hence the order. Nothing
-  // references audit, so this is belt and braces rather than load bearing.
+  // Asked first, outside any transaction, only so the usual open costs one
+  // read; the plan that runs is made again inside the lock.
+  try { if (!schemaLater.auditRebuildPlan(query).length) return; } catch {}
+  // foreign_keys cannot be changed inside a transaction, hence out here.
+  // Nothing references audit, so this is belt and braces rather than load bearing.
   db.exec("PRAGMA foreign_keys = OFF");
   try {
-    schemaLater.widenAudit(query, (statements) => {
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        for (const statement of statements) db.prepare(statement).run();
-        db.exec("COMMIT");
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
-    });
+    schemaLater.widenAuditLocked(query);
+  } catch (error) {
+    // Logged, not thrown. The rebuild rolled back, so the table is as it was
+    // and everything in it still reads and undoes; only a layout cannot be
+    // recorded, and saveLayout says so in a sentence. Throwing here would
+    // abandon open() half way, past the migrations that follow.
+    console.error(`audit: could not widen the History table (${error.message}); layouts cannot be saved until it is`);
   } finally {
     db.exec("PRAGMA foreign_keys = ON");
   }
@@ -437,6 +436,13 @@ function listLayouts() {
  * History calls it: summary and label.
  */
 const saveLayout = atomic(function saveLayout({ screen, projectId = null, layout, summary, label }) {
+  // The History table on a database whose widening failed refuses a layout
+  // row by its CHECK; said as what it means rather than as SQLite's words.
+  const audit = one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit'");
+  const allowed = schemaLater.auditEntitiesIn(audit && audit.sql);
+  if (allowed && !allowed.includes("layout")) {
+    throw new Error("Layouts cannot be saved on this database yet: its History table could not be updated when Delphi opened it. Restart Delphi, and if this stays, run delphi doctor.");
+  }
   const text = layout == null ? null : JSON.stringify(layout);
   const pid = projectId == null ? null : Number(projectId);
   const row = one("SELECT * FROM layouts WHERE screen = :screen AND COALESCE(project_id, 0) = :pid",
@@ -583,6 +589,16 @@ function undo(auditId) {
   const entry = one("SELECT * FROM audit WHERE id = :id", { id: auditId });
   if (!entry) throw new Error("No such audit entry");
   if (entry.undone) throw new Error("That change has already been undone");
+  // A project's layout that went with the project when it was deleted: there
+  // is nothing here to put back, and marking it undone would say otherwise.
+  // Undoing the delete brings the row back, and then this can be undone.
+  if (entry.entity === "layout" && entry.action !== "delete" && !one("SELECT id FROM layouts WHERE id = :id", { id: entry.entity_id })) {
+    const gone = all(`SELECT id, label, before_json FROM audit
+                       WHERE entity = 'project' AND action = 'delete' AND undone = 0 AND id > :id
+                         AND before_json LIKE '%"__layouts"%' ORDER BY id DESC`, { id: entry.id })
+      .find((d) => { try { return (JSON.parse(d.before_json).__layouts || []).some((r) => Number(r.id) === Number(entry.entity_id)); } catch { return false; } });
+    if (gone) throw new Error(`This layout went with the project "${gone.label}" when it was deleted. Undo that delete first, then this.`);
+  }
 
   // One transaction over the whole reversal, the check included, so nothing can
   // change the row between the check passing and the restore. A restore is many

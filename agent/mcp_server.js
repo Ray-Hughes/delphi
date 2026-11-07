@@ -383,10 +383,15 @@ for (const failure of MIGRATED.errors) {
 }
 // The History table's entity list, widened the way the app widens it, so an
 // agent on a database the app has not opened since the upgrade writes rows
-// the app can read. One batch, so on the binary route it is one process and
-// one transaction. A failure leaves the old table exactly as it was.
+// the app can read. On node:sqlite the plan is made inside the transaction,
+// as the app makes it. On the binary route each statement is its own process,
+// so the plan is read first and checks, as its first statement inside the
+// one-script transaction, that the table is still the one it read. Either way
+// a failure leaves the old table exactly as it was.
 try {
-  schemaLater.widenAudit((statement) => DATABASE.query(statement), (statements) => DATABASE.batch(statements));
+  const q = (statement) => DATABASE.query(statement);
+  if (DATABASE.kind === "node:sqlite") schemaLater.widenAuditLocked(q);
+  else schemaLater.widenAudit(q, (statements) => DATABASE.batch(statements));
 } catch (error) {
   process.stderr.write(`delphi: could not widen the History table (${error.message})\n`);
 }
@@ -564,8 +569,11 @@ const { createWorkbench } = require("../workbench/workbench");
 const folderRule = require("../workbench/folders");
 const { runEntry } = require("../sheet/run");
 const benchStore = makeWorkbenchStore({ sql, actor: ACTOR, who: WHO, step: currentStep });
+// The pull request description workbench_pr defaults to, from the same
+// builder the Finish dialog uses.
+const sheetReport = require("../sheet/report").makeReport({ sql });
 const benches = createWorkbench({
-  store: benchStore, sheet: sheets, runEntry, logDir: SHEET_LOG_DIR,
+  store: benchStore, sheet: sheets, runEntry, logDir: SHEET_LOG_DIR, report: sheetReport,
   settings: () => readSettings(),
 });
 
@@ -1757,9 +1765,15 @@ const TOOLS = {
     run: (a) => benches.push(benchFor(a.task_id).id),
   },
   workbench_pr: {
-    description: "Where to open a pull request, or with create, open one with gh.",
-    schema: { type: "object", required: ["task_id"], properties: { task_id: { type: "number" }, create: { type: "boolean" } } },
-    run: (a) => benches.pr(benchFor(a.task_id).id, { create: a.create === true }),
+    description: "Where to open a pull request, or with create, open one with gh. The answer's body is the description it uses: the one given, or else the one the Sheet writes (decisions, passing checks, open questions, the diff stat).",
+    schema: {
+      type: "object", required: ["task_id"],
+      properties: {
+        task_id: { type: "number" }, create: { type: "boolean" },
+        body: { type: "string", description: "The pull request description, in Markdown. Leave it out for the one the Sheet writes." },
+      },
+    },
+    run: (a) => benches.pr(benchFor(a.task_id).id, { create: a.create === true, body: a.body === undefined ? null : a.body }),
   },
   workbench_finish_plan: {
     description: "The files git does not keep that Finish would remove, summarised by folder.",

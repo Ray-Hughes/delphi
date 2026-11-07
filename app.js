@@ -1497,6 +1497,7 @@ async function renderOverview(root) {
   }
   right.append(linkCard.card);
   if (window.DelphiLedger) right.append(DelphiLedger.projectCard(project.id));
+  if (window.DelphiReport) right.append(DelphiReport.statusCard(project.id));
 
   // --- handoffs ------------------------------------------------------------
   // Work one agent has handed to another. Here rather than on its own tab
@@ -7797,28 +7798,46 @@ async function finishFlow(wbId, taskId, { title = "", after = null } = {}) {
     const plan = await wbApi.finishPlan(wbId);
     if (plan.blocked) { await wbStop(plan.blocked.code === "NESTED" ? "Other repositories are inside this folder" : "Finish cannot go ahead", plan.blocked.message, plan.nested && plan.nested.length ? plan.nested : plan.unreadable); return; }
 
+    // The description is shown on every Finish, editable, whether or not a
+    // pull request can be opened from here: written from the Sheet, it is
+    // worth copying even when the branch goes up some other way. What the
+    // person leaves in the editor is exactly what goes to gh.
     const pr = await wbApi.pr(wbId);
-    if (pr.via) {
-      const go = await wbDialog({
-        title: "Open a pull request?",
-        lead: pr.via === "gh"
-          ? "The branch is on the remote. GitHub's command line can open the pull request now, or find the one already open."
-          : "The branch is on the remote. This opens the host's page for starting a pull request.",
-        actions: [
-          { label: "Cancel", value: null },
-          { label: "Finish without one", value: "skip" },
-          { label: "Open pull request", value: "pr", kind: "primary" },
-        ],
-      });
-      if (!go) return;
-      if (go === "pr") {
-        const made = await wbApi.pr(wbId, { create: true });
-        // No pull request and no page to open one on: stop here, with the
-        // folder still in place, rather than finish as though it had worked.
-        if (!made.url) { notifyError(made.reason || "Could not open a pull request."); return; }
-        window.delphi.openExternal(made.url);
-        if (made.reason) notify(made.reason);
+    const ed = DelphiReport.editor(pr.body);
+    const go = await wbDialog({
+      title: pr.via ? "Open a pull request?" : "PR description",
+      lead: pr.via === "gh"
+        ? "The branch is on the remote. GitHub's command line can open the pull request with this description, or find the one already open, which keeps its own."
+        : pr.via
+        ? "The branch is on the remote. This opens the host's page for starting a pull request, with the description copied to paste in."
+        : `${pr.reason || "No pull request can be opened from here."} Copy the description to use it later.`,
+      body: [ed.node],
+      className: "rp-dialog",
+      actions: pr.via
+        ? [{ label: "Cancel", value: null }, { label: "Finish without one", value: "skip" }, { label: "Open pull request", value: "pr", kind: "primary" }]
+        : [{ label: "Cancel", value: null }, { label: "Finish", value: "skip", kind: "primary" }],
+    });
+    if (!go) return;
+    if (go === "pr") {
+      const body = ed.value();
+      // The dialog is gone by now, so a failure keeps the person's edits on
+      // the clipboard rather than losing them with it.
+      const keepEdits = async () => { try { await navigator.clipboard.writeText(body); return " Your description is on the clipboard."; } catch { return ""; } };
+      let made;
+      try { made = await wbApi.pr(wbId, { create: true, body }); } catch (error) {
+        notifyError(`${error.message || error}${await keepEdits()}`);
+        return;
       }
+      // No pull request and no page to open one on: stop here, with the
+      // folder still in place, rather than finish as though it had worked.
+      if (!made.url) { notifyError(`${made.reason || "Could not open a pull request."}${await keepEdits()}`); return; }
+      // A compare page cannot be handed a description, so it goes on the
+      // clipboard for the person to paste.
+      if (made.via === "compare") {
+        try { await navigator.clipboard.writeText(body); notify("The description is copied. Paste it into the pull request page."); } catch {}
+      }
+      window.delphi.openExternal(made.url);
+      if (made.reason) notify(made.reason);
     }
 
     let confirm = null;
@@ -10715,12 +10734,13 @@ const RUNS_LAYOUT = window.DelphiLayout ? DelphiLayout.register({
     ] },
     { id: "side", label: "Side column", className: "waiting-col", sections: [
       { id: "waiting", label: "Waiting on you" },
+      { id: "report", label: "Status report", empty: "The status report card shows here." },
       { id: "cost", label: "Cost and time", empty: "The cost and time card shows here." },
     ] },
   ],
   presets: [
     { id: "default", label: "Default", desc: "Every section, in Runs' own order.", layout: {} },
-    { id: "focus", label: "Focus", desc: "What is running and what waits on you, nothing else.", layout: { hidden: ["queued", "finished", "cost"] } },
+    { id: "focus", label: "Focus", desc: "What is running and what waits on you, nothing else.", layout: { hidden: ["queued", "finished", "report", "cost"] } },
   ],
 }) : null;
 
@@ -10768,10 +10788,16 @@ function renderRuns(root) {
 
   parts.waiting = section("Waiting on you", waiting.length, "paused until you answer",
     box(waiting.map(waitingRow), "Nothing is waiting on you."));
+  // Runs is the place agent work is read across projects, so a status report
+  // is written from here too, for whichever project is picked.
+  parts.report = window.DelphiReport
+    ? section("Status report", null, DelphiReport.statusButton(() => projectFor(), { projects: () => state.projects || [] }),
+      el("div", { className: "box" }, el("div", { className: "empty-line", textContent: "A project's week, or any dates, written from its Sheets: done, decided, checked and still open. Edit it, then copy it." })))
+    : null;
   parts.cost = window.DelphiLedger ? DelphiLedger.runsCard() : null;
 
   page.append(RUNS_LAYOUT ? DelphiLayout.mount("runs", parts)
-    : el("div", { className: "runs-cols" }, el("div", {}, parts.running, parts.queued || "", parts.finished), el("div", { className: "waiting-col" }, parts.waiting, parts.cost || "")));
+    : el("div", { className: "runs-cols" }, el("div", {}, parts.running, parts.queued || "", parts.finished), el("div", { className: "waiting-col" }, parts.waiting, parts.report || "", parts.cost || "")));
   root.append(page);
 }
 
@@ -14670,7 +14696,8 @@ DelphiDrawer.init({
   openTask: (id) => openTaskSheet(id),
   openNoteFull: (n) => { openNoteSheet.full = true; try { openNoteSheet(n); } finally { openNoteSheet.full = false; } },
   wb: { guard: wbGuard, starting: wbStarting, busy: wbBusyTasks, look: wbLook, chip: wbChip, update: wbUpdate, dialog: wbDialog,
-    closingLong, finish: finishWorkbench, discard: discardWorkbench, pickRepo },
+    closingLong, finish: finishWorkbench, discard: discardWorkbench, pickRepo,
+    describe: (wbId, taskId) => DelphiReport.describe(wbId, taskId) },
   runs: { OPEN: RUN_OPEN, WAITING: RUN_WAITING, words: RUN_STATE_WORDS, stateChip: runStateChip, settingFix, open: openRunSheet,
     buffers: runBuffers, kills: runKills, ended: runsEnded, buffer: runBuffer, pre: runPre, line: runLine,
     reload: async () => { try { state.runs = await window.delphi.runs.list({ limit: 300 }); } catch {} paintRunsLive(); } },
