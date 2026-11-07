@@ -2138,7 +2138,11 @@ function toggleLine(entity, id, tick = {}) {
   const anchor = pad.derives_tasks ? pads.ANCHOR.exec(md.linesOf(pad.body)[got.line] || "") : null;
   // Only a task this pad owns: an anchor copied in from another pad is stale
   // text, as the derivation treats it, and must not tick somebody else's.
-  const task = anchor ? one("SELECT * FROM tasks WHERE id = :id AND pad_id = :padId", { id: Number(anchor[1]), padId: pad.id }) : null;
+  // And only an anchor on one line: the board's write-back rewrites the first
+  // line carrying it, which would be the other copy, so a pad with the same
+  // anchor twice has the clicked line written as text instead.
+  const once = anchor && pads.parse(pad.body).filter((e) => e.taskId === Number(anchor[1])).length === 1;
+  const task = once ? one("SELECT * FROM tasks WHERE id = :id AND pad_id = :padId", { id: Number(anchor[1]), padId: pad.id }) : null;
   if (task) {
     const status = tick.checked ? "done" : "todo";
     if (task.status !== status) updateTask(task.id, { status });

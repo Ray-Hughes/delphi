@@ -465,13 +465,15 @@ globalThis.DelphiMarkdown = (() => {
         const start = p;
         for (; p < destStop; p++) {
           const ch = s[p];
-          if (ch === "\\" && ESCAPABLE.test(s[p + 1] || "")) { p += 1; continue; }
+          // In a destination a parenthesis can be escaped too, as in
+          // [a](https://x/\(1\)).
+          if (ch === "\\" && (ESCAPABLE.test(s[p + 1] || "") || s[p + 1] === "(" || s[p + 1] === ")")) { p += 1; continue; }
           if (/\s/.test(ch)) break;
           if (ch === "(") { parens += 1; if (parens > 32) return null; }
           else if (ch === ")") { if (!parens) break; parens -= 1; }
         }
         if (p >= destStop && p < n) return null;
-        dest = s.slice(start, p).replace(UNESCAPE, "$1");
+        dest = s.slice(start, p).replace(UNESCAPE, "$1").replace(/\\([()])/g, "$1");
       }
       const titleStop = Math.min(n, p + URL_MAX);
       while (p < titleStop && (s[p] === " " || s[p] === "\n")) p += 1;

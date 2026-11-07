@@ -278,6 +278,7 @@ console.log("\nthe review's findings");
   check("and regexes", MD.inline("\\d+\\.rb\\(x\\)"), [{ t: "text", v: "\\d+\\.rb\\(x\\)" }]);
   check("an escape this renderer uses still works", MD.inline("\\*a\\* \\# \\[b\\]"), [{ t: "text", v: "*a* # [b]" }]);
   check("src/__tests__/x stays a path", MD.inline("src/__tests__/x.js"), [{ t: "text", v: "src/__tests__/x.js" }]);
+  check("an escaped parenthesis in a link destination", MD.inline("[a](https://x.dev/\\(1\\))")[0].href, "https://x.dev/(1)");
   check("__init__ stays a dunder", MD.inline("call __init__ first"), [{ t: "text", v: "call __init__ first" }]);
   check("__bold words__ are still bold", MD.inline("__two words__")[0].t, "strong");
   const t = MD.parse("| a | b |\n|---|---|\n| 1 | 2 | 3 |\n| `x | y |")[0];
@@ -366,6 +367,15 @@ console.log("\nthe store: one transaction per tick (db.toggleLine)");
   check("two unanchored identical lines in a pad that moved: refused, nothing ticked", [r.refused, db.getScratchpad(sketch.id).body], ["ambiguous", "added above\n- [ ] same\n- [ ] same"]);
   r = db.toggleLine("pad", sketch.id, { line: 2, checked: true, text: "- [ ] same", source: "added above\n- [ ] same\n- [ ] same" });
   check("drawn from the stored text, the exact line is ticked", r.body, "added above\n- [ ] same\n- [x] same");
+
+  // The same anchor on two lines (copied by hand): the clicked line is the
+  // one that changes, never the other copy.
+  const twin = db.createScratchpad({ projectId: project.id, key: "twin", title: "Twin", body: "- [ ] one" });
+  const tid = pads.parse(twin.body)[0].taskId;
+  db.handle().prepare("UPDATE scratchpads SET body = ? WHERE id = ?").run(`- [ ] one <!--d:${tid}-->\n- [ ] one again <!--d:${tid}-->`, twin.id);
+  const tb = db.getScratchpad(twin.id).body;
+  r = db.toggleLine("pad", twin.id, { line: 1, checked: true, text: MD.linesOf(tb)[1], source: tb });
+  check("a tick on the second copy of an anchor changes that line only", pads.parse(db.getScratchpad(twin.id).body).map((e) => e.done), [false, true]);
 
   // A note and a description.
   const note = db.createNote({ projectId: project.id, title: "N", body: "- [ ] a\r\n- [ ] a\r\n" });
