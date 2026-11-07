@@ -24,7 +24,10 @@
  */
 
 const ledgerCore = require("../ledger/ledger");
+const scrub = require("./scrub");
 
+// GitHub's title limit.
+const MAX_TITLE = 256;
 // GitHub refuses a body over 65536 characters. Said before gh is asked, so the
 // refusal is a sentence rather than an API error.
 const MAX_BODY = 65536;
@@ -72,21 +75,12 @@ function isPrivate(row) {
 }
 
 /**
- * Text as it may go out: comments gone (again until none are left, so one
- * hidden inside another cannot leave an opener behind), line endings plain,
- * no control characters, ends trimmed.
+ * Text as it may go out: nothing invisible (sheet/scrub.js strip), dashes
+ * plain, every secret and number redacted, ends trimmed. Everything copied
+ * from the database into either report passes through here first, and the
+ * finished text passes through redact() again on its way out.
  */
-function clean(text) {
-  let out = String(text == null ? "" : text);
-  for (let before = null; before !== out;) {
-    before = out;
-    out = out.replace(/<!--[\s\S]*?(-->|$)/g, "");
-  }
-  // Control characters other than tab and newline go too. Nothing on a Sheet
-  // needs them, and printed by the command line before its "open the pull
-  // request?" question, an escape sequence could redraw what the person reads.
-  return out.replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "").trim();
-}
+const clean = (text) => scrub.scrub(text).trim();
 
 /**
  * An @handle in code, so a pull request does not notify whoever an agent
@@ -103,26 +97,15 @@ const quiet = (text) => text
 const oneLine = (text) => quiet(clean(text).replace(/\s+/g, " ").trim());
 
 /**
- * A command with what looks like a credential taken out. The person sees the
- * command in the preview before anything is sent, but a token pasted into a
- * curl line weeks ago is easy to read past, so the obvious shapes go first:
- * an Authorization header or one named for a key, token or cookie, a
- * NAME=value whose name says it is secret, a --password or --token option,
- * curl's -u user:password, a URL with a password in it, and GitHub's own token
- * prefixes. A shape not listed here still goes out, which is why the person
- * reads the preview before anything is sent.
+ * A line that would be read as Markdown structure, escaped so it reads as the
+ * words it is: a heading ("## Checks" in a task's description would start a
+ * section of its own, a fake one), or the --- or === under a line that makes
+ * it a heading too.
  */
-const SECRET_NAME = /token|secret|passw(or)?d|pass$|^pass|api_?key|auth|credential|private_?key/i;
-
-function redact(command) {
-  return String(command)
-    .replace(/((?:proxy-)?authorization:\s*)(?:bearer\s+|token\s+|basic\s+)?[^\s'"]+/gi, "$1[redacted]")
-    .replace(/((?:x-[\w-]*)?(?:api-?key|token|secret|cookie|session)[\w-]*:\s*)[^\s'"]+/gi, "$1[redacted]")
-    .replace(/((?:^|\s)(?:-u|--user)(?:=|\s+)['"]?[^\s:'"]+:)[^\s'"]+/g, "$1[redacted]")
-    .replace(/\b([A-Za-z_]\w*)=("[^"]*"|'[^']*'|\S+)/g, (all, name) => (SECRET_NAME.test(name) ? `${name}=[redacted]` : all))
-    .replace(/(--?(?:password|passwd|token|secret|api-?key)(?:=|\s+))("[^"]*"|'[^']*'|\S+)/gi, "$1[redacted]")
-    .replace(/(\b[a-z][\w+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, "$1[redacted]@")
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[redacted]");
+function plainLine(line) {
+  if (/^\s{0,3}#{1,6}(\s|$)/.test(line)) return line.replace("#", "\\#");
+  if (/^\s{0,3}(=+|-{2,})\s*$/.test(line)) return line.replace(/[=-]/, (c) => `\\${c}`);
+  return line;
 }
 
 /** The first paragraph, for the Summary: a long detail is the task's, not the PR's. */
@@ -134,7 +117,7 @@ function firstParagraph(text) {
   // every section below into code. Cut at an unclosed fence instead.
   const fences = para.split("\n").map((line, i) => [i, /^\s*(```|~~~)/.test(line)]).filter(([, f]) => f);
   if (fences.length % 2) para = para.split("\n").slice(0, fences[fences.length - 1][0]).join("\n").trim();
-  return quiet(para);
+  return quiet(para.split("\n").map(plainLine).join("\n"));
 }
 
 /** Backticks that cannot be closed by what is inside them. */
@@ -174,6 +157,20 @@ function decisionLines(ask, decision) {
   return out;
 }
 
+/** A run that says it passed: state ok, and an exit code of 0 when it has one. */
+const passedRun = (meta) => meta.state === "ok" && (meta.code == null || Number(meta.code) === 0);
+
+/**
+ * Whether Delphi's own runner (sheet/run.js runEntry) ran the command, which is
+ * the only way a pass is Delphi's word rather than an agent's. The runner
+ * marks its runs ran_by: "delphi"; the MCP tools refuse that key from anyone
+ * but the command line (whose runner reports through them), and refuse a
+ * change to the result of a run so marked. A tripwire like the others: an
+ * agent with a shell can write the database. An agent's own commands, even
+ * ones delphi chat recorded from its stream, say "reported passing by".
+ */
+const byRunner = (meta) => meta.ran_by === "delphi";
+
 /**
  * What the Sheet says, in parts: decisions with their questions, open
  * questions, and the commands whose latest run passed. Latest, because a
@@ -192,21 +189,26 @@ function readSheet(rows) {
     decisions.push({ ask, decision: r });
   }
   const open = rows.filter((r) => r.kind === "ask" && !answered.has(Number(r.id)) && !hidden.has(Number(r.id)));
+  // The latest run of each command, whatever state it is in: a pass followed
+  // by a run still going, or one lost with its runner, has no result yet.
   const latest = new Map();
   for (const r of rows) {
     if (r.kind !== "run") continue;
-    const meta = metaOf(r);
-    // A run still going, or one lost with its runner, has no result to report.
-    if (meta.state !== "ok" && meta.state !== "fail") continue;
-    const command = redact(clean(r.body).replace(/\s+/g, " ").trim());
+    const command = clean(r.body).replace(/\s+/g, " ").trim();
     if (!command) continue;
     // A private run hides its command but still counts as the latest, so an
     // earlier public pass cannot stand in for a private failure.
-    latest.set(command, { row: r, meta, hidden: hidden.has(Number(r.id)) });
+    latest.set(command, { row: r, meta: metaOf(r), hidden: hidden.has(Number(r.id)) });
   }
   const passed = [...latest.entries()]
-    .filter(([, v]) => v.meta.state === "ok" && !v.hidden)
-    .map(([command, v]) => ({ command, ms: Number.isFinite(Number(v.meta.dur_ms)) ? Number(v.meta.dur_ms) : null, task_id: v.row.task_id }));
+    .filter(([, v]) => !v.hidden && passedRun(v.meta))
+    .map(([command, v]) => ({
+      command,
+      ms: v.meta.dur_ms != null && v.meta.dur_ms !== "" && Number.isFinite(Number(v.meta.dur_ms)) ? Number(v.meta.dur_ms) : null,
+      task_id: v.row.task_id,
+      byRunner: byRunner(v.meta),
+      author: v.row.author || null,
+    }));
   return { decisions, open, passed };
 }
 
@@ -236,7 +238,22 @@ function costLine(totals) {
 }
 
 const section = (title, lines) => (lines.length ? [`## ${title}`, "", ...lines, ""] : []);
-const checkLine = (p) => `- ${code(p.command)} passed${p.ms == null ? "" : ` in ${ledgerCore.duration(p.ms / 1000)}`}`;
+// A pass Delphi ran says so plainly. One an agent wrote down says who, since
+// nothing but its word says the command passed.
+const checkLine = (p) => `- ${code(p.command)} ${p.byRunner ? "passed" : `reported passing by ${oneLine(p.author || "an agent")}`}`
+  + `${p.ms == null ? "" : ` in ${ledgerCore.duration(p.ms / 1000)}`}`;
+
+/** The finished text: one last strip and redact over all of it. */
+const finish = (lines) => `${scrub.redact(scrub.strip(lines.join("\n"))).text.trim()}\n`;
+
+/**
+ * A pull request title: one line, scrubbed like everything else, and no
+ * longer than GitHub takes. Not Markdown, so nothing in it is escaped.
+ */
+function prTitle(title, prefix = null) {
+  const text = clean([prefix, title].filter(Boolean).join(" ")).replace(/\s+/g, " ").trim();
+  return text.length > MAX_TITLE ? `${text.slice(0, MAX_TITLE - 3)}...` : text;
+}
 
 function makeReport({ sql } = {}) {
   if (typeof sql !== "function") throw new Error("makeReport needs a sql(query, params) function.");
@@ -249,15 +266,23 @@ function makeReport({ sql } = {}) {
    * The pull request description for a task, as Markdown. opts.diffStat is
    * the caller's, since git is not read here.
    */
-  function prDescription(taskId, { diffStat = null } = {}) {
+  function prDescription(taskId, opts = {}) {
+    return prDraft(taskId, opts).body;
+  }
+
+  /**
+   * The title and the description together, as the person is shown them and
+   * as gh is sent them. opts.prefix (a ticket key) leads the title.
+   */
+  function prDraft(taskId, { diffStat = null, prefix = null } = {}) {
     const id = idOf(taskId, "task_id");
     const task = sql("SELECT id, title, detail FROM tasks WHERE id = :p1", [id])[0];
     if (!task) throw new Error(`No task ${id}.`);
-    const rows = sql(`SELECT id, task_id, kind, body, meta, ref_id FROM comments
+    const rows = sql(`SELECT id, task_id, kind, author, body, meta, ref_id FROM comments
                        WHERE task_id = :p1 AND kind IN ('ask', 'decide', 'run') ORDER BY id`, [id]);
     const { decisions, open, passed } = readSheet(rows);
 
-    const summary = [oneLine(task.title)];
+    const summary = [plainLine(oneLine(task.title))];
     const para = firstParagraph(task.detail);
     if (para) summary.push("", para);
     if (!decisions.length && !open.length && !passed.length) {
@@ -279,7 +304,7 @@ function makeReport({ sql } = {}) {
       // issue 623, which is some other piece of work.
       `From Delphi task ${id}.`,
     ];
-    return out.join("\n").trim() + "\n";
+    return { title: prTitle(task.title, prefix), body: finish(out) };
   }
 
   /**
@@ -316,22 +341,31 @@ function makeReport({ sql } = {}) {
     // Every ask, decide and run on the project's tasks, then cut to the window
     // here: an open question asked last month is still open now, and a
     // decision's question may be older than the window.
-    const rows = sql(`SELECT c.id, c.task_id, c.kind, c.body, c.meta, c.ref_id, c.created_at
+    // Every ask, decide and run on the project's tasks. Decisions and runs
+    // are cut to the window here; open questions are the ones open now,
+    // whenever they were asked, as "In progress now" is.
+    const rows = sql(`SELECT c.id, c.task_id, c.kind, c.author, c.body, c.meta, c.ref_id, c.created_at
                         FROM comments c JOIN tasks t ON t.id = c.task_id
-                       WHERE t.project_id = :p1 AND c.kind IN ('ask', 'decide', 'run') AND c.created_at < :p2
-                       ORDER BY c.id`, [pid, u.until]);
+                       WHERE t.project_id = :p1 AND c.kind IN ('ask', 'decide', 'run')
+                       ORDER BY c.id`, [pid]);
     const sheet = readSheet(rows);
-    const ref = (taskId) => `#${taskId} ${title.get(Number(taskId)) || ""}`.trim();
+    // "task 624", not "#624": pasted into GitHub, #624 is that repository's
+    // own issue 624.
+    const ref = (taskId) => `task ${taskId}, ${title.get(Number(taskId)) || ""}`.replace(/, $/, "");
     const decided = sheet.decisions.filter((d) => inRange(d.decision.created_at));
     // Finished runs only: one still going has neither passed nor failed.
-    const ran = rows.filter((r) => r.kind === "run" && inRange(r.created_at) && !isPrivate(r) && ["ok", "fail"].includes(metaOf(r).state));
-    const okRuns = ran.filter((r) => metaOf(r).state === "ok").length;
-    const failRuns = ran.filter((r) => metaOf(r).state === "fail").length;
+    // Private runs are counted, their commands never shown, so a private
+    // failure cannot make the numbers look better than they were.
+    const ran = rows.filter((r) => r.kind === "run" && inRange(r.created_at) && ["ok", "fail"].includes(metaOf(r).state));
+    const okRuns = ran.filter((r) => passedRun(metaOf(r))).length;
+    const failRuns = ran.length - okRuns;
+    const ranByDelphi = ran.filter((r) => byRunner(metaOf(r))).length;
     const openDone = new Set(tasks.filter((t) => t.status === "done").map((t) => Number(t.id)));
     const open = sheet.open.filter((a) => !openDone.has(Number(a.task_id)));
     const cost = costLine(safely(() => ledger.between({ since: u.since, until: u.until, projectId: pid }).totals));
 
-    const taskLine = (t) => `- ${ref(t.id)}`;
+    const taskLine = (t) => `- ${title.get(Number(t.id)) || ""} (task ${t.id})`;
+    const tasksRan = new Set(ran.map((r) => r.task_id)).size;
     const out = [
       `# ${oneLine(project.name)}: status, ${w.d_from} to ${w.d_to}`,
       "",
@@ -344,23 +378,39 @@ function makeReport({ sql } = {}) {
         const [head, ...rest] = decisionLines(d.ask, d.decision);
         return [`${head} (${ref(d.decision.task_id)})`, ...rest];
       })),
-      ...section("Checks", ran.length ? [`${okRuns} ${okRuns === 1 ? "run" : "runs"} passed and ${failRuns} failed, across ${new Set(ran.map((r) => r.task_id)).size} ${new Set(ran.map((r) => r.task_id)).size === 1 ? "task" : "tasks"}.`] : []),
-      ...section("Open questions", open.map((a) => `- ${oneLine(a.body)} (${ref(a.task_id)})`)),
+      ...section("Checks", ran.length ? [`${okRuns} ${okRuns === 1 ? "run" : "runs"} passed and ${failRuns} failed, across ${tasksRan} ${tasksRan === 1 ? "task" : "tasks"}. `
+        + `${ranByDelphi === ran.length ? "Delphi ran all of them." : `Delphi ran ${ranByDelphi}; agents reported the other ${ran.length - ranByDelphi}.`}`] : []),
+      ...section("Open questions now", open.map((a) => `- ${oneLine(a.body)} (${ref(a.task_id)})`)),
       ...section("Cost (estimate)", cost ? [cost] : []),
     ];
     if (out.length === 2) out.push("Nothing was finished, started, decided or run in this project in these dates.");
-    return out.join("\n").trim() + "\n";
+    return finish(out);
   }
 
-  return { prDescription, statusReport };
+  return { prDescription, prDraft, statusReport };
 }
 
-/** A body for gh, or a sentence saying why not. null means none was given. */
+/**
+ * A body for gh, or a sentence saying why not. null means none was given.
+ * What a person wrote is redacted too: the rule is that a secret never
+ * leaves, not that Delphi's own draft has none. Their comments, dashes and
+ * layout are theirs and stay as they are.
+ */
 function checkBody(body) {
   if (body === null || body === undefined) return null;
   if (typeof body !== "string") throw new Error("body must be text.");
   if (body.length > MAX_BODY) throw new Error(`The description is ${body.length} characters; GitHub takes at most ${MAX_BODY}. Shorten it.`);
-  return body;
+  return scrub.redact(body).text;
 }
 
-module.exports = { MAX_BODY, makeReport, checkBody, isPrivate, clean, firstParagraph, redact };
+/** A title for gh, the same way: one line, redacted, within GitHub's limit. */
+function checkTitle(title) {
+  if (title === null || title === undefined) return null;
+  if (typeof title !== "string") throw new Error("title must be text.");
+  const text = scrub.redact(title.replace(/[\r\n]+/g, " ")).text.trim();
+  if (!text) throw new Error("A pull request needs a title.");
+  if (text.length > MAX_TITLE) throw new Error(`The title is ${text.length} characters; GitHub takes at most ${MAX_TITLE}.`);
+  return text;
+}
+
+module.exports = { MAX_BODY, MAX_TITLE, makeReport, checkBody, checkTitle, prTitle, isPrivate, clean, firstParagraph, plainLine };

@@ -286,6 +286,46 @@ async function yes(question) {
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 const warn = (text) => process.stderr.write(`delphi: ${text}\n`);
 
+// --- Pull request drafts --------------------------------------------------------
+
+const scrub = require("../sheet/scrub");
+// GitHub's limit on a description, the one sheet/report.js checks.
+const MAX_PR_BODY = require("../sheet/report").MAX_BODY;
+
+/** Text fit for a terminal: no escape sequences or other invisible characters. */
+const terminalSafe = (text) => scrub.strip(String(text == null ? "" : text));
+
+/** The draft as the person reads it, with what it mentions that is worth a look. */
+function showDraft({ title, body }) {
+  say(`\nPull request title:\n  ${terminalSafe(title)}\n\nDescription:\n\n${terminalSafe(body).replace(/^/gm, "  ")}`);
+  const found = scrub.flag(`${title}\n${body}`);
+  if (found.length) {
+    warn(`This text mentions: ${scrub.flagWords(found)}: ${[...new Set(found.map((f) => terminalSafe(f.text)))].slice(0, 12).join(", ")}. Edit them out if they should not leave.`);
+  }
+}
+
+/**
+ * The draft in $EDITOR: the title on the first line, a blank line, then the
+ * description. Null when the editor failed or left the file empty.
+ */
+function editDraft({ title, body }) {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "delphi-pr-")), "PULL_REQUEST.md");
+  try {
+    fs.writeFileSync(file, `${title}\n\n${body}`);
+    const [cmd, ...args] = splitCommand(process.env.EDITOR);
+    const r = require("child_process").spawnSync(cmd, [...args, file], { stdio: "inherit" });
+    if (r.status !== 0) return null;
+    const text = fs.readFileSync(file, "utf8").replace(/\r\n?/g, "\n");
+    const [first, ...rest] = text.split("\n");
+    if (!first.trim()) return null;
+    return { title: first.trim(), body: rest.join("\n").replace(/^\n+/, "") };
+  } catch {
+    return null;
+  } finally {
+    fs.rmSync(path.dirname(file), { recursive: true, force: true });
+  }
+}
+
 // --- Workbenches -------------------------------------------------------------------
 
 async function benchOf(client, taskId) {
@@ -361,16 +401,26 @@ async function finishFlow(client, taskId) {
   if (person) {
     const pr = await client.call("workbench_pr", { task_id: taskId });
     if (pr.via === "gh") {
-      // The description the Sheet wrote, shown before the question, and the
-      // same text passed back, so what goes to GitHub is what was read here.
-      if (pr.body) say(`\nThe pull request description:\n\n${pr.body.replace(/^/gm, "  ")}`);
-      if (await yes("Open a pull request with gh, with this description?")) {
-        const made = await client.call("workbench_pr", { task_id: taskId, create: true, ...(pr.body ? { body: pr.body } : {}) });
-        if (made.url) say(`Pull request: ${made.url}`);
-        else if (made.reason) warn(made.reason);
+      let draft = { title: pr.title, body: pr.body };
+      // Shown before the question, and the same text passed back, so what
+      // goes to GitHub is what was read here, or what the person edited.
+      showDraft(draft);
+      if (process.env.EDITOR && interactive() && await yes(`Edit the title and description in ${process.env.EDITOR} first?`)) {
+        const edited = editDraft(draft);
+        if (edited) { draft = edited; showDraft(draft); } else warn("The editor did not finish; the draft above is unchanged.");
+      }
+      if (draft.body.length > MAX_PR_BODY) {
+        draft = { ...draft, body: `${draft.body.slice(0, MAX_PR_BODY - 200).trimEnd()}\n\n(Trimmed to fit GitHub's limit; the full text is on the task's Sheet.)\n` };
+        warn(`The description was over ${MAX_PR_BODY} characters, GitHub's limit, so it was trimmed. Edit it in $EDITOR to choose what goes.`);
+      }
+      if (await yes("Open a pull request with gh, with this title and description?")) {
+        const made = await client.call("workbench_pr", { task_id: taskId, create: true, title: draft.title, body: draft.body });
+        if (made.url) say(`Pull request: ${terminalSafe(made.url)}`);
+        else if (made.reason) warn(terminalSafe(made.reason));
+        if (made.url && made.existing) say("It was already open, and keeps its own title and description.");
       }
     } else if (pr.via === "compare" && pr.url) {
-      say(`To open a pull request: ${pr.url}`);
+      say(`To open a pull request: ${terminalSafe(pr.url)}`);
     }
   }
   // Files git does not keep (an edited .env, notes in build/) are named, and

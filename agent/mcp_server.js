@@ -601,6 +601,29 @@ const ledger = ledgerCore.makeLedger({ sql });
 const SWEEP_EVERY_MS = 30000;
 const swept = new Map();
 
+// The mark sheet/run.js writes on a run it ran itself. A pull request says a
+// check "passed" only for a run carrying it (sheet/report.js byRunner), so
+// only Delphi's runner may write it: in this server that is the command line,
+// whose runner reports through these tools, and setup, which writes through
+// the store directly. An agent's run says "reported passing by" it.
+const RUNNER_KEYS = ["ran_by"];
+
+/**
+ * Refuses the runner's mark from anyone but the command line, and a change to
+ * the result of a run it marks. A courtesy like CLI_CLIENT itself, not a
+ * boundary: it stops an agent dressing up its own report as Delphi's.
+ */
+function refuseRunnerMeta(meta, entryId = null) {
+  if (CLI_CLIENT || !meta || typeof meta !== "object") return;
+  const named = RUNNER_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(meta, k));
+  if (named.length) throw new Error(`${named.join(" and ")} is written by Delphi's own runner only. Report a command you ran with state, code and dur_ms.`);
+  if (entryId == null) return;
+  const before = sheets.get(entryId);
+  const ranByDelphi = before.kind === "run" && before.meta && before.meta.ran_by === "delphi";
+  const result = ["state", "code", "exit"].filter((k) => Object.prototype.hasOwnProperty.call(meta, k));
+  if (ranByDelphi && result.length) throw new Error(`Entry ${before.id} was run by Delphi, so its ${result.join(", ")} is Delphi's to write. Run the command again for a new result.`);
+}
+
 /** A task's live Workbench, or a sentence saying it has none. */
 function benchFor(taskId) {
   const wb = benchStore.live(taskId);
@@ -1566,6 +1589,7 @@ const TOOLS = {
     },
     run: (a) => {
       if (a.kind === "ask" || a.kind === "decide") throw new Error(`Use sheet_${a.kind} for that, not sheet_append.`);
+      refuseRunnerMeta(a.meta);
       return sheets.append({ taskId: a.task_id, kind: a.kind, body: a.body, meta: a.meta ?? null,
                              refId: a.ref_id ?? null, promote: a.promote === true });
     },
@@ -1588,6 +1612,7 @@ const TOOLS = {
     run: (a) => {
       let entry = null;
       if (a.meta !== undefined || a.body !== undefined || a.promote === undefined) {
+        refuseRunnerMeta(a.meta, a.id);
         entry = sheets.update(a.id, { meta: a.meta, body: a.body });
       }
       if (a.promote !== undefined) entry = sheets.promote(a.id, a.promote === true);
@@ -1765,15 +1790,18 @@ const TOOLS = {
     run: (a) => benches.push(benchFor(a.task_id).id),
   },
   workbench_pr: {
-    description: "Where to open a pull request, or with create, open one with gh. The answer's body is the description it uses: the one given, or else the one the Sheet writes (decisions, passing checks, open questions, the diff stat).",
+    description: "Where to open a pull request, or with create, open one with gh. The answer's title and body are what it uses: the ones given, or else the ones the Sheet writes (decisions, passing checks, open questions, the diff stat). Secrets and people's numbers are redacted from both either way.",
     schema: {
       type: "object", required: ["task_id"],
       properties: {
         task_id: { type: "number" }, create: { type: "boolean" },
+        title: { type: "string", description: "The pull request title. Leave it out for the one the Sheet writes." },
         body: { type: "string", description: "The pull request description, in Markdown. Leave it out for the one the Sheet writes." },
       },
     },
-    run: (a) => benches.pr(benchFor(a.task_id).id, { create: a.create === true, body: a.body === undefined ? null : a.body }),
+    run: (a) => benches.pr(benchFor(a.task_id).id, {
+      create: a.create === true, body: a.body === undefined ? null : a.body, title: a.title === undefined ? null : a.title,
+    }),
   },
   workbench_finish_plan: {
     description: "The files git does not keep that Finish would remove, summarised by folder.",

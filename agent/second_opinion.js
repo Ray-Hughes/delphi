@@ -393,17 +393,12 @@ function capAnswer(text, { already = false } = {}) {
   return { text: `${kept}\n\n[trimmed: the answer was longer than ${Math.round(ANSWER_CAP / 1024)} KB and the rest was dropped]`, trimmed: true };
 }
 
-// Shapes a token has when it is pasted whole. Deliberately few and obvious:
-// this is a net for an answer that quoted a key file back, not a scanner, and a
-// false match costs a word of a review.
-const SECRET_SHAPES = [
-  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
-  /\bxox[abposr]-[A-Za-z0-9-]{10,}/g,
-  // To its END line, or to the end of the text when the answer was cut short.
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g,
-];
+// Shapes a token has when it is pasted whole: the list sheet/scrub.js keeps
+// for everything Delphi sends out, so a shape added there is caught here too.
+// Only the token shapes, not scrub's people's numbers or its context rules:
+// this is a net for an answer that quoted a key file back, and a false match
+// costs a word of a review.
+const { SECRET_SHAPES } = require("../sheet/scrub");
 
 /** The text with anything shaped like a token replaced, and how many were. */
 function redact(text) {

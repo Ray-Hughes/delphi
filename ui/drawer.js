@@ -1774,6 +1774,14 @@ globalThis.DelphiDrawer = (() => {
           await reload();
         } },
       ];
+      // Private keeps an entry out of every pull request description and
+      // status report (sheet/report.js), which go where this Sheet does not.
+      // Read the way the report reads it, any spelling of yes.
+      const isPrivate = Boolean(entry.meta) && /^(true|1|yes|on|y)$/i.test(String(entry.meta.private).trim());
+      items.push({ label: isPrivate ? "Allow in PR descriptions and reports" : "Keep out of PR descriptions and reports", run: async () => {
+        try { await window.delphi.sheets.setPrivate(entry.id, !isPrivate); flash(isPrivate ? "allowed in reports" : "kept out of reports"); } catch (error) { flash(String(error.message || error)); }
+        await reload();
+      } });
       // Filing is once only: a second note from the same words would be a
       // duplicate in search and in the graph.
       if (!entry.note_id) {

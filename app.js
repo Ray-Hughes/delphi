@@ -7543,7 +7543,7 @@ function closingLong(closing) {
  * which is what keeps a typed-confirm Discard from going early. Focus stays
  * inside while it is open and goes back where it was when it closes.
  */
-function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, className = "" }) {
+function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, className = "", focus: focusOn = null, beforeClose = null }) {
   return new Promise((resolve) => {
     const overlay = el("div", { className: "overlay" });
     const box = el("div", { className: `ask wb-dialog ${className}`.trim(), role: "dialog" });
@@ -7571,9 +7571,24 @@ function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, 
       if (back && typeof back.focus === "function") back.focus({ preventScroll: true });
       resolve(value);
     };
+    // beforeClose(value) may say no, for a dialog holding something a person
+    // wrote: an edited description is not lost to a stray Escape. One ask at
+    // a time, so a second Escape while it asks does nothing.
+    let asking = false;
+    const close = async (value) => {
+      if (settled || asking) return;
+      if (beforeClose) {
+        asking = true;
+        let ok = true;
+        try { ok = await beforeClose(value); } catch { ok = false; }
+        asking = false;
+        if (!ok) return;
+      }
+      finish(value);
+    };
     const buttons = actions.map((a) => {
       const b = el("button", { className: `btn ${a.kind || ""}`.trim(), textContent: a.label, type: "button" });
-      b.onclick = () => { if (!b.disabled) finish(a.value); };
+      b.onclick = () => { if (!b.disabled) close(a.value); };
       if (a.bind) a.bind(b);
       return b;
     });
@@ -7583,13 +7598,17 @@ function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, 
     const onKey = (event) => {
       if (dialogStack[dialogStack.length - 1] !== me) return;
       if (event.key === "Escape") {
+        // Escape that ends an IME composition belongs to the composition.
+        if (event.isComposing) return;
         event.preventDefault();
         event.stopPropagation();
-        finish(cancelValue);
+        close(cancelValue);
       } else if (event.key === "Enter" && !event.isComposing) {
         event.stopPropagation();
         const t = event.target;
-        const typing = t && t.tagName === "INPUT" && !["checkbox", "radio", "button", "submit"].includes(t.type);
+        // A date or time field's Enter is its own (it commits the date), not
+        // a press of the dialog's button.
+        const typing = t && t.tagName === "INPUT" && !["checkbox", "radio", "button", "submit", "date", "time", "datetime-local", "month", "week"].includes(t.type);
         if (typing) {
           event.preventDefault();
           if (primary && !primary.disabled) primary.click();
@@ -7610,10 +7629,18 @@ function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, 
     for (const node of body) if (node) box.append(node);
     box.append(el("div", { className: "ask-actions" }, buttons));
     overlay.append(box);
-    overlay.onclick = (event) => { if (event.target === overlay) finish(cancelValue); };
+    // A click outside closes it, but only one that began outside too: a text
+    // selection dragged out of the box ends on the overlay and is not a click
+    // on it.
+    let downOutside = false;
+    overlay.addEventListener("mousedown", (event) => { downOutside = event.target === overlay; });
+    overlay.onclick = (event) => { if (event.target === overlay && downOutside) close(cancelValue); downOutside = false; };
     document.body.append(overlay);
-    const focus = box.querySelector("input") || primary || buttons[buttons.length - 1];
+    const focus = focusOn || box.querySelector("input") || primary || buttons[buttons.length - 1];
     if (focus) focus.focus();
+    // A long text focused opens at its top, where reading starts, not at the
+    // caret's default end.
+    if (focus && focus.tagName === "TEXTAREA") { focus.setSelectionRange(0, 0); focus.scrollTop = 0; }
   });
 }
 
@@ -7796,21 +7823,25 @@ async function finishFlow(wbId, taskId, { title = "", after = null } = {}) {
     const plan = await wbApi.finishPlan(wbId);
     if (plan.blocked) { await wbStop(plan.blocked.code === "NESTED" ? "Other repositories are inside this folder" : "Finish cannot go ahead", plan.blocked.message, plan.nested && plan.nested.length ? plan.nested : plan.unreadable); return; }
 
-    // The description is shown on every Finish, editable, whether or not a
-    // pull request can be opened from here: written from the Sheet, it is
-    // worth copying even when the branch goes up some other way. What the
-    // person leaves in the editor is exactly what goes to gh.
+    // The title and description are shown on every Finish, editable,
+    // whether or not a pull request can be opened from here: written from
+    // the Sheet, they are worth copying even when the branch goes up some
+    // other way. What the person leaves in them is exactly what goes to gh.
     const pr = await wbApi.pr(wbId);
-    const ed = DelphiReport.editor(pr.body);
+    const ed = DelphiReport.editor(pr.body, { title: pr.title });
     const go = await wbDialog({
       title: pr.via ? "Open a pull request?" : "PR description",
       lead: pr.via === "gh"
-        ? "The branch is on the remote. GitHub's command line can open the pull request with this description, or find the one already open, which keeps its own."
+        ? "The branch is on the remote. GitHub's command line can open the pull request with this title and description, or find the one already open, which keeps its own."
         : pr.via
         ? "The branch is on the remote. This opens the host's page for starting a pull request, with the description copied to paste in."
         : `${pr.reason || "No pull request can be opened from here."} Copy the description to use it later.`,
       body: [ed.node],
       className: "rp-dialog",
+      focus: ed.area,
+      // Cancel, Escape, a click outside and "Finish without one" all leave
+      // the text behind, so an edited one is asked about first.
+      beforeClose: (value) => (value === "pr" ? true : ed.confirmDiscard()),
       actions: pr.via
         ? [{ label: "Cancel", value: null }, { label: "Finish without one", value: "skip" }, { label: "Open pull request", value: "pr", kind: "primary" }]
         : [{ label: "Cancel", value: null }, { label: "Finish", value: "skip", kind: "primary" }],
@@ -7818,22 +7849,28 @@ async function finishFlow(wbId, taskId, { title = "", after = null } = {}) {
     if (!go) return;
     if (go === "pr") {
       const body = ed.value();
-      // The dialog is gone by now, so a failure keeps the person's edits on
-      // the clipboard rather than losing them with it.
-      const keepEdits = async () => { try { await navigator.clipboard.writeText(body); return " Your description is on the clipboard."; } catch { return ""; } };
-      let made;
-      try { made = await wbApi.pr(wbId, { create: true, body }); } catch (error) {
-        notifyError(`${error.message || error}${await keepEdits()}`);
-        return;
-      }
+      const prTitle = ed.titleValue();
+      let made = null;
+      let failed = null;
+      try { made = await wbApi.pr(wbId, { create: true, body, title: prTitle }); } catch (error) { failed = error.message || String(error); }
       // No pull request and no page to open one on: stop here, with the
       // folder still in place, rather than finish as though it had worked.
-      if (!made.url) { notifyError(`${made.reason || "Could not open a pull request."}${await keepEdits()}`); return; }
-      // A compare page cannot be handed a description, so it goes on the
-      // clipboard for the person to paste.
-      if (made.via === "compare") {
-        try { await navigator.clipboard.writeText(body); notify("The description is copied. Paste it into the pull request page."); } catch {}
+      // The dialog is gone by now, so the text comes back in one of its own
+      // rather than trusting the clipboard after a network wait.
+      if (failed || !made.url) {
+        await DelphiReport.keep({ title: "The pull request was not opened", reason: failed || made.reason || "Could not open a pull request.", body, prTitle });
+        return;
       }
+      // A compare page cannot be handed a description, so it goes on the
+      // clipboard for the person to paste, and when that fails they are told
+      // and shown it.
+      if (made.via === "compare") {
+        let copied = false;
+        try { await navigator.clipboard.writeText(body); copied = true; } catch {}
+        if (copied) notify("The description is copied. Paste it into the pull request page.");
+        else await DelphiReport.keep({ title: "Copy the description", reason: "The clipboard could not be written. Copy it from here, then paste it into the pull request page.", body, prTitle });
+      }
+      if (made.existing) notify("A pull request was already open for this branch; it keeps its own title and description.");
       window.delphi.openExternal(made.url);
       if (made.reason) notify(made.reason);
     }

@@ -51,6 +51,8 @@ contextBridge.exposeInMainWorld("delphi", {
     read: (taskId, opts) => call("sheet:read", taskId, opts),
     append: (taskId, payload) => call("sheet:append", taskId, payload),
     promote: (id, on) => call("sheet:promote", id, on),
+    // Kept out of pull request descriptions and status reports (sheet/report.js).
+    setPrivate: (id, on) => call("sheet:private", id, on),
     file: (id, kind, title) => call("sheet:file", id, kind, title),
     ask: (taskId, question, options) => call("sheet:ask", taskId, question, options),
     decide: (askId, choice, why) => call("sheet:decide", askId, choice, why),
