@@ -34,6 +34,7 @@ const naming = require("./naming");
 const setupMod = require("./setup");
 const defaultGit = require("./git");
 const keep = require("./keep");
+const { checkBody } = require("../sheet/report");
 
 // Status is asked for on every repaint of a task panel and every row of the
 // Overview, and each answer is three or four git processes. Ten seconds is
@@ -430,6 +431,9 @@ function createWorkbench({
   settings = () => ({}),
   logDir = null,
   onEvent = null,
+  // sheet/report.js made over the same sql, for a pull request's description.
+  // Without one the description is the single line it always was.
+  report = null,
   env = process.env,
   // The app empties a moved-aside folder behind the call, since deleting a
   // big tree can take minutes; everyone else waits for it.
@@ -891,31 +895,55 @@ function createWorkbench({
   }
 
   /**
+   * The pull request description the Sheet writes for this Workbench's task,
+   * with the branch's diff stat against base. A draft for a person to edit:
+   * Finish shows it, and nothing posts it without them.
+   */
+  async function prBody(id) {
+    const wb = requireOpen(store.get(id));
+    const fallback = `From Delphi task ${wb.task_id}.`;
+    if (!report) return fallback;
+    let diffStat = null;
+    if (typeof git.diffStat === "function") {
+      try { diffStat = await git.diffStat(wb.path, await git.baseRef(wb.path, wb.base)); } catch { diffStat = null; }
+    }
+    // A Sheet the builder cannot read costs the description, never the pull request.
+    try { return report.prDescription(wb.task_id, { diffStat }); } catch { return fallback; }
+  }
+
+  /**
    * Where to open a pull request. With create, gh opens it (or finds the one
    * already open). Without, this only says which way it would go, so a surface
    * can label its button before anything happens.
+   *
+   * body is the description a person edited. Without one it is the one the
+   * Sheet writes (prBody), and every answer carries the body that would be
+   * used, so an agent or the Finish dialog can show it before anything is
+   * opened. A pull request gh finds already open keeps its own description.
    */
-  async function pr(id, { create: make = false } = {}) {
+  async function pr(id, { create: make = false, body = null } = {}) {
+    const given = checkBody(body);
     const wb = requireOpen(store.get(id));
+    const text = given === null ? await prBody(id) : given;
     const st = await statusOf(wb, { fresh: true });
-    if (!st.hasRemoteBranch) return { url: null, via: null, reason: "Push the branch first: a pull request needs it on the remote." };
+    if (!st.hasRemoteBranch) return { url: null, via: null, body: text, reason: "Push the branch first: a pull request needs it on the remote." };
     const tool = git.gh();
     let reason = null;
     if (tool.available && tool.authed) {
-      if (!make) return { url: null, via: "gh", reason: null };
+      if (!make) return { url: null, via: "gh", body: text, reason: null };
       const task = store.task(wb.task_id);
       const ticket = naming.ticketOf(task.ref);
       const made = await git.prCreate(wb.path, {
         base: wb.base, branch: wb.branch,
         title: ticket ? `${ticket} ${task.title}` : task.title,
-        body: `From Delphi task #${task.id}.`,
+        body: text,
       });
-      if (made.ok) return { url: made.url, via: "gh", reason: null };
+      if (made.ok) return { url: made.url, via: "gh", body: text, reason: null };
       reason = made.reason;
     }
     const url = git.compareUrl(await git.remoteUrl(wb.path), wb.base, wb.branch);
-    if (url) return { url, via: "compare", reason };
-    return { url: null, via: null, reason: reason || "Could not tell where this remote opens pull requests. Open one on the host's website." };
+    if (url) return { url, via: "compare", body: text, reason };
+    return { url: null, via: null, body: text, reason: reason || "Could not tell where this remote opens pull requests. Open one on the host's website." };
   }
 
   // ---------------------------------------------------------------------------
@@ -1578,7 +1606,7 @@ function createWorkbench({
   }
 
   return {
-    candidates, start, status, forTask, list, park, resume, update, commit, push, pr,
+    candidates, start, status, forTask, list, park, resume, update, commit, push, pr, prBody,
     finishPlan,
     finish, markFinished, discardPlan, discard, markDiscarded, recreate, intent: intentFor, forget: forgetBench, housekeep, advanced,
     get: (id) => store.get(id), live: (taskId) => store.live(taskId),

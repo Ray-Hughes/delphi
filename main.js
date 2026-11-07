@@ -1097,6 +1097,9 @@ const sheetRun = require("./sheet/run");
 // click's step id with whatever else that click wrote. See agent/audit.js.
 const sheets = makeSheetStore({ sql: db.sqlP, batch: db.batchP, actor: "you", authorType: "human", step: db.currentStep });
 const SHEET_LOG_DIR = path.join(paths.DATA_DIR, "sheets");
+// Pull request descriptions and status reports, written from the Sheet. Read
+// only, and never posted from here: the window shows them to be edited.
+const sheetReport = require("./sheet/report").makeReport({ sql: db.sqlP });
 // The tail of a log the rail will show. A build log can be hundreds of
 // megabytes, and the end is where the error is.
 const SHEET_LOG_LIMIT = 200 * 1024;
@@ -1289,6 +1292,7 @@ const benchStore = makeWorkbenchStore({ sql: db.sqlP, actor: "you", who: { actor
 const benches = createWorkbench({
   store: benchStore,
   sheet: sheets,
+  report: sheetReport,
   runEntry: sheetRun.runEntry,
   logDir: SHEET_LOG_DIR,
   settings: () => settings,
@@ -1416,7 +1420,16 @@ handle("workbench:resume", benchWrite((id) => benches.resume(id)));
 handle("workbench:update", benchWrite((id) => benches.update(id)));
 handle("workbench:commit", (id, message) => benches.commit(id, message));
 handle("workbench:push", (id) => benches.push(id));
-handle("workbench:pr", (id, opts = {}) => benches.pr(id, { create: Boolean(opts && opts.create) }));
+// opts.body is the description as the person left it in the Finish dialog;
+// without it the Sheet's own draft is used.
+handle("workbench:pr", (id, opts = {}) => benches.pr(id, {
+  create: Boolean(opts && opts.create),
+  body: opts && typeof opts.body === "string" ? opts.body : null,
+}));
+handle("report:status", (projectId, range = {}) => sheetReport.statusReport(projectId, {
+  from: range && typeof range.from === "string" ? range.from : null,
+  to: range && typeof range.to === "string" ? range.to : null,
+}));
 // opts.confirm is the person's "these exact files can go": the token from
 // finishPlan (or an IGNORED refusal's details), passed back as given. A list
 // that changed since it was shown refuses with IGNORED again.

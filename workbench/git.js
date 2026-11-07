@@ -473,6 +473,28 @@ async function countCommits(dir, args) {
 }
 
 /**
+ * What the branch changes against base, per file, for a pull request's
+ * Changes section: [{ path, added, deleted }], with null counts for a binary
+ * file. Three dots, so the comparison is with where the branch left base and
+ * a colleague's later commits on base are not counted as this branch's.
+ * Commits only: a pull request carries nothing that is not committed. Renames
+ * are not followed, which keeps each record one path long. null when git
+ * cannot say.
+ */
+async function diffStat(dir, onto) {
+  if (!onto) return null;
+  const result = await run(dir, ["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", `${onto}...HEAD`]);
+  if (!result.ok) return null;
+  const files = [];
+  for (const rec of result.stdout.split("\0")) {
+    const m = /^(-|\d+)\t(-|\d+)\t([\s\S]+)$/.exec(rec);
+    if (!m) continue;
+    files.push({ path: m[3], added: m[1] === "-" ? null : Number(m[1]), deleted: m[2] === "-" ? null : Number(m[2]) });
+  }
+  return { files };
+}
+
+/**
  * Commits on a branch that exist nowhere else: on no remote and on no other
  * local branch. This is what Discard would destroy by deleting the branch, so
  * it is what Discard lists.
@@ -690,7 +712,7 @@ module.exports = {
   toplevel, mainCheckout, isBare, isLinkedWorktree, hasSubmodules, hasRemote, refExists, defaultBranch, baseRef,
   fetch, fetchBranch, remoteUrl,
   parseWorktrees, worktreeList, branchState, worktreeAdd, worktreeRemove, worktreePrune, forgetRegistration,
-  parseStatusFiles, parseIndexFlags, status, operation, lonelyCommits, ignoredPaths, countCommits, localOnlyCommits,
+  parseStatusFiles, parseIndexFlags, status, operation, lonelyCommits, ignoredPaths, countCommits, localOnlyCommits, diffStat,
   commitAll, push, pullRebase, deleteBranch,
   compareUrl, gh, prCreate, plain,
 };
