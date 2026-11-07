@@ -260,6 +260,9 @@ globalThis.DelphiMemory = (() => {
     if (why) b.append(whyChip(why));
     b.append(el("span", { className: "grow" }));
     const meta = el("span", { className: "mm-meta" });
+    // Inside the row's own button, so the words only; the drawer has the Move.
+    const routed = globalThis.DelphiFolderList ? DelphiFolderList.chip("note", n, { passive: true }) : null;
+    if (routed) meta.append(routed);
     if (Number(n.associated)) meta.append(fromChip(n.project_id, n.home_name));
     else if (!inProject) meta.append(projectChip(n.project_id, n.home_name));
     meta.append(el("span", { className: "mm-age", textContent: age(n.updated_at) }));

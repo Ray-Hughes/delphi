@@ -37,11 +37,28 @@ kbd { font: 500 10.5px/1 var(--mono); color: var(--ink-faint); border: 1px solid
 .top-row > *:not(.grow) { -webkit-app-region: no-drag; }
 /* With a popover open, a click anywhere has to reach the page to close it. */
 body.pop-open .top-row { -webkit-app-region: no-drag; }
-/* Room for the window buttons, on whichever side the platform puts them.
-   The class comes from the main process, the only place that knows. */
-body.mac .top-row { padding-left: 84px; }
-body.overlay .top-row { padding-right: 148px; }
-body.panel .top-row { padding-left: 12px; }
+/* The window's own chrome: what the system draws over the top of the page,
+   and so what the page has to keep clear of. The classes come from the main
+   process, the only place that knows the platform and the state.
+
+   --chrome-left and --chrome-right are the room the top row leaves for the
+   window buttons. --chrome-top is how far down a layer that starts at the top
+   of the window (a dialog, Settings, the weekly review) has to begin to clear
+   them. --chrome-gap is extra room above the top row itself.
+
+   macOS draws its traffic lights at 16,17, 14px square and 23px apart (main.js,
+   TRAFFIC_LIGHTS), so their middle is the middle of the 48px row and the third
+   ends at 76: the row starts 12px after that. A panel is a hiddenInset window
+   too (main.js chromeFor), lights and all, so it gets the same room. Windows
+   draws its overlay over the right 148px and the top 46px. In full screen on macOS the lights go and
+   the menu bar comes instead, sliding over the top 24px whenever the pointer
+   touches the edge, so the whole bar moves down out of that strip. */
+body { --chrome-left: 0px; --chrome-right: 0px; --chrome-top: 0px; --chrome-gap: 0px; }
+body.mac { --chrome-left: 88px; --chrome-top: 40px; }
+body.overlay { --chrome-right: 148px; --chrome-top: 46px; }
+body.mac.is-fullscreen { --chrome-left: 0px; --chrome-top: 24px; --chrome-gap: 24px; }
+.top { padding-top: var(--chrome-gap); }
+.top-row { padding-left: max(12px, var(--chrome-left)); padding-right: max(14px, var(--chrome-right)); }
 .top .grow { flex: 1; }
 .top-mark { width: 26px; height: 26px; border-radius: 7px; flex: none; }
 
@@ -186,12 +203,21 @@ body.panel .top-row { padding-left: 12px; }
 .tag.red { color: var(--crit-ink); background: var(--crit-soft); }
 .pal-empty { padding: 14px; color: var(--ink-faint); font-size: 12.5px; }
 
-.switcher { width: 480px; max-height: min(640px, calc(100vh - 80px)); }
-.sessions-pop { width: 320px; max-height: min(560px, calc(100vh - 120px)); padding: 6px 0; }
+/* --pop-top is where ui/topbar.js placed it; the rest of the window, less a
+   margin, is all it may take. */
+.switcher { width: 480px; max-height: min(640px, calc(100vh - var(--pop-top, 80px) - 16px)); }
+.sessions-pop { width: 320px; max-height: min(560px, calc(100vh - var(--pop-top, 120px) - 16px)); padding: 6px 0; }
 
 /* The bar: centred, over a scrim the click closes. */
 .pal-scrim { position: fixed; inset: 0; z-index: 59; background: transparent; }
-.cmdk { top: 96px; left: 50%; width: 640px; margin-left: -320px; max-height: calc(100vh - 140px); }
+/* Closer to the top on a short window, and never taller than what is left
+   below it: the list scrolls inside, and the field it hangs from stays put. */
+.cmdk {
+  --cmdk-top: calc(var(--chrome-gap) + min(96px, 12vh));
+  top: var(--cmdk-top); left: 50%; width: 640px; margin-left: -320px;
+  max-height: calc(100vh - var(--cmdk-top) - 24px);
+}
+.cmdk .pal-list { flex: 1 1 auto; }
 .cmdk .pop-search { height: 52px; }
 .cmdk .pop-search input { font-size: 15px; }
 .cmdk .pop-search > svg.i { color: var(--ink-faint); }

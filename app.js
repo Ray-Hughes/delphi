@@ -243,8 +243,8 @@ function askText({ title, label, value = "", placeholder = "", confirmLabel = "C
       finish(text);
     };
 
-    // Captured on the document, because the window-level handler treats Escape as
-    // "hide the window" and would take the whole app away instead of this box.
+    // Captured on the document, so one Escape closes this box and nothing
+    // behind it: the drawer or Focus underneath would otherwise close too.
     const onKey = (event) => {
       if (dialogStack[dialogStack.length - 1] !== me) return;
       if (event.key === "Escape") {
@@ -513,24 +513,37 @@ let travelling = false;
 
 /**
  * Where the page was, put back after a drawer closes or Back lands: the
- * scroll, and the row the keyboard was on. Applied now and again after the
- * next render, because closing a drawer often repaints the page under it.
+ * scroll (null leaves it where it is), and the row the keyboard was on.
+ * Applied now, on the next frame, and once more after the next render if one
+ * comes within 1.5 seconds, because closing a drawer often repaints the page
+ * under it. Never again after that: scrolling done since is the reader's.
  */
 let viewRestore = null;
 function restoreView(snap) {
   if (!snap) return;
-  viewRestore = { scroll: Number(snap.scroll) || 0, lit: snap.lit || null, until: Date.now() + 1500 };
-  applyRestore();
-  requestAnimationFrame(applyRestore);
+  viewRestore = { scroll: snap.scroll == null ? null : Number(snap.scroll) || 0, lit: snap.lit || null, until: Date.now() + 1500 };
+  applyRestore(false);
+  requestAnimationFrame(() => applyRestore(false));
 }
-function applyRestore() {
+function applyRestore(rendered = true) {
   if (!viewRestore) return;
   if (Date.now() > viewRestore.until) { viewRestore = null; return; }
   const c = $("content");
   if (!c) return;
-  c.scrollTop = viewRestore.scroll;
-  if (viewRestore.lit) {
-    const row = c.querySelector(`[data-task-id="${CSS.escape(String(viewRestore.lit))}"]`);
+  const snap = viewRestore;
+  if (rendered) {
+    viewRestore = null;
+    // Once more on the next frame, for a view still growing when it resolved.
+    requestAnimationFrame(() => {
+      const again = $("content");
+      if (!again) return;
+      if (snap.scroll != null) again.scrollTop = snap.scroll;
+    });
+  }
+  if (snap.scroll != null) c.scrollTop = snap.scroll;
+  const lit = snap.lit;
+  if (lit) {
+    const row = c.querySelector(`[data-task-id="${CSS.escape(String(lit))}"]`);
     if (row) { for (const n of c.querySelectorAll(".kbd-hi")) n.classList.remove("kbd-hi"); row.classList.add("kbd-hi"); }
   }
 }
@@ -593,6 +606,14 @@ function showTasks(filter) {
   refresh();
 }
 
+/** Back and Forward in the head, shown only when there is somewhere to go. */
+function paintBackForward() {
+  $("back").hidden = state.history.length === 0;
+  $("back").title = `Back (${isMac() ? "Command" : "Ctrl"} + [)`;
+  $("fwd").hidden = state.future.length === 0;
+  $("fwd").title = `Forward (${isMac() ? "Command" : "Ctrl"} + ])`;
+}
+
 function goBack() { return travel(state.history, state.future); }
 function goForward() { return travel(state.future, state.history); }
 
@@ -603,6 +624,9 @@ function goForward() { return travel(state.future, state.history); }
  * opened from, scrolled where it was; Forward opens it again.
  */
 async function travel(from, to) {
+  // One step at a time: a second Back while the first is still closing a
+  // drawer or painting would read a stop that is half the old one.
+  if (travelling) return false;
   const here = stop();
   let target = from.pop();
   while (target && sameStop(target, here)) target = from.pop();
@@ -1102,6 +1126,8 @@ function renderTabs() {
 function paintCrumbs(place) {
   const box = $("crumbs");
   if (!box) return;
+  // Rebuilt on every render, so a keyboard user on a crumb is put back on it.
+  const focused = box.contains(document.activeElement) ? document.activeElement.textContent : null;
   box.textContent = "";
   box.hidden = !place;
   if (!place) return;
@@ -1119,6 +1145,7 @@ function paintCrumbs(place) {
   const now = el("span", { className: "crumb-now here", textContent: place.here });
   now.setAttribute("aria-current", "page");
   box.append(now);
+  if (focused) [...box.querySelectorAll("button.crumb")].find((n) => n.textContent === focused)?.focus({ preventScroll: true });
 }
 
 /**
@@ -1186,10 +1213,7 @@ function render() {
 
   // Hidden rather than disabled when there is nowhere to go: a button that is
   // always present but usually dead trains people to stop looking at it.
-  $("back").hidden = state.history.length === 0;
-  $("back").title = `Back (${isMac() ? "Command" : "Ctrl"} + [)`;
-  $("fwd").hidden = state.future.length === 0;
-  $("fwd").title = `Forward (${isMac() ? "Command" : "Ctrl"} + ])`;
+  paintBackForward();
 
   renderMetrics();
   paintTitleLive();
@@ -1269,8 +1293,7 @@ function render() {
   // that appends and then measures can still be growing when the promise
   // resolves.
   const restoreScroll = () => {
-    applyRestore();
-    requestAnimationFrame(applyRestore);
+    applyRestore(true);
     if (!previousScroll || content !== $("content")) return;
     content.scrollTop = previousScroll;
     requestAnimationFrame(() => {
@@ -1869,9 +1892,22 @@ function renderProjectSettings(root) {
   // sends people here, so it has to be here.
   const folderList = el("div");
   DelphiFolderList.mount(folderList, project, { onChanged: () => refresh() });
+  // Words that name this project in a branch beside its key: ssnr for SSNR
+  // when its key is ssnr-mpi, say. Read by workbench/route.js.
+  const aliasMsg = el("span", { className: "hint" });
+  const aliasInput = commitOnEnter(el("input", { className: "field", value: project.aliases || "", placeholder: "ssnr, person-update", spellcheck: false }));
+  aliasInput.setAttribute("aria-label", "Also matches branches containing");
+  aliasInput.onblur = () => {
+    const live = currentProject();
+    if (!live || aliasInput.value.trim() === (live.aliases || "")) return;
+    save({ aliases: aliasInput.value }, aliasMsg);
+  };
+  const aliasRow = el("label", { className: "fl-alias" },
+    el("span", { className: "fl-alias-k", textContent: "Also matches branches containing" }), aliasInput,
+    el("span", { className: "hint", textContent: "Comma-separated whole words. A branch or commit with one of them is filed here when an agent works in a shared folder." }), aliasMsg);
   const folderBox = settingSection("Folders",
     "Where agents work on this project. Home is where its jobs, runs and sessions start; a task can name another of its folders for its Workbench. Another project can share a folder: when an agent files something there without saying which project, Delphi works it out and says how.",
-    folderList);
+    folderList, aliasRow);
   folderBox.id = "project-folder";
   root.append(folderBox);
 
@@ -2085,9 +2121,8 @@ async function destroyProject(project, onError = (error) => alert(error.message)
  * key to be typed: the point is to make it impossible to do by reflex, and the
  * key is short, immutable and printed a few lines above on the same pane.
  *
- * Escape is captured on the document exactly the way askText captures it. The
- * window-level handler treats Escape as "hide the window", so without this the
- * whole app disappears rather than the dialog.
+ * Escape is captured on the document exactly the way askText captures it, so
+ * it closes the dialog and nothing behind it.
  */
 function confirmDestroy({ project, counts }) {
   return new Promise((resolve) => {
@@ -3560,8 +3595,7 @@ function openViewMenu(trigger, land = "current") {
     const at = rows.indexOf(document.activeElement);
 
     if (e.key === "Escape") {
-      // Escape reaches the window handler otherwise, and hides the whole panel
-      // when all that was wanted was to shut this.
+      // Stopped here, so shutting this does not also close what is behind it.
       e.preventDefault();
       e.stopPropagation();
       dismiss();
@@ -5112,6 +5146,8 @@ function padPane() {
   // Delete is in the Item menu, with Move, Copy, Also belongs to and Flag.
   const padItem = itemOf("scratchpad", pad);
   if (padItem.associated) head.insertBefore(fromChip(padItem), seg);
+  const routedPad = DelphiFolderList.chip("scratchpad", pad);
+  if (routedPad) head.insertBefore(routedPad, seg);
   head.append(itemMoreButton(padItem));
   pane.append(head);
 
@@ -5381,6 +5417,8 @@ function noteCard(n) {
   // shown here from another project says what deleting it would really do.
   const item = itemOf("note", n);
   if (item.associated) head.insertBefore(fromChip(item), kind);
+  const routedNote = DelphiFolderList.chip("note", n);
+  if (routedNote) head.insertBefore(routedNote, kind);
   head.append(itemMoreButton(item));
   wrap.append(head);
   wrap.dataset.row = `note-${n.id}`;
@@ -5471,8 +5509,8 @@ function noteCard(n) {
     };
     head.insertBefore(done, expand);
 
-    // Escape leaves the note rather than the window. Without this it reaches the
-    // document handler, which hides the whole app.
+    // Escape leaves the note and nothing else: stopped here, so the layer
+    // behind it stays open.
     body.addEventListener("keydown", async (event) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
@@ -7659,9 +7697,13 @@ function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, 
     // A click outside closes it, but only one that began outside too: a text
     // selection dragged out of the box ends on the overlay and is not a click
     // on it.
+    // Both ends of the click on the overlay: a drag from inside out, or from
+    // outside in, is a selection or a slip, not a dismissal.
     let downOutside = false;
+    let upOutside = false;
     overlay.addEventListener("mousedown", (event) => { downOutside = event.target === overlay; });
-    overlay.onclick = (event) => { if (event.target === overlay && downOutside) close(cancelValue); downOutside = false; };
+    overlay.addEventListener("mouseup", (event) => { upOutside = event.target === overlay; });
+    overlay.onclick = (event) => { if (event.target === overlay && downOutside && upOutside) close(cancelValue); downOutside = false; upOutside = false; };
     document.body.append(overlay);
     const focus = focusOn || box.querySelector("input") || primary || buttons[buttons.length - 1];
     if (focus) focus.focus();
@@ -7891,11 +7933,13 @@ async function finishFlow(wbId, taskId, { title = "", after = null } = {}) {
       // A compare page cannot be handed a description, so it goes on the
       // clipboard for the person to paste, and when that fails they are told
       // and shown it.
+      // made.title and made.body are what the main process scrubbed, so
+      // what is pasted is what would have been sent.
       if (made.via === "compare") {
         let copied = false;
-        try { await navigator.clipboard.writeText(body); copied = true; } catch {}
-        if (copied) notify("The description is copied. Paste it into the pull request page.");
-        else await DelphiReport.keep({ title: "Copy the description", reason: "The clipboard could not be written. Copy it from here, then paste it into the pull request page.", body, prTitle });
+        try { await navigator.clipboard.writeText(`${made.title}\n\n${made.body}`); copied = true; } catch {}
+        if (copied) notify("The title and description are copied, the title on the first line. Paste them into the pull request page.");
+        else await DelphiReport.keep({ title: "Copy the description", reason: "The clipboard could not be written. Copy it from here, then paste it into the pull request page.", body: made.body, prTitle: made.title });
       }
       if (made.existing) notify("A pull request was already open for this branch; it keeps its own title and description.");
       window.delphi.openExternal(made.url);
@@ -8475,7 +8519,9 @@ async function openTaskSheet(taskId) {
     const from = stop();
     const opened = await DelphiDrawer.open(taskId);
     const now = drawerTask();
-    if (!travelling && now != null && now !== from.drawer) { remember(from); render(); }
+    // Only the Back and Forward buttons change: a full render would replace
+    // the page under the drawer, and lose what Escape is meant to come back to.
+    if (!travelling && now != null && now !== from.drawer) { remember(from); paintBackForward(); }
     return opened;
   }
   if (openSheet) await openSheet.close();
@@ -11222,8 +11268,8 @@ function openModal({ className, label, onKey = null }) {
     if (returnTo && returnTo.isConnected && typeof returnTo.focus === "function") returnTo.focus({ preventScroll: true });
     settle(value);
   };
-  // Captured on the document, as askText does: the window's own handler
-  // treats Escape as "hide the window".
+  // Captured on the document, as askText does, so one Escape closes this
+  // dialog and nothing behind it.
   const key = (event) => {
     if (dialogStack[dialogStack.length - 1] !== me) return;
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); finish(null); return; }
@@ -14448,7 +14494,8 @@ document.addEventListener("keydown", (e) => {
   // old full panel, which is still modal.
   const drawerOnly = openSheet && drawerTask() != null;
   const typingNow = (() => { const t = e.target; return Boolean(t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))); })();
-  const backKey = modKey(e) && !e.shiftKey && (e.key === "[" || e.key === "ArrowLeft");
+  // Cmd+Left and Cmd+Right in a text box move to the start and end of the line.
+  const backKey = modKey(e) && !e.shiftKey && (e.key === "[" || (e.key === "ArrowLeft" && !typingNow));
   const forwardKey = modKey(e) && !e.shiftKey && (e.key === "]" || (e.key === "ArrowRight" && !typingNow));
   if ((backKey || forwardKey) && (!openSheet || drawerOnly) && !(drawerOnly && typingNow)) {
     e.preventDefault();
@@ -14466,8 +14513,11 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (e.key === "Escape") {
-    // The sheet is the innermost thing open, so it closes first. Without this,
-    // Escape would hide the whole window and lose unsaved edits.
+    // The bottom of the Escape stack. Every layer above the page (the bar,
+    // a popover, a menu, a dialog, Settings, the weekly review, Focus) takes
+    // its own Escape in the capture phase and stops it, so one press closes
+    // one layer, innermost first. What reaches here found nothing open but
+    // the sheet, or nothing at all.
     if (openSheet) { openSheet.close(); return; }
     if ($("search").value) {
       $("search").value = "";
@@ -14476,7 +14526,10 @@ document.addEventListener("keydown", (e) => {
       refresh();
       return;
     }
-    window.delphi.hide();
+    // With nothing left to close, Escape does nothing, in a panel too. It
+    // used to hide the window, so pressing it a few times too often, which is
+    // what people do to get back to the page, made the whole app vanish as if
+    // it had quit. A panel still goes by its hotkey, the tray, or a click away.
   }
   // Only where there are two panes to flip between.
   if ((e.metaKey || e.ctrlKey) && e.key === "j" && state.view === "chat") {
@@ -14491,11 +14544,15 @@ document.addEventListener("keydown", (e) => {
 // leave room for them. Which side needs the room at all is a platform question:
 // macOS puts its traffic lights on the left of our bar, Windows puts the system
 // control overlay on the right of it.
-window.delphi.onMode(({ panelMode, platform, overlay }) => {
+window.delphi.onMode(({ panelMode, platform, overlay, fullScreen }) => {
   document.body.classList.toggle("panel", panelMode);
   document.body.classList.toggle("mac", platform === "darwin");
   document.body.classList.toggle("overlay", overlay === true);
+  document.body.classList.toggle("is-fullscreen", fullScreen === true);
 });
+// In full screen the traffic lights are gone and the menu bar drops over the
+// top of the page instead; styles/topbar.css moves everything clear of it.
+window.delphi.onFullScreen((on) => document.body.classList.toggle("is-fullscreen", on));
 
 // ---------------------------------------------------------------------------
 // The application menu

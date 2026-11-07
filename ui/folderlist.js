@@ -145,10 +145,19 @@ globalThis.DelphiFolderList = (() => {
   }
   const routeOf = (entity, id) => routes.get(`${entity}:${Number(id)}`) || null;
 
-  /** The chip for an item Delphi filed by a guess, or null. */
-  function chip(entity, item) {
+  /**
+   * The chip for an item Delphi filed by a guess, or null. passive gives the
+   * words alone, for a place that is itself a button (a Memory row), where a
+   * button inside would be one control inside another.
+   */
+  function chip(entity, item, { passive = false } = {}) {
     const r = item ? routeOf(entity, item.id) : null;
     if (!r) return null;
+    if (passive) {
+      const s = el("span", { className: "route-chip passive" }, I("folder", "xs"), el("span", { textContent: r.words }));
+      s.dataset.route = `${entity}:${item.id}`;
+      return s;
+    }
     const b = el("button", { className: "route-chip", type: "button" }, I("folder", "xs"), el("span", { textContent: r.words }));
     b.dataset.route = `${entity}:${item.id}`;
     b.title = `An agent filed this from ${r.shown} without naming a project, and ${r.shown} is ${[r.project_name, ...r.others.map((o) => o.name)].join(" and ")}'s. Click to move it or keep it here.`;

@@ -205,8 +205,8 @@ globalThis.DelphiPalette = (() => {
       paint();
     }
 
-    // Capture, so nothing behind the bar sees these keys: app.js's Escape
-    // hides the whole window when nothing else is open.
+    // Capture, so nothing behind the bar sees these keys: one Escape closes
+    // the bar and nothing under it.
     function trap(e) {
       if (!current) return;
       // Escape while an input method is composing cancels the composition and

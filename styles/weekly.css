@@ -21,9 +21,9 @@
 .wk-ib { display: inline-flex; align-items: center; gap: 6px; }
 
 /* The panel */
-.wk-scrim.overlay { z-index: 55; padding: 0; background: var(--scrim); backdrop-filter: blur(2px); }
+.wk-scrim.overlay { z-index: 55; padding: var(--chrome-top) 0 0; background: var(--scrim); backdrop-filter: blur(2px); }
 @media (prefers-reduced-transparency: reduce) { .wk-scrim.overlay { backdrop-filter: none; } }
-.wk { width: min(860px, calc(100vw - 48px)); height: min(820px, calc(100vh - 48px));
+.wk { width: min(860px, calc(100vw - 48px)); height: min(820px, calc(100vh - 48px - var(--chrome-top)));
   display: grid; grid-template-rows: auto minmax(0, 1fr) 50px;
   background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 14px;
   box-shadow: var(--shadow-3); overflow: hidden; font-size: 13px; line-height: 1.45;
@@ -225,3 +225,11 @@
   .wk-tf { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .wk-sugbar { flex-wrap: wrap; }
 }
+
+/* The once-only question before titles go to a model off this computer. */
+.wk-consent { margin: 0 0 10px; padding: 12px 14px; border: 1px solid var(--accent-line); border-radius: var(--r-lg);
+  background: linear-gradient(100deg, var(--accent-soft), transparent 70%), var(--surface); }
+.wk-consent b { display: block; font-size: 13px; color: var(--ink); }
+.wk-consent p { margin: 4px 0 10px; font-size: 12.5px; color: var(--ink-dim); line-height: 1.45; }
+.wk-linkish { padding: 0; border: 0; background: none; color: var(--accent-ink); font: inherit; font-size: 12.5px;
+  text-decoration: underline; text-underline-offset: 3px; }

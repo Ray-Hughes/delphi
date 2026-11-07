@@ -169,9 +169,23 @@ function openDatabase() {
         // out version produced, so nothing downstream has to know which is in use.
         return handle.prepare(statement).all();
       },
-      // Several statements as one unit, for a move that must land whole. A
-      // savepoint so it nests if a caller ever holds a transaction already.
+      // Several statements as one unit, for a move that must land whole. At the
+      // top, the write lock first (BEGIN IMMEDIATE, as the binary route's
+      // script does): a deferred savepoint reads under a snapshot that another
+      // writer can make stale before its first write. A savepoint when a
+      // caller already holds a transaction.
       batch(statements) {
+        if (handle.isTransaction === false) {
+          handle.exec("BEGIN IMMEDIATE");
+          try {
+            for (const statement of statements) handle.prepare(statement).all();
+            handle.exec("COMMIT");
+          } catch (error) {
+            try { handle.exec("ROLLBACK"); } catch {}
+            throw error;
+          }
+          return;
+        }
         handle.exec("SAVEPOINT delphi_batch");
         try {
           for (const statement of statements) handle.prepare(statement).all();
@@ -630,6 +644,24 @@ function refuseRunnerMeta(meta, entryId = null, body = undefined) {
   if (ranByDelphi && result.length) throw new Error(`Entry ${before.id} was run by Delphi, so its ${result.join(", ")} is Delphi's to write. Run the command again for a new result.`);
 }
 
+/**
+ * Keeping an entry out of pull requests and status reports is a person's
+ * call, made from the Sheet's menu in the window (sheet:private) or at the
+ * command line. An agent setting meta.private on an existing entry could
+ * undo it, so the key is refused here from anyone else, the way ran_by is.
+ * An entry an agent writes may still start out private (sheet_append).
+ */
+function refusePrivateChange(meta, entryId) {
+  if (CLI_CLIENT || !meta || typeof meta !== "object") return;
+  if (!Object.prototype.hasOwnProperty.call(meta, "private")) return;
+  // The same value written back (a whole meta read and returned) changes
+  // nothing and is let through.
+  const before = sheets.get(entryId);
+  if (JSON.stringify(meta.private) !== JSON.stringify(before.meta ? before.meta.private : undefined)) {
+    throw new Error("Whether an entry is kept out of pull requests and reports is a person's choice; change it from the Sheet in the Delphi window.");
+  }
+}
+
 /** A task's live Workbench, or a sentence saying it has none. */
 function benchFor(taskId) {
   const wb = benchStore.live(taskId);
@@ -816,32 +848,111 @@ function patchSection(body, heading, text) {
   return [...lines.slice(0, start + 1), "", text, "", ...lines.slice(end)].join("\n");
 }
 
+/** Waits ms without an event loop turn: the tools here run synchronously. */
+function pause(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {}
+}
+
 /**
  * Reads a pad's checkbox lines into tasks. Twin of db.js deriveInPlace.
  *
  * Returns what the caller should report back: the pad, and the tasks it now
  * owns. An agent that has just written a plan wants to know which task ids it
  * got, because those are what it will claim and close later.
+ *
+ * Several servers and the app write one pad at once, so the read, the tasks
+ * it files and the anchors it writes back are one unit: planned from one read,
+ * then written as one batch that first sets the body only where it is still
+ * the body that was read (and fails the whole batch if not), so nothing is
+ * filed and no line is written over. A batch that failed because the pad moved
+ * is planned again from a fresh read. On the sqlite3 binary route every call
+ * is its own process and no transaction spans a read and a write; the
+ * conditional write is what makes the pair one unit on both routes, and it is
+ * why two servers can never both file the same new line.
  */
+const RETRIES = 30;
+const backoff = (attempt) => 5 + Math.floor(Math.random() * 10 * (attempt + 1));
+const keptChanging = (padId) => ({
+  ...sql("SELECT * FROM scratchpads WHERE id = :p1", [padId])[0], tasks: [],
+  // The caller's own write landed; only the filing waits for the next one.
+  // Said, not thrown: an agent told its append failed would append again.
+  warning: "The pad kept changing while its checkbox lines were being filed. Your write landed; its lines are filed on the next write to this pad.",
+});
+
+/** For callers that cannot wait a turn (the items store's copy and move). */
 function derivePad(padId) {
+  for (let attempt = 0; attempt < RETRIES; attempt++) {
+    const r = derivePadOnce(padId);
+    if (r) return r;
+    // Another writer had the pad between our read and our write: read again,
+    // after a short wait that grows and is jittered, so two retries do not
+    // keep meeting.
+    pause(backoff(attempt));
+  }
+  return keptChanging(padId);
+}
+
+/**
+ * The same, for the pad tools, which may wait: between tries the server is
+ * let go (a timer, not a blocking pause), so a pad that keeps moving does not
+ * hold up every other tool call this server is asked for meanwhile.
+ */
+async function derivePadSoon(padId) {
+  for (let attempt = 0; attempt < RETRIES; attempt++) {
+    const r = derivePadOnce(padId);
+    if (r) return r;
+    await new Promise((resolve) => setTimeout(resolve, backoff(attempt)));
+  }
+  return keptChanging(padId);
+}
+
+/**
+ * Whether a batch that failed was refused because the pad moved under it. The
+ * guard's refusal is a JSON error, and so is a real one; only a pad whose body
+ * is no longer the one read is the guard's. A real one is said plainly, once,
+ * rather than retried thirty times into a message about the pad changing.
+ */
+function padMoved(error, padId, readBody, doing) {
+  const text = String((error && error.message) || error);
+  if (/SQLITE_BUSY|database is locked/i.test(text)) return true;
+  if (/malformed JSON/i.test(text)) {
+    const now = sql("SELECT body FROM scratchpads WHERE id = :p1", [padId])[0];
+    if (now && now.body !== readBody) return true;
+  }
+  throw new Error(`${doing} failed, and not because another writer changed the pad: ${text}`);
+}
+
+const MOVED = "derive: the pad moved";
+
+function derivePadOnce(padId) {
   const pad = sql("SELECT * FROM scratchpads WHERE id = :p1", [padId])[0];
   if (!pad) throw new Error("No such scratchpad");
   if (!pad.derives_tasks) return { ...pad, tasks: [] };
 
   let body = pad.body;
-  let entries = pads.parse(body);
-  const idByEntry = new Map();
-  const filed = [];
+  const entries = pads.parse(body);
+  // A task filed by this pass has no id until the batch runs: it is named by a
+  // key only this pass uses, and its line carries a stand-in anchor that the
+  // batch replaces with the id once the row exists.
+  const nonce = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  const tempKey = (k) => `derive:${nonce}:${k}`;
+  const refOf = (k) => `(SELECT id FROM tasks WHERE external_key = '${tempKey(k)}')`;
+  const standIn = (k) => 900000000000000 + k;
+  const idByEntry = new Map();   // entry.at -> { id } or { k }
+  const filed = [];              // { id } or { k }, title, status
   const stepId = auditor.step();
+  const statements = [];
+  let fresh = 0;
 
-  for (const entry of entries.slice()) {
-    // Re-read each pass, because anchoring a line shifts nothing but rewrites it,
-    // and the entry we are holding was parsed from the text before that.
+  for (const entry of entries) {
+    // Re-read each pass, because anchoring a line rewrites it, and the entry
+    // we are holding was parsed from the text before that.
     const current = pads.parse(body)[entry.at];
     if (!current) continue;
-    const parentId = current.parentIndex != null ? idByEntry.get(current.parentIndex) ?? null : null;
+    const parent = current.parentIndex != null ? idByEntry.get(current.parentIndex) ?? null : null;
+    const parentSql = parent == null ? "NULL" : parent.k != null ? refOf(parent.k) : String(Number(parent.id));
 
-    let task = current.taskId
+    let task = current.taskId && current.taskId < standIn(0)
       ? sql("SELECT * FROM tasks WHERE id = :p1", [current.taskId])[0]
       : null;
     if (task && task.pad_id !== pad.id) task = null;
@@ -851,10 +962,12 @@ function derivePad(padId) {
       // other line currently claims, is that task with its marker rewritten away.
       // See pads.js: exact match only, because a wrong merge is harder to spot
       // than a duplicate.
-      const claimed = [...pads.anchoredIds(body)];
+      const claimed = [...pads.anchoredIds(body)].filter((id) => id < standIn(0));
+      const taken = filed.filter((f) => f.id != null).map((f) => f.id);
+      const not = [...claimed, ...taken];
       const rows = sql(
         `SELECT * FROM tasks WHERE pad_id = :p1 AND title = :p2
-         ${claimed.length ? `AND id NOT IN (${claimed.join(", ")})` : ""} ORDER BY id`,
+         ${not.length ? `AND id NOT IN (${not.join(", ")})` : ""} ORDER BY id`,
         [pad.id, current.title]
       );
       task = rows[0] || null;
@@ -862,12 +975,7 @@ function derivePad(padId) {
 
     if (task) {
       // Values go through sql()'s placeholders, never spliced into the text
-      // first. A title spliced in as a literal is still query text when sql()
-      // runs, so a line that happened to mention a placeholder was rewritten.
-      //
-      // Every change is recorded with the row before and after, in one batch
-      // with the write. Only status flips and creates used to be, so a title
-      // or a parent the sync rewrote could not be undone or even seen.
+      // first. Every change is recorded with the row before and after.
       const sets = [];
       const values = [];
       const said = [];
@@ -881,7 +989,11 @@ function derivePad(padId) {
       }
       if (current.assignee && current.assignee !== task.assignee) { set("assignee", current.assignee); said.push("assignee changed"); }
       if (current.priority && current.priority !== task.priority) { set("priority", current.priority); said.push("priority changed"); }
-      if (parentId !== (task.parent_id ?? null)) { set("parent_id", parentId); said.push(parentId == null ? "taken out from under its parent" : "moved under another task"); }
+      if (parent && parent.k != null) { sets.push(`parent_id = ${parentSql}`); said.push("moved under another task"); }
+      else {
+        const parentId = parent ? parent.id : null;
+        if (parentId !== (task.parent_id ?? null)) { set("parent_id", parentId); said.push(parentId == null ? "taken out from under its parent" : "moved under another task"); }
+      }
       const anchorKey = `pad:${pad.id}:${task.id}`;
       if (task.external_key !== anchorKey) set("external_key", anchorKey);
       if (sets.length) {
@@ -890,44 +1002,76 @@ function derivePad(padId) {
         if (status !== task.status) {
           writes.push(["INSERT INTO status_events (task_id, status, actor) VALUES (:p1, :p2, :p3)", [task.id, status, ACTOR]]);
         }
-        auditor.run(auditor.update("task", task.id, { summary: said.length ? said.join(", ") : "anchored to its pad line",
-                                                      label: current.title || task.title, stepId }, writes));
+        statements.push(...auditor.update("task", task.id, { summary: said.length ? said.join(", ") : "anchored to its pad line",
+                                                             label: current.title || task.title, stepId }, writes));
       }
+      idByEntry.set(current.at, { id: task.id });
+      filed.push({ id: task.id, title: current.title, status: pads.statusFor(current.done, task.status) });
+      if (current.taskId !== task.id) body = pads.anchorLine(body, current, task.id);
     } else {
-      // RETURNING rather than a second SELECT on last_insert_rowid(). On the
-      // sqlite3 binary route every sql() call is its own process, and a new
-      // connection's last_insert_rowid() is always 0, so every pad task filed
-      // that way came back as undefined.
-      // One batch for the task, its anchor key, its opening status and its
-      // History row, with the id taken inside it (agent/audit.js create). The
-      // key goes in before the row is recorded, so the recorded after is the
-      // task as the sync left it.
+      // A new task, inserted by the batch under this pass's key. Its History
+      // row takes the id from last_insert_rowid(), inside the batch's process.
+      const k = fresh++;
       const title = current.title || "Untitled";
-      auditor.run(auditor.create("task", { summary: "read out of a pad", label: title, stepId },
-        [`INSERT INTO tasks (project_id, title, status, priority, assignee, parent_id, pad_id, source, completed_at)
-          VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, 'pad',
-                  CASE WHEN :p3 = 'done' THEN datetime('now') END)`,
-         [pad.project_id, title, current.done ? "done" : "todo",
-          current.priority || "med", current.assignee || null, parentId, pad.id]],
-        [[`INSERT INTO status_events (task_id, status, actor) SELECT id, status, :p1 FROM tasks WHERE id = ${auditor.createdId("task", stepId)}`, [ACTOR]]],
-        [["UPDATE tasks SET external_key = 'pad:' || pad_id || ':' || id WHERE id = last_insert_rowid()", []]]));
-      task = sql("SELECT * FROM tasks WHERE id = :p1", [auditor.created("task", stepId)])[0];
+      const status = current.done ? "done" : "todo";
+      statements.push(...auditor.create("task", { summary: "read out of a pad", label: title, stepId },
+        [`INSERT INTO tasks (project_id, title, status, priority, assignee, parent_id, pad_id, source, external_key, completed_at)
+          VALUES (:p1, :p2, :p3, :p4, :p5, ${parentSql}, :p6, 'pad', :p7, CASE WHEN :p3 = 'done' THEN datetime('now') END)`,
+         [pad.project_id, title, status, current.priority || "med", current.assignee || null, pad.id, tempKey(k)]],
+        [[`INSERT INTO status_events (task_id, status, actor) SELECT id, status, :p1 FROM tasks WHERE id = ${auditor.createdId("task", stepId)}`, [ACTOR]]]));
+      idByEntry.set(current.at, { k });
+      filed.push({ k, title: current.title, status });
+      body = pads.anchorLine(body, current, standIn(k));
     }
-
-    idByEntry.set(current.at, task.id);
-    filed.push({ id: task.id, title: current.title, status: pads.statusFor(current.done, task.status) });
-
-    if (current.taskId !== task.id) body = pads.anchorLine(body, current, task.id);
   }
 
+  if (!statements.length && body === pad.body) {
+    return { ...pad, tasks: filed.map(({ id, title, status }) => ({ id, title, status })) };
+  }
+
+  // The guard, first: the body is set only where it is still the body read,
+  // and if it was not, the next statement fails the batch, so nothing in it
+  // lands. json() of something that is not JSON is the failure, because
+  // RAISE() is only allowed in a trigger and this has to work on both routes.
+  const batchAll = [
+    ["UPDATE scratchpads SET body = :p1 WHERE id = :p2 AND body IS :p3", [body, pad.id, pad.body]],
+    [`SELECT CASE WHEN changes() = 0 THEN json('${MOVED}') END`, []],
+    ...statements,
+  ];
+  if (fresh) {
+    for (let k = 0; k < fresh; k++) {
+      // Never NULL: a stand-in whose row is somehow missing stays as it is
+      // rather than taking the whole body with it.
+      batchAll.push([`UPDATE scratchpads SET body = CASE WHEN ${refOf(k)} IS NULL THEN body
+                        ELSE replace(body, '<!--d:${standIn(k)}-->', '<!--d:' || ${refOf(k)} || '-->') END WHERE id = :p1`, [pad.id]]);
+    }
+    batchAll.push([`UPDATE tasks SET external_key = 'pad:' || pad_id || ':' || id WHERE external_key LIKE 'derive:${nonce}:%'`, []]);
+    // The History rows of the tasks filed here say how the sync left them,
+    // key and all, so undo does not read them as edited since.
+    batchAll.push([`UPDATE audit SET after_json = ${auditor.rowSql("task", "audit.entity_id")}
+                    WHERE step = :p1 AND entity = 'task' AND action = 'create'
+                      AND entity_id IN (SELECT id FROM tasks WHERE pad_id = :p2)`, [stepId, pad.id]]);
+  }
   // The anchors are part of the write that made them: the step's own row for
   // the pad is given the body with them in, or undo would read the pad as
   // edited since by the time anyone pressed it.
-  if (body !== pad.body) {
-    auditor.run(auditor.refreshAfter("scratchpad", pad.id, { summary: "anchored its lines to their tasks", label: pad.title, stepId },
-      [["UPDATE scratchpads SET body = :p1 WHERE id = :p2", [body, pad.id]]]));
+  batchAll.push(...auditor.refreshAfter("scratchpad", pad.id, { summary: "anchored its lines to their tasks", label: pad.title, stepId }, []));
+  try {
+    batch(batchAll);
+  } catch (error) {
+    padMoved(error, pad.id, pad.body, "Your write landed, but filing this pad's checkbox lines");
+    return null;
   }
-  return { ...sql("SELECT * FROM scratchpads WHERE id = :p1", [pad.id])[0], tasks: filed };
+  // The ids the batch gave the tasks filed here, in the order they were made.
+  let made = [];
+  if (fresh) {
+    // The step's newest creates are this batch's, in the order it made them.
+    made = sql(`SELECT entity_id FROM audit WHERE step = :p1 AND entity = 'task' AND action = 'create' ORDER BY id`, [stepId])
+      .map((r) => Number(r.entity_id)).slice(-fresh);
+  }
+  const now = sql("SELECT * FROM scratchpads WHERE id = :p1", [pad.id])[0];
+  const tasks = filed.map((f) => ({ id: f.id != null ? f.id : made[f.k] ?? null, title: f.title, status: f.status }));
+  return { ...now, tasks };
 }
 
 // --- tools ------------------------------------------------------------------
@@ -980,7 +1124,9 @@ function routeHere() {
   const places = [...new Set([process.cwd(), ...ROOTS])];
   for (const cwd of places) {
     try {
-      const r = route.resolve(sql, { ...base, cwd, ...gitHere(cwd) });
+      // git is read only when the launch, a Workbench folder and the folder
+      // itself have not already decided.
+      const r = route.resolve(sql, { ...base, cwd, git: () => gitHere(cwd) });
       if (r) return r;
     } catch (error) {
       process.stderr.write(`delphi: could not work out the project for ${cwd}: ${(error && error.message) || error}\n`);
@@ -1001,12 +1147,20 @@ function routeRecord(entity, idSql, routed) {
   }
   return routesTable ? [route.recordStatement(entity, idSql, routed, ACTOR)] : [];
 }
+// How the agent can put a misfiled item right. A task it filed in the last
+// day it may move itself; a note or a pad it can only propose moving, and a
+// person decides (items/store.js).
+const MOVE_WITH = {
+  task: "update_task with project_id, within 24 hours of filing it",
+  note: "propose_move with entity note; a person decides",
+  scratchpad: "propose_move with entity scratchpad; a person decides",
+};
 /** What a write tells the agent about where its item went, when Delphi chose. */
-function filedUnder(r) {
+function filedUnder(r, entity = "task") {
   if (!r) return null;
   const p = sql("SELECT key, name FROM projects WHERE id = :p1", [r.projectId])[0] || {};
   return { project_id: r.projectId, project: p.key || null, name: p.name || null, via: r.via, guessed: Boolean(r.guessed),
-           ...(r.guessed ? { why: route.WHY[r.via] || null, move_with: "update_task project_id, within 24 hours of filing it" } : {}) };
+           ...(r.guessed ? { why: route.WHY[r.via] || null, move_with: MOVE_WITH[entity] || MOVE_WITH.task } : {}) };
 }
 
 const isDirectory = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
@@ -1681,6 +1835,7 @@ const TOOLS = {
       let entry = null;
       if (a.meta !== undefined || a.body !== undefined || a.promote === undefined) {
         refuseRunnerMeta(a.meta, a.id, a.body);
+        refusePrivateChange(a.meta, a.id);
         entry = sheets.update(a.id, { meta: a.meta, body: a.body });
       }
       if (a.promote !== undefined) entry = sheets.promote(a.id, a.promote === true);
@@ -1973,7 +2128,7 @@ const TOOLS = {
          [projectId, a.title, a.body, a.kind || "note"]],
         routeRecord("note", auditor.createdId("note", stepId), routed)));
       const made = sql("SELECT id, title, project_id FROM notes WHERE id = :p1", [auditor.created("note", stepId)])[0];
-      return routed ? { ...made, filed_under: filedUnder(routed) } : made;
+      return routed ? { ...made, filed_under: filedUnder(routed, "note") } : made;
     },
   },
 
@@ -2043,13 +2198,23 @@ const TOOLS = {
         },
       },
     },
-    run: (a) => {
+    run: async (a) => {
       let projectId = a.project_id ?? resolveProjectId(a);
       const routed = projectId == null ? routeHere() : null;
       if (routed) projectId = routed.projectId;
+      if (projectId == null) {
+        throw new Error("Pass project_id or project: this folder is no project's, so there is no project to keep the pad in. Call list_projects to see them, or list_scratchpads to find the pad you mean.");
+      }
       const key = padKeyFor(projectId, a.key || a.title);
       const existing = sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
                            [projectId, key])[0];
+      // A guessed project never has its pads rewritten: replacing a plan in
+      // the wrong project, unrecorded as a guess, is the one write here that
+      // loses work. Asked for by name instead.
+      if (existing && routed && routed.guessed) {
+        const p = sql("SELECT key, name FROM projects WHERE id = :p1", [projectId])[0] || {};
+        throw new Error(`Pass project_id: this folder is several projects', and Delphi's guess (${p.name || projectId}, ${route.WHY[routed.via] || "a guess"}) already has a pad '${key}'. Name the project to write to it, or use another key for a new pad.`);
+      }
       // Recorded with the pad before and after, so an agent's rewrite of a plan
       // is one undo away; it used to be recorded with neither, and every one of
       // them refused to undo.
@@ -2059,7 +2224,7 @@ const TOOLS = {
                derives_tasks = :p4, updated_at = datetime('now') WHERE id = :p5`,
            [a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : existing.derives_tasks, existing.id]],
         ]));
-        return derivePad(existing.id);
+        return derivePadSoon(existing.id);
       }
       const stepId = auditor.step();
       auditor.run(auditor.create("scratchpad", { summary: "created", label: a.title, stepId },
@@ -2067,8 +2232,8 @@ const TOOLS = {
           VALUES (:p1, :p2, :p3, :p4, :p5, :p6)`,
          [projectId, key, a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : 1]],
         routeRecord("scratchpad", auditor.createdId("scratchpad", stepId), routed)));
-      const pad = derivePad(auditor.created("scratchpad", stepId));
-      return routed ? { ...pad, filed_under: filedUnder(routed) } : pad;
+      const pad = await derivePadSoon(auditor.created("scratchpad", stepId));
+      return routed ? { ...pad, filed_under: filedUnder(routed, "scratchpad") } : pad;
     },
   },
 
@@ -2088,14 +2253,15 @@ const TOOLS = {
     run: (a) => {
       const pad = findPad(a);
       if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
-      const joiner = !pad.body || pad.body.endsWith("\n") ? "" : "\n";
       // The text is appended in SQL rather than from the body read above, so a
-      // write landing between the read and this batch is not overwritten.
-      const tail = `${joiner}${a.text}`;
+      // write landing between the read and this batch is not overwritten; and
+      // the newline before it is decided there too, from the body as it is
+      // then, or two writers' lines could run into one.
       auditor.run(auditor.update("scratchpad", pad.id, { summary: "added to the pad", label: pad.title }, [
-        ["UPDATE scratchpads SET body = body || :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3", [tail, ACTOR, pad.id]],
+        [`UPDATE scratchpads SET body = body || CASE WHEN body = '' OR substr(body, -1) = char(10) THEN '' ELSE char(10) END || :p1,
+            author = :p2, updated_at = datetime('now') WHERE id = :p3`, [a.text, ACTOR, pad.id]],
       ]));
-      return derivePad(pad.id);
+      return derivePadSoon(pad.id);
     },
   },
 
@@ -2113,14 +2279,30 @@ const TOOLS = {
         text: { type: "string" },
       },
     },
-    run: (a) => {
+    run: async (a) => {
       const pad = findPad(a);
       if (!pad) throw new Error("No such scratchpad. Call list_scratchpads to see them.");
-      auditor.run(auditor.update("scratchpad", pad.id, { summary: `rewrote "${a.heading}"`, label: pad.title }, [
-        ["UPDATE scratchpads SET body = :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3",
-         [patchSection(pad.body, a.heading, a.text), ACTOR, pad.id]],
-      ]));
-      return derivePad(pad.id);
+      // The section is rewritten from the body read, so the write is set only
+      // where the body is still that one (a guard that fails the batch if not)
+      // and planned again from a fresh read otherwise: an append landing in
+      // between is never written over.
+      for (let attempt = 0; ; attempt++) {
+        const now = attempt ? sql("SELECT * FROM scratchpads WHERE id = :p1", [pad.id])[0] : pad;
+        if (!now) throw new Error("No such scratchpad");
+        try {
+          auditor.run(auditor.update("scratchpad", pad.id, { summary: `rewrote "${a.heading}"`, label: pad.title }, [
+            ["UPDATE scratchpads SET body = :p1, author = :p2, updated_at = datetime('now') WHERE id = :p3 AND body IS :p4",
+             [patchSection(now.body, a.heading, a.text), ACTOR, pad.id, now.body]],
+            [`SELECT CASE WHEN changes() = 0 THEN json('${MOVED}') END`, []],
+          ]));
+          break;
+        } catch (error) {
+          padMoved(error, pad.id, now.body, `Rewriting "${a.heading}"`);
+          if (attempt >= RETRIES) throw new Error(`The pad kept changing, so "${a.heading}" was not rewritten. Try again.`);
+          await new Promise((resolve) => setTimeout(resolve, backoff(attempt)));
+        }
+      }
+      return derivePadSoon(pad.id);
     },
   },
 

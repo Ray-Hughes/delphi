@@ -156,17 +156,30 @@ const themeNow = () => settingsSchema.resolvedTheme(settings, nativeTheme.should
 /**
  * Colours for the Windows window control overlay.
  *
- * These are the --surface and --ink-dim tokens from index.html. They have to be
+ * These are the --surface and --ink-dim tokens from styles/tokens.css, and
+ * tools/contrast_test.js checks they still are. They have to be
  * repeated here because the buttons are drawn by Windows rather than by the page,
  * so a stylesheet cannot reach them, and a mismatch shows as a block of the wrong
  * colour in the corner of the title bar.
  */
 const OVERLAY = {
-  light: { color: "#ffffff", symbolColor: "#5a6376", height: 46 },
+  light: { color: "#FFFFFF", symbolColor: "#4B5563", height: 46 },
   paper: { color: "#FBF9F4", symbolColor: "#4A525C", height: 46 },
-  dark: { color: "#1C2230", symbolColor: "#A3ADBE", height: 46 },
+  dark: { color: "#252C3A", symbolColor: "#A9B3C3", height: 46 },
 };
 const overlay = () => OVERLAY[themeNow()] || OVERLAY.light;
+
+/**
+ * Where macOS draws the traffic lights: the close button's top left corner, in
+ * the page's own pixels. Each button is 14px square and they are 23px apart.
+ *
+ * Left to itself, hiddenInset puts them where a native toolbar would want them,
+ * which is not where our bar is, and the place moves between macOS releases. So
+ * the position is pinned: 17 + 7 puts their middle at 24, the middle of the
+ * 48px .top-row, and the row's left inset (--chrome-left in styles/topbar.css)
+ * starts 12px past the third button. tools/chrome_test.js checks the two agree.
+ */
+const TRAFFIC_LIGHTS = { x: 16, y: 17 };
 
 /**
  * Window chrome, which is the one place the two platforms cannot share a setting.
@@ -177,7 +190,7 @@ const overlay = () => OVERLAY[themeNow()] || OVERLAY.light;
  * our bar. A panel is frameless on both, because it is dismissed by clicking away.
  */
 function chromeFor(panel) {
-  if (isMac) return { frame: false, titleBarStyle: "hiddenInset" };
+  if (isMac) return { frame: false, titleBarStyle: "hiddenInset", trafficLightPosition: TRAFFIC_LIGHTS };
   if (panel) return { frame: false };
   return { titleBarStyle: "hidden", titleBarOverlay: overlay() };
 }
@@ -194,8 +207,8 @@ function createWindow() {
     show: !panel && !SMOKE,        // a normal app opens; a panel waits for the key
     icon: path.join(__dirname, "assets", "mark-64.png"),
     // The page's --bg, so the frame painted before the page loads is the
-    // colour the page will be.
-    backgroundColor: { light: "#FAFAFA", paper: "#F3F0E8", dark: "#161B24" }[themeNow()] || "#FAFAFA",
+    // colour the page will be (tools/contrast_test.js checks the copies).
+    backgroundColor: { light: "#FAFAFA", paper: "#F3F0E8", dark: "#1E2430" }[themeNow()] || "#FAFAFA",
     ...chromeFor(panel),
     // In panel mode it floats over the work and cannot be full screened, because
     // a full screen panel is just a window with extra rules.
@@ -221,8 +234,20 @@ function createWindow() {
       panelMode: panel,
       platform: process.platform,
       overlay: !isMac && !panel,
+      fullScreen: win.isFullScreen(),
     });
   });
+
+  // Full screen changes what the top of the page has to keep clear of. The
+  // traffic lights go, so their inset is wasted room; the menu bar comes
+  // instead, sliding down over the top of the page whenever the pointer
+  // reaches the edge, so nothing clickable may sit in that strip. Only the
+  // page can move its own controls, and only this process knows the state.
+  const sendFullScreen = (on) => {
+    if (win && !win.isDestroyed()) win.webContents.send("full-screen", on);
+  };
+  win.on("enter-full-screen", () => sendFullScreen(true));
+  win.on("leave-full-screen", () => sendFullScreen(false));
 
   // Closing hides rather than quits in both modes, so the shortcut and the tray
   // can bring it back without a cold start.

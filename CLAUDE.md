@@ -173,12 +173,16 @@ project whose folders a person changed since and says so in the row.
 **Delphi works out the project; Today never asks.** When an agent files
 something without naming a project, `workbench/route.js` resolves it: what
 launched the agent (its job's task, its session, `DELPHI_PROJECT`), then a
-Workbench, then for a folder several projects share a ticket or key in the
-branch or the latest commit, the project most recently active in the folder,
-and the folder's Home. Shared by the server and the app, handed `sql` and the
+Workbench (its folder, or its branch in its own repository), then for a
+folder several projects share a ticket or a distinctive key in the branch or
+the latest commit, the project a person most recently worked or settled a
+filing in there, a common-word key, and the folder's Home. Archived projects
+are skipped, and git is read only when the folder is shared. Shared by the server and the app, handed `sql` and the
 git facts, so it is the same answer on both routes. The last three are guesses:
 the filing is recorded in `filed_routes` and the window shows "Filed under SSNR,
-from branch" with a Move through the item store, which settles it.
+from branch" on tasks, notes and pads with a Move through the item store.
+Only a person's Move or "That's right" settles it (an undo un-settles it), and
+a guess never rewrites an existing pad.
 
 **The never-lose-work rules are why `workbench/` refuses more than it does.**
 Finish removes the folder only when nothing is unsaved and nothing is unpushed,
@@ -344,5 +348,6 @@ Paper. The dark set is declared twice on purpose: once under
 while "System" still follows the OS live. Components reference tokens only, so
 no theme can end up with another theme's ink on its ground. Focus rings use
 `--focus-ring`, never `--accent` directly, because dark draws them in the
-accent's ink. `tools/contrast_test.js` checks every theme, including the "Soft"
-dark kept in a comment at the end of the file as a candidate.
+accent's ink. `tools/contrast_test.js` checks every theme, and that the
+colours `main.js` and `styles/settings.css` copy as literals (the Windows title
+bar, the window's first paint, the theme cards) still match the tokens.

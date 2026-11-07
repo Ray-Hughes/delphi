@@ -182,6 +182,19 @@ function sqlP(query, params = []) {
  */
 function batchP(statements) {
   const conn = open();
+  // At the top, the write lock first, as atomic() takes it: a deferred
+  // savepoint can find its snapshot stale at its first write.
+  if (conn.isTransaction === false) {
+    try { conn.exec("BEGIN IMMEDIATE"); } catch (error) { throw busyAsConflict(error); }
+    try {
+      for (const [query, params] of statements) sqlP(query, params || []);
+      conn.exec("COMMIT");
+    } catch (error) {
+      try { conn.exec("ROLLBACK"); } catch {}
+      throw busyAsConflict(error);
+    }
+    return;
+  }
   conn.exec("SAVEPOINT delphi_batch");
   try {
     for (const [query, params] of statements) sqlP(query, params || []);
@@ -323,10 +336,11 @@ function busyAsConflict(error) {
   // 5 is SQLITE_BUSY and 517 SQLITE_BUSY_SNAPSHOT (a WAL reader whose
   // snapshot went stale before it could write).
   // SQLITE_BUSY (5) and its extended codes: RECOVERY 261, SNAPSHOT 517 (a WAL
-  // reader whose snapshot went stale before it could write), TIMEOUT 773;
-  // and SQLITE_LOCKED (6). Each means: read again and retry.
-  const BUSY = [5, 6, 261, 517, 773];
-  const busy = error && (BUSY.includes(error.errcode) || /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i.test(String(error.message || error)));
+  // reader whose snapshot went stale before it could write), TIMEOUT 773. Each
+  // means another connection had it: read again and retry. Not SQLITE_LOCKED
+  // (6), which is this connection in its own way, a bug to see, not to retry.
+  const BUSY = [5, 261, 517, 773];
+  const busy = error && (BUSY.includes(error.errcode) || (error.errcode == null && /SQLITE_BUSY|database is locked/i.test(String(error.message || error))));
   if (busy && error.code !== "CONFLICT") {
     const c = new Error("Something else was writing the database at the same moment, so nothing was written.");
     c.code = "CONFLICT";
@@ -1030,7 +1044,12 @@ function createProject({ key, name, summary = null, colour = "#7c8698", path = n
 }
 
 function updateProject(id, fields, detected = {}) {
-  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view", "path", "icon", "auto_approve", "allow_unguarded"];
+  const allowed = ["name", "summary", "status", "colour", "sort_order", "task_view", "path", "icon", "auto_approve", "allow_unguarded", "aliases"];
+  // Comma-separated whole words, tidied, and empty as NULL.
+  if (fields.aliases !== undefined) {
+    const list = String(fields.aliases || "").split(",").map((a) => a.trim().toLowerCase().replace(/\s+/g, " ")).filter(Boolean);
+    fields = { ...fields, aliases: list.length ? [...new Set(list)].join(", ") : null };
+  }
   // What agents may do here unasked. Only ever 0 or 1, and only ever from the
   // window: the MCP server has no way to write either, so no agent can approve
   // its own work by changing them.
@@ -3448,6 +3467,13 @@ function undoFolder(op) {
  * under: one moved some other way is settled by that move.
  */
 function filedRoutes() {
+  // A guess nobody acted on in 30 days has stopped being news, and one a
+  // person settled that long ago is old evidence for the folder.
+  run("DELETE FROM filed_routes WHERE COALESCE(settled_at, created_at) < datetime('now', '-30 days')");
+  // And any whose item is gone from before the delete triggers existed.
+  run(`DELETE FROM filed_routes WHERE (entity = 'task' AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = filed_routes.entity_id))
+         OR (entity = 'note' AND NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = filed_routes.entity_id))
+         OR (entity = 'scratchpad' AND NOT EXISTS (SELECT 1 FROM scratchpads s WHERE s.id = filed_routes.entity_id))`);
   return all(`SELECT r.entity, r.entity_id, r.project_id, r.folder, r.via, r.detail, r.created_at, p.name AS project_name
                 FROM filed_routes r JOIN projects p ON p.id = r.project_id
                WHERE r.settled_at IS NULL

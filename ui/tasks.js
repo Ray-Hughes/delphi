@@ -605,7 +605,7 @@ globalThis.DelphiTasks = (() => {
     track(title, "edit");
     r.addEventListener("keydown", (e) => {
       if (e.isComposing) return;
-      // Kept here: Escape on the page hides the window, and Enter on the row opens it.
+      // Kept here: Escape on the page closes the sheet, and Enter on the row opens it.
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelEdit(draft); }
       else if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); saveEdit(t, draft, { field: title, focus: true }); }
       else e.stopPropagation();

@@ -189,8 +189,12 @@ globalThis.DelphiWeekly = (() => {
     // After a save the picks are spent, but what was Parked or Dropped keeps
     // its Undo for the next time the panel opens.
     const week = P.week || (status && status.week) || null;
+    // Applied cards no longer listed have nothing to undo from here.
+    for (const id of [...P.tidy.applied.keys()]) if (!(P.tidy.cards || []).some((c) => c.id === id)) P.tidy.applied.delete(id);
     draft = P.saved ? { acted: P.acted, tidy: P.tidy, step: P.step, week } : { picks: P.picks, own: P.own, projectId: P.projectId, acted: P.acted, tidy: P.tidy, step: P.step, week };
-    status = null;
+    // Kept, not cleared, so Today's card turns to Resume without blinking
+    // out while the status is read again behind it.
+    statusAt = 0;
     P.scrim.remove();
     P = null;
     // Today's card changes either way: it now offers Resume or End.
@@ -427,7 +431,7 @@ globalThis.DelphiWeekly = (() => {
   // else the one open now (the same Map of what was done rides in the draft).
   const target = () => P;
   /** After a write that finished with no panel open: Today and the lists catch up. */
-  const settled = (mine) => { if (P !== mine) { status = null; if (app && app.refresh) app.refresh(); } };
+  const settled = (mine) => { if (P !== mine) { statusAt = 0; if (app && app.refresh) app.refresh(); } };
 
   async function act(taskId, kind, why) {
     if (inflight) return;
@@ -585,8 +589,11 @@ globalThis.DelphiWeekly = (() => {
     try {
       const r = await window.delphi.weekly.end({ state, projectId: chosenProject(), objectives: mine.picks.map((p) => ({ text: p.text })) });
       // Ended: the panel goes, and with it the draft, so Cmd+K starts afresh.
+      // The status is known now, so Today's card goes at once rather than
+      // flickering back to an offer while it is read again.
       draft = null;
-      status = null;
+      status = status ? { ...status, ended: state } : status;
+      statusAt = 0;
       if (P === mine) { P.scrim.remove(); P = null; }
       const back = mine.returnTo && mine.returnTo.isConnected ? mine.returnTo : document.getElementById("content");
       if (back && typeof back.focus === "function") { if (back.id === "content" && back.tabIndex < 0) back.tabIndex = -1; back.focus({ preventScroll: true }); }
@@ -614,7 +621,8 @@ globalThis.DelphiWeekly = (() => {
       try {
         await window.delphi.weekly.undo({ receipt });
         if (restore) draft = { ...restore, acted: new Map(), step: "next", week: restore.week };
-        status = null;
+        status = status ? { ...status, ended: null } : status;
+        statusAt = 0;
         box.remove();
         if (app && app.refresh) app.refresh();
       } catch (error) {
@@ -637,10 +645,23 @@ globalThis.DelphiWeekly = (() => {
 
   const ACTION_WORDS = { park: "Park", drop: "Drop", done: "Mark done", move: "Move", due: "Set due date", merge: "Merge", split: "Split" };
 
+  /**
+   * Once per opening: where titles would go, and the open cards read again,
+   * so one whose change was undone in History meanwhile comes back with
+   * Approve rather than a stale Undo. Cards applied here keep theirs.
+   */
   async function loadTidy() {
     const mine = P;
-    if (!mine || mine.tidy.cards) return;
-    try { const list = await window.delphi.tidy.list(); if (P === mine && !mine.tidy.cards) { mine.tidy.cards = list; paint(); } } catch {}
+    if (!mine) return;
+    loadDestination();
+    try {
+      const list = await window.delphi.tidy.list();
+      if (P !== mine) return;
+      for (const c of list) mine.tidy.applied.delete(c.id);
+      const kept = [...mine.tidy.applied.values()].map((a) => a.card).filter((c) => !list.some((x) => x.id === c.id));
+      mine.tidy.cards = [...kept, ...list];
+      paint();
+    } catch {}
   }
 
   // Asking can take a minute or two; End and the rest stay usable meanwhile.
@@ -653,7 +674,13 @@ globalThis.DelphiWeekly = (() => {
     mine.tidy.msg = null;
     paint();
     try {
-      const r = await window.delphi.tidy.suggest();
+      let r = await window.delphi.tidy.suggest();
+      if (r && r.needs_consent) {
+        mine.tidy.destination = { kind: "cloud", words: r.destination, consented: false };
+        mine.tidy.asking = true;
+        mine.focusNext = "consent-no";
+        return;
+      }
       // Cards already applied stay listed with their Undo; the new ones follow.
       const kept = [...mine.tidy.applied.values()].map((a) => a.card).filter((c) => !r.suggestions.some((x) => x.id === c.id));
       mine.tidy.cards = [...kept, ...r.suggestions];
@@ -668,6 +695,25 @@ globalThis.DelphiWeekly = (() => {
       mine.tidy.busy = false;
       if (P) paint();
     }
+  }
+
+  /** Where titles go now, for the panel to say before anything is sent. */
+  async function loadDestination() {
+    const mine = P;
+    try { const d = await window.delphi.tidy.destination(); if (P === mine) { mine.tidy.destination = d; paint(); } } catch {}
+  }
+
+  /** The once-only yes to sending titles to a cloud model, kept in settings. */
+  async function consent(yes) {
+    const mine = P;
+    mine.tidy.asking = false;
+    if (!yes) { mine.focusNext = "suggest"; paint(); return; }
+    try {
+      await window.delphi.settings.set({ tidyCloudOk: true });
+      if (mine.tidy.destination) mine.tidy.destination.consented = true;
+    } catch (error) { mine.tidy.msg = errOf(error); paint(); return; }
+    paint();
+    runSuggest();
   }
 
   /** One card's Approve (with the edit when Edit is open). Resolves true when applied. */
@@ -700,10 +746,41 @@ globalThis.DelphiWeekly = (() => {
   }
 
   /** Approve all shown: the visible open cards, one by one, each its own Undo. */
+  /**
+   * What Approve all shown applies, and what it leaves out with a sentence:
+   * the card being edited (its edit is applied by its own button), and every
+   * card that shares a task with a merge on another card, since applying
+   * both could close a duplicate and its twin. Merges go last, and each is
+   * checked again against the database when it is applied. Pure, for tests.
+   */
+  function approveAllPlan(cards, editing = null) {
+    const merges = cards.filter((c) => c.action === "merge");
+    const tied = new Set();
+    for (const m of merges) {
+      const ends = [m.task_id, m.detail && m.detail.merge_into];
+      for (const c of cards) {
+        if (c.id === m.id) continue;
+        const touches = ends.includes(c.task_id) || (c.action === "merge" && ends.includes(c.detail && c.detail.merge_into));
+        if (touches) { tied.add(c.id); tied.add(m.id); }
+      }
+    }
+    const skipped = [];
+    for (const c of cards) {
+      if (c.id === editing) skipped.push([c.id, "Left out of Approve all while it is being edited."]);
+      else if (tied.has(c.id)) skipped.push([c.id, "Left out of Approve all: it shares a task with a merge on another card. Decide these one by one."]);
+    }
+    const out = new Set(skipped.map(([id]) => id));
+    const apply = cards.filter((c) => !out.has(c.id)).sort((a, b) => (a.action === "merge") - (b.action === "merge"));
+    return { apply, skipped };
+  }
+
   async function approveAll() {
     if (inflight) return;
     const mine = P;
-    const shown = openCards(mine);
+    const plan = approveAllPlan(openCards(mine), mine.tidy.editing);
+    for (const [id, why] of plan.skipped) mine.tidy.cardMsg.set(id, why);
+    const shown = plan.apply;
+    const skipped = plan.skipped;
     inflight = true;
     mine.tidy.busy = true;
     paint();
@@ -715,7 +792,8 @@ globalThis.DelphiWeekly = (() => {
         if (await approveCard(c)) ok++;
         if (P === mine) paint();
       }
-      mine.tidy.msg = ok === shown.length ? null : `${ok} of ${shown.length} applied; the others say why.`;
+      mine.tidy.msg = ok === shown.length && !skipped.length ? null
+        : `${ok} of ${shown.length + skipped.length} applied; the others say why.`;
       mine.focusNext = "suggest";
     } finally {
       inflight = false;
@@ -910,9 +988,29 @@ globalThis.DelphiWeekly = (() => {
     } else if (t.cards) {
       nodes.push(quiet(t.source ? "No suggestions: nothing here has an obvious next step." : "Suggest tidy asks for one action per stale or idle task: park, drop, done, move, a due date, merge or split. You approve, deny or edit each."));
     }
-    const sends = settings().tidyIncludeDetails === true
-      ? "Task numbers, titles, status, ages, projects and descriptions (scrubbed) are sent"
-      : "Only task numbers, titles, status, ages and projects are sent";
+    const d = t.destination;
+    const what = settings().tidyIncludeDetails === true ? "titles, status, ages, projects and descriptions" : "titles, status, ages and projects";
+    const sends = !d ? "Checking where titles would go..."
+      : d.kind === "rules" ? "Rules, nothing sent"
+      : d.kind === "local" ? `Local model on this Mac: ${what} stay here`
+      : `${d.words}: ${what}, secrets and VA numbers removed`;
+    if (t.asking) {
+      const ask = el("div", { className: "wk-consent", role: "group" });
+      ask.setAttribute("aria-labelledby", "wk-consent-t");
+      const yes = button("Send to Claude Code", "btn sm primary");
+      yes.dataset.wk = "consent-yes";
+      yes.onclick = () => consent(true);
+      const no = button("Not now", "btn sm");
+      no.dataset.wk = "consent-no";
+      no.onclick = () => consent(false);
+      const change = el("button", { className: "wk-linkish", type: "button", textContent: "Change who suggests tidying" });
+      change.dataset.wk = "consent-settings";
+      change.onclick = () => { if (globalThis.DelphiSettingsPanel) DelphiSettingsPanel.open({ key: "tidySuggester" }); };
+      ask.append(el("b", { id: "wk-consent-t", textContent: "Send these titles to Claude Code?" }),
+        el("p", { textContent: `Only task numbers, titles, status, ages, subtask counts and project names go to Anthropic, with secrets and VA numbers removed. Names and dates of birth in a title are sent as written. Asked once; ${settings().tidyIncludeDetails === true ? "descriptions go too, because Include task details is on." : "descriptions stay here."}` }),
+        el("div", { className: "wk-acts" }, yes, no, change));
+      nodes.splice(1, 0, ask);
+    }
     return section("Suggestions", cards.length ? openCards(P).length : null, sends, ...nodes);
   }
 
@@ -1164,5 +1262,5 @@ globalThis.DelphiWeekly = (() => {
     ];
   }
 
-  return { init, open, close, card, cardState, commands, isOpen: () => Boolean(P), isReviewDay, askEnd };
+  return { init, open, close, card, cardState, approveAllPlan, commands, isOpen: () => Boolean(P), isReviewDay, askEnd };
 })();

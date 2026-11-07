@@ -9,9 +9,9 @@
 // reads the real stylesheet rather than a copy of the values, so a token edited
 // later is checked against WCAG AA (4.5:1) the moment it changes.
 //
-// The themes are Light, Paper and Dark, and the "Soft" dark kept in a comment
-// at the end of the file as the owner's other choice: it is checked like a
-// shipped theme, so swapping it in can never be the change that breaks AA.
+// The themes are Light, Paper and Dark. The colours other files have to copy
+// as literals (the Windows title bar and the window's first paint in main.js,
+// the theme cards in styles/settings.css) are checked against the tokens too.
 //
 // It also checks that the two dark blocks are the same, because they are the
 // same set written twice (CLAUDE.md, Theming) and they have drifted before,
@@ -62,15 +62,11 @@ const light = block(/(^|\n):root\s*\{/);
 const paperOwn = block(/:root\[data-theme="paper"\]\s*\{/);
 const darkMedia = block(/:root:not\(\[data-theme="light"\]\):not\(\[data-theme="paper"\]\)\s*\{/);
 const darkPinned = block(/:root\[data-theme="dark"\]\s*\{/);
-// The candidate is a comment, so it is read from the file before comments go.
-const softText = (raw.match(/\/\* candidate: dark soft([\s\S]*?)end candidate \*\//) || [])[1];
-const softOwn = softText ? declarations(softText) : null;
 
 const THEMES = [
   ["light", light],
   ["paper", { ...light, ...paperOwn }],
   ["dark", { ...light, ...darkPinned }],
-  ["dark soft (candidate)", { ...light, ...softOwn }],
 ];
 
 function resolve(vars, name, seen = new Set()) {
@@ -134,10 +130,9 @@ check("the paper set is there", Boolean(paperOwn && paperOwn["--bg"]));
 check("the dark set is there, under the media query, guarded from both light themes", Boolean(darkMedia && darkMedia["--bg"]),
   'the selector is :root:not([data-theme="light"]):not([data-theme="paper"]), or a pinned Paper turns dark on a dark Mac');
 check("and again for a pinned dark theme", Boolean(darkPinned && darkPinned["--bg"]));
-check("the soft candidate is there, in its comment", Boolean(softOwn && softOwn["--bg"]));
 check("the two dark blocks are the same set", JSON.stringify(darkMedia) === JSON.stringify(darkPinned),
   "edit them together: one is used when the system is dark, the other when Dark is chosen");
-for (const [name, own] of [["paper", paperOwn], ["dark", darkPinned], ["dark soft", softOwn]]) {
+for (const [name, own] of [["paper", paperOwn], ["dark", darkPinned]]) {
   const extra = Object.keys(own || {}).filter((k) => !(k in light));
   check(`every name the ${name} set redefines exists in the light set`, extra.length === 0, extra.join(", "));
   const gaps = Object.keys(light).filter((k) => !SHARED.test(k) && !(k in (own || {})));
@@ -145,8 +140,8 @@ for (const [name, own] of [["paper", paperOwn], ["dark", darkPinned], ["dark sof
 }
 check("light and paper say color-scheme: light", [light.colorScheme, paperOwn && paperOwn.colorScheme].join() === "light,light",
   `${light.colorScheme}, ${paperOwn && paperOwn.colorScheme}`);
-check("both dark blocks and the candidate say color-scheme: dark",
-  [darkMedia, darkPinned, softOwn].every((b) => b && b.colorScheme === "dark"));
+check("both dark blocks say color-scheme: dark",
+  [darkMedia, darkPinned].every((b) => b && b.colorScheme === "dark"));
 
 for (const [theme, vars] of THEMES) {
   console.log(`\n${theme}: inks on grounds, at least 4.5:1`);
@@ -263,6 +258,33 @@ for (const [theme, vars] of THEMES) {
   const layoutCss = fs.readFileSync(path.join(__dirname, "..", "styles", "layout.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
   console.log("\nEdit this page: focus is drawn in its own token");
   check(".ly-cell:focus-visible uses --ly-focus with an offset", /\.ly-cell:focus-visible \{[^}]*outline: 2px solid var\(--ly-focus\); outline-offset: 3px/.test(layoutCss));
+}
+
+// Copies. Windows draws the title bar's buttons and Electron paints the
+// window before the page loads, so main.js has to name colours as literals,
+// and each theme card in Settings is a picture of a theme that is not
+// necessarily the one showing. Each copy must still be the token it copies.
+{
+  const byTheme = Object.fromEntries(THEMES);
+  const same = (a, b) => String(a || "").toLowerCase() === String(b || "").toLowerCase();
+  const mainJs = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8");
+  const settingsCss = fs.readFileSync(path.join(__dirname, "..", "styles", "settings.css"), "utf8");
+  console.log("\ncopies of tokens outside tokens.css");
+  const overlay = mainJs.match(/const OVERLAY = \{([\s\S]*?)\n\};/);
+  const first = mainJs.match(/backgroundColor: \{([^}]*)\}\[themeNow\(\)\]/);
+  check("main.js has the title bar's colours and the first paint's, per theme", Boolean(overlay && first));
+  for (const theme of ["light", "paper", "dark"]) {
+    const vars = byTheme[theme];
+    const o = overlay && overlay[1].match(new RegExp(`${theme}: \\{ color: "(#[0-9a-fA-F]{6})", symbolColor: "(#[0-9a-fA-F]{6})"`));
+    check(`main.js ${theme} title bar is --surface and --ink-dim`, Boolean(o) && same(o[1], resolve(vars, "--surface")) && same(o[2], resolve(vars, "--ink-dim")),
+      `${o ? o.slice(1).join(", ") : "missing"} against ${resolve(vars, "--surface")}, ${resolve(vars, "--ink-dim")}`);
+    const b = first && first[1].match(new RegExp(`${theme}: "(#[0-9a-fA-F]{6})"`));
+    check(`main.js ${theme} first paint is --bg`, Boolean(b) && same(b[1], resolve(vars, "--bg")), `${b ? b[1] : "missing"} against ${resolve(vars, "--bg")}`);
+    const pane = settingsCss.match(new RegExp(`\\.sp-thm \\.pane\\.${theme} \\{ background: (#[0-9a-fA-F]{6}); \\} \\.sp-thm \\.pane\\.${theme} \\.tb \\{ background: (#[0-9a-fA-F]{6}); border-bottom: 1px solid (#[0-9a-fA-F]{6}); \\}\\s*\\.sp-thm \\.pane\\.${theme} i \\{ background: (#[0-9a-fA-F]{6}); \\}`));
+    const want = ["--bg", "--surface", "--line", "--line"].map((t) => resolve(vars, t));
+    check(`settings.css ${theme} card is --bg, --surface and --line`, Boolean(pane) && pane.slice(1, 5).every((v, i) => same(v, want[i])),
+      `${pane ? pane.slice(1, 5).join(", ") : "missing"} against ${want.join(", ")}`);
+  }
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

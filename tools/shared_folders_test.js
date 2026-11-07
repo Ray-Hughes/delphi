@@ -247,6 +247,21 @@ function routeFixture(file) {
   ins("INSERT INTO workbenches (task_id, repo_id, path, branch, base) VALUES (51, 1, ?, 'ray/51-person-update', 'main')", path.join(dir, "va", "caseflow.workbenches", "51-person-update"));
   ins("INSERT INTO handoffs (id, project_id, to_harness, task_id, request) VALUES (70, 1, 'claude', 50, 'do it')");
   ins("INSERT INTO sessions (id, project_id, title, cwd) VALUES (80, 4, 'veterans chat', ?)", P);
+  // A project keyed on a word every branch uses, sharing caseflow.
+  ins("INSERT INTO projects (id, key, name) VALUES (5, 'general', 'General')");
+  ins("INSERT INTO repos (id, project_id, name, path, is_primary) VALUES (5, 5, 'caseflow', ?, 0)", P);
+  // A Workbench of another repository's project, on a branch name caseflow could have too.
+  ins("INSERT INTO repos (id, project_id, name, path, is_primary) VALUES (6, 3, 'perf', ?, 1)", Q);
+  ins("INSERT INTO tasks (id, project_id, title) VALUES (52, 3, 'Perf work')");
+  ins("INSERT INTO workbenches (task_id, repo_id, path, branch, base) VALUES (52, 6, ?, 'ray/fix-timeouts', 'main')", path.join(dir, "va", "perf.workbenches", "52-perf"));
+  // An archived project, with a session and a Workbench of its own.
+  ins("INSERT INTO projects (id, key, name, path, status) VALUES (9, 'old-work', 'Old work', ?, 'archived')", P);
+  ins("INSERT INTO sessions (id, project_id, title, cwd) VALUES (82, 9, 'old chat', ?)", P);
+  ins("INSERT INTO tasks (id, project_id, title) VALUES (55, 9, 'Old task')");
+  ins("INSERT INTO workbenches (task_id, repo_id, path, branch, base) VALUES (55, 1, ?, 'ray/55-old', 'main')", path.join(dir, "va", "caseflow.workbenches", "55-old"));
+  // A ticket only a finished task carries, and one a finished task shares with a project's name.
+  ins("INSERT INTO tasks (id, project_id, title, status) VALUES (53, 1, 'VACOLS-77 done long ago', 'done')");
+  ins("INSERT INTO tasks (id, project_id, title, status) VALUES (54, 1, 'APREQ-987 old follow up', 'done')");
   h.close();
 }
 
@@ -263,7 +278,20 @@ function resolverOn(name, makeRoute) {
   check("(b) a Workbench branch, from the main checkout", go({ cwd: P, branch: "ray/51-person-update" }), [1, "workbench", false]);
   check("(c) a ticket in the branch, against a project's name", go({ cwd: P, branch: "apreq-987-hearing-address" }), [8, "branch", true]);
   check("(c) a ticket in the branch, against a task's ref", go({ cwd: P, branch: "fix/VACOLS-12" }), [8, "branch", true]);
-  check("(c) a project key in the branch", go({ cwd: path.join(P, "app", "models"), branch: "ssnr/person-merge" }), [1, "branch", true]);
+  check("(c) a project key in the branch, whole", go({ cwd: path.join(P, "app", "models"), branch: "ssnr-mpi/person-merge" }), [1, "branch", true]);
+  check("(c) a project's own name beats a finished task's title", go({ cwd: P, branch: "apreq-987" }), [8, "branch", true]);
+  check("(c) a ticket only a finished task carries names nothing", go({ cwd: P, branch: "fix/VACOLS-77" })[1] !== "branch", true);
+  check("(b) a Workbench branch in another repository is not this folder's", go({ cwd: P, branch: "ray/fix-timeouts" })[1] !== "workbench", true);
+  check("(a) an archived project's session falls through", go({ sessionId: 82, cwd: P, branch: "main" })[1] !== "session", true);
+  check("(b) and so does its Workbench", (go({ cwd: path.join(dir, "va", "caseflow.workbenches", "55-old"), branch: "main" }) || [])[1] !== "workbench", true);
+  check("an archived project is never a candidate", route.resolve(r.sql, { cwd: P, branch: "main" }).candidates.includes(9), false);
+  let asked = 0;
+  route.resolve(r.sql, { jobId: 70, cwd: P, git: () => { asked += 1; return { branch: "x" }; } });
+  route.resolve(r.sql, { cwd: Q, git: () => { asked += 1; return { branch: "x" }; } });
+  check("git is not read when the launch or the folder decides", asked, 0);
+  route.resolve(r.sql, { cwd: P, git: () => { asked += 1; return { branch: "apreq-987" }; } });
+  check("and is, once, when the folder is shared", asked, 1);
+  check("distinctive keys", ["general", "test", "claude", "platform", "ssnr-mpi", "co-hearing-address", "q4-2026"].map(route.distinctive), [false, false, false, false, true, true, true]);
   check("(c) the latest commit's subject, when the branch says nothing", go({ cwd: P, branch: "main", subject: "APREQ-987: keep the address" }), [8, "commit", true]);
   check("(e) nothing to go on: the oldest Home", go({ cwd: P, branch: "main", subject: "tidy" }), [1, "home", true]);
   // (d): a session working in the folder writes History.
@@ -275,11 +303,29 @@ function resolverOn(name, makeRoute) {
   r.sql("INSERT INTO filed_routes (entity, entity_id, project_id, folder, via, created_at) VALUES ('task', 50, 8, :p1, 'home', '2026-11-06 12:00:00')", [P]);
   check("(d) a guess nobody confirmed is no vote for itself", go({ cwd: P, branch: "main" }), [1, "recent", true]);
   check("(c) still beats (d)", go({ cwd: P, branch: "apreq-987" }), [8, "branch", true]);
+  check("(d) beats a common-word key", go({ cwd: P, branch: "general-cleanup", subject: "general tidy" }), [1, "recent", true]);
   check("(c) a ticket is a whole word: VACOLS-1 is not VACOLS-12", go({ cwd: P, branch: "fix/VACOLS-1" })[1] !== "branch", true);
-  check("a linked folder counts: three projects share caseflow", route.resolve(r.sql, { cwd: P }).candidates.sort(), [1, 4, 8]);
-  check("a branch naming two of them is no answer from the branch", go({ cwd: P, branch: "ssnr-mpi/apreq-987" })[1] !== "branch", true);
+  check("a linked folder counts: four projects share caseflow", route.resolve(r.sql, { cwd: P }).candidates.sort(), [1, 4, 5, 8]);
+  check("a ticket outranks a key in the same branch", go({ cwd: P, branch: "ssnr-mpi/apreq-987" }), [8, "branch", true]);
+  check("two keys in one branch are no answer from the branch", go({ cwd: P, branch: "ssnr-mpi/veterans" })[1] !== "branch", true);
   check("a folder only one project has is no guess", go({ cwd: Q, branch: "apreq-987" }), [3, "folder", false]);
   check("a folder no project has is nothing", go({ cwd: path.join(dir, "elsewhere") }), null);
+  // The owner's real branches: SSNR's key is ssnr-mpi, and its branches say ssnr.
+  r.sql("INSERT INTO audit (at, action, entity, entity_id, summary, session_id) VALUES (datetime('now'), 'create', 'task', 50, 'created', 81)", []);
+  check("Central Office is the most recent in caseflow", go({ cwd: P, branch: "main" }), [8, "recent", true]);
+  for (const b of ["feature/ssnr-trunk", "merge-ssnr-into-feature", "craig/ssnr-merge-main-4-17"]) {
+    check(`${b} names SSNR by its key's first word, above recency`, go({ cwd: P, branch: b }), [1, "branch", true]);
+  }
+  check("in a commit subject too", go({ cwd: P, branch: "main", subject: "ssnr: retry the person update" }), [1, "commit", true]);
+  check("a word inside another word does not", go({ cwd: P, branch: "feature/ssnrx-trunk" }), [8, "recent", true]);
+  r.sql("INSERT INTO projects (id, key, name, status) VALUES (20, 'ssnr-reports', 'SSNR reports', 'active')", []);
+  check("a first word another active project shares names neither", go({ cwd: P, branch: "feature/ssnr-trunk" }), [8, "recent", true]);
+  r.sql("UPDATE projects SET aliases = 'ssnr, person update' WHERE id = 1", []);
+  check("an alias a person gave it names it again", go({ cwd: P, branch: "feature/ssnr-trunk" }), [1, "branch", true]);
+  check("an alias of several words, whole", [go({ cwd: P, branch: "fix/person-update-retry" }), go({ cwd: P, branch: "fix/person-updates" })[1]], [[1, "branch", true], "recent"]);
+  r.sql("DELETE FROM projects WHERE id = 20", []);
+  r.sql("UPDATE projects SET aliases = NULL WHERE id = 1", []);
+  check("a generic first word never counts", route.resolve(r.sql, { cwd: P, branch: "feature/general-trunk" }).via, "recent");
   check("tickets are read in any case", route.tickets("feature/apreq-987_and-CF-12"), ["APREQ-987", "CF-12"]);
   check("a short key word is not a project", [route.keyIn("co-hearing-address", "co/whatever"), route.keyIn("co-hearing-address", "x/co-hearing-address-fix"), route.keyIn("co", "fix/co")], [false, true, false]);
   r.close();
@@ -308,6 +354,8 @@ async function main() {
   check("a second folder is linked, not Home", [linked.added, linked.home, db.getProject(ssnr.id).path], [true, false, A]);
   check("and listed after Home, with who else has each", db.projectFolderList(ssnr.id).map((f) => [f.path, f.home, f.also.map((x) => x.id)]), [[A, true, [co.id]], [B, false, []]]);
   check("linking it twice changes nothing", db.linkFolder(ssnr.id, B).added, false);
+  check("aliases are tidied: lower case, trimmed, once each", db.updateProject(ssnr.id, { aliases: " SSNR ,ssnr,, Person  Update " }).aliases, "ssnr, person update");
+  check("and empty is none", db.updateProject(ssnr.id, { aliases: " , " }).aliases, null);
   const stale = db.createProject({ key: "stale", name: "Stale row" });
   db.createRepo({ projectId: stale.id, name: "kept settings", path: C, isPrimary: 1 });
   db.sqlP("UPDATE repos SET base_branch = 'release' WHERE project_id = :p1", [stale.id]);
@@ -414,10 +462,35 @@ async function main() {
       const named = await agent.call("add_task", { title: "named", project_id: pS.id });
       check("a project named is never second-guessed", [named.project_id, named.filed_under === undefined], [pS.id, true]);
       const note = await agent.call("add_note", { title: "a note with no project", body: "b" });
-      check("add_note too", [note.project_id, note.filed_under.via], [pC.id, "branch"]);
-      db.items().move("task", made.id, pS.id);
-      check("a Move settles it, and the chip goes", [db.sqlP("SELECT project_id, settled_at IS NOT NULL AS s FROM filed_routes WHERE entity_id = :p1 AND entity = 'task'", [made.id])[0], db.filedRoutes().some((x) => x.entity === "task" && x.entity_id === made.id)],
-        [{ project_id: pS.id, s: 1 }, false]);
+      check("add_note too, and its way to move is a proposal", [note.project_id, note.filed_under.via, /propose_move/.test(note.filed_under.move_with)], [pC.id, "branch", true]);
+      const routeOf = (entity, id) => db.sqlP("SELECT project_id, settled_at IS NOT NULL AS s FROM filed_routes WHERE entity = :p1 AND entity_id = :p2", [entity, id])[0] || null;
+      const key = `plan-${name.replace(/\W+/g, "-")}`;
+      const pad = await agent.call("write_scratchpad", { key, title: "Plan", body: "first" });
+      check("a guessed pad is made new, and recorded", [pad.project_id, pad.filed_under.via, routeOf("scratchpad", pad.id) && routeOf("scratchpad", pad.id).project_id], [pC.id, "branch", pC.id]);
+      const err = await agent.call("write_scratchpad", { key, title: "Plan", body: "OVERWRITTEN" }).then(() => null, (e) => String(e.message));
+      check("a guess never rewrites a pad that is there: it asks for the project", [/Pass project_id/.test(err || ""), db.sqlP("SELECT body FROM scratchpads WHERE id = :p1", [pad.id])[0].body], [true, "first"]);
+      const named2 = await agent.call("write_scratchpad", { key, title: "Plan", body: "second", project_id: pC.id });
+      check("named, it writes", [named2.id, named2.body], [pad.id, "second"]);
+      const own = await agent.call("update_task", { id: made.id, project_id: pS.id });
+      check("an agent moving its own guess does not settle it", [own.project_id, routeOf("task", made.id).s], [pS.id, 0]);
+      check("and the chip goes, since it is not where it was filed", db.filedRoutes().some((x) => x.entity === "task" && x.entity_id === made.id), false);
+      const t2 = await agent.call("add_task", { title: `second guess (${name})` });
+      db.items().move("task", t2.id, pS.id);
+      check("a person's Move settles it", routeOf("task", t2.id), { project_id: pS.id, s: 1 });
+      db.undoLast(1);
+      check("undoing the Move un-settles it", routeOf("task", t2.id), { project_id: pC.id, s: 0 });
+      db.sqlP("DELETE FROM tasks WHERE id = :p1", [t2.id]);
+      check("the filing goes with its item", routeOf("task", t2.id), null);
+    } finally { await agent.close(); }
+  }
+  {
+    section("the MCP server in a folder no project has");
+    const nowhere = repoAt(mk("elsewhere", "loose"));
+    const agent = openServer({ actor: "claude-code", env: { DELPHI_AUTHOR_TYPE: "agent", DELPHI_DISCOVERY: "0" }, clientName: "test", warn: () => {}, cwd: nowhere });
+    await agent.start();
+    try {
+      const err = await agent.call("write_scratchpad", { title: "Plan", body: "x" }).then(() => null, (e) => String(e.message));
+      check("write_scratchpad with no project says how to name one", /Pass project_id or project: this folder is no project's/.test(err || ""), true);
     } finally { await agent.close(); }
   }
   {

@@ -405,22 +405,28 @@ async function finishFlow(client, taskId) {
       // Shown before the question, and the same text passed back, so what
       // goes to GitHub is what was read here, or what the person edited.
       showDraft(draft);
+      let shown = draft;
       if (process.env.EDITOR && interactive() && await yes(`Edit the title and description in ${process.env.EDITOR} first?`)) {
         const edited = editDraft(draft);
-        if (edited) { draft = edited; showDraft(draft); } else warn("The editor did not finish; the draft above is unchanged.");
+        if (edited) draft = edited; else warn("The editor did not finish; the draft above is unchanged.");
       }
-      // Redacted here before any trim, so a cut can never split a secret
-      // into halves its pattern no longer matches. A trim is shown again.
+      // Scrubbed here as the server will, before any trim, so a cut can never
+      // split a secret into halves its pattern no longer matches.
       draft = { title: scrub.scrub(draft.title).replace(/\s+/g, " ").trim(), body: scrub.scrub(draft.body) };
-      let trimmed = false;
-      if (draft.title.length > MAX_PR_TITLE) { draft.title = `${draft.title.slice(0, MAX_PR_TITLE - 3)}...`; trimmed = true; }
+      if (draft.title.length > MAX_PR_TITLE) {
+        draft.title = `${draft.title.slice(0, MAX_PR_TITLE - 3)}...`;
+        warn(`The title was over GitHub's ${MAX_PR_TITLE} characters, so it was trimmed.`);
+      }
       if (draft.body.length > MAX_PR_BODY) {
         draft.body = `${draft.body.slice(0, MAX_PR_BODY - 200).trimEnd()}\n\n(Trimmed to fit GitHub's limit; the full text is on the task's Sheet.)\n`;
-        trimmed = true;
+        warn(`The description was over GitHub's ${MAX_PR_BODY} characters, so it was trimmed.`);
       }
-      if (trimmed) {
-        warn(`The title or description was over GitHub's limit (${MAX_PR_TITLE} and ${MAX_PR_BODY} characters), so it was trimmed. This is what would be sent:`);
+      // Whatever changed since it was read (an edit, a redaction, a trim),
+      // the person reads the text that will be sent before saying yes to it.
+      if (draft.title !== shown.title || draft.body !== shown.body) {
+        say("\nThis is what would be sent:");
         showDraft(draft);
+        shown = draft;
       }
       if (await yes("Open a pull request with gh, with this title and description?")) {
         const made = await client.call("workbench_pr", { task_id: taskId, create: true, title: draft.title, body: draft.body });

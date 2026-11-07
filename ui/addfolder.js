@@ -44,7 +44,7 @@ globalThis.DelphiAddFolder = (() => {
       if (sheet && sheet.overlay === overlay) sheet = null;
       if (before && before.isConnected) before.focus({ preventScroll: true });
     };
-    // Captured, because the window's own Escape hides the whole app.
+    // Captured, so one Escape closes this and nothing behind it.
     const onKey = (e) => {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
       else if (e.key === "Tab") {

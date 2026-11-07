@@ -575,6 +575,22 @@ function makeItemStore({
       moved.repos.push(op.id);
     }
 
+    // An item Delphi filed by a guess (workbench/route.js) is settled by being
+    // moved: the chip goes, and the folder's next guess learns from where the
+    // person put it.
+    // Only a person's move: an agent moving its own guess is not a person
+    // saying where the folder's work belongs. What the row was is kept on the
+    // move, so undoing the move un-settles it.
+    const routeWas = ROUTED.includes(op.entity) && writerType === "human" && hasRoutes()
+      ? sql("SELECT project_id, settled_at FROM filed_routes WHERE entity = :p1 AND entity_id = :p2", [op.entity, op.id])[0] || null
+      : null;
+    let routeStatement = null;
+    if (routeWas) {
+      record.route = { project_id: routeWas.project_id ?? null, settled_at: routeWas.settled_at ?? null };
+      routeStatement = [`UPDATE filed_routes SET project_id = :p1, settled_at = datetime('now'),
+                          detail = json_set(CASE WHEN json_valid(detail) THEN detail ELSE '{}' END, '$.moved_from', :p2)
+                        WHERE entity = :p3 AND entity_id = :p4`, [to, from, op.entity, op.id]];
+    }
     const auditEntity = KINDS[op.entity].audit;
     // An epic or a repository has no audit entity of its own, so its row is
     // filed against the project it moved into, with the one it left in
@@ -588,14 +604,7 @@ function makeItemStore({
     const what = auditEntity === "project" ? `${op.entity === "organizer" ? "epic" : "repository"} ${label} ${summary}` : summary;
     statements.push(auditStatement("update", auditEntity, auditId, what, label, before, { id: auditId, project_id: to }));
     statements.push(...(ctx.extra || []));
-    // An item Delphi filed by a guess (workbench/route.js) is settled by being
-    // moved: the chip goes, and the folder's next guess learns from where the
-    // person put it.
-    if (ROUTED.includes(op.entity) && hasRoutes()) {
-      statements.push([`UPDATE filed_routes SET project_id = :p1, settled_at = datetime('now'),
-                          detail = json_set(CASE WHEN json_valid(detail) THEN detail ELSE '{}' END, '$.moved_from', :p2)
-                        WHERE entity = :p3 AND entity_id = :p4`, [to, from, op.entity, op.id]]);
-    }
+    if (routeStatement) statements.push(routeStatement);
     // The pads were read before the batch, and on the sqlite3 route nothing
     // can hold them still in between. So the batch opens by checking each is
     // still the body it was cut from; json() of something that is not JSON is
@@ -916,6 +925,10 @@ function makeItemStore({
                           VALUES (:p1, :p2, :p3, :p4, :p5, :p6)`, [e, id, pid, by ?? null, at, flag ?? null]]);
       }
       if (op.entity === "task") statements.push(sheetNote(op.id, `Moved back to ${projectName(op.from)} by ${writer} (undo).`, { moved: { from: op.to, to: op.from, undo: true } }));
+      if (op.route && hasRoutes()) {
+        statements.push(["UPDATE filed_routes SET project_id = :p1, settled_at = :p2 WHERE entity = :p3 AND entity_id = :p4",
+          [op.route.project_id, op.route.settled_at, op.entity, op.id]]);
+      }
     } else if (op.kind === "associate") {
       statements.push(["DELETE FROM item_projects WHERE entity = :p1 AND entity_id = :p2 AND project_id = :p3", [op.entity, op.id, op.project]]);
     } else if (op.kind === "dissociate") {

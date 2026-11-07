@@ -383,14 +383,14 @@
       key: "tidySuggester", section: "brief", group: "Suggest tidy", type: "enum", default: "auto",
       choices: [["auto", "Best available"], ["claude", "Claude Code"], ["local", "Local model"], ["rules", "Rules only"]],
       label: "Who suggests tidying",
-      desc: "Best available asks Claude Code if it is signed in, then a local model through Ollama, then falls back to plain rules. Every suggestion waits for you to approve, deny or edit it.",
+      desc: "Best available asks Claude Code if it is signed in, then a local model through Ollama, then falls back to plain rules. Claude Code sends titles to Anthropic, after asking you once; a local model keeps them on this Mac. Every suggestion waits for you to approve, deny or edit it.",
       notChanged: "What is sent, which the next setting decides, or anything applied: a suggestion changes nothing until you approve it.",
       synonyms: ["tidy", "suggest", "ai", "model", "ollama", "claude", "cleanup", "clean up"],
     },
     {
       key: "tidyIncludeDetails", section: "brief", group: "Suggest tidy", type: "bool", default: false,
       label: "Include task details in Suggest tidy",
-      desc: "Off sends only each task's number, title, status, age, subtask counts and project. On adds its description, with anything that looks like a secret, a Social Security number or a file number taken out first.",
+      desc: "Off sends only each task's number, title, status, age, subtask counts and project. On adds its description, with anything that looks like a secret, a Social Security number or a file number taken out first. Names and dates of birth are sent as written.",
       notChanged: "Sheets, run output and notes, which are never sent.",
       synonyms: ["privacy", "description", "details", "send", "share", "redact"],
     },
@@ -433,6 +433,14 @@
       key: "checkoutNoticeSeen", section: null, internal: true, type: "checkoutNotice", default: null, nullable: true,
       label: "Checkout database notice seen",
       desc: "The ignored checkout database you have already been told about, so the notice shows once per file.",
+      synonyms: [],
+    },
+    {
+      // Asked once, the first time Suggest tidy would send titles to a model
+      // off this computer. Choosing Local model or Rules only never needs it.
+      key: "tidyCloudOk", section: null, internal: true, type: "bool", default: false, portable: false,
+      label: "Suggest tidy may send titles to Claude Code",
+      desc: "Whether you agreed, once, to Suggest tidy sending task titles, status and ages to Claude Code (Anthropic).",
       synonyms: [],
     },
     {

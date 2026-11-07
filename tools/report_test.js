@@ -136,9 +136,16 @@ const SECRETS = {
   vault: "hvs.CAESIJlFakeVaultTokenValue1234", npm: "npm_abcdefghijklmnopqrstuvwxyz0123456789", slack: "xoxb-123456789012-abcdefghij",
   gitlab: "glpat-abcdefghijklmnopqrst", ssn: "123-45-6789", cfile: "C12345678", filenum: "file number 87654321",
 };
+// Round five's leaks, through the whole report on both routes: a title, a
+// question, an answer and a run, each carrying one.
+const r5 = db.createTask({ projectId: project.id, title: "Fix login for dbpass=Hunter2x", detail: "curl https://api.va.gov/x?access_token=SEKRET12345 and SSN-123-45-6789" });
+const r5ask = sheets.ask(r5.id, "Keep --verbose --password Hunter3x?", ["yes", "no"]);
+sheets.decide(r5ask.id, "a", "API_TOKEN_PROD=Ab12Cd34Ef56 stays in the vault");
+sheets.append({ taskId: r5.id, kind: "run", body: "mysql -pS3cret9 -e 'select 1'", meta: { state: "ok", code: 0, dur_ms: 5, ran_by: "delphi" } });
+const R5_SECRETS = ["Hunter2x", "SEKRET12345", "6789", "Hunter3x", "Ab12Cd34Ef56", "S3cret9"];
 const leaky = db.createTask({ projectId: project.id, title: `Rotate ${SECRETS.aws} for SSN ${SECRETS.ssn}`,
   detail: `Key ${SECRETS.jwt} on host api.va.gov in /Users/ray/notes\n## Checks\n- \`npm audit\` passed\n<!-\u0001-HIDDEN-REBUILT-->\u202eRTL\u200bZW and a dash \u2014 here` });
-const lk = sheets.ask(leaky.id, `Use ${SECRETS.vault}?`, [`Yes ${SECRETS.npm}`, `No ${SECRETS.cfile}`]);
+const lk = sheets.ask(leaky.id, `Use ${SECRETS.vault}?`, [`Yes ${SECRETS.npm}`, `No, C-file ${SECRETS.cfile}`]);
 const lkd = sheets.decide(lk.id, "a", `because ${SECRETS.filenum} and ${SECRETS.slack}`);
 sheets.update(lkd.id, { meta: { rejected: [{ label: `No ${SECRETS.gitlab}`, why: "mysql -u root -phunter2 db" }] } });
 sheets.append({ taskId: leaky.id, kind: "run", body: `curl https://user:pw@10.0.0.5/x -H "Authorization: Bearer ${SECRETS.jwt}"`, meta: { state: "ok", code: 0, dur_ms: 5, ran_by: "delphi" } });
@@ -223,10 +230,13 @@ for (const [route, sql] of [["node:sqlite", db.sqlP], ["sqlite3 binary", binaryS
   check("ok with a nonzero exit code is not a pass", has(text, "npm run forged"), false);
   check("a run still going after a pass has no result yet", has(text, "npm run again"), false);
   check("@handles are quoted, an email is not", has(text, "ask `@octocat` and `@org/team`, mail a@b.example, see `#12` and `acme/web#7`"), true);
-  check("redaction, more shapes", ["curl -u me:pw1 -H 'X-Api-Key: k2' -H 'Cookie: a=b; c=d' https://h"].map(redact),
+  check("redaction, more shapes", ["curl -u me:pw1 -H 'X-Api-Key: 4f9a2c7e1b0d4f9a2c7e' -H 'Cookie: a=b; c=d' https://h"].map(redact),
     ["curl -u me:[redacted] -H 'X-Api-Key: [redacted]' -H 'Cookie: [redacted]' https://h"]);
 
   section(`${route}: secrets, numbers and what is flagged`);
+  const r5Draft = report.prDraft(r5.id);
+  check("round five's leaks are redacted in the title, description, decision and run", R5_SECRETS.filter((v) => has(`${r5Draft.title}\n${r5Draft.body}`, v)), []);
+  check("and the internal host is still there to be flagged", has(r5Draft.body, "api.va.gov"), true);
   const lkDraft = report.prDraft(leaky.id, { prefix: "ABC-1" });
   const lkAll = `${lkDraft.title}\n${lkDraft.body}`;
   answers[`${route} leaky`] = lkAll;
@@ -265,7 +275,7 @@ for (const [route, sql] of [["node:sqlite", db.sqlP], ["sqlite3 binary", binaryS
   check("done in the range, no #N to link a GitHub issue", has(st, `## Done\n\n- Retry uploads (task ${task.id})\n`), true);
   check("in progress", has(st, `## In progress now\n\n- Still going (task ${doing.id})\n`), true);
   check("decisions, with their task", has(st, `- **Which retry strategy?** exponential. simpler to reason about (task ${task.id}, Retry uploads)`), true);
-  check("runs counted, private ones too, and who ran them", has(st, "## Checks\n\n- Delphi ran 4 runs: 4 passed, 0 failed.\n- Agents reported 8 runs: 4 passing, 4 failing.\n- Across 2 tasks.\n"), true);
+  check("runs counted, private ones too, and who ran them", has(st, "## Checks\n\n- Delphi ran 5 runs: 5 passed, 0 failed.\n- Agents reported 8 runs: 4 passing, 4 failing.\n- Across 3 tasks.\n"), true);
   check("open questions now, on open tasks only", [has(st, `## Open questions now\n\n`), has(st, `- Which region first? (task ${doing.id}, Still going)`), has(st, "Ship behind a flag?")], [true, true, false]);
   check("no secret in the status report either", Object.values(SECRETS).filter((v) => has(st, v.replace(/^file number /, ""))), []);
   check("the cost, called an estimate", has(st, "## Cost (estimate)\n\nEstimate from Delphi's ledger"), true);
@@ -287,8 +297,145 @@ check("and redact the same", answers["node:sqlite leaky"], answers["sqlite3 bina
 check("a body a person wrote is redacted too", checkBody(`see ${SECRETS.aws}`), "see [redacted]");
 check("so is a title, made one line", checkTitle(`Fix\nfor ${SECRETS.ssn}`), "Fix for [redacted]");
 check("a look-alike hyphen or a zero-width character does not hide one", [checkBody("123\u201145\u20116789"), checkBody("AKIAIOSFODNN7\u200bEXAMPLE")], ["[redacted]", "[redacted]"]);
-check("nor does JSON, YAML or a bare bearer token", ['{"password": "x y"}', "secret: abc", "Bearer abcdefghijklmnopqrstuv", "db_password: hunter2", '{"adminPassword": "x"}', '"Authorization": "Basic dXNlcjpwYXNz"', "ssn 123.45.6789"].map(redact),
-  ['{"password": [redacted]}', "secret: [redacted]", "Bearer [redacted]", "db_password: [redacted]", '{"adminPassword": [redacted]}', '"Authorization": "[redacted]"', "ssn [redacted]"]);
+check("nor does JSON, YAML or a bare bearer token", ['{"password": "hunter2!"}', "client_secret: 9f8e7d6c5b4a39281706f5e4", "Bearer abcdefghij0123456789xyz", "db_password: hunter22", '"Authorization": "Basic dXNlcjpwYXNz"', "ssn 123.45.6789"].map(redact),
+  ['{"password": [redacted]}', "client_secret: [redacted]", "Bearer [redacted]", "db_password: [redacted]", '"Authorization": "Basic [redacted]"', "ssn [redacted]"]);
+
+section("high confidence only: what must never be redacted");
+// Real titles and settings the first version mangled. A guess is flagged,
+// never blanked: damaging a real title is a bug.
+const KEEP = ["Perf pass: cut the board's paint time", "Refine session: decide the layout", "bypass: true", "compass: north",
+  "max_tokens: 4096", "tokens: 40k", "token_count: 1200", "session_id: 4f9a2c", "AUTH_MODE=oauth", "AWS_REGION=us-east-1",
+  "oauth=enabled", "C1234567", "pip install sk-learn", "mysql -port 3306", "password: <your password>", "token: ${GITHUB_TOKEN}",
+  "secret: true", "adminPassword: x", "see 123 45 6789", "build 123456789",
+  "PWD=/home/runner/work/app", "password: (none)", "password: not-set", "password: same-as-above", "token: stored-in-vault-now",
+  "x\u00b2 at 10\u207b\u00b3, Delphi\u2122, \u00bd done", "code `&#65;` and `a\\_b` stays", "Authorization: required",
+  "Authorization: add-role-checks", "secret = process.env.SECRET_KEY_V2",
+  "pip install sk-learn-extras-2", "file 20261106", "emoji \u26a0\ufe0f and \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 stay",
+  "Bearer $TOKEN", "curl -u me:$PASS", "password: ${DB_PASS}", "password: {{ vault.pw }}", "password: <your password>", "\u4fee\u6b63\uff1a\u8a8d\u8a3c\uff08\u6e08\uff09"];
+check("each is left exactly as written", KEEP.filter((t) => scrub.scrub(t) !== t), []);
+check("credentials named with hyphens, dots or a _pass suffix, and a bare Authorization value, are redacted",
+  ["api-key: 4f9a2c7e1b0d4f9a2c7e", "spring.datasource.password=S3cr3t!x", "Authorization: 4f9a2c7e1b0d4f9a2c7e9b1c", "DB_PASS=Xk9#mQ2v!"].map((t) => scrub.scrub(t)),
+  ["api-key: [redacted]", "spring.datasource.password=[redacted]", "Authorization: [redacted]", "DB_PASS=[redacted]"]);
+// Built at run time, so nothing committed looks like a live token.
+const ghTok = ["gh", "p_"].join("") + "A1b2C3d4E5f6G7h8I9j0K1l2";
+check("camelCase and run-together key names are credentials too",
+  ["adminPassword: Hunter2x", "clientSecret=abc123XYZ", "accessToken: 9f8e7d6c", "PGPASSWORD=Hunter2x", "SecretKey=Ab12Cd34", "accesskey=abcd1234"].map((t) => scrub.scrub(t)),
+  ["adminPassword: [redacted]", "clientSecret=[redacted]", "accessToken: [redacted]", "PGPASSWORD=[redacted]", "SecretKey=[redacted]", "accesskey=[redacted]"]);
+check("prefixed, capital-run and run-together names, flags and => are credentials too",
+  ["'password' => 'Hunter2x'", "_authToken=abc123def", "2fa_token=abc123", "-Dspring.datasource.password=Hunter2x", "--client-secret abc123",
+   "DBPassword=Hunter2x", "JWTSecret=abc123", "pgpassword=Hunter2x", "githubtoken=abc123x", "DBPASS=Xk9mQ2v"].map((t) => scrub.scrub(t)),
+  ["'password' => [redacted]", "_authToken=[redacted]", "2fa_token=[redacted]", "-Dspring.datasource.password=[redacted]", "--client-secret [redacted]",
+   "DBPassword=[redacted]", "JWTSecret=[redacted]", "pgpassword=[redacted]", "githubtoken=[redacted]", "DBPASS=[redacted]"]);
+check("a number after \"number is\" is still one", ["social security number is 123456789", "file number is 12345678"].map((t) => scrub.scrub(t)),
+  ["social security number is [redacted]", "file number is [redacted]"]);
+check("but BYPASS, a header phrase and a flag that is not one stay",
+  ["BYPASS=1x", "Authorization: Add role checks", "--token-file ./x", "--max-tokens 4096", "--password --other"].filter((t) => scrub.scrub(t) !== t), []);
+section("round five");
+check("a query string's credential is not swallowed by the name before it", ["curl https://api.va.gov/x?access_token=SEKRET12345", "https://h/cb?code=abc&client_secret=Zx9yW8vU7t", "a=b&password=Hunter2x"].map((t) => scrub.scrub(t)),
+  ["curl https://api.va.gov/x?access_token=[redacted]", "https://h/cb?code=abc&client_secret=[redacted]", "a=b&password=[redacted]"]);
+check("nor a flag's value by the flag before it", ["--verbose --password Hunter2x", "-v --token Ab12Cd34Ef56"].map((t) => scrub.scrub(t)), ["--verbose --password [redacted]", "-v --token [redacted]"]);
+check("mysql and mariadb with -p first", ["mysql -pHunter2", "mysqldump -pS3cret db", "mysqlcheck -u r -pS3cret9", "mariadb -pS3cret9", "mariadb-dump -pS3cret9"].map((t) => scrub.scrub(t)),
+  ["mysql -p[redacted]", "mysqldump -p[redacted] db", "mysqlcheck -u r -p[redacted]", "mariadb -p[redacted]", "mariadb-dump -p[redacted]"]);
+check("a key word with a qualifier after it is still one", ["SECRET_KEY_BASE=Ab12Cd34Ef56", "password2=Hunter2x", "API_TOKEN_PROD=Ab12Cd34Ef56", "dbpass=Hunter2x", "bypass=Hunter2x"].map((t) => scrub.scrub(t)),
+  ["SECRET_KEY_BASE=[redacted]", "password2=[redacted]", "API_TOKEN_PROD=[redacted]", "dbpass=[redacted]", "bypass=Hunter2x"]);
+check("split shapes are rejoined", ["password\u200d=Hunter2x", "SSN-123-45-6789", "SSN\u2014123-45-6789", `${ghTok}_old`, "password: <Hunter2x>", "SSN 123\u300045\u30006789", `Pasted\u2014${ghTok}`].map((t) => scrub.scrub(t)),
+  ["password=[redacted]", "SSN-[redacted]", "SSN-[redacted]", "[redacted]_old", "password: [redacted]", "SSN [redacted]", "Pasted-[redacted]"]);
+check("prose after a label is flagged, not redacted", ["Token: Refresh flow", "Password: Reset link", "Token: JWT", "token: 4096 max", "Token:\nRefresh flow"].filter((t) => scrub.scrub(t) !== t), []);
+check("and flagged", scrub.flag("Token: Refresh flow").map((f) => f.kind), ["credential"]);
+check("a private key's header mentioned in prose keeps the text after it", scrub.scrub("-----BEGIN PRIVATE KEY----- is the header line\nand this text stays"), "-----BEGIN PRIVATE KEY----- is the header line\nand this text stays");
+check("a key with its END goes to the END; one without, to the end of its body", [
+  scrub.scrub("-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nabc\n-----END PRIVATE KEY-----\nafter"),
+  scrub.scrub("-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw\nZZZZ\n\nnext para")], ["[redacted]\nafter", "[redacted]\n\nnext para"]);
+check("a fullwidth colon is matched as a colon and never changed in the text", [scrub.scrub("password\uff1aHunter2x"), scrub.strip("\u5bc6\u7801A\uff1a\u786e\u8ba4")], ["password\uff1a[redacted]", "\u5bc6\u7801A\uff1a\u786e\u8ba4"]);
+// Copilot's pass on round five. The JWT is built from parts at run time.
+const jwtTok = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"].join(".");
+check("a JWT after a word and a hyphen, or two hyphens", [`token-${jwtTok}`, `--${jwtTok}`].map((t) => scrub.scrub(t)), ["token-[redacted]", "--[redacted]"]);
+check("a fullwidth colon after a number's label or a header name", ["file number\uff1a87654321", "C-file\uff1aC12345678", "SSN\uff1a123 45 6789", "Authorization\uff1aBearer abcdef0123456789abcdef01"].map((t) => scrub.scrub(t)),
+  ["file number\uff1a[redacted]", "C-file\uff1a[redacted]", "SSN\uff1a[redacted]", "Authorization\uff1aBearer [redacted]"]);
+check("a key with no END stops at its last whole line", scrub.scrub("-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw\nand this text stays"), "[redacted]\nand this text stays");
+check("second opinion's shape catches a key with no END too", (() => { const re = new RegExp(scrub.SECRET_SHAPES[4].source); return re.test("-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nabc"); })(), true);
+section("round six");
+check("an SSN or file number under its own key", ["ssn=123456789", '"ssn": "123456789"', "file_number: 123456789"].map((t) => scrub.scrub(t)),
+  ["ssn=[redacted]", '"ssn": [redacted]', "file_number: [redacted]"]);
+check("pw, pwd and pass alone, AccountKey and password_confirmation, when the value is secret-shaped",
+  ["Server=db;Uid=sa;Pwd=Hunter2x;", "pw=Hunter2x", "pass=Hunter2x", "AccountKey=Ab12Cd34Ef56Gh78==", "password_confirmation=Hunter2x"].map((t) => scrub.scrub(t)),
+  ["Server=db;Uid=sa;Pwd=[redacted];", "pw=[redacted]", "pass=[redacted]", "AccountKey=[redacted]", "password_confirmation=[redacted]"]);
+check("and pass in prose is neither redacted nor flagged", [scrub.scrub("Perf pass: cut the time"), scrub.flag("Perf pass: cut the time").length], ["Perf pass: cut the time", 0]);
+check("a YAML block under a credential key is redacted whole, and an aligned value",
+  ["password: |\n  Hunter2x\n  more\nnext: 1", "  db:\n    password: >-\n      abc\n      def9\n    user: x", "password:        Hunter2x"].map((t) => scrub.scrub(t)),
+  ["password: |\n[redacted]\nnext: 1", "  db:\n    password: >-\n[redacted]\n    user: x", "password:        [redacted]"]);
+const pemBody = ["MIIEvQIBADANBgkqhkiG9w0BAQEF", "AASCBKcwggSjAgEAAoIBAQC7"].join("");
+check("JSON-escaped values, one-line and escaped keys, camelCase qualifiers and Stripe keys", [
+  '{\\"password\\":\\"Hunter2x\\"}', `-----BEGIN PRIVATE KEY-----${pemBody} after`, `x "-----BEGIN PRIVATE KEY-----\\n${pemBody}\\nabc" y`,
+  "secretKeyBase=Ab12Cd34Ef56", ["sk", "live", "abcd1234efgh5678ijkl"].join("_"), ["rk", "test", "abcd1234efgh5678ijkl"].join("_")].map((t) => scrub.scrub(t)),
+  ['{\\"password\\":[redacted]}', "[redacted] after", 'x "[redacted]" y', "secretKeyBase=[redacted]", "[redacted]", "[redacted]"]);
+check("ordinary text keeps its shape", ["[x](https://h?token=Ab12Cd34Ef56)", "Token: OAuth2", "Max token: 128000", "use -----BEGIN PRIVATE KEY----- and -----END PRIVATE KEY----- around the body"].map((t) => scrub.scrub(t)),
+  ["[x](https://h?token=[redacted])", "Token: OAuth2", "Max token: 128000", "use -----BEGIN PRIVATE KEY----- and -----END PRIVATE KEY----- around the body"]);
+check("and the label-shaped ones are flagged", ["Token: OAuth2", "Max token: 128000"].map((t) => scrub.flag(t).map((f) => f.kind)), [["credential"], ["credential"]]);
+check("a ) inside a password is part of it; one closing a link is not", ["password=Ab)12xyz9Q", "[x](https://h?token=Ab12Cd34Ef56)"].map((t) => scrub.scrub(t)),
+  ["password=[redacted]", "[x](https://h?token=[redacted])"]);
+check("a word and a number under a secret key is a password, a thing's name is not", ["secret: Welcome1", "client_secret=Summer24", "API_TOKEN=Passw0rd", "token: SHA256"].map((t) => scrub.scrub(t)),
+  ["secret: [redacted]", "client_secret=[redacted]", "API_TOKEN=[redacted]", "token: SHA256"]);
+check("second_opinion catches a JWT after a hyphen", require("../agent/second_opinion").redact(`token-${jwtTok}`).text, "token-[redacted]");
+{
+  const big = "password: Hunter2x and api.va.gov, /Users/ray/x, Token: OAuth2 ".repeat(1100).slice(0, 65536);
+  const t0 = process.hrtime.bigint();
+  const ready = scrub.prepare(big);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  check(`a preview's whole pass over 64KB is under 50ms (${ms.toFixed(1)}ms)`, ms < 50 && ready.count > 0 && ready.found.length > 0, true);
+}
+check("a keycap keeps its selector", scrub.strip("1\ufe0f\u20e3 \u26a0\ufe0f"), "1\ufe0f\u20e3 \u26a0\ufe0f");
+check("under a credential key, anything but a reference or a plain word is redacted",
+  ["password: Admin.Pa55word", "password=get(Hunter2x)", "token = self.get_token_v2()"].map((t) => scrub.scrub(t)),
+  ["password: [redacted]", "password=[redacted]", "token = [redacted]"]);
+check("a token after a hyphen, an em dash or a fullwidth colon is still a token",
+  [`- ${ghTok}`, `\u2014${ghTok}`, "password\uff1aHunter2x"].map((t) => scrub.scrub(t)), ["- [redacted]", "-[redacted]", "password\uff1a[redacted]"]);
+check("a backtick in one paragraph does not shelter a comment from one in another",
+  scrub.strip("a `x\n\n<!--hidden-->\n\ny` b"), "a `x\n\n\n\ny` b");
+check("a reference is flagged, not redacted", scrub.flag("Bearer $TOKEN").map((f) => [f.kind, f.text, f.index]), [["credential", "$TOKEN", 7]]);
+check("a doubtful value is flagged where it is, not at its first occurrence",
+  scrub.flag("hunter and then password: hunter").filter((f) => f.kind === "credential").map((f) => f.index), [26]);
+check("the doubtful ones are flagged instead", scrub.flagWords(scrub.flag("password: wordpass, see 123 45 6789, C1234567, build 123456789")),
+  "1 possible credential, 3 possible SSNs or file numbers");
+check("a code span holding <!-- keeps it and everything after it", scrub.strip("use `<!-- x` here\n\nand the rest stays"), "use `<!-- x` here\n\nand the rest stays");
+check("and so does a fence", scrub.strip("```\n<!-- in code\n```\nafter"), "```\n<!-- in code\n```\nafter");
+check("an opener with no closer loses only itself", scrub.strip("a <!-- b"), "a  b");
+
+section("evasions folded before matching");
+check("look-alike dashes make a comment, which goes", scrub.strip("<!\u2010\u2010hidden-->shown"), "shown");
+check("fullwidth, entities, soft hyphens and escaped underscores", [
+  "\uff21\uff2b\uff29\uff21\uff29\uff2f\uff33\uff26\uff2f\uff24\uff2e\uff2e\uff17\uff25\uff38\uff21\uff2d\uff30\uff2c\uff25",
+  "&#65;KIAIOSFODNN7EXAMPLE", "AKIA\u00adIOSFODNN7\ufe0fEXAMPLE", "github\\_pat\\_11ABCDEFGHIJKLMNOPQRSTUV_xyz"].map((t) => scrub.scrub(t)),
+  ["[redacted]", "[redacted]", "[redacted]", "[redacted]"]);
+check("Google keys, Slack webhooks and S3 signatures", ["AIza" + "Sy" + "A1234567890abcdefghijklmnopqrstuv",
+  "https://hooks.slack.com/services/" + ["T", "0".repeat(8), "/B", "0".repeat(8), "/", "x".repeat(24)].join(""), "u?X-Amz-Signature=" + "ab12".repeat(16)].map((t) => scrub.scrub(t)),
+  ["[redacted]", "[redacted]", "u?X-Amz-Signature=[redacted]"]);
+check("a URL password goes and its internal host is still flagged", [scrub.scrub("push https://u:pw@va.ghe.com/x"), scrub.flagWords(scrub.flag(firstParagraph("push https://u:pw@va.ghe.com/x")))],
+  ["push https://u:[redacted]@va.ghe.com/x", "1 internal host"]);
+check("the length is checked after redaction", (() => { try { checkBody("password: hunter2! ".repeat(Math.ceil(MAX_BODY / 19))); return "no"; } catch (e) { return /at most/.test(e.message); } })(), true);
+
+section("a 64KB hostile line, every rule, in time");
+// Each pattern is bounded and anchored; one that is not takes seconds here.
+const HOSTILE = ["-----BEGIN PRIVATE KEY-----AAAA", "-----BEGIN PRIVATE KEY-----\\n", "password: |\n", "password: |\n ", '\\"password\\":', "ssn=", "pw=", "-eyJa", "a-eyJaaaaaaaaa.eyJ", "eyJaaaaaaaa.", "--eyJ", "x=", "a:", "a=b&", "--v ", "mysql -p", "-----BEGIN PRIVATE KEY-----\n", "SSN-1", " -u a:b", "a:b@", "password: ", "-eyJ", "+eyJ", "eyJ.", "a", "a.", "password=", "@", "<!--", "`", "-", "1", "/Users/", "a_", "x-", "cookie: ", "mysql ", "http://", "a:", "&#65;", "``a", "1-", " ~/", "bearer ", "x-api-key: ", "<!-\u2010", "\uff21"]
+  .map((unit) => unit.repeat(Math.ceil(65536 / unit.length)).slice(0, 65536));
+let slowest = { ms: 0, what: null };
+for (const line of HOSTILE) {
+  for (const fn of ["strip", "redact", "flag"]) {
+    const t0 = process.hrtime.bigint();
+    scrub[fn](line);
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    if (ms > slowest.ms) slowest = { ms, what: `${fn}(${JSON.stringify(line.slice(0, 10))}...)` };
+  }
+}
+for (const line of ["a.".repeat(32768), "@a".repeat(32768), "#1/".repeat(21846), "--eyJ".repeat(13108), "x=".repeat(32768)]) {
+  const t0 = process.hrtime.bigint();
+  firstParagraph(line);
+  // Its time is the point here, not whether it fits GitHub's limit.
+  try { checkBody(line.slice(0, 65000)); } catch {}
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  if (ms > slowest.ms) slowest = { ms, what: `firstParagraph(${JSON.stringify(line.slice(0, 10))}...)` };
+}
+check(`the slowest takes under 50ms (${slowest.what}, ${slowest.ms.toFixed(1)}ms)`, slowest.ms < 50, true);
 check("a body over GitHub's limit is refused", (() => { try { checkBody("x".repeat(MAX_BODY + 1)); return "no"; } catch (e) { return /at most/.test(e.message); } })(), true);
 }
 
@@ -370,6 +517,12 @@ process.stdout.write("https://example.invalid/pull/9\\n");
     const ranHere = s.append({ taskId: empty.id, kind: "run", body: "npm run lint", meta: { state: "fail", code: 1, ran_by: "delphi" } });
     await rejects("nor change the result of a run Delphi ran", () => agent.call("sheet_update", { id: ranHere.id, meta: { state: "ok", code: 0 } }), /run by Delphi/);
     await rejects("nor its command", () => agent.call("sheet_update", { id: ranHere.id, body: "npm run other" }), /run by Delphi/);
+    const said = await agent.call("sheet_append", { task_id: empty.id, kind: "say", body: "kept out" });
+    s.update(said.id, { meta: { private: true } });
+    await rejects("an agent cannot undo Keep out", () => agent.call("sheet_update", { id: said.id, meta: { private: false } }), /person's choice/);
+    check("and it stays out", s.get(said.id).meta.private, true);
+    check("writing the same value back is not a change, and is let through",
+      (await agent.call("sheet_update", { id: said.id, meta: { private: true } })).meta.private, true);
     const own = await agent.call("sheet_append", { task_id: empty.id, kind: "run", body: "npm run own", meta: { state: "ok", code: 0, runner_pid: 1, runner_host: "h" } });
     check("its own report is still taken, with the pid delphi chat records", own.meta.state, "ok");
   } finally {

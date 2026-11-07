@@ -91,6 +91,11 @@ const tasks = [];
 for (let i = 0; i < 60; i++) tasks.push(db.createTask({ projectId: ssnr.id, title: `Task number ${i}` }));
 const routed = db.createTask({ projectId: co.id, title: "Filed by an agent" });
 db.sqlP("INSERT INTO filed_routes (entity, entity_id, project_id, folder, via, detail) VALUES ('task', :p1, :p2, :p3, 'branch', '{}')", [routed.id, co.id, caseflow]);
+const routedNote = db.createNote({ projectId: co.id, title: "A note an agent filed", body: "b" });
+const routedPad = db.createScratchpad({ projectId: co.id, key: "agent-plan", title: "An agent's plan", body: "- one" });
+for (const [e, id] of [["note", routedNote.id], ["scratchpad", routedPad.id]]) {
+  db.sqlP("INSERT INTO filed_routes (entity, entity_id, project_id, folder, via, detail) VALUES (:p1, :p2, :p3, :p4, 'recent', '{}')", [e, id, co.id, caseflow]);
+}
 
 require("../main.js");
 
@@ -150,12 +155,15 @@ async function main() {
   check("and the Forward button appears", await js("document.getElementById('fwd').hidden"), false);
   await key("]", mod);
   await until("state.view === 'project'");
+  await wait(400);
   check("Cmd+] goes forward again", await where(), { p: ssnr.id, v: "project", d: null });
   await js("window.dispatchEvent(new MouseEvent('mouseup', { button: 3, bubbles: true })); 1");
   await until("state.view === 'tasks'");
+  await wait(400);
   check("the mouse's back button", (await where()).v, "tasks");
   await js("window.dispatchEvent(new MouseEvent('mouseup', { button: 4, bubbles: true })); 1");
   await until("state.view === 'project'");
+  await wait(400);
   check("and its forward button", (await where()).v, "project");
   await js("document.getElementById('back').click(); 1");
   await until("state.view === 'tasks'");
@@ -191,7 +199,8 @@ async function main() {
   check("the page is scrolled down to start with", before > 200, true);
   await js("document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); 1");
   await until(`DelphiDrawer.openTask() === ${row}`);
-  await js("document.getElementById('content').scrollTop = 0; 1");
+  // A repaint under the drawer replaces the page, at the top.
+  await js("(() => { const c = document.getElementById('content'); c.replaceWith(c.cloneNode(true)); return 1; })()");
   await js("(document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); 1");
   await until("DelphiDrawer.openTask() === null");
   await wait(400);
@@ -203,6 +212,15 @@ async function main() {
   check("the same scroll", Math.abs(after.scroll - before) < 2, true);
   check("the same row lit, and focused", [after.lit, after.focus], [String(row), String(row)]);
   check("and the same page", await where(), { p: ssnr.id, v: "tasks", d: null });
+  // Scrolling done while the drawer was open is the reader's, and stays.
+  await js(`openTaskSheet(${row}).then(() => 1)`);
+  await until(`DelphiDrawer.openTask() === ${row}`);
+  await js("document.getElementById('content').scrollTop = 40; 1");
+  await js("(document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); 1");
+  await until("DelphiDrawer.openTask() === null");
+  await wait(400);
+  check("a page scrolled while the drawer was open stays where the reader put it", await js("document.getElementById('content').scrollTop"), 40);
+  await js(`navigate({ projectId: ${ssnr.id}, view: "tasks", query: "" }).then(() => 1)`);
 
   console.log("\nthe breadcrumb");
   const crumbs = () => js("(() => { const b = document.getElementById('crumbs'); return b.hidden ? null : [...b.querySelectorAll('.crumb, .crumb-now')].map((n) => n.textContent); })()");
@@ -249,6 +267,22 @@ async function main() {
   await wait(600);
   check("no picker for a project with one folder", await js("!!document.querySelector('.dw .wb-folder-pick')"), false);
   check("the chip under the drawer's title too", await js(`!!document.querySelector('.dw .dw-route [data-route="task:${routed.id}"]')`), true);
+  await js("DelphiDrawer.close(); 1");
+  await js(`DelphiDrawer.openNote(${JSON.stringify(routedNote)}); 1`);
+  await until(`!!document.querySelector('.dw [data-route="note:${routedNote.id}"]')`);
+  check("a guessed note says so in its drawer", await js(`document.querySelector('.dw [data-route="note:${routedNote.id}"]').textContent`), "Filed under Central Office (APREQ-987), most recent in this folder");
+  await js("DelphiDrawer.close(); 1");
+  await js(`DelphiDrawer.openPad(${routedPad.id}); 1`);
+  await until(`!!document.querySelector('.dw [data-route="scratchpad:${routedPad.id}"]')`);
+  check("and a guessed pad in its", await js(`!!document.querySelector('.dw [data-route="scratchpad:${routedPad.id}"]')`), true);
+  await js("DelphiDrawer.close(); 1");
+  await js(`navigate({ projectId: ${co.id}, view: "memory", query: "" }).then(() => 1)`);
+  await until(`!!document.querySelector('#content [data-route="note:${routedNote.id}"]')`);
+  check("Memory's row says so, as words inside the row's own button", await js(`document.querySelector('#content [data-route="note:${routedNote.id}"]').tagName`), "SPAN");
+  {
+    await js(`(state.padId = ${routedPad.id}, navigate({ projectId: ${co.id}, view: "pads", query: "" })).then(() => 1)`);
+    check("and the Pads tab", await until(`!!document.querySelector('#content [data-route="scratchpad:${routedPad.id}"]')`), true);
+  }
 
   console.log(`\n${checks - failures}/${checks} passed`);
 }

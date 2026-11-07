@@ -118,3 +118,6 @@
 .dw-route { padding: 2px 0 6px 34px; }
 .dw-route .route-chip { max-width: 100%; }
 .dw .dw-route .route-chip { border: 1px dashed var(--accent-line); background: var(--accent-soft); color: var(--accent-ink); padding: 1px 9px 1px 7px; border-radius: 99px; font-size: 11.5px; }
+.route-chip.passive { cursor: inherit; }
+.fl-alias { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; }
+.fl-alias-k { font-size: 12.5px; font-weight: 600; color: var(--ink); }

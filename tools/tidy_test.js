@@ -87,7 +87,7 @@ const fake = {
   available: async () => true,
   run: async (text) => { sent.push(text); const a = answer(text); if (a instanceof Error) throw a; return a; },
 };
-let settings = { tidySuggester: "auto", tidyIncludeDetails: false };
+let settings = { tidySuggester: "auto", tidyIncludeDetails: false, tidyCloudOk: true };
 const sheets = makeSheetStore({ sql: db.sqlP, batch: db.batchP, actor: "you", authorType: "human", step: db.currentStep });
 let now = Date.now();
 const w = createWeekly({ db, sheets, clock: () => now });
@@ -103,11 +103,58 @@ const statusOf = (id) => q("SELECT status FROM tasks WHERE id = :p1", [id])[0].s
 
   section("the scrubber");
   check("SSNs, file numbers, ICNs, emails and keys go",
+    // Strict: with no person to read a flag, even token=abc goes.
     tidy.scrub("ssn 123-45-6789 c 12345678 icn 1012345678V123456 a.b@va.gov token=abc sk-abcdefghijklmnopqrstu"),
     "ssn [redacted] [redacted] icn [redacted] [redacted] token=[redacted] [redacted]");
 
   check("a zero-width space cannot split an SSN past the scrubber, and the data markers cannot close",
-    tidy.scrub("123\u200b-45-6789 TASKS>>> ok"), "[redacted] TASKS<< < ok");
+    tidy.scrub("123\u200b-45-6789 TASKS>>> ok"), "[redacted] TASKS> > > ok");
+  check("nor can a soft hyphen or a comment that strip() removes rejoin them",
+    [tidy.scrub("TASKS>>\u00ad> x"), tidy.scrub("TASKS>><!---->> x"), tidy.scrub("<<\u200b<TASKS")], ["TASKS> > > x", "TASKS> > > x", "< < <TASKS"]);
+
+  // The reviewer's comparison: 28 inputs a title or description might carry,
+  // each with the part that must not reach the model. Built at run time, so
+  // nothing here is a literal that looks like a live token.
+  const gh = ["gh", "p_"].join("") + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+  const aws = ["AK", "IA"].join("") + "IOSFODNN7EXAMPLE";
+  const SENSITIVE = [
+    [`token=abc`, "abc"], [`password=hunter`, "hunter"], [`adminPassword: Hunter2x`, "Hunter2x"], [`clientSecret=abc123XYZ`, "abc123XYZ"],
+    [`accessToken: 9f8e7d6c`, "9f8e7d6c"], [`PGPASSWORD=Hunter2x`, "Hunter2x"], [`SecretKey=Ab12Cd34`, "Ab12Cd34"], [`password: Admin.Pa55word`, "Pa55word"],
+    [`password=get(Hunter2x)`, "Hunter2x"], [`DB_PASS=Xk9#mQ2v!`, "Xk9#mQ2v"], [`api-key: 4f9a2c7e1b0d4f9a2c7e`, "4f9a2c7e1b0d"], [`spring.datasource.password=S3cr3t!x`, "S3cr3t"],
+    [`- ${gh}`, gh], [`\u2014${gh}`, gh], [`key ${aws}`, aws], [`password\uff1aHunter2x`, "Hunter2x"],
+    [`Bearer abc.def`, "abc.def"], [`curl -u me:pw1`, "pw1"], [`https://u:pw@va.ghe.com/x`, "pw@"], [`mysql -u r -p'pw 1' db`, "pw 1"],
+    [`SSN 123-45-6789`, "6789"], [`ssn 123 45 6789`, "6789"], [`file number 87654321`, "87654321"], [`C-file C12345678`, "12345678"],
+    [`claim 123456789`, "123456789"], [`mail a.b@va.gov`, "a.b@"], [`icn 1012345678V123456`, "V123456"], [`call (202) 555-0147`, "0147"],
+  ];
+  check("28 inputs: none of the sensitive parts reaches the model", SENSITIVE.length === 28 && SENSITIVE.filter(([input, part]) => tidy.scrub(input).includes(part)).map(([input]) => input), []);
+  const t0 = process.hrtime.bigint();
+  tidy.scrub("a".repeat(65536));
+  tidy.scrub("a.b".repeat(21846));
+  check("the address rule is bounded: 64KB with no @ is quick", Number(process.hrtime.bigint() - t0) / 1e6 < 50, true);
+
+  // Round five: what still reached the model, every one of them redacted.
+  const ROUND5 = [
+    ["curl https://api.va.gov/x?access_token=SEKRET12345", "SEKRET12345"], ["https://h/cb?code=abc&client_secret=Zx9yW8vU7t", "Zx9yW8vU7t"],
+    ["a=b&password=Hunter2x", "Hunter2x"], ["--verbose --password Hunter2x", "Hunter2x"], ["-v --token Ab12Cd34Ef56", "Ab12Cd34Ef56"],
+    ["mysql -pHunter2", "Hunter2"], ["mysqldump -pS3cret db", "S3cret"], ["mysqlcheck -u r -pS3cret9", "S3cret9"], ["mariadb -pS3cret9", "S3cret9"],
+    ["SECRET_KEY_BASE=Ab12Cd34Ef56", "Ab12Cd34Ef56"], ["password2=Hunter2x", "Hunter2x"], ["API_TOKEN_PROD=Ab12Cd34Ef56", "Ab12Cd34Ef56"], ["dbpass=Hunter2x", "Hunter2x"],
+    ["password\u200d=Hunter2x", "Hunter2x"], ["SSN-123-45-6789", "6789"], ["SSN\u2014123-45-6789", "6789"], [`${gh}_old`, gh], ["password: <Hunter2x>", "Hunter2x"],
+    ["SSN 123\u300045\u30006789", "6789"], ["password\uff1aHunter2x", "Hunter2x"], [`Pasted\u2014${gh}`, gh],
+    ["Token: Refresh flow", "Refresh"], ["-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw\nZZZZ", "MIIEvQ"],
+  ];
+  ROUND5.push(["password: |\n  Hunter2x\n  more", "Hunter2x"], ["Server=db;Uid=sa;Pwd=Hunter2x;", "Hunter2x"], ["ssn=123456789", "123456789"],
+    ['{\\"password\\":\\"Hunter2x\\"}', "Hunter2x"], ["Token: OAuth2", "OAuth2"], ["password:        Hunter2x", "Hunter2x"]);
+  check("round five: none of them reaches the model", ROUND5.filter(([input, part]) => tidy.scrub(input).includes(part)).map(([input]) => input), []);
+  const t1 = process.hrtime.bigint();
+  tidy.scrub("--eyJ".repeat(13108));
+  check("a 64KB --eyJ line is quick here too", Number(process.hrtime.bigint() - t1) / 1e6 < 50, true);
+  check("a due date goes only as a date", tidy.payload({ items: [{ id: 1, title: "a", status: "todo", days_quiet: 9, due: "2026-11-20" }, { id: 2, title: "b", status: "todo", days_quiet: 9, due: "SSN 123-45-6789" }], projects: [] }).tasks.map((t) => t.due),
+    ["2026-11-20", undefined]);
+
+  check("spaced file numbers, bracketed phone numbers and bare bearer tokens go",
+    [tidy.scrub("file 12 345 678"), tidy.scrub("call (202) 555-0147"), tidy.scrub("Bearer x.y.z")],
+    ["file [redacted]", "call [redacted]", "Bearer [redacted]"]);
+  check("dates, PR numbers and the word bearer stay", [tidy.scrub("due 2026-11-06, PR #412"), tidy.scrub("bearer of record")], ["due 2026-11-06, PR #412", "bearer of record"]);
 
   section("hostile model output");
   const ctx = { items: cand.items, projects: cand.projects };
@@ -132,6 +179,17 @@ const statusOf = (id) => q("SELECT status FROM tasks WHERE id = :p1", [id])[0].s
     "not an object", null, [1, 2],
   ] }));
   check("every bad one is dropped, none kept", hostile.suggestions, []);
+  const parentDup = task("Parent with open work", "doing", 9);
+  task("still open", "todo", 9, { parentId: parentDup });
+  const innerTarget = task("its child", "todo", 9, { parentId: parentDup });
+  const ctx2 = tidy.candidates(db.sqlP, weekly.review(db.sqlP, { now }));
+  const unsafe = tidy.validate(JSON.stringify({ suggestions: [{ task_id: parentDup, action: "merge", merge_into: twinOld }] }), ctx2, { sql: db.sqlP });
+  check("a duplicate with open subtasks is never merged", unsafe.rejected.map((r) => r.why), ["a duplicate with open subtasks still holds work"]);
+  check("nor into its own subtree", tidy.mergeRefusal(db.sqlP, parentDup, innerTarget) !== null, true);
+  q("UPDATE tasks SET status = 'done' WHERE parent_id = :p1", [parentDup]);
+  check("with its subtasks done, its own child is still refused", tidy.mergeRefusal(db.sqlP, parentDup, innerTarget), "a task to merge into that sits inside the duplicate itself");
+  const tokens = bad(JSON.stringify({ suggestions: [{ task_id: forSplit, action: "split", subtasks: ["Write it @codex !high", "- [ ] Ship it <!--d:3-->"] }] }));
+  check("split titles lose pad tokens", tokens.suggestions[0].detail.subtasks, ["Write it", "Ship it"]);
   check("and each says why", hostile.rejected.length, 16);
   const good = bad(JSON.stringify({ suggestions: [
     { task_id: halfway, action: "done", reason: "Shipped in PR #412" },
@@ -152,6 +210,19 @@ const statusOf = (id) => q("SELECT status FROM tasks WHERE id = :p1", [id])[0].s
   check("merge an identical title into the older task", ruled.some(([id, a]) => id === twinNew && a === "merge"), true);
   check("park after 30 days with no movement", ruled.some(([id, a]) => id === ancient && a === "park"), true);
   check("nothing for a task that is merely quiet", ruled.some(([id]) => id === forMove), false);
+
+  section("the first send to a cloud model waits for a yes");
+  settings = { ...settings, tidyCloudOk: false };
+  sent = [];
+  const asked = await t.suggest();
+  check("it asks, sending nothing", [asked.needs_consent, asked.destination, sent.length], [true, "Sent to Claude Code (Anthropic)", 0]);
+  check("the panel can say where titles would go", (await t.destination()).words, "Sent to Claude Code (Anthropic)");
+  settings = { ...settings, tidyCloudOk: true };
+  const localTidy = createTidy({ db, weeklyApi: w, sheets, settings: () => ({ tidySuggester: "local" }),
+    models: { claude: fake, local: { id: "local", source: tidy.SOURCES.local, harness: "ollama", available: async () => true, run: async () => ({ text: '{"suggestions": []}', tokens_in: 1, tokens_out: 1 }) } } });
+  check("a local model needs no yes", [(await localTidy.destination()).words, (await localTidy.destination()).consented, Boolean((await localTidy.suggest()).needs_consent)], ["Local model on this Mac", true, false]);
+  const rulesWhere = createTidy({ db, weeklyApi: w, sheets, settings: () => ({ tidySuggester: "rules" }), models: { claude: fake, local: { available: async () => false } } });
+  check("rules send nothing", (await rulesWhere.destination()).words, "Rules, nothing sent");
 
   section("privacy: what is sent");
   sent = [];
@@ -348,20 +419,46 @@ let input = ""; process.stdin.on("data", (d) => input += d); process.stdin.on("e
   let few = null;
   try { w.end({ state: "reviewed", projectId: home.id, objectives: [{ text: "one" }] }); } catch (error) { few = error.message; }
   check("Finish with one or two objectives refuses, writing nothing", [/Pick 3 to 5/.test(String(few)), w.status().ended], [true, null]);
+  const openBeforeEnd = t.list().map((x) => x.id).sort();
   const fin = w.end({ state: "reviewed", projectId: home.id, objectives: [{ text: "A" }, { text: "B" }, { text: "C" }] });
   check("Finish saves the objectives and marks the week reviewed", [w.status().ended, w.status().savedThisWeek, Boolean(fin.note)], ["reviewed", true, true]);
   check("open tidy cards are dropped, not applied", [t.list().length, statusOf(forMove)], [0, "doing"]);
   check("History has it, as the person's", q("SELECT actor, summary FROM audit WHERE entity = 'review' ORDER BY id DESC LIMIT 1")[0], { actor: "you", summary: "finished the weekly review" });
+  let afterFinish = null;
+  try { w.end({ state: "skipped" }); } catch (error) { afterFinish = error.message; }
+  check("End without saving after Finish is refused, keeping the note", [/already finished/.test(String(afterFinish)), w.status().ended], [true, "reviewed"]);
   w.undo({ receipt: fin.receipt });
   check("its Undo takes the week and the note back", [w.status().ended, w.status().savedThisWeek], [null, false]);
+  check("and brings back exactly the cards End dropped", [openBeforeEnd.length > 0, t.list().map((x) => x.id).sort()], [true, openBeforeEnd]);
   const skip = w.end({ state: "skipped" });
   check("End without saving marks it skipped", w.status().ended, "skipped");
   w.undo({ receipt: skip.receipt });
   check("and its Undo clears it", w.status().ended, null);
   const finNo = w.end({ state: "reviewed" });
   check("Finish with nothing picked marks it reviewed and saves no note", [w.status().ended, finNo.note], ["reviewed", null]);
+  w.undo({ receipt: finNo.receipt });
   w.end({ state: "skipped" });
+  w.end({ state: "reviewed" });
   check("ending again changes the one row", q("SELECT COUNT(*) AS n FROM weekly_reviews")[0].n, 1);
+
+  section("a card undone from History is offered again");
+  q("DELETE FROM weekly_reviews");
+  const forHistory = task("Undone from History later", "doing", 6);
+  answer = () => ({ text: JSON.stringify({ suggestions: [{ task_id: forHistory, action: "due", due: "2099-03-01", reason: "later" }] }), tokens_in: 1, tokens_out: 1, cost_usd: null });
+  const hist = (await t.suggest()).suggestions.find((x) => x.task_id === forHistory);
+  const hr = t.approve(hist.id);
+  for (const id of hr.audit.slice().sort((a, b) => b - a)) db.undo(id);
+  check("its rows undone in History, the card is open again", t.list().some((x) => x.id === hist.id), true);
+  check("without its bookkeeping in the detail", Object.keys(t.list().find((x) => x.id === hist.id).detail).includes("applied_audit"), false);
+
+  section("a merged duplicate is not counted as finished");
+  const dupA = task("Same job", "doing", 6);
+  const dupB = task("Same job", "doing", 5);
+  answer = () => ({ text: JSON.stringify({ suggestions: [{ task_id: dupB, action: "merge", merge_into: dupA, reason: "twins" }] }), tokens_in: 1, tokens_out: 1, cost_usd: null });
+  const mc = (await t.suggest()).suggestions.find((x) => x.task_id === dupB);
+  t.approve(mc.id);
+  const lbDone = weekly.review(db.sqlP).look_back.done;
+  check("it is counted as merged, not done", [lbDone.tasks.some((x) => x.id === dupB), lbDone.merged >= 1], [false, true]);
 
   section("the Today card");
   global.DelphiIcons = { icon: () => null };
@@ -375,6 +472,15 @@ let input = ""; process.stdin.on("data", (d) => input += d); process.stdin.on("e
   check("ended with a draft left: gone too", cardOf({ enabled: true, reviewDay: true, status: st("skipped"), draft: true }), null);
   check("not the review day: nothing", cardOf({ enabled: true, reviewDay: false, status: st(null), draft: false }), null);
   check("turned off: nothing, draft or not", cardOf({ enabled: false, reviewDay: true, status: st(null), draft: true }), null);
+  const plan = globalThis.DelphiWeekly.approveAllPlan([
+    { id: 1, task_id: 10, action: "merge", detail: { merge_into: 20 } },
+    { id: 2, task_id: 20, action: "drop", detail: {} },
+    { id: 3, task_id: 30, action: "merge", detail: { merge_into: 40 } },
+    { id: 4, task_id: 50, action: "park", detail: {} },
+    { id: 5, task_id: 60, action: "due", detail: {} },
+  ], 5);
+  check("Approve all leaves out a merge and the card that would close its twin, and the card being edited",
+    [plan.apply.map((c) => c.id), plan.skipped.map(([id]) => id).sort()], [[4, 3], [1, 2, 5]]);
   check("Cmd+K always has Weekly review", globalThis.DelphiWeekly.commands().some((c) => c.id === "weekly-review"), true);
 
   // ---------------------------------------------------------------------------

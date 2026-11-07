@@ -220,150 +220,104 @@
    not, and choosing Dark in Settings painted light task colours on the dark
    ground. tools/contrast_test.js fails if they differ.
 
-   This is "Dim": a slate ground in the spirit of GitHub's and Linear's dim
+   This is "Soft": a slate ground in the spirit of GitHub's and Linear's dim
    themes, lifted off the near black v2 first had (#090D16, #111827, #151E2E),
-   which the owner found too dark. A step lighter, "Soft", is kept at the end
-   of this file in a comment so it can be chosen from renders; contrast_test
-   checks it too, so swapping it in is a paste, not a redesign. */
+   which the owner found too dark, and chosen from renders over a darker step. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]):not([data-theme="paper"]) {
-    --bg: #161B24; --surface: #1C2230; --raised: #232A39;
-    --line: #2E3648; --line-soft: #262E3D;
+    --bg: #1E2430; --surface: #252C3A; --raised: #2C3445;
+    --line: #384156; --line-soft: #313A4C;
     /* The frame sits a step behind the work, as in light: between the page
        and a card. */
-    --chrome: #191F2A; --chrome-deep: #161B24;
+    --chrome: #222835; --chrome-deep: #1E2430;
 
-    --ink: #E6E9EF; --ink-dim: #A3ADBE; --ink-faint: #7A8599;
+    --ink: #E9ECF2; --ink-dim: #A9B3C3; --ink-faint: #828DA1;
 
     /* Violet on the dark ground, where the light theme's indigo goes muddy. */
-    --accent: #8B5CF6; --accent-ink: #A78BFA;
-    --accent-soft: rgba(139, 92, 246, 0.16); --accent-line: rgba(139, 92, 246, 0.45);
-    --good: #10B981; --good-ink: #10B981; --good-soft: rgba(16, 185, 129, 0.14);
+    --accent: #9A7BF8; --accent-ink: #B39DFB;
+    --accent-soft: rgba(154, 123, 248, 0.16); --accent-line: rgba(154, 123, 248, 0.45);
+    --good: #10B981; --good-ink: #2CC994; --good-soft: rgba(16, 185, 129, 0.14);
     --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.14);
-    --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.14);
-    --btn-fg: #fff; --on-good: #161B24;
+    --crit: #EF4444; --crit-ink: #FA8585; --crit-soft: rgba(239, 68, 68, 0.14);
+    --btn-fg: #fff; --on-good: #1E2430;
     --btn-primary: #8655F6; --crit-fill: #EB1616;
-    --glass: rgba(28, 34, 48, 0.72);
+    --glass: rgba(37, 44, 58, 0.72);
 
     --tc-blue:   #7c9bff;
     --tc-teal:   #4fc4c0;
     --tc-green:  #4fb477;
     --tc-amber:  #e0b95c;
     --tc-orange: #f0925c;
-    --tc-red:    #ea7a71;
+    --tc-red:    #EE8278;
     --tc-purple: #b48bf0;
     --tc-slate:  #98a1b2;
 
-    --kind-say: #A3ADBE; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
-    --kind-decide: #4fb477; --kind-note: #A78BFA; --kind-ledger: #A78BFA;
+    --kind-say: #A9B3C3; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+    --kind-decide: #4fb477; --kind-note: #B39DFB; --kind-ledger: #B39DFB;
     --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
-    --on-decide: #161B24; --scrim: rgba(6, 9, 15, 0.5);
+    --on-decide: #1E2430; --scrim: rgba(6, 9, 15, 0.5);
     --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #855FCF;
-    --on-agent: #fff; --on-agent-codex: #161B24;
+    --on-agent: #fff; --on-agent-codex: #1E2430;
 
-    --code-bg: #131821;
+    --code-bg: #1A202B;
     --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
-    --hl-com: #8D97A8; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
+    --hl-com: #9AA4B5; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
 
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.25);
     --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.03);
     --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
-    --ly-outline: #8B5CF6; --ly-outline-quiet: #7A8599; --ly-focus: #E6E9EF;
+    --ly-outline: #8E6CF2; --ly-outline-quiet: #828DA1; --ly-focus: #E9ECF2;
     --focus-ring: var(--accent-ink);
     color-scheme: dark;
   }
 }
 
 :root[data-theme="dark"] {
-  --bg: #161B24; --surface: #1C2230; --raised: #232A39;
-  --line: #2E3648; --line-soft: #262E3D;
+  --bg: #1E2430; --surface: #252C3A; --raised: #2C3445;
+  --line: #384156; --line-soft: #313A4C;
   /* The frame sits a step behind the work, as in light: between the page
      and a card. */
-  --chrome: #191F2A; --chrome-deep: #161B24;
+  --chrome: #222835; --chrome-deep: #1E2430;
 
-  --ink: #E6E9EF; --ink-dim: #A3ADBE; --ink-faint: #7A8599;
+  --ink: #E9ECF2; --ink-dim: #A9B3C3; --ink-faint: #828DA1;
 
   /* Violet on the dark ground, where the light theme's indigo goes muddy. */
-  --accent: #8B5CF6; --accent-ink: #A78BFA;
-  --accent-soft: rgba(139, 92, 246, 0.16); --accent-line: rgba(139, 92, 246, 0.45);
-  --good: #10B981; --good-ink: #10B981; --good-soft: rgba(16, 185, 129, 0.14);
+  --accent: #9A7BF8; --accent-ink: #B39DFB;
+  --accent-soft: rgba(154, 123, 248, 0.16); --accent-line: rgba(154, 123, 248, 0.45);
+  --good: #10B981; --good-ink: #2CC994; --good-soft: rgba(16, 185, 129, 0.14);
   --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.14);
-  --crit: #EF4444; --crit-ink: #F87171; --crit-soft: rgba(239, 68, 68, 0.14);
-  --btn-fg: #fff; --on-good: #161B24;
+  --crit: #EF4444; --crit-ink: #FA8585; --crit-soft: rgba(239, 68, 68, 0.14);
+  --btn-fg: #fff; --on-good: #1E2430;
   --btn-primary: #8655F6; --crit-fill: #EB1616;
-  --glass: rgba(28, 34, 48, 0.72);
+  --glass: rgba(37, 44, 58, 0.72);
 
   --tc-blue:   #7c9bff;
   --tc-teal:   #4fc4c0;
   --tc-green:  #4fb477;
   --tc-amber:  #e0b95c;
   --tc-orange: #f0925c;
-  --tc-red:    #ea7a71;
+  --tc-red:    #EE8278;
   --tc-purple: #b48bf0;
   --tc-slate:  #98a1b2;
 
-  --kind-say: #A3ADBE; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
-  --kind-decide: #4fb477; --kind-note: #A78BFA; --kind-ledger: #A78BFA;
+  --kind-say: #A9B3C3; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
+  --kind-decide: #4fb477; --kind-note: #B39DFB; --kind-ledger: #B39DFB;
   --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
-  --on-decide: #161B24; --scrim: rgba(6, 9, 15, 0.5);
+  --on-decide: #1E2430; --scrim: rgba(6, 9, 15, 0.5);
   --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #855FCF;
-  --on-agent: #fff; --on-agent-codex: #161B24;
+  --on-agent: #fff; --on-agent-codex: #1E2430;
 
-  --code-bg: #131821;
+  --code-bg: #1A202B;
   --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
-  --hl-com: #8D97A8; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
+  --hl-com: #9AA4B5; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
 
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.25);
   --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.03);
   --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
-  --ly-outline: #8B5CF6; --ly-outline-quiet: #7A8599; --ly-focus: #E6E9EF;
+  --ly-outline: #8E6CF2; --ly-outline-quiet: #828DA1; --ly-focus: #E9ECF2;
   --focus-ring: var(--accent-ink);
   color-scheme: dark;
 }
 
-/* candidate: dark soft
-   Paste over both dark blocks to try it. It carries no comments because the
-   whole block is one.
-
-   --bg: #1E2430; --surface: #252C3A; --raised: #2C3445;
-   --line: #384156; --line-soft: #313A4C;
-   --chrome: #222835; --chrome-deep: #1E2430;
-
-   --ink: #E9ECF2; --ink-dim: #A9B3C3; --ink-faint: #828DA1;
-
-   --accent: #9A7BF8; --accent-ink: #B39DFB;
-   --accent-soft: rgba(154, 123, 248, 0.16); --accent-line: rgba(154, 123, 248, 0.45);
-   --good: #10B981; --good-ink: #2CC994; --good-soft: rgba(16, 185, 129, 0.14);
-   --warn: #F59E0B; --warn-ink: #FBBF24; --warn-soft: rgba(245, 158, 11, 0.14);
-   --crit: #EF4444; --crit-ink: #FA8585; --crit-soft: rgba(239, 68, 68, 0.14);
-   --btn-fg: #fff; --on-good: #1E2430;
-   --btn-primary: #8655F6; --crit-fill: #EB1616;
-   --glass: rgba(37, 44, 58, 0.72);
-
-   --tc-blue:   #7c9bff;
-   --tc-teal:   #4fc4c0;
-   --tc-green:  #4fb477;
-   --tc-amber:  #e0b95c;
-   --tc-orange: #f0925c;
-   --tc-red:    #EE8278;
-   --tc-purple: #b48bf0;
-   --tc-slate:  #98a1b2;
-
-   --kind-say: #A9B3C3; --kind-agent: #b48bf0; --kind-run: #4fc4c0; --kind-ask: #e0b95c;
-   --kind-decide: #4fb477; --kind-note: #B39DFB; --kind-ledger: #B39DFB;
-   --run-ok: #96e3a6; --run-fail: #f08a82; --run-busy: #e0a458;
-   --on-decide: #1E2430; --scrim: rgba(6, 9, 15, 0.5);
-   --agent-claude: #d97757; --agent-codex: #e8e8e3; --agent-copilot: #855FCF;
-   --on-agent: #fff; --on-agent-codex: #1E2430;
-
-   --code-bg: #1A202B;
-   --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
-   --hl-com: #9AA4B5; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
-
-   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.25);
-   --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.03);
-   --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
-   --ly-outline: #8E6CF2; --ly-outline-quiet: #828DA1; --ly-focus: #E9ECF2;
-   --focus-ring: var(--accent-ink);
-   color-scheme: dark;
-   end candidate */
+/* Dim, the step between the first dark and this one, kept for reference:
+   --bg #161B24, --surface #1C2230, --raised #232A39. */

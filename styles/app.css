@@ -65,8 +65,6 @@
     color: var(--ink-faint); font-size: 15px; pointer-events: none;
   }
   .titlebar .spacer { flex: 1; }
-  /* A frameless panel has no traffic lights to avoid. */
-  body.panel .titlebar { padding-left: var(--s5); }
 
   .body { flex: 1; display: flex; min-height: 0; }
 
@@ -1938,7 +1936,7 @@
   .field.mono-in { font-family: var(--mono); font-size: 12.5px; }
   .setting .row .field.mono-in { flex: 1; max-width: 360px; }
   .wb-example { margin: var(--s2) 0 0; }
-  .wb-dialog { width: min(520px, 100%); max-height: calc(100vh - 64px); overflow-y: auto; }
+  .wb-dialog { width: min(520px, 100%); max-height: var(--overlay-room, calc(100vh - 64px)); overflow-y: auto; }
   .wb-dialog li .hint { margin-left: auto; white-space: nowrap; }
   .wb-dialog li .wb-li-acts { margin-left: auto; display: inline-flex; gap: 10px; white-space: nowrap; }
   .wb-dialog .wb-cmd code { color: var(--ink); }
@@ -2015,6 +2013,12 @@
     position: fixed; inset: 0; z-index: 50;
     background: color-mix(in srgb, var(--bg) 78%, black);
     display: grid; place-items: center; padding: var(--s6);
+    /* Clear of the window buttons (--chrome-top, styles/topbar.css), so a
+       tall dialog never has its corner under them. A box that can grow tall
+       caps itself with --overlay-room, which is what is left between. */
+    --overlay-top: max(var(--s6), calc(var(--chrome-top) + var(--s2)));
+    --overlay-room: calc(100vh - var(--s6) - var(--overlay-top));
+    padding-top: var(--overlay-top);
     animation: fade 120ms ease;
   }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
@@ -3085,7 +3089,7 @@
   .where-pop .wv { display: flex; flex-wrap: wrap; gap: 4px 10px; min-width: 0; }
 
   /* The picker: where an item belongs. */
-  .pk { width: min(560px, 100%); padding: 0; gap: 0; max-height: calc(100vh - 48px); overflow: hidden; display: flex; flex-direction: column; }
+  .pk { width: min(560px, 100%); padding: 0; gap: 0; max-height: var(--overlay-room, calc(100vh - 48px)); overflow: hidden; display: flex; flex-direction: column; }
   .pk-head { padding: 16px 20px 12px; }
   .pk-head h3 { margin: 0 0 4px; }
   .pk-head .sub { font-size: 12.5px; color: var(--ink-dim); display: flex; align-items: center; gap: 7px; min-width: 0; }
@@ -3129,7 +3133,7 @@
   .kind.sm { font-size: 9.5px; padding: 1px 6px; flex: 0 0 auto; }
 
   /* The Flag dialog. */
-  .fl-dlg { width: min(820px, 100%); padding: 0; gap: 0; overflow: hidden; max-height: calc(100vh - 48px); display: flex; flex-direction: column; }
+  .fl-dlg { width: min(820px, 100%); padding: 0; gap: 0; overflow: hidden; max-height: var(--overlay-room, calc(100vh - 48px)); display: flex; flex-direction: column; }
   .fl-top { display: flex; align-items: center; gap: 8px; padding: 16px 20px 12px; border-bottom: 1px solid var(--line-soft); }
   .fl-top h3 { display: flex; align-items: center; gap: 8px; }
   .fl-top h3 svg { width: 16px; height: 16px; color: var(--accent-ink); }

@@ -139,6 +139,9 @@ const LATER_COLUMNS = [
   // the folder off the project sends the task back to Home rather than
   // deleting it. Added by ALTER, never a rebuild of tasks. See schema.sql.
   ["tasks", "repo_id", "INTEGER REFERENCES repos(id) ON DELETE SET NULL"],
+  // Words a person says also name a project in a branch or a commit subject,
+  // comma-separated (workbench/route.js). See schema.sql.
+  ["projects", "aliases", "TEXT"],
   // A person's per project say over what agents may do there unasked.
   ["projects", "auto_approve", "INTEGER NOT NULL DEFAULT 0"],
   ["projects", "allow_unguarded", "INTEGER NOT NULL DEFAULT 0"],
@@ -393,6 +396,12 @@ function itemTrigger(name, table, entity) {
 END`;
 }
 
+function routeTrigger(name, table, entity) {
+  return `CREATE TRIGGER IF NOT EXISTS ${name} AFTER DELETE ON ${table} BEGIN
+  DELETE FROM filed_routes WHERE entity = '${entity}' AND entity_id = old.id;
+END`;
+}
+
 // [name, table it fires on, the tables its body writes, statement]. Created
 // when missing and every table it names exists, after the tables above.
 const LATER_TRIGGERS = [
@@ -400,6 +409,10 @@ const LATER_TRIGGERS = [
   ["items_note_ad", "notes", ["item_projects", "item_copies", "item_flags"], itemTrigger("items_note_ad", "notes", "note")],
   ["items_pad_ad", "scratchpads", ["item_projects", "item_copies", "item_flags"], itemTrigger("items_pad_ad", "scratchpads", "scratchpad")],
   ["items_link_ad", "links", ["item_projects", "item_copies", "item_flags"], itemTrigger("items_link_ad", "links", "link")],
+  // A guessed filing goes with its item. See schema.sql.
+  ["routes_task_ad", "tasks", ["filed_routes"], routeTrigger("routes_task_ad", "tasks", "task")],
+  ["routes_note_ad", "notes", ["filed_routes"], routeTrigger("routes_note_ad", "notes", "note")],
+  ["routes_pad_ad", "scratchpads", ["filed_routes"], routeTrigger("routes_pad_ad", "scratchpads", "scratchpad")],
 ];
 
 // Table names go into PRAGMA text, which cannot take a bound parameter. They

@@ -750,9 +750,12 @@ globalThis.DelphiDrawer = (() => {
         let back = opener && opener.isConnected ? opener : null;
         if (!back && openerKey) back = [...document.querySelectorAll(`#content ${openerKey}, ${openerKey}`)].find((n) => n.offsetParent !== null) || null;
         if (!busy && back && typeof back.focus === "function") back.focus({ preventScroll: true });
-        // The page under it has not moved while it was open, so it is put
-        // back as it was, whether this closed for good or for the next task.
-        if (host.restoreView) host.restoreView(was);
+        // The row the keyboard was on comes back. The scroll comes back only
+        // if nobody scrolled the page while the drawer was open: a repaint
+        // can reset it, but scrolling done since is the reader's own.
+        const pageNow = document.getElementById("content");
+        const moved = pageNow && pageNow === page && Math.abs(pageNow.scrollTop - was.scroll) > 1;
+        if (host.restoreView) host.restoreView({ lit: was.lit, scroll: moved ? null : was.scroll });
       }
     }
     const me = { root, head, body, foot, close, handle: null, focusFirst: () => (focusables()[0] || root).focus({ preventScroll: true }) };
@@ -2862,6 +2865,9 @@ globalThis.DelphiDrawer = (() => {
     kindSel.onchange = async () => { await window.delphi.notes.update(n.id, { kind: kindSel.value }); n.kind = kindSel.value; kindSel.className = `dw-kchip sel ${n.kind}`; host.refresh(); };
     const chips = el("div", { className: "dw-chips" }, kindSel, el("span", { className: "dw-kchip", textContent: shortDate(n.updated_at || n.created_at), title: `Updated ${n.updated_at || ""}` }));
     if (n.associated && n.home_name) chips.append(host.fromChip(item()));
+    // Filed by a guess into a shared folder (ui/folderlist.js).
+    const routedNote = host.routeChip ? host.routeChip("note", n) : null;
+    if (routedNote) chips.append(routedNote);
     const growName = () => { nameIn.style.height = "auto"; nameIn.style.height = `${nameIn.scrollHeight}px`; };
     nameIn.addEventListener("input", growName);
     nameIn.addEventListener("blur", () => nameKeep.save());
@@ -3060,7 +3066,9 @@ globalThis.DelphiDrawer = (() => {
     };
     paintToggle();
     nameBox = titleField(nameIn, "plain", { revert: () => nameKeep.base() });
-    me.head.append(topRow(crumbs, [pin, share, del, moreB], flashHost, () => me.close()), nameBox.node, props, el("div", { className: "dw-note-line" }, toggle, toggleWords));
+    const routedPad = host.routeChip ? host.routeChip("scratchpad", pad) : null;
+    me.head.append(topRow(crumbs, [pin, share, del, moreB], flashHost, () => me.close()), nameBox.node,
+      ...(routedPad ? [el("div", { className: "dw-route" }, routedPad)] : []), props, el("div", { className: "dw-note-line" }, toggle, toggleWords));
     // The <!--d:N--> markers are how a line and its task stay the same thing.
     // Kept in the source, and left out of the formatted view by the renderer,
     // which drops HTML comments, so the preview keeps the source line numbers

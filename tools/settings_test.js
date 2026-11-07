@@ -368,8 +368,7 @@ fs.rmSync(tmp, { recursive: true, force: true });
 
 // --- accents ------------------------------------------------------------------------
 console.log("\naccents, against styles/tokens.css");
-const css0 = read("styles/tokens.css");
-const css = css0.replace(/\/\*[\s\S]*?\*\//g, "");
+const css = read("styles/tokens.css").replace(/\/\*[\s\S]*?\*\//g, "");
 function block(re) {
   const at = css.search(re); const open = css.indexOf("{", at); let d = 1; let i = open + 1;
   for (; i < css.length && d; i++) { if (css[i] === "{") d++; else if (css[i] === "}") d--; }
@@ -378,7 +377,6 @@ function block(re) {
 const light = block(/(^|\n):root\s*\{/);
 const paper = { ...light, ...block(/:root\[data-theme="paper"\]\s*\{/) };
 const dark = { ...light, ...block(/:root\[data-theme="dark"\]\s*\{/) };
-const soft = { ...light, ...Object.fromEntries([...((css0.match(/\/\* candidate: dark soft([\s\S]*?)end candidate \*\//) || [])[1] || "").matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()])) };
 const rgb = (hex) => { const h = hex.replace("#", ""); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); };
 const lum = ([r, g, b]) => { const f = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b); };
 const ratio = (a, b) => { const [x, y] = [lum(rgb(a)), lum(rgb(b))].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
@@ -386,11 +384,11 @@ const ratio = (a, b) => { const [x, y] = [lum(rgb(a)), lum(rgb(b))].sort((p, q) 
 // focus ring where it is one. Dark draws its ring in the ink (--focus-ring in
 // tokens.css), because no fill that carries white at 4.5:1 is also 3:1 on a
 // dark ground, so there the ink is held to 3:1 as the ring as well as 4.5:1 as
-// text. The Soft dark kept as a candidate is checked as if it shipped.
+// text.
 const low = [];
 const ring = [];
 for (const a of schema.ACCENTS) {
-  for (const [theme, vars, [fill, ink], ringIs] of [["light", light, a.light, fill0(a.light)], ["paper", paper, a.paper, fill0(a.paper)], ["dark", dark, a.dark, a.dark[1]], ["dark soft", soft, a.dark, a.dark[1]]]) {
+  for (const [theme, vars, [fill, ink], ringIs] of [["light", light, a.light, fill0(a.light)], ["paper", paper, a.paper, fill0(a.paper)], ["dark", dark, a.dark, a.dark[1]]]) {
     for (const g of ["--bg", "--surface", "--raised", "--chrome"]) {
       if (ratio(ink, vars[g]) < 4.5) low.push(`${a.id} ${theme} ink on ${g}: ${ratio(ink, vars[g]).toFixed(2)}`);
       if (ratio(ringIs, vars[g]) < 3) ring.push(`${a.id} ${theme} focus ring on ${g}: ${ratio(ringIs, vars[g]).toFixed(2)}`);

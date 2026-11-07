@@ -177,6 +177,12 @@ function createWeekly({ db, sheets, after = () => {}, clock = () => Date.now() }
         undone.push(auditId);
       }
       for (const e of r.events) sql("DELETE FROM status_events WHERE id = :p1 AND task_id = :p2", [e.id, e.task_id]);
+      // Not where a newer Suggest tidy already offers the same thing.
+      for (const c of r.reopen || []) {
+        sql(`UPDATE tidy_suggestions SET state = 'open', decided_at = NULL WHERE id = :p1 AND state = 'dropped'
+               AND NOT EXISTS (SELECT 1 FROM tidy_suggestions n JOIN tidy_suggestions o ON o.id = :p1
+                                WHERE n.state = 'open' AND n.task_id = o.task_id AND n.action = o.action)`, [c]);
+      }
       return { undone };
     });
     receipts.delete(Number(id));
@@ -236,13 +242,21 @@ function createWeekly({ db, sheets, after = () => {}, clock = () => Date.now() }
     const now = clock();
     const week = weekly.objectivesWeek(now);
     const out = locked(() => {
+      // A finished week keeps its objectives: ending it again without saving
+      // would leave a note the week says was never written.
+      const was = sql("SELECT state FROM weekly_reviews WHERE week = :p1", [week])[0];
+      if (was && was.state === "reviewed" && state === "skipped") {
+        throw new Error("This week's review is already finished, with what it saved. Undo the Finish first if you meant to end it without saving.");
+      }
       let note = null;
+      // The cards dropped here come back if the End is undone.
+      const reopen = sql("SELECT id FROM tidy_suggestions WHERE state = 'open'", []).map((r) => Number(r.id));
       const rows = wrote(() => {
         if (list) note = writeNote(Number(projectId), list, week, now);
         db.markWeeklyReview({ week, state, noteId: note ? note.id : null });
         sql("UPDATE tidy_suggestions SET state = 'dropped', decided_at = datetime('now') WHERE state = 'open'", []);
       });
-      return { note, rows };
+      return { note, rows: { ...rows, reopen } };
     });
     done();
     return { ...receipt(null, null, state, out.rows), week, state, note: out.note };

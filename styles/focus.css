@@ -32,6 +32,12 @@
 
 /* Top bar: who and how long on the left, the verbs on the right. */
 .fx-top { height: 56px; flex: 0 0 56px; display: flex; align-items: center; gap: 10px; padding: 0 20px; position: relative; z-index: 3; -webkit-app-region: drag; }
+/* Focus covers the top bar, so it keeps clear of the window's chrome itself
+   (styles/topbar.css): past the traffic lights and level with them in a
+   Mac window, short of the caption buttons on Windows, below the menu bar's
+   strip in full screen. */
+.fx-top { padding-left: max(20px, var(--chrome-left)); padding-right: max(20px, var(--chrome-right)); margin-top: var(--chrome-gap); }
+body.mac:not(.is-fullscreen) .fx-top { padding-bottom: 8px; }
 .fx-top button, .fx-top select { -webkit-app-region: no-drag; }
 .fx-top .grow { flex: 1; }
 .fx-brand { display: flex; align-items: center; gap: 9px; font-family: var(--display); font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
@@ -223,7 +229,7 @@
 .fx-keys span { display: inline-flex; align-items: center; gap: 6px; }
 
 /* Done, and the toast with Undo. */
-.fx-done { position: fixed; inset: 56px 0 0; z-index: 30; display: grid; place-items: center; pointer-events: none; }
+.fx-done { position: fixed; inset: calc(56px + var(--chrome-gap)) 0 0; z-index: 30; display: grid; place-items: center; pointer-events: none; }
 .fx-done-in { display: flex; flex-direction: column; align-items: center; gap: 12px; animation: fx-done-in 1050ms var(--ease) both; }
 .fx-done .ring {
   width: 84px; height: 84px; border-radius: 99px; background: var(--good); color: var(--on-good);
@@ -235,7 +241,7 @@
 @keyframes fx-done-in { 0% { opacity: 0; transform: scale(.9); } 20% { opacity: 1; transform: none; } 80% { opacity: 1; } 100% { opacity: 0; transform: translateY(-10px); } }
 
 .fx-toast {
-  position: fixed; left: 50%; top: 66px; z-index: 46; transform: translateX(-50%);
+  position: fixed; left: 50%; top: calc(66px + var(--chrome-gap)); z-index: 46; transform: translateX(-50%);
   background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 9px 14px; font-size: 12.5px;
   box-shadow: var(--shadow-3); display: flex; align-items: center; gap: 12px; animation: fx-pop 200ms ease;
   max-width: min(640px, calc(100% - 48px));

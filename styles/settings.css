@@ -10,14 +10,14 @@
 :root[data-density="spacious"] { --s1: 5px; --s2: 10px; --s3: 14px; --s4: 20px; --s5: 28px; --s6: 38px; --s7: 56px; }
 
 .sp-scrim.overlay {
-  padding: 0; z-index: 60;
+  padding: var(--chrome-top) 0 0; z-index: 60;
   background: var(--scrim);
   backdrop-filter: blur(2px);
 }
 @media (prefers-reduced-transparency: reduce) { .sp-scrim.overlay { backdrop-filter: none; } }
 
 .sp {
-  width: min(1100px, calc(100vw - 48px)); height: min(800px, calc(100vh - 48px));
+  width: min(1100px, calc(100vw - 48px)); height: min(800px, calc(100vh - 48px - var(--chrome-top)));
   display: grid; grid-template-rows: 54px minmax(0, 1fr) 34px;
   background: var(--surface); color: var(--ink);
   border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow-3);
@@ -174,11 +174,12 @@
 .sp-thm .pane.light { background: #FAFAFA; } .sp-thm .pane.light .tb { background: #FFFFFF; border-bottom: 1px solid #E5E7EB; }
 .sp-thm .pane.light i { background: #E5E7EB; }
 /* Each card is a picture of that theme whatever theme is showing, so these
-   are its own grounds as literals, copied from styles/tokens.css. */
+   are its own grounds as literals, copied from styles/tokens.css: --bg, the
+   bar in --surface, the rules in --line. tools/contrast_test.js checks them. */
 .sp-thm .pane.paper { background: #F3F0E8; } .sp-thm .pane.paper .tb { background: #FBF9F4; border-bottom: 1px solid #D9D2C3; }
 .sp-thm .pane.paper i { background: #D9D2C3; }
-.sp-thm .pane.dark { background: #161B24; } .sp-thm .pane.dark .tb { background: #1C2230; border-bottom: 1px solid #2E3648; }
-.sp-thm .pane.dark i { background: #2E3648; }
+.sp-thm .pane.dark { background: #1E2430; } .sp-thm .pane.dark .tb { background: #252C3A; border-bottom: 1px solid #384156; }
+.sp-thm .pane.dark i { background: #384156; }
 .sp-thm .pane i.a { background: var(--accent); }
 .sp-thm .cap { display: flex; align-items: center; gap: 7px; margin-top: 8px; font-weight: 600; font-size: 12.5px; }
 .sp-thm .cap .hint { font-weight: 400; color: var(--ink-faint); font-size: 11.5px; }

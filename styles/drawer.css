@@ -7,7 +7,7 @@
    scrolls costs frames. */
 
 .dw {
-  position: fixed; top: 48px; right: 0; bottom: 0; z-index: 30;
+  position: fixed; top: calc(48px + var(--chrome-gap)); right: 0; bottom: 0; z-index: 30;
   width: 450px; max-width: calc(100vw - 48px);
   display: flex; flex-direction: column;
   background: var(--surface); color: var(--ink);

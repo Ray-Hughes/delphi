@@ -398,14 +398,15 @@ function capAnswer(text, { already = false } = {}) {
 // Only the token shapes, not scrub's people's numbers or its context rules:
 // this is a net for an answer that quoted a key file back, and a false match
 // costs a word of a review.
-const { SECRET_SHAPES } = require("../sheet/scrub");
+const { redactShapes } = require("../sheet/scrub");
 
-/** The text with anything shaped like a token replaced, and how many were. */
+/**
+ * The text with anything shaped like a token replaced, and how many were:
+ * sheet/scrub.js's token shapes, through its redactShapes, so a JWT after a
+ * hyphen is caught here as it is in a pull request.
+ */
 function redact(text) {
-  let count = 0;
-  let out = String(text);
-  for (const shape of SECRET_SHAPES) out = out.replace(shape, () => { count++; return "[redacted]"; });
-  return { text: out, count };
+  return redactShapes(text);
 }
 
 // --- limits --------------------------------------------------------------------

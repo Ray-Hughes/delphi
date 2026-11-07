@@ -9,13 +9,17 @@
  *
  *   a. what the agent was launched from: its job's task, its session, or the
  *      project the harness scoped it to. Never a guess.
- *   b. a Workbench: the folder or the branch is one task's, so its project.
- *   c. a ticket or a project key in the branch name, then in the latest
- *      commit's subject: APREQ-987 matches the project whose name or key
- *      carries it, or one holding a task with it as its ref, Jira key or in
- *      its title.
+ *   b. a Workbench: its folder, or its branch checked out in its own
+ *      repository, is one task's, so its project.
+ *   c. a ticket or a distinctive project key in the branch name, then in
+ *      the latest commit's subject: APREQ-987 matches the project whose name
+ *      or key carries it as a whole word, and only failing that one holding
+ *      an open task with it as its ref, Jira key or a word of its title; a
+ *      key counts only whole (ssnr-mpi, never ssnr).
  *   d. the project most recently active in the folder: a session or a job
- *      that ran there, or an item a person moved after it was filed there.
+ *      that ran there, or an item a person moved or confirmed there.
+ *   d2. a key that is a common word (general, test, platform) in the branch
+ *      or the subject, which says less than d.
  *   e. the folder's Home project (the oldest, when it is several projects'
  *      Home).
  *
@@ -60,19 +64,38 @@ const words = (text) => String(text || "").toLowerCase().split(/[^a-z0-9]+/).fil
 
 /**
  * Whether a project's key names it in this text: the whole key as a run of
- * the text's words (ssnr-mpi in feature/ssnr-mpi-fix), or its first word when
- * that is at least four letters and the key's own (ssnr in ssnr/fix). Short
- * first words (co, ui) are too common to mean a project.
+ * the text's words (ssnr-mpi in feature/ssnr-mpi-fix), never a part of it. A
+ * one-word key shorter than four letters (co, ui) is too common to mean a
+ * project at all.
  */
 function keyIn(key, text) {
   const k = words(key);
   const t = words(text);
   if (!k.length || !t.length) return false;
-  // A one-word key shorter than four letters (co, ui) is too common to mean a
-  // project, whole or not.
   if (k.length === 1 && k[0].length < 4) return false;
   for (let i = 0; i + k.length <= t.length; i++) if (k.every((w, j) => t[i + j] === w)) return true;
-  return k[0].length >= 4 && /[a-z]/.test(k[0]) && t.includes(k[0]);
+  return false;
+}
+
+// Words that turn up in branch names and commit subjects whatever the work
+// is, so a project keyed on one of them is named by every other branch.
+const GENERIC = new Set(("test tests testing general platform monitoring claude main master dev develop development feature fix fixes " +
+  "release hotfix docs doc tools tool app apps api web core common misc infra ops data work tasks notes project projects default " +
+  "staging prod production update updates cleanup refactor chore build deploy config settings setup scripts script example demo " +
+  "temp tmp wip draft review migration migrations queue system systems service services server client frontend backend").split(" "));
+
+/**
+ * Whether a key is worth more than the folder's recent activity: it carries
+ * a digit (a ticket, a year), or is at least six letters and not a word
+ * every branch uses. "general" and "test" are not; "ssnr-mpi" and
+ * "co-hearing-address" are.
+ */
+function distinctive(key) {
+  const k = String(key || "").toLowerCase();
+  if (!k) return false;
+  if (/\d/.test(k)) return true;
+  if (k.replace(/[^a-z0-9]/g, "").length < 6) return false;
+  return !words(k).every((w) => GENERIC.has(w)) && !GENERIC.has(k);
 }
 
 /** The folders known to Delphi that hold `cwd`, deepest first, each with the projects that have it. */
@@ -94,7 +117,13 @@ function foldersHolding(sql, cwd) {
 
 /** The project a launch names: a job's task, a task, a session, then the harness's scope. */
 function launched(sql, { jobId = null, taskId = null, sessionId = null, scopeProject = null }) {
-  const project = (id) => (id == null ? null : sql("SELECT id, name, status FROM projects WHERE id = :p1", [Number(id)])[0] || null);
+  // An archived project is not where new work goes: fall through to the next
+  // step rather than file into it.
+  const project = (id) => {
+    if (id == null) return null;
+    const row = sql("SELECT id, name, status FROM projects WHERE id = :p1", [Number(id)])[0] || null;
+    return row && row.status !== "archived" ? row : null;
+  };
   if (jobId != null) {
     const job = sql(`SELECT h.project_id, h.task_id, t.project_id AS task_project FROM handoffs h LEFT JOIN tasks t ON t.id = h.task_id
                       WHERE h.id = :p1`, [Number(jobId)])[0];
@@ -116,45 +145,116 @@ function launched(sql, { jobId = null, taskId = null, sessionId = null, scopePro
   return null;
 }
 
-/** The task whose Workbench this folder or branch is. */
-function workbench(sql, { cwd = null, branch = null }) {
-  const rows = sql(`SELECT w.path, w.branch, w.task_id, t.project_id FROM workbenches w JOIN tasks t ON t.id = w.task_id
-                     WHERE w.state IN ${LIVE_BENCH} AND t.project_id IS NOT NULL ORDER BY w.id DESC`, []);
+/** Live Workbenches of active projects, with the repository each was made from. */
+const benchRows = (sql) => sql(`SELECT w.path, w.branch, w.task_id, t.project_id, r.path AS repo_path FROM workbenches w
+                                  JOIN tasks t ON t.id = w.task_id JOIN projects p ON p.id = t.project_id
+                                  LEFT JOIN repos r ON r.id = w.repo_id
+                                 WHERE w.state IN ${LIVE_BENCH} AND p.status != 'archived' ORDER BY w.id DESC`, []);
+
+/** b: the task whose Workbench folder this is. Needs no git. */
+function workbenchAt(sql, cwd) {
   const here = discover.key(cwd);
-  const at = here ? rows.find((w) => discover.within(here, discover.key(w.path))) : null;
-  if (at) return { projectId: Number(at.project_id), via: "workbench", detail: { task_id: Number(at.task_id), branch: at.branch } };
-  const named = branch ? rows.find((w) => w.branch === branch) : null;
-  if (named) return { projectId: Number(named.project_id), via: "workbench", detail: { task_id: Number(named.task_id), branch: named.branch } };
-  return null;
+  if (!here) return null;
+  const at = benchRows(sql).find((w) => discover.within(here, discover.key(w.path)));
+  return at ? { projectId: Number(at.project_id), via: "workbench", detail: { task_id: Number(at.task_id), branch: at.branch } } : null;
 }
 
-/** c: the one candidate a ticket or a key in this text names, or null. */
-function named(sql, candidates, text) {
+/**
+ * b, by branch: a Workbench's branch checked out in its own repository's
+ * main folder. Only there: the same branch name in another repository is
+ * another piece of work, and filing it into this task's project would be
+ * certain and wrong.
+ */
+function workbenchBranch(sql, cwd, branch) {
+  const here = discover.key(cwd);
+  if (!here || !branch) return null;
+  const at = benchRows(sql).find((w) => w.branch === branch && w.repo_path && discover.within(here, discover.key(w.repo_path)));
+  return at ? { projectId: Number(at.project_id), via: "workbench", detail: { task_id: Number(at.task_id), branch: at.branch } } : null;
+}
+
+/**
+ * c: the one candidate this text names, at one strength:
+ *   "ticket"  a ticket that is a whole word of a project's name or key, then
+ *             (only if no project's own name has it) one that is an open
+ *             task's ref, Jira key or a whole word of its title;
+ *   "key"     a project's whole key, when the key is distinctive, the
+ *             distinctive first word of a hyphenated key, or an alias a
+ *             person gave it (namesFor);
+ *   "generic" a project's whole key that is a common word, ranked below the
+ *             folder's recent activity.
+ * Two candidates at the same strength is no answer.
+ */
+function named(sql, candidates, text, strength) {
   if (!text) return null;
-  const found = tickets(text);
-  const hits = new Map();
-  for (const p of candidates) {
-    const row = sql("SELECT key, name FROM projects WHERE id = :p1", [p.id])[0] || {};
-    const label = `${row.key || ""} ${row.name || ""}`.toUpperCase();
-    for (const t of found) {
-      // A whole word in the name: APREQ-987 is not APREQ-9870.
-      const whole = new RegExp(`(^|[^A-Z0-9])${t.replace(/[^A-Z0-9-]/g, "")}(?![0-9])`);
-      if (whole.test(label)) { hits.set(p.id, { ticket: t, by: "project" }); break; }
-      // LIKE finds the candidates; the title is then read for the ticket as a
-      // whole word, so APPEALS-12 never matches a task about APPEALS-120.
-      const exact = whole;
-      const task = sql(`SELECT id, title, ref, external_key FROM tasks WHERE project_id = :p1
-                          AND (UPPER(COALESCE(ref, '')) = :p2 OR UPPER(COALESCE(external_key, '')) = :p3 OR UPPER(title) LIKE :p4)
-                        ORDER BY id DESC LIMIT 200`, [p.id, t, `JIRA:${t}`, `%${t}%`])
-        .find((x) => String(x.ref || "").toUpperCase() === t || String(x.external_key || "").toUpperCase() === `JIRA:${t}` || exact.test(String(x.title || "").toUpperCase()));
-      if (task) { hits.set(p.id, { ticket: t, by: "task", task_id: Number(task.id) }); break; }
+  const rows = candidates.map((p) => ({ id: Number(p.id), ...(sql("SELECT * FROM projects WHERE id = :p1", [p.id])[0] || {}) }));
+  const one = (hits) => (hits.size === 1 ? (([[projectId, why]]) => ({ projectId, why }))([...hits]) : null);
+  if (strength === "ticket") {
+    const found = tickets(text);
+    if (!found.length) return null;
+    const whole = (t) => new RegExp(`(^|[^A-Z0-9])${t.replace(/[^A-Z0-9-]/g, "")}(?![0-9])`);
+    const byProject = new Map();
+    for (const r of rows) {
+      const label = `${r.key || ""} ${r.name || ""}`.toUpperCase();
+      const t = found.find((x) => whole(x).test(label));
+      if (t) byProject.set(r.id, { ticket: t, by: "project" });
     }
-    if (!hits.has(p.id) && keyIn(row.key, text)) hits.set(p.id, { key: row.key, by: "key" });
+    if (byProject.size) return one(byProject);
+    const byTask = new Map();
+    for (const r of rows) {
+      for (const t of found) {
+        const task = sql(`SELECT id, title, ref, external_key FROM tasks WHERE project_id = :p1 AND status != 'done'
+                            AND (UPPER(COALESCE(ref, '')) = :p2 OR UPPER(COALESCE(external_key, '')) = :p3 OR UPPER(title) LIKE :p4)
+                          ORDER BY id DESC LIMIT 200`, [r.id, t, `JIRA:${t}`, `%${t}%`])
+          .find((x) => String(x.ref || "").toUpperCase() === t || String(x.external_key || "").toUpperCase() === `JIRA:${t}` || whole(t).test(String(x.title || "").toUpperCase()));
+        if (task) { byTask.set(r.id, { ticket: t, by: "task", task_id: Number(task.id) }); break; }
+      }
+    }
+    return one(byTask);
   }
-  // Two projects named by one branch is no answer: fall through to d.
-  if (hits.size !== 1) return null;
-  const [[projectId, why]] = [...hits];
-  return { projectId, why };
+  const byKey = new Map();
+  if (strength === "generic") {
+    for (const r of rows) if (r.key && !distinctive(r.key) && keyIn(r.key, text)) byKey.set(r.id, { key: r.key, by: "key" });
+    return one(byKey);
+  }
+  const others = strength === "key" ? firstWordsTaken(sql) : null;
+  for (const r of rows) {
+    const term = namesFor(r, others).find((t) => keyIn(t.text, text));
+    if (term) byKey.set(r.id, { key: term.text, by: term.by });
+  }
+  return one(byKey);
+}
+
+/** Aliases as written in Settings: comma-separated, each a run of whole words. */
+const aliasesOf = (raw) => String(raw || "").split(",").map((a) => a.trim()).filter((a) => words(a).length);
+
+/**
+ * How many active projects each word starts a key or a name of, so a first
+ * word two projects share (caseflow-x and caseflow-y) names neither.
+ */
+function firstWordsTaken(sql) {
+  const count = new Map();
+  for (const p of sql("SELECT key, name FROM projects WHERE status != 'archived'", [])) {
+    const own = new Set([...words(p.key), ...words(p.name)]);
+    for (const w of own) count.set(w, (count.get(w) || 0) + 1);
+  }
+  return count;
+}
+
+/**
+ * What names a project at the "key" strength: its whole key when that is
+ * distinctive; the first word of a hyphenated key (ssnr from ssnr-mpi) when
+ * it is four letters or more, not a common word, and no other active
+ * project's key or name has it; and every alias a person gave it.
+ */
+function namesFor(r, taken) {
+  const out = [];
+  if (r.key && distinctive(r.key)) out.push({ text: r.key, by: "key" });
+  const k = words(r.key);
+  if (k.length > 1 && k[0].length >= 4 && /[a-z]/.test(k[0]) && !GENERIC.has(k[0]) && taken && (taken.get(k[0]) || 0) <= 1) {
+    out.push({ text: k[0], by: "key word" });
+  }
+  for (const a of aliasesOf(r.aliases)) out.push({ text: a, by: "alias" });
+  return out;
 }
 
 /** d: the candidate with the newest activity in this folder, or null. */
@@ -175,7 +275,7 @@ function recent(sql, candidates, folder) {
     // right" says which project this folder's work is. Settled rows only, or
     // Delphi's own first guess would vote for itself every time after.
     ...sql(`SELECT project_id AS pid, NULL AS n, MAX(settled_at) AS at FROM filed_routes
-             WHERE settled_at IS NOT NULL AND project_id IN (${inList}) AND (folder = :p1 OR folder LIKE :p2 ESCAPE '\\') GROUP BY project_id`, under),
+             WHERE settled_at IS NOT NULL AND settled_at >= datetime('now', '-30 days') AND project_id IN (${inList}) AND (folder = :p1 OR folder LIKE :p2 ESCAPE '\\') GROUP BY project_id`, under),
   ].filter((r) => r.pid != null && r.at);
   if (!rows.length) return null;
   rows.sort((a, b) => String(b.at).localeCompare(String(a.at)) || Number(b.n || 0) - Number(a.n || 0));
@@ -187,46 +287,69 @@ function recent(sql, candidates, folder) {
  *
  *   facts: { jobId, taskId, sessionId, scopeProject, cwd, branch, subject }
  *
+ * branch and subject may be left out and a git() handed in instead, which is
+ * asked only when the answer needs them: the launch, a Workbench folder and a
+ * folder one project has decide without git.
+ *
  * Returns null when nothing names a project (a folder no project has), else
  * { projectId, via, guessed, folder, detail, candidates }.
  */
 function resolve(sql, facts = {}) {
-  const { cwd = null, branch = null, subject = null } = facts;
+  const { cwd = null } = facts;
+  let seen = null;
+  const gitFacts = () => {
+    if (!seen) seen = ("branch" in facts || "subject" in facts || !facts.git)
+      ? { branch: facts.branch || null, subject: facts.subject || null }
+      : (facts.git() || { branch: null, subject: null });
+    return seen;
+  };
+  const sure = (r) => ({ ...r, guessed: false, folder: null, candidates: [r.projectId] });
   const a = launched(sql, facts);
-  if (a) return { ...a, guessed: false, folder: null, candidates: [a.projectId] };
-  const b = workbench(sql, { cwd, branch });
-  if (b) return { ...b, guessed: false, folder: null, candidates: [b.projectId] };
+  if (a) return sure(a);
+  const b = cwd ? workbenchAt(sql, cwd) : null;
+  if (b) return sure(b);
   const holding = cwd ? foldersHolding(sql, cwd) : [];
   if (!holding.length) return null;
   const { folder, projects } = holding[0];
   const candidates = projects.map((p) => p.id);
   const answer = (projectId, via, guessed, detail = {}) => ({ projectId: Number(projectId), via, guessed, folder, detail, candidates });
   if (projects.length === 1) return answer(projects[0].id, "folder", false);
-  const fromBranch = named(sql, projects, branch);
-  if (fromBranch) return answer(fromBranch.projectId, "branch", true, { branch, ...fromBranch.why });
-  const fromCommit = named(sql, projects, subject);
-  if (fromCommit) return answer(fromCommit.projectId, "commit", true, { subject, ...fromCommit.why });
+  const { branch, subject } = gitFacts();
+  const bb = workbenchBranch(sql, cwd, branch);
+  if (bb && candidates.includes(bb.projectId)) return sure(bb);
+  for (const strength of ["ticket", "key"]) {
+    const fromBranch = named(sql, projects, branch, strength);
+    if (fromBranch) return answer(fromBranch.projectId, "branch", true, { branch, ...fromBranch.why });
+    const fromCommit = named(sql, projects, subject, strength);
+    if (fromCommit) return answer(fromCommit.projectId, "commit", true, { subject, ...fromCommit.why });
+  }
   const last = recent(sql, projects, folder);
   if (last) return answer(last.projectId, "recent", true, last.why);
+  const fromBranch = named(sql, projects, branch, "generic");
+  if (fromBranch) return answer(fromBranch.projectId, "branch", true, { branch, ...fromBranch.why });
+  const fromCommit = named(sql, projects, subject, "generic");
+  if (fromCommit) return answer(fromCommit.projectId, "commit", true, { subject, ...fromCommit.why });
   const homes = projects.filter((p) => p.home);
   return answer((homes[0] || projects[0]).id, "home", true);
 }
 
 /**
  * The project a folder no project has yet probably is, for discovery's "Add
- * to project": a ticket or key in the branch the session was on, then in the
- * latest commit's subject, then the folder's own name naming a project's key.
- * Among every active project. Null when nothing points at one: a suggestion
- * is only worth making when there is a reason to give.
+ * to project": a ticket or distinctive key in the branch the session was on,
+ * then in the latest commit's subject, then the folder's own name naming a
+ * project's key. Among every active project. Null when nothing points at
+ * one: a suggestion is only worth making when there is a reason to give.
  */
 function suggest(sql, { folder = null, branch = null, subject = null } = {}) {
   const all = sql("SELECT id FROM projects WHERE status != 'archived' ORDER BY sort_order, id", []).map((p) => ({ id: Number(p.id) }));
-  const fromBranch = named(sql, all, branch);
-  if (fromBranch) return { projectId: fromBranch.projectId, via: "branch", why: WHY.branch, detail: fromBranch.why };
-  const fromCommit = named(sql, all, subject);
-  if (fromCommit) return { projectId: fromCommit.projectId, via: "commit", why: WHY.commit, detail: fromCommit.why };
+  for (const strength of ["ticket", "key"]) {
+    const fromBranch = named(sql, all, branch, strength);
+    if (fromBranch) return { projectId: fromBranch.projectId, via: "branch", why: WHY.branch, detail: fromBranch.why };
+    const fromCommit = named(sql, all, subject, strength);
+    if (fromCommit) return { projectId: fromCommit.projectId, via: "commit", why: WHY.commit, detail: fromCommit.why };
+  }
   const base = folder ? path.basename(String(folder)) : "";
-  const byName = base ? named(sql, all, base) : null;
+  const byName = base ? named(sql, all, base, "key") : null;
   if (byName) return { projectId: byName.projectId, via: "name", why: "from the folder's name", detail: byName.why };
   return null;
 }
@@ -270,4 +393,4 @@ function readGit(cwd, { run = execFileSync, timeout = 1500 } = {}) {
   return { branch: branch === "HEAD" ? null : branch, subject: branch ? ask("log", "-1", "--format=%s") : null };
 }
 
-module.exports = { resolve, ranked, suggest, tickets, keyIn, foldersHolding, chipWords, recordStatement, readGit, WHY };
+module.exports = { resolve, ranked, suggest, tickets, keyIn, distinctive, aliasesOf, foldersHolding, chipWords, recordStatement, readGit, WHY };

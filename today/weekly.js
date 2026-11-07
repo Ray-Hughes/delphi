@@ -185,17 +185,23 @@ function review(sql, { now = new Date(), projectId = null, days = 7 } = {}) {
             EXISTS (SELECT 1 FROM comments c WHERE c.task_id = t.id AND c.kind = 'note'
                       AND CASE WHEN json_valid(c.meta) THEN json_extract(c.meta, '$.dropped_in') END = :p4
                       AND datetime(c.created_at) > datetime(:p1)
-                      AND datetime(c.created_at) >= datetime(t.completed_at, '-60 seconds')) AS dropped
+                      AND datetime(c.created_at) >= datetime(t.completed_at, '-60 seconds')) AS dropped,
+            EXISTS (SELECT 1 FROM comments c WHERE c.task_id = t.id AND c.kind = 'note'
+                      AND CASE WHEN json_valid(c.meta) THEN json_extract(c.meta, '$.merged_into') END IS NOT NULL
+                      AND datetime(c.created_at) > datetime(:p1)
+                      AND datetime(c.created_at) >= datetime(t.completed_at, '-60 seconds')) AS merged
        FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
       WHERE t.status = 'done' AND t.completed_at IS NOT NULL
         AND datetime(t.completed_at) > datetime(:p1) AND datetime(t.completed_at) <= datetime(:p2)
         AND ${LIVE_PROJECT} AND ${inScope("t", 3)}
       ORDER BY datetime(t.completed_at) DESC, t.id DESC`, [since, until, scope, DROP_META.dropped_in]);
-  const finished = doneRows.filter((r) => Number(r.dropped) !== 1);
+  // A duplicate merged into its twin is closed, not finished: counted apart, as a Drop is.
+  const finished = doneRows.filter((r) => Number(r.dropped) !== 1 && Number(r.merged) !== 1);
   const done = {
     count: finished.length,
     subtasks: finished.filter((r) => r.parent_id != null).length,
-    dropped: doneRows.length - finished.length,
+    dropped: doneRows.filter((r) => Number(r.dropped) === 1).length,
+    merged: doneRows.filter((r) => Number(r.dropped) !== 1 && Number(r.merged) === 1).length,
     tasks: finished.slice(0, 12).map((r) => ({ id: Number(r.id), title: r.title, at: brief.stamp(r.at), project_id: num(r.project_id), project_name: r.project_name || null })),
   };
 
@@ -331,7 +337,7 @@ function compact(r, { budget = 1200 } = {}) {
   const dayOf = (at) => String(at || "").slice(0, 10);
   const lb = r.look_back;
   const look = [];
-  look.push(`Done: ${lb.done.count}${lb.done.subtasks ? ` (${lb.done.subtasks} subtasks)` : ""}${lb.done.dropped ? `, and ${lb.done.dropped} dropped` : ""}.`);
+  look.push(`Done: ${lb.done.count}${lb.done.subtasks ? ` (${lb.done.subtasks} subtasks)` : ""}${lb.done.dropped ? `, and ${lb.done.dropped} dropped` : ""}${lb.done.merged ? `, ${lb.done.merged} merged into a twin` : ""}.`);
   look.push(`Agent work: ${ledgerCore.phrases(lb.cost.totals).join(", ")}.`);
   for (const t of lb.cost.top_tasks) look.push(`Cost: #${t.task_id} ${clip(t.title, 60)}: ${ledgerCore.brief(t).join(", ")}.`);
   for (const d of lb.decisions) {

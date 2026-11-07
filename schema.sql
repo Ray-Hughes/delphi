@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS projects (
   -- a value on a new install and accept it on an old one. Validated in db.js,
   -- where every database behaves the same.
   task_view   TEXT NOT NULL DEFAULT 'list',
+  -- Also matches branches containing: comma-separated words a person says
+  -- name this project in a branch or a commit subject, beside its key
+  -- (workbench/route.js). agent/schema_later.js adds it to an older database.
+  aliases     TEXT,
   -- Whether a job an agent asks for here starts without a person approving it.
   -- Off by default: an agent setting another agent to work is the loop a
   -- person is there to see.
@@ -937,6 +941,17 @@ CREATE TABLE IF NOT EXISTS filed_routes (
   settled_at  TEXT,
   PRIMARY KEY (entity, entity_id)
 );
+-- A filing goes with its item, cascades included, so a reused id never
+-- inherits another item's chip. agent/schema_later.js holds the same text.
+CREATE TRIGGER IF NOT EXISTS routes_task_ad AFTER DELETE ON tasks BEGIN
+  DELETE FROM filed_routes WHERE entity = 'task' AND entity_id = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS routes_note_ad AFTER DELETE ON notes BEGIN
+  DELETE FROM filed_routes WHERE entity = 'note' AND entity_id = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS routes_pad_ad AFTER DELETE ON scratchpads BEGIN
+  DELETE FROM filed_routes WHERE entity = 'scratchpad' AND entity_id = old.id;
+END;
 
 -- Edit this page: how a person has arranged a screen's sections. One row per
 -- screen for everyone (project_id NULL) and at most one per screen per project,

@@ -88,10 +88,15 @@ const clean = (text) => scrub.scrub(text).trim();
  * a word character.
  */
 const quiet = (text) => text
-  .replace(/(^|[^\w`@])@([A-Za-z0-9][\w-]*(?:\/[\w-]+)?)/g, "$1`@$2`")
+  // Not an @ in an address or a URL (u:[redacted]@va.ghe.com): a handle is
+  // never followed by a dot and a label, and quoting one there would cut the
+  // host in two and hide it from flag().
+  .replace(/(^|[^\w`@\]:/])@([A-Za-z0-9][\w-]{0,62}(?:\/[\w-]{1,64})?)(?![\w-]|\.[A-Za-z0-9])/g, "$1`@$2`")
   // #123 and owner/repo#123 too: GitHub links them and leaves a "mentioned
   // this" on that issue, which is somebody else's piece of work.
-  .replace(/(^|[^\w`#&])((?:[\w.-]+\/[\w.-]+)?#\d+)\b/g, "$1`$2`");
+  // Bounded, and starting only where a run of name characters starts, so a
+  // long "a.a.a..." is not rescanned from every dot.
+  .replace(/(^|[^\w`#&.\/-])((?:[\w.-]{1,100}\/[\w.-]{1,100})?#\d{1,10})(?!\w)/g, "$1`$2`");
 
 /** One line, for a list item: a body's line breaks would end the item early. */
 const oneLine = (text) => quiet(clean(text).replace(/\s+/g, " ").trim());
@@ -406,14 +411,21 @@ function makeReport({ sql } = {}) {
 function checkBody(body) {
   if (body === null || body === undefined) return null;
   if (typeof body !== "string") throw new Error("body must be text.");
-  if (body.length > MAX_BODY) throw new Error(`The description is ${body.length} characters; GitHub takes at most ${MAX_BODY}. Shorten it.`);
-  return scrub.redact(scrub.strip(body)).text;
+  const tooLong = (n) => new Error(`The description is ${n} characters; GitHub takes at most ${MAX_BODY}. Shorten it.`);
+  // Twice the limit is refused before any work: nothing that long can come
+  // back under it.
+  if (body.length > MAX_BODY * 2) throw tooLong(body.length);
+  // Measured after, because [redacted] can be longer than what it replaced.
+  const text = scrub.redact(scrub.strip(body)).text;
+  if (text.length > MAX_BODY) throw tooLong(text.length);
+  return text;
 }
 
 /** A title for gh, the same way: one line, redacted, within GitHub's limit. */
 function checkTitle(title) {
   if (title === null || title === undefined) return null;
   if (typeof title !== "string") throw new Error("title must be text.");
+  if (title.length > MAX_TITLE * 4) throw new Error(`The title is ${title.length} characters; GitHub takes at most ${MAX_TITLE}.`);
   const text = scrub.redact(scrub.strip(title).replace(/\s+/g, " ")).text.trim();
   if (!text) throw new Error("A pull request needs a title.");
   if (text.length > MAX_TITLE) throw new Error(`The title is ${text.length} characters; GitHub takes at most ${MAX_TITLE}.`);

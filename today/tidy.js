@@ -47,23 +47,35 @@ const SOURCES = { claude: "Claude Code", api: "Claude (API key)", local: "local 
  * address. A false positive costs a word in a title; a miss costs far more.
  */
 function scrub(text) {
-  // Invisible and control characters first, so a zero-width space cannot
-  // split a number and slip it past the patterns below. Then the prompt's own
-  // data markers, which a title must not be able to close.
-  // eslint-disable-next-line no-control-regex
-  const plain = String(text == null ? "" : text)
-    .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]|\udb40[\udc00-\udc7f]/g, "")
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ")
-    .replace(/<<<|>>>/g, "<< <");
-  return shared.scrub(plain)
+  // The shared redactor first, strict: tidy's prompt has no person reading
+  // flags before it goes, so what the PR description would only flag is
+  // blanked here: a word under a password key, prose under a token key, and
+  // a reference where a secret is expected (Bearer $TOKEN, curl -u me:$PASS).
+  // A template reference as a key's value (password: ${DB_PASS}) says where
+  // a secret lives, not what it is, and is kept in both. strip() inside it removes invisible and control characters, so a
+  // zero-width space cannot split a number past the patterns below.
+  const out = shared.redact(shared.strip(String(text == null ? "" : text)), { strict: true }).text
+    // A bearer token of any length or shape, with or without its header.
+    // Only a token: something with a digit or token punctuation in it, so
+    // "bearer of record" keeps its words.
+    .replace(/\b(bearer\s{1,4})(?!\[redacted\])(?=[^\s]{0,4096}[\d._~+/=$-])[^\s]{1,4096}/gi, "$1[redacted]")
+    // A phone number with its area code in brackets.
+    .replace(/\(\d{3}\)\s*\d{3}[-. ]\d{4}\b/g, "[redacted]")
+    // A VA file number written in groups: 12 345 678, 123 45 678.
+    .replace(/\b\d{2,3}[ -]\d{2,3}[ -]\d{3}\b/g, "[redacted]")
     .replace(/\b\d{3}[- ]?\d{2}[- ]?\d{4}\b/g, "[redacted]")
     .replace(/\b[Cc][- ]?\d{3}[- ]?\d{3}[- ]?\d{2,3}\b/g, "[redacted]")
     .replace(/\b[Cc][- ]?\d{7,9}\b/g, "[redacted]")
     .replace(/\b\d{3}[-. ]\d{3}[-. ]\d{3,4}\b/g, "[redacted]")
     .replace(/\b\d{8,10}(?:V\d{6})?\b/g, "[redacted]")
-    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, "[redacted]")
-    .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}\b/g, "[redacted]")
+    // Bounded, and starting only where a run of address characters starts:
+    // unbounded, a 64KB run with no @ took seconds.
+    .replace(/(?<![\w.+-])[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}/g, "[redacted]")
+    .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,255}\b/g, "[redacted]")
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, "[redacted]");
+  // The prompt's own data markers, last, so nothing above (strip deleting a
+  // soft hyphen or a comment between two >) can rejoin them afterwards.
+  return out.replace(/<{3,}|>{3,}/g, (run) => run.split("").join(" "));
 }
 
 const clip = (text, n) => {
@@ -116,7 +128,9 @@ function payload({ items, projects }, { details = false } = {}) {
         id: it.id, title: clip(scrub(it.title), TITLE_MAX), status: it.status, days_without_movement: it.days_quiet,
         project: it.project ? clip(scrub(it.project), 80) : null, subtasks: it.subtasks,
       };
-      if (it.due) out.due = String(it.due).slice(0, 10);
+      // A due date goes only as a date. Anything else in the column (an agent
+      // can write it) is text, and text that is not scrubbed does not go.
+      if (it.due && /^\d{4}-\d{2}-\d{2}$/.test(String(it.due).slice(0, 10))) out.due = String(it.due).slice(0, 10);
       if (details && it.detail) out.detail = it.detail;
       return out;
     }),
@@ -156,6 +170,34 @@ function extractJson(text) {
   for (const t of tries) {
     try { return JSON.parse(t); } catch {}
   }
+  return null;
+}
+
+/**
+ * A subtask title a model wrote, without what the pad grammar would read as
+ * more than words: an anchor, an assignee or a priority.
+ */
+const padSafe = (title) => String(title)
+  .replace(/<!--[\s\S]*?-->|<!--|-->/g, " ")
+  .replace(/(^|\s)@[\w:.-]+/g, " ")
+  .replace(/(^|\s)!(?:high|med|low)\b/gi, " ")
+  .replace(/^\s*(?:[-*+]\s*)?\[[ xX]\]\s*/, "")
+  .replace(/\s+/g, " ").trim();
+
+/**
+ * Why merging source into target would lose work, or null. A duplicate with
+ * open subtasks still has work in it, and a target inside the source's own
+ * subtree would be closed with it. Asked at validation and again, under the
+ * write lock, just before a merge is applied.
+ */
+function mergeRefusal(sql, source, target) {
+  const open = sql("SELECT COUNT(*) AS n FROM tasks WHERE parent_id = :p1 AND status != 'done'", [Number(source)])[0];
+  if (open && Number(open.n) > 0) return "a duplicate with open subtasks still holds work";
+  const inside = sql(`WITH RECURSIVE up(id, parent_id) AS (
+                        SELECT id, parent_id FROM tasks WHERE id = :p1
+                        UNION SELECT t.id, t.parent_id FROM tasks t JOIN up ON t.id = up.parent_id)
+                      SELECT 1 AS hit FROM up WHERE id = :p2 LIMIT 1`, [Number(target), Number(source)])[0];
+  if (inside) return "a task to merge into that sits inside the duplicate itself";
   return null;
 }
 
@@ -219,12 +261,14 @@ function validate(answer, { items, projects }, { sql = null, today = null } = {}
       const target = sql ? sql("SELECT t.id, t.title, t.status, t.project_id FROM tasks t WHERE t.id = :p1", [into])[0] : byId.get(into);
       if (!target || target.status === "done") { no("a task to merge into that is not open"); continue; }
       if (Number(target.project_id) !== Number(it.project_id) || target.project_id == null) { no("a task to merge into in another project"); continue; }
+      const why = sql ? mergeRefusal(sql, taskId, into) : null;
+      if (why) { no(why); continue; }
       s.detail.merge_into = into;
       s.detail.merge_title = clip(target.title, TITLE_MAX);
     }
     if (action === "split") {
       const titles = Array.isArray(raw.subtasks) ? raw.subtasks : [];
-      const clean = [...new Set(titles.filter((t) => typeof t === "string").map((t) => clip(scrub(t), TITLE_MAX)).filter(Boolean))];
+      const clean = [...new Set(titles.filter((t) => typeof t === "string").map((t) => clip(padSafe(scrub(t)), TITLE_MAX)).filter(Boolean))];
       if (clean.length < 2 || clean.length > 5 || clean.length !== titles.length) { no("not 2 to 5 subtask titles"); continue; }
       s.detail.subtasks = clean;
     }
@@ -278,6 +322,8 @@ function open(sql, { projectId = null } = {}) {
     .map((r) => {
       let detail = {};
       try { detail = JSON.parse(r.detail || "{}") || {}; } catch {}
+      // What an earlier approval wrote is bookkeeping, not part of the suggestion.
+      delete detail.applied_audit;
       return { id: Number(r.id), run_id: r.run_id, task_id: Number(r.task_id), action: r.action, detail, reason: r.reason || "",
                source: r.source, created_at: r.created_at, title: r.title, status: r.status,
                project_id: num(r.project_id), project_name: r.project_name || null };
@@ -313,5 +359,5 @@ function compact(list, { budget = 800 } = {}) {
 
 module.exports = {
   ACTIONS, SOURCES, DENIAL_DAYS, PARK_DAYS, MAX_SUGGESTIONS, MAX_SENT, EVIDENCE,
-  scrub, candidates, payload, prompt, extractJson, validate, rules, denied, open, words, compact, isDate,
+  scrub, padSafe, mergeRefusal, candidates, payload, prompt, extractJson, validate, rules, denied, open, words, compact, isDate,
 };

@@ -149,7 +149,26 @@ function localRunner({ base = OLLAMA } = {}) {
  */
 function createTidy({ db, weeklyApi, sheets, settings = () => ({}), models = null, clock = () => Date.now() }) {
   const sql = db.sqlP;
-  const runners = models || { claude: claudeRunner({ findCli: () => require("../ai").findClaudeCli() }), local: localRunner() };
+  const runners = models || { claude: claudeRunner({ findCli: () => trustedClaude() }), local: localRunner() };
+
+  /**
+   * Claude Code as the dispatcher would run it: the harness row's command,
+   * only when agent/binaries.js finds it is the binary an installer put
+   * there or one a person trusted. Without a row (a database the app never
+   * seeded), the CLI ai.js finds.
+   */
+  function trustedClaude() {
+    let row = null;
+    try { row = sql("SELECT * FROM harnesses WHERE key = 'claude-code'", [])[0] || null; } catch (error) {
+      // Only a database with no harnesses table at all falls back; any other
+      // error is not a reason to skip the check.
+      if (!/no such table/i.test(String(error.message))) { console.error("Suggest tidy: reading the harness row", error); return null; }
+    }
+    if (!row) return require("../ai").findClaudeCli();
+    const found = require("../agent/binaries").jobCommand(row);
+    if (found.error) { console.error(`Suggest tidy: ${found.error}`); return null; }
+    return found.path;
+  }
   const stamp = (ms) => new Date(ms).toISOString().slice(0, 19).replace("T", " ");
   const today = () => weekly.localDate(clock());
 
@@ -163,6 +182,20 @@ function createTidy({ db, weeklyApi, sheets, settings = () => ({}), models = nul
       try { if (r && await r.available()) return r; } catch {}
     }
     return null;
+  }
+
+  // Where titles go, in the words the panel says before anything is sent.
+  const WHERE = {
+    claude: { kind: "cloud", words: "Sent to Claude Code (Anthropic)" },
+    local: { kind: "local", words: "Local model on this Mac" },
+    rules: { kind: "rules", words: "Rules, nothing sent" },
+  };
+
+  /** Which way a Suggest tidy would go now, and whether the person has agreed to a cloud one. */
+  async function destination() {
+    const r = await chooseModel();
+    const d = r ? WHERE[r.id] || WHERE.rules : WHERE.rules;
+    return { ...d, source: r ? r.source : tidy.SOURCES.rule, consented: d.kind !== "cloud" || (settings() || {}).tidyCloudOk === true };
   }
 
   /** A model run in the cost ledger: a finished, already reviewed job, so it is counted and never waits on anyone. */
@@ -214,6 +247,11 @@ function createTidy({ db, weeklyApi, sheets, settings = () => ({}), models = nul
     let rejected = [];
     let jobId = null;
     const runner = await chooseModel();
+    // The first send to a model off this computer waits for the person's yes,
+    // which the window asks for once and keeps in settings.
+    if (runner && (WHERE[runner.id] || {}).kind === "cloud" && (settings() || {}).tidyCloudOk !== true) {
+      return { run_id: runId, needs_consent: true, destination: WHERE[runner.id].words, source: runner.source, suggestions: tidy.open(sql) };
+    }
     if (runner) {
       const text = tidy.prompt(tidy.payload(cand, { details }), { today: today() });
       const started = clock();
@@ -337,6 +375,9 @@ function createTidy({ db, weeklyApi, sheets, settings = () => ({}), models = nul
           notDone(t);
           const into = sql("SELECT status FROM tasks WHERE id = :p1", [v.detail.merge_into])[0];
           if (!into || into.status === "done") throw new Error(`#${v.detail.merge_into} is not open, so nothing can be merged into it.`);
+          // Again under the lock: subtasks opened, or the tree moved, since the card was made.
+          const refused = tidy.mergeRefusal(sql, t.id, v.detail.merge_into);
+          if (refused) throw new Error(`That merge would lose work: ${refused}.`);
         }, (t) => {
           // The link both ways, on both Sheets, so either task leads to the other.
           sheets.append({ ...note(`Merged into #${v.detail.merge_into}`), meta: { ...meta, merged_into: v.detail.merge_into } });
@@ -357,6 +398,13 @@ function createTidy({ db, weeklyApi, sheets, settings = () => ({}), models = nul
         throw new Error(`Unknown action ${v.action}.`);
     }
     applied.set(r.receipt, s.id);
+    for (const k of [...applied.keys()].slice(0, Math.max(0, applied.size - 200))) applied.delete(k);
+    // The History rows it wrote go on the card, so a card whose change was
+    // undone elsewhere (History, or after a restart) is offered again.
+    try {
+      weeklyApi.locked(() => sql(`UPDATE tidy_suggestions SET detail = json_set(COALESCE(detail, '{}'), '$.applied_audit', json(:p1)) WHERE id = :p2`,
+        [JSON.stringify(r.audit || []), s.id]));
+    } catch (error) { console.error("tidy: could not note what was applied", error); }
     return { ...r, suggestion_id: s.id, action: v.action };
   }
 
@@ -408,12 +456,36 @@ function createTidy({ db, weeklyApi, sheets, settings = () => ({}), models = nul
     return { ...out, suggestion_id: sid ?? null, reopened };
   }
 
-  return { suggest, list: () => tidy.open(sql), approve, deny, undo, chooseModel };
+  /**
+   * The open cards, after putting back any approved card whose change was
+   * undone outside this panel: every History row it wrote is undone, and no
+   * newer card offers the same thing.
+   */
+  function list() {
+    try {
+      const rows = sql(`SELECT id, detail FROM tidy_suggestions WHERE state = 'approved'
+                          AND datetime(decided_at) > datetime('now', '-30 days')`, []);
+      for (const r of rows) {
+        let ids = [];
+        try { ids = (JSON.parse(r.detail || "{}").applied_audit || []).map(Number).filter(Number.isInteger); } catch {}
+        if (!ids.length) continue;
+        const left = sql(`SELECT COUNT(*) AS n FROM audit WHERE undone = 0 AND id IN (${ids.join(", ")})`, [])[0];
+        if (Number(left.n) > 0) continue;
+        weeklyApi.locked(() => sql(`UPDATE tidy_suggestions SET state = 'open', decided_at = NULL WHERE id = :p1 AND state = 'approved'
+                                      AND NOT EXISTS (SELECT 1 FROM tidy_suggestions n JOIN tidy_suggestions o ON o.id = :p1
+                                                       WHERE n.state = 'open' AND n.task_id = o.task_id AND n.action = o.action)`, [Number(r.id)]));
+      }
+    } catch (error) { console.error("tidy: reconciling cards", error); }
+    return tidy.open(sql);
+  }
+
+  return { suggest, list, approve, deny, undo, chooseModel, destination };
 }
 
 function register(handle, { tidy: t }) {
   handle("tidy:suggest", () => t.suggest());
   handle("tidy:list", () => t.list());
+  handle("tidy:destination", () => t.destination());
   handle("tidy:approve", (id, edits) => t.approve(id, edits || null));
   handle("tidy:deny", (id) => t.deny(id));
   handle("tidy:undo", (what) => t.undo(what || {}));

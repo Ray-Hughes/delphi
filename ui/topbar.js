@@ -213,7 +213,11 @@ globalThis.DelphiTopbar = (() => {
   function place(node, button, align = "left") {
     if (!button) return;
     const r = button.getBoundingClientRect();
-    node.style.top = `${Math.round(r.bottom + 6)}px`;
+    const top = Math.round(r.bottom + 6);
+    node.style.top = `${top}px`;
+    // For its max-height in styles/topbar.css: whatever is left below it, so
+    // a long list scrolls inside rather than running off a short window.
+    node.style.setProperty("--pop-top", `${top}px`);
     if (align === "right") node.style.right = `${Math.round(window.innerWidth - r.right)}px`;
     else node.style.left = `${Math.round(r.left)}px`;
   }
@@ -250,10 +254,10 @@ globalThis.DelphiTopbar = (() => {
   }
 
   // Escape closes a popover wherever the focus is. Without this, after a click
-  // left the focus on the page, it reached app.js, whose Escape hides the window.
+  // left the focus on the page, it reached app.js and closed the sheet instead.
   document.addEventListener("keydown", (e) => {
     // During an IME composition Escape is the input method's: kept from
-    // app.js (which would hide the window) but not acted on.
+    // app.js (which would close the sheet) but not acted on.
     if (pop && e.key === "Escape" && e.isComposing) { e.stopPropagation(); return; }
     if (pop && e.key === "Escape" && !document.querySelector(".ctx")) {
       e.preventDefault();

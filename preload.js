@@ -268,7 +268,7 @@ contextBridge.exposeInMainWorld("delphi", {
   // The weekly review: the review, the Today card's question, Park, Drop, Undo (by receipt) and the objectives.
   weekly: { view: (opts) => call("weekly:view", opts || {}), status: () => call("weekly:status"), park: (id) => call("weekly:park", id), drop: (id, why) => call("weekly:drop", id, why), undo: (what) => call("weekly:undo", what), save: (payload) => call("weekly:save", payload), end: (payload) => call("weekly:end", payload) },
   // Suggest tidy: ask, list, and a person's Approve (with edits), Deny and Undo.
-  tidy: { suggest: () => call("tidy:suggest"), list: () => call("tidy:list"), approve: (id, edits) => call("tidy:approve", id, edits || null), deny: (id) => call("tidy:deny", id), undo: (what) => call("tidy:undo", what) },
+  tidy: { suggest: () => call("tidy:suggest"), list: () => call("tidy:list"), destination: () => call("tidy:destination"), approve: (id, edits) => call("tidy:approve", id, edits || null), deny: (id) => call("tidy:deny", id), undo: (what) => call("tidy:undo", what) },
   // The cost and time ledger (main/ledger.js). Read only.
   ledger: {
     forTask: (taskId) => call("ledger:forTask", taskId),
@@ -368,6 +368,7 @@ contextBridge.exposeInMainWorld("delphi", {
   openExternal: (url) => ipcRenderer.send("open-external", url),
   onShown: (fn) => ipcRenderer.on("shown", fn),
   onMode: (fn) => ipcRenderer.on("mode", (_e, payload) => fn(payload)),
+  onFullScreen: (fn) => ipcRenderer.on("full-screen", (_e, on) => fn(on === true)),
   onAlertsChanged: (fn) => ipcRenderer.on("alerts-changed", fn),
   // Another process (an agent, the command line) wrote to the database.
   onDbChanged: (fn) => ipcRenderer.on("db-changed", () => fn()),

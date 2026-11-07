@@ -31,9 +31,11 @@
   const COPIED_MS = 1400;
   // A preview redrawn on every key is a full Markdown parse per key; this is
   // under what a person notices.
-  const PREVIEW_MS = 120;
+  const PREVIEW_MS = 300;
 
-  const outgoing = (text) => (S ? S.redact(text).text : text);
+  // What leaves: stripped and redacted, the same scrub the main process
+  // applies before gh, so Copy and the preview show what is sent.
+  const outgoing = (text) => (S ? S.scrub(text) : text);
 
   function copyButton(get, label = "Copy", onCopied = null) {
     const b = el("button", { className: "btn sm", type: "button", textContent: label });
@@ -50,20 +52,42 @@
     return b;
   }
 
-  /** The flagged words in a rendered preview, wrapped in <mark>, text node by text node. */
-  function highlight(rootNode) {
+  const FLAG_WORDS = { host: "an internal host", ip: "a private address", home: "a home folder", number: "a possible SSN or file number", credential: "a possible credential" };
+
+  const escape = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  /**
+   * The flagged words and every redaction in a rendered preview, wrapped in
+   * <mark>, text node by text node, so the person sees each one where it is.
+   * The flags come from the one flag() of the whole text (prepare), and are
+   * found in each node by their words: no second pass of every rule.
+   */
+  function highlight(rootNode, flagged) {
     if (!S) return;
+    const kindOf = new Map([[S.REDACTED, "redacted"]]);
+    for (const f of flagged) if (!kindOf.has(f.text)) kindOf.set(f.text, f.kind);
+    // Longest first, so a host is marked whole rather than by a shorter one
+    // inside it, and [redacted] always among the words however many there are.
+    const words = [S.REDACTED, ...[...kindOf.keys()].filter((w) => w !== S.REDACTED).sort((a, b) => b.length - a.length).slice(0, 200)];
+    // Whole words only: 10.0.0.1 is not marked inside 110.0.0.12. A flag
+    // split across bold or code in the rendered text is not marked, and the
+    // warning above still names it.
+    const pattern = new RegExp(`(?<![A-Za-z0-9_.])(?:${words.map(escape).join("|")})(?![A-Za-z0-9_])`, "g");
     const walker = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
     const nodes = [];
     for (let n = walker.nextNode(); n; n = walker.nextNode()) nodes.push(n);
     for (const node of nodes) {
-      const found = S.flag(node.nodeValue);
+      const text = node.nodeValue;
+      const found = [];
+      for (const m of text.matchAll(pattern)) found.push({ kind: kindOf.get(m[0]), text: m[0], index: m.index });
       if (!found.length) continue;
       const frag = document.createDocumentFragment();
       let at = 0;
       for (const f of found) {
         if (f.index < at) continue;
-        frag.append(node.nodeValue.slice(at, f.index), el("mark", { className: "rp-flag", textContent: f.text, title: `Check before sending: ${f.kind === "host" ? "an internal host" : f.kind === "ip" ? "a private address" : "a home folder"}` }));
+        frag.append(node.nodeValue.slice(at, f.index), f.kind === "redacted"
+          ? el("mark", { className: "rp-redacted", textContent: f.text, title: "Redacted: this is sent in place of what was written here" })
+          : el("mark", { className: "rp-flag", textContent: f.text, title: `Check before sending: ${FLAG_WORDS[f.kind] || "worth a look"}` }));
         at = f.index + f.text.length;
       }
       frag.append(node.nodeValue.slice(at));
@@ -75,11 +99,9 @@
    * The warning above the editor: what the text mentions that is worth a look,
    * and what will be redacted on the way out. Empty, and hidden, when neither.
    */
-  function paintWarning(box, text) {
+  function paintWarning(box, { found, count: secrets }) {
     box.textContent = "";
     if (!S) return;
-    const found = S.flag(text);
-    const secrets = S.redact(text).count;
     if (found.length) {
       const names = [...new Set(found.map((f) => f.text))];
       box.append(el("div", {}, el("b", { textContent: `This text mentions: ${S.flagWords(found)}.` }),
@@ -87,7 +109,7 @@
         el("div", { className: "rp-warn-list" }, names.slice(0, 12).map((n) => el("mark", { className: "rp-flag", textContent: n })),
           names.length > 12 ? el("span", { textContent: ` and ${names.length - 12} more` }) : null));
     }
-    if (secrets) box.append(el("div", { textContent: `${secrets === 1 ? "1 secret or number" : `${secrets} secrets or numbers`} will be replaced with [redacted] when this is sent or copied.` }));
+    if (secrets) box.append(el("div", { textContent: `${secrets === 1 ? "1 secret or number" : `${secrets} secrets or numbers`} in what you wrote will be replaced with [redacted] when this is sent or copied, as the preview shows.` }));
     box.hidden = !box.childNodes.length;
   }
 
@@ -114,9 +136,17 @@
     const paint = () => {
       timer = null;
       preview.textContent = "";
-      if (area.value.trim()) { preview.append(renderMarkdown(area.value)); highlight(preview); }
+      // The preview is what is sent, not what was typed: scrubbed, with each
+      // redaction and each flagged word marked.
+      // One prepare() of the text and one of the title: one strip, one redact
+      // and one flag each, shared by the preview, its marks and the warning.
+      // Apart, so nothing the title ends with can join the text's first line.
+      const none = (t) => ({ text: t, count: 0, found: [] });
+      const ready = S ? S.prepare(area.value) : none(area.value);
+      const titled = titleField ? (S ? S.prepare(titleField.value) : none(titleField.value)) : none("");
+      if (area.value.trim()) { preview.append(renderMarkdown(ready.text)); highlight(preview, ready.found); }
       else preview.append(el("p", { className: "rp-empty", textContent: "Nothing to preview." }));
-      paintWarning(warn, `${titleField ? `${titleField.value}\n` : ""}${area.value}`);
+      paintWarning(warn, { count: ready.count + titled.count, found: [...titled.found, ...ready.found] });
     };
     area.addEventListener("input", () => { if (!timer) timer = setTimeout(paint, PREVIEW_MS); });
     if (titleField) titleField.addEventListener("input", () => { if (!timer) timer = setTimeout(paint, PREVIEW_MS); });
