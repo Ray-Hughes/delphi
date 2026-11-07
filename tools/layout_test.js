@@ -325,6 +325,31 @@ for (const [what, change, survives] of [
   check(`${what} added mid-way: the stale plan is refused`, /CHECK constraint failed/.test(refused || ""), true);
   check(`${what} added mid-way: it is still there, and every row`, [q(file, survives)[0].n, allAudit(file).length], [1, OLD.length]);
 }
+// The same refusal, through widenAudit as the binary route runs it, says what
+// happened rather than the scratch table's CHECK.
+{
+  const file = path.join(dir, "stale-words", "delphi.db");
+  oldDatabase(file);
+  const a = new DatabaseSync(file);
+  const query = (st) => a.prepare(st).all();
+  const batch = (list) => { a.exec("BEGIN IMMEDIATE"); try { for (const st of list) a.prepare(st).all(); a.exec("COMMIT"); } catch (e) { a.exec("ROLLBACK"); throw e; } };
+  const changed = throws(() => schemaLater.widenAudit(query, (list) => { const b = new DatabaseSync(file); b.exec("ALTER TABLE audit ADD COLUMN meanwhile TEXT"); b.close(); batch(list); }));
+  check("changed underneath: said so, and left alone", /changed while it was being widened, so it was left as it was/.test(changed || ""), true);
+  a.close();
+  const file2 = path.join(dir, "stale-words-2", "delphi.db");
+  oldDatabase(file2);
+  const c = new DatabaseSync(file2);
+  const already = throws(() => schemaLater.widenAudit((st) => c.prepare(st).all(), (list) => {
+    const other = new DatabaseSync(file2);
+    schemaLater.widenAuditLocked((st) => other.prepare(st).all());
+    other.close();
+    c.exec("BEGIN IMMEDIATE");
+    try { for (const st of list) c.prepare(st).all(); c.exec("COMMIT"); } catch (e) { c.exec("ROLLBACK"); throw e; }
+  }));
+  c.close();
+  check("already widened by another process: said so", /already widened by another process, so it was left alone/.test(already || ""), true);
+  check("and the other process's widening stands, every row with it", [schemaLater.auditEntitiesIn(auditSql(file2)).includes("layout"), allAudit(file2)], [true, OLD]);
+}
 
 // The routes that hold a connection plan inside BEGIN IMMEDIATE: a second
 // connection cannot change the table between the plan and the rebuild, and

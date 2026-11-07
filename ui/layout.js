@@ -822,7 +822,8 @@
       return;
     }
     if (was) was.saving = false;
-    stopEditing();
+    // Only the edit this preset was applied from: one started since is not its to end.
+    if (editing === was) stopEditing();
     if (app) { app.repaint(); app.notify(`${p.label} layout applied. History can undo it.`); }
     focusEntry();
     announce(`${p.label} layout applied.`);
@@ -842,13 +843,22 @@
     if (!storedFor(spec, target)) { if (app) app.notify(`${spec.label} already has its own layout.`); return; }
     try { await save(spec, target, null, "page reset"); } catch (error) { if (app) app.notify(errText(error), { error: true }); return; }
     if (app) { app.repaint(); app.notify(`${spec.label} is back to its own layout. History can undo it.`); }
+    focusEntry();
   }
 
   async function resetEverything() {
     if (editing && editing.saving) return;
     if (!confirm("Reset the layout of every page, for every project? Each one is in History and can be undone there.")) return;
-    try { rows = await window.delphi.layout.resetAll(); } catch (error) { if (app) app.notify(errText(error), { error: true }); return; }
-    stopEditing();
+    // Held like a Done, so nothing edited while main resets is quietly lost.
+    const was = editing;
+    if (was) was.saving = true;
+    try { rows = await window.delphi.layout.resetAll(); } catch (error) {
+      if (was) was.saving = false;
+      if (app) app.notify(errText(error), { error: true });
+      return;
+    }
+    if (was) was.saving = false;
+    if (editing === was) stopEditing();
     if (app) { app.repaint(); app.notify("Every page is back to its own layout. History can undo it."); }
     focusEntry();
     announce("Every page's layout was reset.");
@@ -859,6 +869,7 @@
     if (!spec || !storedFor(spec, projectId)) return;
     try { await save(spec, projectId, null, "back to the global layout"); } catch (error) { if (app) app.notify(errText(error), { error: true }); return; }
     if (app) { app.repaint(); app.notify(`${app.projectName ? app.projectName(projectId) || "This project" : "This project"} uses the global layout again. History can undo it.`); }
+    focusEntry();
     announce("Using the global layout.");
   }
 
