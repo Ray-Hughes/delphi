@@ -5110,8 +5110,10 @@ function padPane() {
         // Compared with LF endings, as the textarea has them, or a CRLF pad
         // would always look as if it had unsaved typing.
         state.padDraft = ed.area.value !== DelphiMarkdown.lf(pad.body) ? ed.area.value : null;
-        // Typing that outlived the save was typed on top of it.
-        state.padDraftBase = state.padDraft != null ? pad.body : null;
+        // Typing that outlived a save was typed on top of what the editor took
+        // as its base, which a tick moves only by the tick: never the stored
+        // text, which may hold an agent's write the typing has not seen.
+        state.padDraftBase = state.padDraft != null ? ed.base() : null;
         refresh();
       }),
     });
