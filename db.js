@@ -88,66 +88,44 @@ let folderGate = () => true;
 function holdFolderAdoption(hold) { folderGate = () => !hold; }
 
 /**
- * Widens the CHECK on audit.entity, once.
+ * Widens the CHECK on audit.entity when it is narrower than schema.sql's.
  *
- * The audit table names the kinds of thing that can be written, and scratchpads
- * are a new one. A CHECK constraint cannot be altered, so the only way to change
- * it is the twelve step rebuild SQLite documents: make the new table, copy, drop
- * the old, rename, put the indexes back.
+ * The audit table names the kinds of thing that can be written: scratchpads
+ * were the first new one, layouts the second. A CHECK constraint cannot be
+ * altered, so the only way to change it is the twelve step rebuild SQLite
+ * documents: make the new table, copy, drop the old, rename, put the indexes
+ * back. The rebuild itself is agent/schema_later.js widenAudit, shared with
+ * the MCP server, which copies every column by name rather than from a list
+ * typed here; see the comment there for why that matters.
  *
- * This is the first thing in the file more structural than an added column, and
- * it is worth the risk rather than the alternative. The alternative was to file
- * pad writes under 'note', which would make the History tab lie about what
- * happened, in the one feature whose whole selling point is that it does not.
+ * It is worth the risk rather than the alternative. The alternative was to
+ * file pad writes and layouts under some other entity, which would make the
+ * History tab lie about what happened, in the one feature whose whole selling
+ * point is that it does not.
  *
  * Guarded on the stored SQL rather than a version number, so it is idempotent
- * without a migrations table: if the constraint already names scratchpad, this
- * has run.
+ * without a migrations table.
  */
 function widenAuditEntities(db) {
-  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit'").get();
-  if (!row || !row.sql || row.sql.includes("'scratchpad'")) return;
+  const query = (statement) => db.prepare(statement).all();
+  if (!schemaLater.auditRebuildPlan(query).length) return;
   // foreign_keys cannot be changed inside a transaction, hence the order. Nothing
   // references audit, so this is belt and braces rather than load bearing.
   db.exec("PRAGMA foreign_keys = OFF");
-  db.exec(`
-    BEGIN;
-    CREATE TABLE audit_rebuilt (
-      id          INTEGER PRIMARY KEY,
-      at          TEXT NOT NULL DEFAULT (datetime('now')),
-      action      TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete')),
-      entity      TEXT NOT NULL CHECK (entity IN ('task', 'note', 'project', 'link',
-                                                  'scratchpad', 'session', 'handoff')),
-      entity_id   INTEGER,
-      summary     TEXT NOT NULL,
-      label       TEXT,
-      before_json TEXT,
-      after_json  TEXT,
-      undone      INTEGER NOT NULL DEFAULT 0,
-      undone_at   TEXT,
-      actor       TEXT,
-      actor_type  TEXT,
-      session_id  INTEGER,
-      job_id      INTEGER,
-      step        TEXT
-    );
-    -- The attribution columns are copied too. schema_later has added them to
-    -- the old table by the time this runs, and leaving them out here would
-    -- drop them from a database old enough to need the rebuild.
-    INSERT INTO audit_rebuilt
-      (id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at,
-       actor, actor_type, session_id, job_id, step)
-      SELECT id, at, action, entity, entity_id, summary, label, before_json, after_json, undone, undone_at,
-             actor, actor_type, session_id, job_id, step
-      FROM audit;
-    DROP TABLE audit;
-    ALTER TABLE audit_rebuilt RENAME TO audit;
-    CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
-    CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit(entity, entity_id, id);
-    CREATE INDEX IF NOT EXISTS idx_audit_session ON audit(session_id, id);
-    COMMIT;
-  `);
-  db.exec("PRAGMA foreign_keys = ON");
+  try {
+    schemaLater.widenAudit(query, (statements) => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const statement of statements) db.prepare(statement).run();
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    });
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
 }
 
 const all = (sql, params = {}) => open().prepare(sql).all(params);
@@ -246,6 +224,9 @@ const TABLES = {
   // reversible. An agent that rewrites your plan badly should be one undo away
   // from having not done that.
   scratchpad: "scratchpads",
+  // A page's arrangement from Edit this page, so a layout change is one undo
+  // away like any other. Only the window writes these.
+  layout: "layouts",
 };
 
 const rowOf = (entity, id) =>
@@ -388,6 +369,69 @@ function projectActivity(projectId, limit = 200) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Layouts (Edit this page)
+//
+// One row per screen for everyone, and one per screen per project. What a
+// layout holds and how a page reads it are ui/layout.js and settings/schema.js;
+// this only stores the JSON and records each change, so History can show it
+// and undo can put the previous one back. A reset writes NULL rather than
+// deleting: after the first save (a create, whose undo removes the row) every
+// change is an update to the same row, so undo never has to reinsert a row
+// under an index that something newer may hold.
+
+const layoutJson = (text) => {
+  if (text == null) return null;
+  try { return JSON.parse(text); } catch { return null; }
+};
+
+/** Every stored layout, parsed. A row whose JSON cannot be read reads as none. */
+function listLayouts() {
+  return all("SELECT id, screen, project_id, layout, updated_at FROM layouts ORDER BY screen, COALESCE(project_id, 0)")
+    .map((r) => ({ ...r, layout: layoutJson(r.layout) }));
+}
+
+/**
+ * Stores one screen's layout, for everyone (projectId null) or one project,
+ * and records it. layout null is a reset. Nothing is written, and nothing
+ * recorded, when the stored value is already this one.
+ *
+ * The caller has checked the layout's shape (settings/schema.js) and says what
+ * History calls it: summary and label.
+ */
+const saveLayout = atomic(function saveLayout({ screen, projectId = null, layout, summary, label }) {
+  const text = layout == null ? null : JSON.stringify(layout);
+  const pid = projectId == null ? null : Number(projectId);
+  const row = one("SELECT * FROM layouts WHERE screen = :screen AND COALESCE(project_id, 0) = :pid",
+                  { screen, pid: pid || 0 });
+  if (!row && text == null) return { changed: false };
+  if (row && (row.layout ?? null) === text) return { changed: false };
+  if (!row) {
+    const r = run("INSERT INTO layouts (screen, project_id, layout) VALUES (:screen, :pid, :layout)", { screen, pid, layout: text });
+    const after = one("SELECT * FROM layouts WHERE id = :id", { id: Number(r.lastInsertRowid) });
+    record({ action: "create", entity: "layout", entityId: after.id, summary, label, after });
+    return { changed: true, id: after.id };
+  }
+  run("UPDATE layouts SET layout = :layout, updated_at = datetime('now') WHERE id = :id", { layout: text, id: row.id });
+  const after = one("SELECT * FROM layouts WHERE id = :id", { id: row.id });
+  record({ action: "update", entity: "layout", entityId: row.id, summary, label, before: row, after });
+  return { changed: true, id: row.id };
+});
+
+/**
+ * Resets every stored layout, global and per project, as one step: one
+ * History row each, all with the same step, written together or not at all.
+ * labelOf(row) names each one.
+ */
+const resetAllLayouts = atomic(function resetAllLayouts({ summary, labelOf }) {
+  let count = 0;
+  for (const row of all("SELECT id, screen, project_id FROM layouts WHERE layout IS NOT NULL ORDER BY id")) {
+    const done = saveLayout({ screen: row.screen, projectId: row.project_id, layout: null, summary, label: labelOf(row) });
+    if (done.changed) count += 1;
+  }
+  return { count };
+});
+
 function listAudit(limit = 100) {
   return all(
     // restorable is the same column projectActivity computes, and for the same
@@ -429,6 +473,8 @@ const RESTORE_ORDER = {
     // parent is not back yet.
     ["__sessions", "sessions"],
     ["__messages", "messages"],
+    // The project's own page layouts (Edit this page), which cascade.
+    ["__layouts", "layouts"],
     // Last, once every item they name is back: the other projects this
     // project's notes, links and tasks were shown in, and the items from
     // elsewhere shown in it. The delete took both, by trigger and cascade.
@@ -1067,6 +1113,9 @@ function deleteProjectRows(id, { tasks = "keep" } = {}) {
      WHERE s.project_id = :id`,
     { id }
   );
+  // Its own page layouts cascade too, and are a person's arrangement, so
+  // they come back with it rather than leaving it on the global layout.
+  before.__layouts = all("SELECT * FROM layouts WHERE project_id = :id", { id });
   // Only the association rows this delete takes, so a strict restore puts
   // back exactly what went: rows naming this project (they cascade), and the
   // other projects its deleted notes, links and tasks were shown in (the
@@ -3211,6 +3260,7 @@ module.exports = {
   listLinks, createLink, deleteLink,
   search, stats,
   listAudit, projectActivity, undo, undoLast,
+  listLayouts, saveLayout, resetAllLayouts,
   recentItems,
   dueAlerts, dueTimers, listAlerts, createAlert, updateAlert, deleteAlert,
   markFired, snoozeAlert, actOnAlert,

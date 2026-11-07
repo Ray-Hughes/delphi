@@ -381,6 +381,15 @@ const MIGRATED = schemaLater.apply((statement) => DATABASE.query(statement));
 for (const failure of MIGRATED.errors) {
   process.stderr.write(`delphi: could not migrate (${failure.message}): ${failure.statement.split("\n")[0]}\n`);
 }
+// The History table's entity list, widened the way the app widens it, so an
+// agent on a database the app has not opened since the upgrade writes rows
+// the app can read. One batch, so on the binary route it is one process and
+// one transaction. A failure leaves the old table exactly as it was.
+try {
+  schemaLater.widenAudit((statement) => DATABASE.query(statement), (statements) => DATABASE.batch(statements));
+} catch (error) {
+  process.stderr.write(`delphi: could not widen the History table (${error.message})\n`);
+}
 
 /**
  * The file's identity, minted if this is the first process to meet it since
