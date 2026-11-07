@@ -230,14 +230,190 @@ globalThis.DelphiDrawer = (() => {
   }
 
   /** A person's choice when both copies moved: theirs, mine, or neither yet (null). */
-  async function chooseCopy(label) {
+  // A base that is not known: a draft kept before drafts carried theirs. It
+  // equals no text, so reconcile reads any stored copy that differs from the
+  // draft as a conflict, which is the safe reading.
+  const UNKNOWN = "\u0000no base";
+
+  async function chooseCopy(label, detail = "") {
     if (!host || !host.wb || !host.wb.dialog) return null;
+    // Not now is last, so it is the button that takes the focus and Enter:
+    // the default does nothing, and Keep mine is never one key away.
     return host.wb.dialog({
       title: `${label} changed while you were writing`,
-      lead: "It was saved from somewhere else, often an agent, after you began. Keep yours over it, or take theirs. Until you choose, yours is kept as a draft and nothing is written.",
-      actions: [{ label: "Not now", value: null }, { label: "Take theirs", value: "theirs" }, { label: "Keep mine", value: "mine", kind: "primary" }],
+      lead: `It was saved from somewhere else, often an agent, after you began.${detail ? ` ${detail}` : ""} Keep yours over it, or take theirs. Until you choose, yours is kept as a draft and nothing is written.`,
+      actions: [{ label: "Keep mine", value: "mine" }, { label: "Take theirs", value: "theirs" }, { label: "Not now", value: null }],
       cancelValue: null,
     });
+  }
+
+  // --- merging a pad, line by line ------------------------------------------
+
+  const ANCHOR_RE = /\s*<!--\s*d:(\d+)\s*-->/;
+  const TICK_RE = /^(\s*[-*+] \[)([ xX])(\])/;
+  const anchorOf = (line) => { const m = ANCHOR_RE.exec(line); return m ? m[0] : ""; };
+  const unanchored = (line) => line.replace(ANCHOR_RE, "");
+  const tickOf = (line) => { const m = TICK_RE.exec(line); return m ? m[2].toLowerCase() === "x" : null; };
+  const setTick = (line, on) => line.replace(TICK_RE, (_, a, _b, c) => `${a}${on ? "x" : " "}${c}`);
+  const untick = (line) => line.replace(TICK_RE, (_, a, _b, c) => `${a} ${c}`);
+
+  /**
+   * One line changed on both sides, merged when the two changes are of
+   * different kinds: the store only added an anchor (the derive filing it),
+   * or only flipped its box (the board writing a status back), while the
+   * person changed the words. Null when both changed the same thing.
+   */
+  function mergeLine(b, t, m) {
+    if (t === b) return m;
+    if (m === b || m === t) return t;
+    let out = m;
+    if (unanchored(t) === unanchored(b)) {
+      // Theirs only filed it: the person's words, with its anchor.
+      return anchorOf(m) ? m : `${unanchored(m)}${anchorOf(t)}`;
+    }
+    const tb = tickOf(b);
+    const tt = tickOf(t);
+    if (tb != null && tt != null && tb !== tt && untick(unanchored(t)) === untick(unanchored(b)) && tickOf(m) === tb) {
+      // Theirs only ticked (or unticked) it: the person's words, its box.
+      out = setTick(m, tt);
+      if (!anchorOf(out) && anchorOf(t)) out = `${out}${anchorOf(t)}`;
+      return out;
+    }
+    return null;
+  }
+
+  /** The longest common run of lines, as pairs of indexes, for a three-way merge. */
+  function matchLines(a, b) {
+    const n = a.length;
+    const m = b.length;
+    // Trimmed ends first, so a long pad with one change costs little.
+    let lo = 0;
+    while (lo < n && lo < m && a[lo] === b[lo]) lo++;
+    let hiA = n;
+    let hiB = m;
+    while (hiA > lo && hiB > lo && a[hiA - 1] === b[hiB - 1]) { hiA--; hiB--; }
+    const pairs = [];
+    for (let i = 0; i < lo; i++) pairs.push([i, i]);
+    const rows = hiA - lo;
+    const cols = hiB - lo;
+    if (rows && cols) {
+      const L = Array.from({ length: rows + 1 }, () => new Uint32Array(cols + 1));
+      for (let i = rows - 1; i >= 0; i--) {
+        for (let j = cols - 1; j >= 0; j--) {
+          L[i][j] = a[lo + i] === b[lo + j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+        }
+      }
+      let i = 0;
+      let j = 0;
+      while (i < rows && j < cols) {
+        if (a[lo + i] === b[lo + j]) { pairs.push([lo + i, lo + j]); i++; j++; }
+        else if (L[i + 1][j] >= L[i][j + 1]) i++;
+        else j++;
+      }
+    }
+    for (let k = 0; k < n - hiA; k++) pairs.push([hiA + k, hiB + k]);
+    return pairs;
+  }
+
+  /** A line without what the store adds to it (an anchor) or flips in it (a box). */
+  const keyOf = (line) => untick(unanchored(line)).replace(/\s+$/, "");
+
+  /** Theirs' anchor and box, put on a line whose words the person changed. */
+  function decorate(m, b, t) {
+    let out = m;
+    const tb = tickOf(b);
+    const tt = tickOf(t);
+    if (tb != null && tt != null && tb !== tt && tickOf(out) === tb) out = setTick(out, tt);
+    if (anchorOf(t) && !anchorOf(out) && !anchorOf(b)) out = `${out}${anchorOf(t)}`;
+    return out;
+  }
+
+  /**
+   * A three-way merge of a pad, by lines: base is the copy the person began
+   * from, theirs the pad as stored now, mine the box. Lines are matched by
+   * their words, so a line the store only filed (an anchor) or the board only
+   * ticked still lines up. Lines changed on one side only come from that
+   * side, both sides' new lines are kept, and an anchor or a tick from theirs
+   * is put on the person's version of the line. Returns { text, mine,
+   * conflicts, lines, tasks }: text leaves each real clash as theirs, mine as
+   * the person's (never with a box theirs ticked put back to empty), and lines
+   * and tasks say how much the clashes touch.
+   */
+  function mergeLines(base, theirs, mine) {
+    const B = String(base).split("\n");
+    const T = String(theirs).split("\n");
+    const M = String(mine).split("\n");
+    const bt = new Map(matchLines(B.map(keyOf), T.map(keyOf)));
+    const bm = new Map(matchLines(B.map(keyOf), M.map(keyOf)));
+    const outT = [];
+    const outM = [];
+    let conflicts = 0;
+    let lines = 0;
+    const tasks = new Set();
+    const same = (x, y) => x.length === y.length && x.every((v, k) => v === y[k]);
+    const clash = (t, m) => {
+      conflicts++;
+      lines += Math.max(t.length, m.length, 1);
+      for (const line of [...t, ...m]) { const a = ANCHOR_RE.exec(line); if (a) tasks.add(a[1]); }
+      outT.push(...t);
+      const ticked = new Set();
+      for (const line of t) { const a = ANCHOR_RE.exec(line); if (a && tickOf(line)) ticked.add(a[1]); }
+      outM.push(...m.map((line) => { const a = ANCHOR_RE.exec(line); return a && ticked.has(a[1]) && tickOf(line) === false ? setTick(line, true) : line; }));
+    };
+    let ib = 0;
+    let it = 0;
+    let im = 0;
+    const flush = (be, te, me) => {
+      const b = B.slice(ib, be);
+      const t = T.slice(it, te);
+      const m = M.slice(im, me);
+      const both = (x) => { outT.push(...x); outM.push(...x); };
+      // Where each base line went in x, by its words, or null if any is gone.
+      const covers = (x) => {
+        const pairs = matchLines(b.map(keyOf), x.map(keyOf));
+        return pairs.length === b.length ? pairs.map(([, j]) => j) : null;
+      };
+      // One side only added lines (and filed or ticked); the other changed
+      // lines in place: walk the base, the added lines where they were added.
+      const weave = (adds, at, edits, addsIsTheirs) => {
+        const out = [];
+        let from = 0;
+        for (let k = 0; k < b.length; k++) {
+          out.push(...adds.slice(from, at[k]));
+          const one = addsIsTheirs ? mergeLine(b[k], adds[at[k]], edits[k]) : mergeLine(b[k], edits[k], adds[at[k]]);
+          if (one == null) return null;
+          out.push(one);
+          from = at[k] + 1;
+        }
+        out.push(...adds.slice(from));
+        return out;
+      };
+      let woven = null;
+      if (same(t, b)) both(m);
+      else if (same(m, b) || same(m, t)) both(t);
+      else if (!b.length) both(same(t, m) ? t : [...t, ...m]);
+      else if (b.length === t.length && b.length === m.length && (woven = b.map((line, k) => mergeLine(line, t[k], m[k]))).every((x) => x != null)) both(woven);
+      else if (m.length === b.length && covers(t) && (woven = weave(t, covers(t), m, true))) both(woven);
+      else if (t.length === b.length && covers(m) && (woven = weave(m, covers(m), t, false))) both(woven);
+      else if (t.length === b.length && t.every((line, k) => keyOf(line) === keyOf(b[k])) && m.length >= b.length) {
+        // Theirs only filed or ticked these lines; the person rewrote them.
+        both(m.map((line, k) => (k < b.length ? decorate(line, b[k], t[k]) : line)));
+      } else clash(t, m);
+      ib = be; it = te; im = me;
+    };
+    for (let k = 0; k < B.length; k++) {
+      if (!bt.has(k) || !bm.has(k)) continue;
+      // A line both sides kept, by its words: everything before it is one run.
+      flush(k, bt.get(k), bm.get(k));
+      const t = T[bt.get(k)];
+      const m = M[bm.get(k)];
+      const one = mergeLine(B[k], t, m);
+      if (one == null) clash([t], [m]);
+      else { outT.push(one); outM.push(one); }
+      ib = k + 1; it = bt.get(k) + 1; im = bm.get(k) + 1;
+    }
+    flush(B.length, T.length, M.length);
+    return { text: outT.join("\n"), mine: outM.join("\n"), conflicts, lines, tasks: tasks.size };
   }
 
   /** What the composer will post, read from its mode and any prefix typed. */
@@ -436,7 +612,7 @@ globalThis.DelphiDrawer = (() => {
    * is saved straight away. A surface with its own route for a tick (a pad's
    * task goes through the board's update) passes toggle(tick, api).
    */
-  function editor({ label, kind, value, onSave, current = null, placeholder = "", draftKey = null, onMode = null, preview = (s) => s, toggle = null }) {
+  function editor({ label, kind, value, onSave, current = null, merge = null, placeholder = "", draftKey = null, onMode = null, preview = (s) => s, toggle = null }) {
     let mode = modeOf(kind);
     let text = value || "";
     // The stored text this box last took. A save compares the store against
@@ -505,8 +681,17 @@ globalThis.DelphiDrawer = (() => {
 
     if (draftKey && window.DelphiRecovery) {
       const kept = DelphiRecovery.draft(draftKey[0], draftKey[1]);
-      if (kept != null && kept !== "" && kept !== text) { area.value = kept; text = kept; restored = true; }
-      area.addEventListener("input", () => DelphiRecovery.saveDraft(draftKey[0], draftKey[1], area.value === saved ? "" : area.value));
+      if (kept != null && kept !== "" && kept !== text) {
+        // The draft comes back with the copy it was typed against as the
+        // base, so whatever changed since is merged or asked about, never
+        // written over. A draft kept without one is checked as a conflict.
+        const was = DelphiRecovery.draftBase ? DelphiRecovery.draftBase(draftKey[0], draftKey[1]) : undefined;
+        saved = typeof was === "string" ? was : UNKNOWN;
+        area.value = kept;
+        text = kept;
+        restored = true;
+      }
+      area.addEventListener("input", () => DelphiRecovery.saveDraft(draftKey[0], draftKey[1], area.value === saved ? "" : area.value, saved === UNKNOWN ? undefined : saved));
     }
     const grow = () => {
       if (mode === "split") { area.style.height = ""; return; }
@@ -539,6 +724,19 @@ globalThis.DelphiDrawer = (() => {
       grow();
     };
     let inflight = null;
+    // The box's text with the caret kept on the same line and column, for
+    // putting anchors into lines somebody is still typing in.
+    const keepCaret = (v) => {
+      if (document.activeElement !== area) { area.value = v; return; }
+      const at = area.selectionStart;
+      const before = area.value.slice(0, at).split("\n");
+      area.value = v;
+      const rows = v.split("\n");
+      const row = Math.min(before.length - 1, rows.length - 1);
+      const col = Math.min(before[before.length - 1].length, rows[row].length);
+      const pos = rows.slice(0, row).reduce((n, r) => n + r.length + 1, 0) + col;
+      area.setSelectionRange(pos, pos);
+    };
     const commit = async () => {
       // Waits out a save already going, refused or not, so one text is never
       // sent twice and a refusal does not throw out of the next caller.
@@ -553,36 +751,56 @@ globalThis.DelphiDrawer = (() => {
         // The stored copy, read now. Unreadable means nothing is written: a
         // save that cannot check is the one that loses an agent's work.
         const read = async () => {
-          if (!current) return remote == null ? saved : remote;
+          // With no way to read the store, a draft whose base is unknown cannot be checked.
+          if (!current) return remote != null ? remote : saved === UNKNOWN ? undefined : saved;
           try { const v = await current(); return v == null ? undefined : v; } catch { return undefined; }
         };
-        let theirs = await read();
-        if (theirs === undefined) { host.notify(`${label} could not be checked against the stored copy, so it was not saved. It is kept here.`); return "kept"; }
-        let what = reconcile(saved, theirs, next);
-        // Asked again if it moved once more while the question was open, so
-        // "Keep mine" never lands on a copy nobody saw.
-        for (let round = 0; what === "conflict" && round < 3; round++) {
-          const pick = await chooseCopy(label);
-          // Theirs, chosen: the box shows it, even over words typed while the
-          // question was open, or the next blur would write them over it.
-          if (pick === "theirs") { take(theirs); return "done"; }
-          if (pick !== "mine") return "kept";
-          const again = await read();
-          if (again === undefined) return "kept";
-          if (again === theirs) { what = "write"; break; }
-          theirs = again;
-          what = reconcile(saved, theirs, next) === "same" ? "same" : "conflict";
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const theirs = await read();
+          if (theirs === undefined) { host.notify(`${label} could not be checked against the stored copy, so it was not saved. It is kept here.`); return "kept"; }
+          const what = reconcile(saved, theirs, next);
+          if (what === "same") { saved = next; remote = null; return "done"; }
+          let body = next;
+          if (what === "conflict") {
+            // A pad merges by lines (merge), so an agent's new lines and the
+            // board's ticks stay; only a line both sides changed is asked
+            // about, and Keep mine never puts a ticked box back to empty.
+            const m = merge && saved !== UNKNOWN ? merge(saved, theirs, next) : null;
+            if (m && !m.conflicts) body = m.text;
+            else {
+              const words = m ? `${m.lines} ${m.lines === 1 ? "line" : "lines"} changed on both sides${m.tasks ? `, touching ${m.tasks} ${m.tasks === 1 ? "task" : "tasks"}` : ""}.` : "";
+              const pick = await chooseCopy(label, words);
+              // Theirs, chosen: the box shows it, even over words typed while
+              // the question was open, or the next blur would write them over it.
+              if (pick === "theirs") { take(theirs); return "done"; }
+              if (pick !== "mine") return "kept";
+              // Read again: Keep mine never lands on a copy nobody saw.
+              const again = await read();
+              if (again === undefined) return "kept";
+              if (again !== theirs) continue;
+              body = m ? m.mine : next;
+            }
+          }
+          // Written only over the copy just read (expect), where the store can
+          // check it; a refusal because it moved again goes round once more.
+          let stored;
+          try { stored = await onSave(body, { expect: theirs }); }
+          catch (error) { if (error && error.code === "CONFLICT") continue; throw error; }
+          const now = stored == null ? body : String(stored);
+          if (area.value === next) take(now);
+          else {
+            // Typed while it saved: what the store added (a new line's anchor)
+            // goes into the typing line by line, so the next save keeps it.
+            const carried = merge ? merge(next, now, area.value) : null;
+            if (carried && !carried.conflicts) keepCaret(carried.text);
+            saved = now;
+            remote = null;
+            text = area.value;
+          }
+          return "done";
         }
-        if (what === "conflict") return "kept";
-        if (what === "same") { saved = next; remote = null; return "done"; }
-        // Marked saved only once it is, so a refused write is tried again on
-        // the next blur or close rather than taken as done. What the store
-        // kept (a pad with its <!--d:N--> anchors) becomes the box's text,
-        // unless more was typed meanwhile.
-        const stored = await onSave(next);
-        const now = stored == null ? next : String(stored);
-        if (area.value === next) take(now); else { saved = now; remote = null; }
-        return "done";
+        host.notify(`${label} kept changing while it was being saved, so it was not. It is kept here.`);
+        return "kept";
       })();
       inflight = run;
       let outcome = null;
@@ -649,7 +867,7 @@ globalThis.DelphiDrawer = (() => {
       }
       area.value = next;
       text = next;
-      if (draftKey && window.DelphiRecovery) DelphiRecovery.saveDraft(draftKey[0], draftKey[1], next === saved ? "" : next);
+      if (draftKey && window.DelphiRecovery) DelphiRecovery.saveDraft(draftKey[0], draftKey[1], next === saved ? "" : next, saved === UNKNOWN ? undefined : saved);
       await commit();
       if (mode !== "write") paintPreview();
     }
@@ -727,8 +945,11 @@ globalThis.DelphiDrawer = (() => {
       // What comes back is the pad with the anchors the derive wrote into new
       // lines, and the box takes it, so the next save keeps them and a renamed
       // line stays the same task.
-      onSave: async (body) => {
-        const row = await window.delphi.pads.write(pad.id, { body, author: "you" });
+      merge: mergeLines,
+      // Compare and set: written only if the pad is still the copy the save
+      // was checked against, else CONFLICT and the editor reads and merges again.
+      onSave: async (body, { expect } = {}) => {
+        const row = await window.delphi.pads.write(pad.id, { body, author: "you" }, expect != null ? { expectBody: expect } : undefined);
         // No body back means no anchors to take: keep what was sent.
         if (!row || typeof row.body !== "string") { pad.body = body; if (onSaved) onSaved(pad); return body; }
         return after(row);
@@ -833,12 +1054,27 @@ globalThis.DelphiDrawer = (() => {
    * title and every editor are: an untouched box takes a rename from
    * elsewhere, and a typed one that meets a rename asks before writing.
    */
-  function titleKeeper(area, { label, fetch, write, onTake }) {
+  function titleKeeper(area, { label, fetch, write, onTake, draftKey = null }) {
     let base = area.value;
+    // What the store said when this opened, for Escape over a draft whose base was not kept.
+    const opened = area.value;
     let touched = false;
     let busy = null;
-    area.addEventListener("input", () => { touched = true; });
-    const take = (v) => { base = v; area.value = v; touched = false; if (onTake) onTake(); };
+    const R = window.DelphiRecovery;
+    // A recovery draft too, kept with the title it was typed against, so a
+    // title left unsaved (Not now, a close, a crash) comes back to be checked.
+    if (draftKey && R) {
+      const kept = R.draft(draftKey[0], draftKey[1]);
+      if (kept && kept !== base) {
+        const was = R.draftBase ? R.draftBase(draftKey[0], draftKey[1]) : undefined;
+        base = typeof was === "string" ? was : UNKNOWN;
+        area.value = kept;
+      }
+    }
+    const keepDraft = () => { if (draftKey && R) R.saveDraft(draftKey[0], draftKey[1], area.value === base ? "" : area.value, base === UNKNOWN ? undefined : base); };
+    const dropDraft = () => { if (draftKey && R) R.clearDraft(draftKey[0], draftKey[1]); };
+    area.addEventListener("input", () => { touched = true; keepDraft(); });
+    const take = (v) => { base = v; area.value = v; touched = false; dropDraft(); if (onTake) onTake(); };
     async function save() {
       // One at a time, and words typed while one ran get their own turn.
       if (busy) { await busy; return save(); }
@@ -847,19 +1083,27 @@ globalThis.DelphiDrawer = (() => {
         try {
           const next = area.value.trim();
           if (!next || next === String(base).trim() || !touched) return;
-          let theirs;
-          try { theirs = await fetch(); } catch { return; }
-          if (theirs == null) return;
-          const what = reconcile(base, theirs, next);
-          if (what === "same") { base = next; touched = false; return; }
-          if (what === "conflict") {
+          const readNow = async () => { try { const v = await fetch(); return v == null ? undefined : v; } catch { return undefined; } };
+          let theirs = await readNow();
+          if (theirs === undefined) return;
+          let what = reconcile(base, theirs, next);
+          while (what === "conflict") {
             const pick = await chooseCopy(label);
             if (pick === "theirs") { take(theirs); return; }
             if (pick !== "mine") return;
+            // Read again before writing: Keep mine never lands on a rename
+            // that arrived while the question was open.
+            const again = await readNow();
+            if (again === undefined) return;
+            if (again === theirs) { what = "write"; break; }
+            theirs = again;
+            what = reconcile(base, theirs, next);
           }
+          if (what === "same") { base = next; if (area.value.trim() === next) { touched = false; dropDraft(); } return; }
           await write(next);
           base = next;
-          touched = false;
+          // Words typed while it saved are not marked saved.
+          if (area.value.trim() === next) { touched = false; dropDraft(); }
         } catch (error) { host.notifyError(error); }
         finally { busy = null; }
       })();
@@ -867,7 +1111,7 @@ globalThis.DelphiDrawer = (() => {
     }
     return {
       save,
-      base: () => base,
+      base: () => (base === UNKNOWN ? opened : base),
       update(v) { if (v != null && v !== base && document.activeElement !== area && area.value === base) take(v); },
     };
   }
@@ -995,8 +1239,14 @@ globalThis.DelphiDrawer = (() => {
     title.addEventListener("input", () => { titleTouched = true; });
     if (window.DelphiRecovery) {
       const kept = DelphiRecovery.draft("title", draftOf);
-      if (kept && kept !== detail.task.title) title.value = kept;
-      title.addEventListener("input", () => DelphiRecovery.saveDraft("title", draftOf, title.value === titleFrom ? "" : title.value));
+      if (kept && kept !== detail.task.title) {
+        // Back with the title it was typed against, so a rename since then
+        // is asked about rather than written over.
+        const was = DelphiRecovery.draftBase ? DelphiRecovery.draftBase("title", draftOf) : undefined;
+        titleFrom = typeof was === "string" ? was : UNKNOWN;
+        title.value = kept;
+      }
+      title.addEventListener("input", () => DelphiRecovery.saveDraft("title", draftOf, title.value === titleFrom ? "" : title.value, titleFrom === UNKNOWN ? undefined : titleFrom));
     }
     const growTitle = () => { title.style.height = "auto"; title.style.height = `${title.scrollHeight}px`; };
     title.addEventListener("input", growTitle);
@@ -1025,9 +1275,9 @@ globalThis.DelphiDrawer = (() => {
           let theirs;
           // Unreadable means not written: the draft stays.
           try { const fresh = await window.delphi.tasks.detail(taskId); if (!fresh) return; theirs = fresh.task.title; } catch { return; }
-          const what = reconcile(titleFrom, theirs, next);
-          if (what === "same") { titleFrom = next; detail.task.title = next; return; }
-          if (what === "conflict") {
+          const readTitle = async () => { try { const f = await window.delphi.tasks.detail(taskId); return f ? f.task.title : undefined; } catch { return undefined; } };
+          let what = reconcile(titleFrom, theirs, next);
+          while (what === "conflict") {
             const pick = await chooseCopy("The title");
             if (pick === "theirs") {
               titleFrom = theirs; detail.task.title = theirs; titleTouched = false;
@@ -1037,14 +1287,22 @@ globalThis.DelphiDrawer = (() => {
               return;
             }
             if (pick !== "mine") return;
+            const again = await readTitle();
+            if (again === undefined) return;
+            if (again === theirs) { what = "write"; break; }
+            theirs = again;
+            what = reconcile(titleFrom, theirs, next);
           }
+          if (what === "same") { titleFrom = next; detail.task.title = next; return; }
           await window.delphi.tasks.update(taskId, { title: next });
           detail.task.title = next;
           titleFrom = next;
-          titleTouched = false;
+          // Words typed while it saved stay unsaved, and stay a draft.
+          const unchanged = title.value.trim() === next;
+          if (unchanged) titleTouched = false;
           if (document.activeElement !== title) { title.value = next; titleBox.show(); }
           // Only a save that landed lets the draft go; a refused one keeps it.
-          if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
+          if (window.DelphiRecovery && unchanged) DelphiRecovery.clearDraft("title", draftOf);
           host.refresh();
         } catch (error) { host.notifyError(error); }
         finally { titleSaving = null; }
@@ -2269,23 +2527,22 @@ globalThis.DelphiDrawer = (() => {
     nameIn.setAttribute("aria-label", "Note title");
     // The note as the store has it now: a row from a list or a search can be
     // stale or cut short, and every save is checked against this.
-    const fetchNote = async () => {
-      const list = await window.delphi.notes.list(n.project_id == null ? null : n.project_id);
-      return (list || []).find((x) => x.id === n.id) || null;
-    };
+    const fetchNote = async () => (window.delphi.notes.get ? window.delphi.notes.get(n.id) : null);
     try { const fresh = await fetchNote(); if (fresh) n = { ...n, ...fresh }; } catch {}
     if (ticket !== opening) return;
     nameIn.value = n.title;
     let nameBox = null;
     const nameKeep = titleKeeper(nameIn, {
       label: "The note's title",
+      draftKey: ["notetitle", n.id],
       fetch: async () => { const f = await fetchNote(); return f ? f.title : null; },
       write: async (title) => { await window.delphi.notes.update(n.id, { title }); n.title = title; host.refresh(); },
       onTake: () => nameBox && nameBox.show(),
     });
     // The title and the body save apart, each on its own blur, so a title
     // change never sends the body again.
-    const saveAll = async () => { await nameKeep.save(); if (ed) await ed.commit(); };
+    let noteGone = false;
+    const saveAll = async () => { if (noteGone) return; await nameKeep.save(); if (ed) await ed.commit(); };
     const me = frame({ label: `Note ${n.id}: ${n.title}`, onClose: saveAll });
     cur = me;
     me.root.classList.add("dw-note");
@@ -2414,9 +2671,7 @@ globalThis.DelphiDrawer = (() => {
             let f = null;
             try { f = await fetchNote(); } catch { return; }
             if (host.sheet() !== handle) return;
-            // Not in its project's list is not proof it is gone (it may live
-            // elsewhere now), so the drawer is left as it is.
-            if (!f) return;
+            if (!f) { noteGone = true; host.notify(`Note #${n.id} was deleted. Restore it from History.`); await me.close(); return; }
             nameKeep.update(f.title);
             ed.update(f.body || "");
             n = { ...n, ...f };
@@ -2452,6 +2707,7 @@ globalThis.DelphiDrawer = (() => {
     let nameBox = null;
     const nameKeep = titleKeeper(nameIn, {
       label: "The pad's title",
+      draftKey: ["padtitle", pad.id],
       fetch: async () => { const f = await window.delphi.pads.get(pad.id); return f ? f.title : null; },
       write: async (title) => { await window.delphi.pads.write(pad.id, { title }); pad.title = title; host.refresh(); },
       onTake: () => nameBox && nameBox.show(),
@@ -2569,7 +2825,7 @@ globalThis.DelphiDrawer = (() => {
     // files against "the task on screen".
     taskId: () => { const h = host && host.sheet(); return h && h.drawer && h.taskId ? h.taskId : null; },
     // Pure, for tools/drawer_test.js.
-    stuck, related, ordered, composed, reconcile,
+    stuck, related, ordered, composed, reconcile, mergeLines,
   };
 })();
 

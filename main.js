@@ -1444,6 +1444,7 @@ handle("workbench:advanced", (id) => benches.advanced(id));
 handle("repos:update", (id, fields) => { const { setup_cmd_detected: _ignored, ...mine } = fields || {}; return benchStore.updateRepo(id, mine); });
 
 handle("notes:list", (projectId) => db.listNotes(projectId));
+handle("notes:get", (id) => db.getNote(id));
 handle("notes:create", (payload) => { const r = db.createNote(payload); scheduleVaultExport(); return r; });
 handle("notes:update", (id, fields) => { const r = db.updateNote(id, fields); scheduleVaultExport(); return r; });
 handle("notes:delete", (id) => { const r = db.deleteNote(id); scheduleVaultExport(); return r; });
@@ -1453,7 +1454,7 @@ handle("notes:delete", (id) => { const r = db.deleteNote(id); scheduleVaultExpor
 handle("pads:list", (projectId) => db.listScratchpads(projectId));
 handle("pads:get", (id) => db.getScratchpad(id));
 handle("pads:create", (payload) => { const r = db.createScratchpad(payload); scheduleVaultExport(); return r; });
-handle("pads:write", (id, fields) => { const r = db.writeScratchpad(id, fields); scheduleVaultExport(); return r; });
+handle("pads:write", (id, fields, opts) => { const r = db.writeScratchpad(id, fields, opts || {}); scheduleVaultExport(); return r; });
 handle("pads:append", (id, text) => { const r = db.appendScratchpad(id, text); scheduleVaultExport(); return r; });
 handle("pads:delete", (id) => { const r = db.deleteScratchpad(id); scheduleVaultExport(); return r; });
 handle("pads:tasks", (id) => db.scratchpadTasks(id));
