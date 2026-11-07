@@ -447,6 +447,22 @@ async function main() {
   check("spaces typed after it are not a rename over the agent's", [titleOf(dTask.id), await js("!!document.querySelector('.wb-dialog')")], ["Renamed again", false]);
   await js("DelphiDrawer.close(); 1"); await wait(300);
 
+  // A tick in the description while an agent has written it, unseen here.
+  const tTask = db.createTask({ projectId: project.id, title: "Ticks", detail: "- [ ] one\n- [ ] two" });
+  await js(`localStorage.setItem("delphi.drawer.mode.task", JSON.stringify("preview")); 1`);
+  await openTask(tTask.id);
+  await until(`!!document.querySelector('.dw [data-fold=description] input[data-line="1"]')`);
+  db.updateTask(tTask.id, { detail: "- [ ] one\n- [ ] two\nwritten by an agent" });
+  await js(`(() => { const b = document.querySelector('.dw [data-fold=description] input[data-line="1"]'); b.checked = true; b.dispatchEvent(new Event("change")); return 1; })()`);
+  await wait(800);
+  check("a tick lands on the agent's newer text, not over it", detailOf(tTask.id), "- [ ] one\n- [x] two\nwritten by an agent");
+  db.updateTask(tTask.id, { detail: "- [ ] zero\n- [ ] one\n- [x] two\nwritten by an agent" });
+  await js(`(() => { const b = document.querySelector('.dw [data-fold=description] input[data-line="0"]'); b.checked = true; b.dispatchEvent(new Event("change")); return 1; })()`);
+  await wait(800);
+  check("and a tick whose line moved meanwhile writes nothing", detailOf(tTask.id), "- [ ] zero\n- [ ] one\n- [x] two\nwritten by an agent");
+  await js("DelphiDrawer.close(); 1"); await wait(300);
+  await js(`localStorage.setItem("delphi.drawer.mode.task", JSON.stringify("write")); 1`);
+
   if (pad) {
     const padRow = () => q("SELECT body FROM scratchpads WHERE id = :id", { id: pad.id })[0].body;
     db.writeScratchpad(pad.id, { derives_tasks: 1 });

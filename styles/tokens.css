@@ -103,6 +103,10 @@
     /* Code: a ground a shade off the page, and four hues for the highlighter. */
     --code-bg: #F6F7F9;
     --kw: #7C3AED; --str: #047857; --key: #B45309; --tag: #2563EB;
+    /* The rest of the highlighter (ui/highlight.js): comments, numbers, and a
+       diff's added, removed and header lines. Each holds 4.5:1 on --code-bg,
+       which tools/contrast_test.js checks. */
+    --hl-com: #5F6775; --hl-num: #B4400F; --hl-add: #166534; --hl-del: #B91C1C; --hl-meta: #6D28D9;
 
     /* Three depths: a control resting on the page, a card lifted off it, and a
        layer over everything (a drawer, the command bar). --shadow is the
@@ -179,6 +183,7 @@
 
     --code-bg: #0B111D;
     --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
+    --hl-com: #8D97A8; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
 
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);
@@ -224,6 +229,7 @@
 
   --code-bg: #0B111D;
   --kw: #C4B5FD; --str: #6EE7B7; --key: #FCD34D; --tag: #93C5FD;
+  --hl-com: #8D97A8; --hl-num: #FDBA74; --hl-add: #86EFAC; --hl-del: #FCA5A5; --hl-meta: #A5B4FC;
 
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);

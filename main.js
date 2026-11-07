@@ -2299,5 +2299,8 @@ handle("settings:setHotkey", (accelerator) => setSettings({ hotkey: accelerator 
 
 ipcMain.on("hide", hide);
 ipcMain.on("open-external", (_e, url) => {
-  if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+  // http(s), and mailto for an address in a note (ui/markdown.js safeHref).
+  // Nothing else: file:, javascript: and custom schemes never leave from here.
+  if (typeof url !== "string") return;
+  if (/^https?:\/\//i.test(url) || /^mailto:[^\s<>"'?&]+@[^\s<>"'?&]+$/i.test(url)) shell.openExternal(url);
 });

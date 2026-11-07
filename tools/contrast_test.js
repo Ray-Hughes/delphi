@@ -113,6 +113,34 @@ for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinne
   }
 }
 
+// The highlighter's colours (ui/highlight.js, styles/markdown.css), on the
+// code ground a block sits on and on the grounds a code span or the drawer's
+// source pane can sit on. Comments included: a comment is read, not skimmed.
+const CODE_INKS = ["--ink", "--kw", "--str", "--key", "--tag", "--hl-com", "--hl-num", "--hl-add", "--hl-del", "--hl-meta"];
+const CODE_GROUNDS = ["--code-bg", "--raised", "--surface"];
+for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinned }]]) {
+  console.log(`\n${theme}: code colours on code grounds, at least 4.5:1`);
+  for (const ink of CODE_INKS) {
+    for (const ground of CODE_GROUNDS) {
+      const a = rgb(resolve(vars, ink));
+      const b = rgb(resolve(vars, ground));
+      if (!a || !b) { check(`${ink} on ${ground} is a plain hex colour`, false, `${resolve(vars, ink)} on ${resolve(vars, ground)}`); continue; }
+      const r = ratio(a, b);
+      check(`${ink} on ${ground}: ${r.toFixed(2)}:1`, r >= 4.5, `${resolve(vars, ink)} on ${resolve(vars, ground)}`);
+    }
+  }
+}
+{
+  // Every colour the stylesheet gives a token type is one of the checked
+  // tokens, so a new type cannot arrive with an unchecked colour.
+  const mdCss = fs.readFileSync(path.join(__dirname, "..", "styles", "markdown.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  const used = [...mdCss.matchAll(/\.hl-[\w-]+[^{]*\{[^}]*color\s*:\s*([^;}]+)/g)].map((m) => m[1].trim());
+  console.log("\nmarkdown.css: every token colour is a checked token");
+  check("the highlighter colours its tokens", used.length >= 8, `${used.length} found`);
+  const loose = used.filter((v) => { const m = v.match(/^var\((--[\w-]+)\)$/); return !m || !CODE_INKS.includes(m[1]); });
+  check("each is var() of a checked ink", loose.length === 0, loose.join(", "));
+}
+
 // Focus's peek is quiet by colour (--ink-dim, checked above), never by
 // opacity: a faded --ink drops under 4.5:1 in both themes and no token check
 // can see it, so the stylesheet itself is read.

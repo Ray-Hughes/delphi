@@ -46,7 +46,7 @@ globalThis.DelphiDrawer = (() => {
   const setFold = (key, open) => store.set(FOLDS_KEY, { ...store.get(FOLDS_KEY, {}), [key]: open });
   const MODES = ["write", "preview", "split"];
   const modeOf = (kind) => {
-    const m = store.get(`delphi.drawer.mode.${kind}`, kind === "pad" ? "write" : "preview");
+    const m = store.get(`delphi.drawer.mode.${kind}`, /^pad/.test(kind) ? "write" : "preview");
     return MODES.includes(m) ? m : "preview";
   };
   const setMode = (kind, m) => store.set(`delphi.drawer.mode.${kind}`, m);
@@ -413,19 +413,43 @@ globalThis.DelphiDrawer = (() => {
     return api;
   }
 
-  /** Write, Preview and Split over one text, rendered with the app's markdown renderer. */
-  function editor({ label, kind, value, onSave, current = null, placeholder = "", draftKey = null, onMode = null, preview = (s) => s }) {
+  const SPLIT_MIN = 0.2;
+  const SPLIT_MAX = 0.8;
+  const splitOf = (kind) => {
+    const r = Number(store.get(`delphi.drawer.split.${kind}`, 0.5));
+    return Number.isFinite(r) ? Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, r)) : 0.5;
+  };
+  // Typing in Split repaints the preview after a pause rather than per key:
+  // a 2,000-line pad renders in a few milliseconds, but not forty times a
+  // second while somebody types a sentence.
+  const PREVIEW_WAIT = 90;
+
+  /**
+   * Write, Preview and Split over one text, rendered with the app's markdown
+   * renderer (ui/markdown.js). The one editor for every long text a person
+   * edits: a task's description, a note and a pad, here and in the Pads tab
+   * (app.js), which is why it is exported.
+   *
+   * kind names the surface, and each surface remembers its own mode and its
+   * own split. A checkbox ticked in the preview edits its line of the text by
+   * line number (DelphiMarkdown.toggleTask), never by matching its words, and
+   * is saved straight away. A surface with its own route for a tick (a pad's
+   * task goes through the board's update) passes toggle(tick, api).
+   */
+  function editor({ label, kind, value, onSave, current = null, placeholder = "", draftKey = null, onMode = null, preview = (s) => s, toggle = null }) {
     let mode = modeOf(kind);
     let text = value || "";
     // The stored text this box last took. A save compares the store against
     // it (reconcile), and a write from elsewhere waits in pending while the
     // box is being typed in, to be taken on blur when nothing was typed.
     let saved = text;
-    let pending = null;
+    let remote = null;
     // A draft restored from an earlier run was typed against an older copy,
     // so it is only written once somebody types here again.
     let restored = false;
+    let ratio = splitOf(kind);
     const wrap = el("div", { className: "dw-ed" });
+    wrap.dataset.kind = kind;
     const bar = el("div", { className: "dw-ed-bar" }, el("span", { className: "lbl", textContent: label }), el("span", { className: "grow" }));
     const seg = el("div", { className: "dw-seg", role: "group" });
     seg.setAttribute("aria-label", `${label} display`);
@@ -442,6 +466,43 @@ globalThis.DelphiDrawer = (() => {
     area.setAttribute("aria-label", label);
     const prev = el("div", { className: "dw-prev", tabIndex: 0 });
     prev.setAttribute("aria-label", `${label}, formatted. Press Enter to edit.`);
+    // The handle between the two halves of Split: a drag, or the arrow keys.
+    const handle = el("div", { className: "dw-split", tabIndex: 0, role: "separator" });
+    handle.setAttribute("aria-orientation", "vertical");
+    handle.setAttribute("aria-label", `Resize the ${label.toLowerCase()} source and preview`);
+    handle.setAttribute("aria-valuemin", String(SPLIT_MIN * 100));
+    handle.setAttribute("aria-valuemax", String(SPLIT_MAX * 100));
+    const setRatio = (r, { save = true } = {}) => {
+      ratio = Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, r));
+      handle.setAttribute("aria-valuenow", String(Math.round(ratio * 100)));
+      if (mode === "split") bodyBox.style.gridTemplateColumns = `minmax(0, ${ratio}fr) 7px minmax(0, ${1 - ratio}fr)`;
+      if (save) store.set(`delphi.drawer.split.${kind}`, Number(ratio.toFixed(3)));
+    };
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      handle.setPointerCapture(e.pointerId);
+      handle.classList.add("drag");
+      const box = bodyBox.getBoundingClientRect();
+      const move = (ev) => setRatio((ev.clientX - box.left) / Math.max(1, box.width), { save: false });
+      const up = () => {
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", up);
+        handle.removeEventListener("pointercancel", up);
+        handle.classList.remove("drag");
+        setRatio(ratio);
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", up);
+      handle.addEventListener("pointercancel", up);
+    });
+    handle.addEventListener("keydown", (e) => {
+      const step = { ArrowLeft: -0.05, ArrowRight: 0.05 }[e.key];
+      if (step) { e.preventDefault(); e.stopPropagation(); setRatio(ratio + step); }
+      else if (e.key === "Home" || e.key === "End") { e.preventDefault(); setRatio(e.key === "Home" ? SPLIT_MIN : SPLIT_MAX); }
+    });
+    handle.addEventListener("dblclick", () => setRatio(0.5));
+
     if (draftKey && window.DelphiRecovery) {
       const kept = DelphiRecovery.draft(draftKey[0], draftKey[1]);
       if (kept != null && kept !== "" && kept !== text) { area.value = kept; text = kept; restored = true; }
@@ -452,16 +513,26 @@ globalThis.DelphiDrawer = (() => {
       area.style.height = "auto";
       area.style.height = `${Math.max(120, area.scrollHeight + 2)}px`;
     };
+    let pending = null;
     const paintPreview = () => {
-      prev.textContent = "";
+      if (pending) { clearTimeout(pending); pending = null; }
       const src = preview(area.value);
-      if (src.trim()) prev.append(host.renderMarkdown(src));
-      else prev.append(el("span", { className: "dw-blank", textContent: placeholder || "Nothing written yet" }));
+      // The checkboxes carry line numbers into this text, so they are live
+      // only while the preview is drawn from it unchanged.
+      const live = src === area.value;
+      const node = src.trim()
+        ? host.renderMarkdown(src, live ? { onToggle: (tick) => ticked(tick) } : {})
+        : el("span", { className: "dw-blank", textContent: placeholder || "Nothing written yet" });
+      prev.replaceChildren(node);
     };
-    area.addEventListener("input", () => { restored = false; text = area.value; if (mode === "split") paintPreview(); grow(); });
+    const paintSoon = () => {
+      if (pending) clearTimeout(pending);
+      pending = setTimeout(paintPreview, PREVIEW_WAIT);
+    };
+    area.addEventListener("input", () => { restored = false; text = area.value; if (mode === "split") paintSoon(); grow(); });
     const take = (v) => {
       saved = v == null ? "" : String(v);
-      pending = null;
+      remote = null;
       area.value = saved;
       text = saved;
       if (mode !== "write") paintPreview();
@@ -474,7 +545,7 @@ globalThis.DelphiDrawer = (() => {
       while (inflight) { try { await inflight; } catch {} }
       const next = area.value;
       if (next === saved) {
-        if (pending != null && document.activeElement !== area) take(pending);
+        if (remote != null && document.activeElement !== area) take(remote);
         return;
       }
       if (restored) return;
@@ -482,7 +553,7 @@ globalThis.DelphiDrawer = (() => {
         // The stored copy, read now. Unreadable means nothing is written: a
         // save that cannot check is the one that loses an agent's work.
         const read = async () => {
-          if (!current) return pending == null ? saved : pending;
+          if (!current) return remote == null ? saved : remote;
           try { const v = await current(); return v == null ? undefined : v; } catch { return undefined; }
         };
         let theirs = await read();
@@ -492,7 +563,7 @@ globalThis.DelphiDrawer = (() => {
         // "Keep mine" never lands on a copy nobody saw.
         for (let round = 0; what === "conflict" && round < 3; round++) {
           const pick = await chooseCopy(label);
-          if (pick === "theirs") { if (area.value === next) take(theirs); else { saved = theirs; pending = null; } return "done"; }
+          if (pick === "theirs") { if (area.value === next) take(theirs); else { saved = theirs; remote = null; } return "done"; }
           if (pick !== "mine") return "kept";
           const again = await read();
           if (again === undefined) return "kept";
@@ -501,14 +572,14 @@ globalThis.DelphiDrawer = (() => {
           what = reconcile(saved, theirs, next) === "same" ? "same" : "conflict";
         }
         if (what === "conflict") return "kept";
-        if (what === "same") { saved = next; pending = null; return "done"; }
+        if (what === "same") { saved = next; remote = null; return "done"; }
         // Marked saved only once it is, so a refused write is tried again on
         // the next blur or close rather than taken as done. What the store
         // kept (a pad with its <!--d:N--> anchors) becomes the box's text,
         // unless more was typed meanwhile.
         const stored = await onSave(next);
         const now = stored == null ? next : String(stored);
-        if (area.value === next) take(now); else { saved = now; pending = null; }
+        if (area.value === next) take(now); else { saved = now; remote = null; }
         return "done";
       })();
       inflight = run;
@@ -517,15 +588,84 @@ globalThis.DelphiDrawer = (() => {
       if (outcome === "done" && draftKey && window.DelphiRecovery && area.value === saved) DelphiRecovery.clearDraft(draftKey[0], draftKey[1]);
     };
     area.addEventListener("blur", commit);
+
+    /** The text as stored now, put in place without losing what is being typed. */
+    function replace(next, tick = null) {
+      // tick is the box just written to the stored text; null when nothing
+      // was, so typing here is kept as it is.
+      next = next || "";
+      if (area.value === saved) {
+        area.value = next;
+      } else if (tick) {
+        // Somebody typed while the tick was saving. Their text stays, with the
+        // same box ticked in it, so the save their blur makes cannot untick it.
+        const local = DelphiMarkdown.toggleTask(area.value, tick.line, tick.checked, tick.text);
+        if (local != null) area.value = local;
+      }
+      saved = next;
+      remote = null;
+      text = area.value;
+      if (mode !== "write") paintPreview();
+      grow();
+    }
+    let ticking = Promise.resolve();
+    function ticked(tick) {
+      // One at a time and in order, so two quick ticks cannot save over each
+      // other.
+      ticking = ticking.then(() => tickNow(tick)).catch((error) => { host.notifyError(error); paintPreview(); });
+      return ticking;
+    }
+    async function tickNow(tick) {
+      const api = { dirty: () => area.value !== saved, replace: (next, { ticked = true } = {}) => replace(next, ticked ? tick : null), local: () => tickLocal(tick) };
+      if (toggle) return toggle(tick, api);
+      return tickLocal(tick);
+    }
+    async function tickLocal(tick) {
+      // Nothing typed here and the stored text moved (an agent wrote it): the
+      // tick goes onto the stored text, never onto this older copy, and only
+      // if its line is still the line that was drawn.
+      if (current && area.value === saved) {
+        let fresh;
+        try { fresh = await current(); } catch { fresh = undefined; }
+        if (fresh === undefined || fresh === null) { host.notify(`${label} could not be read, so nothing was ticked.`); paintPreview(); return; }
+        if (fresh !== saved) {
+          const onTheirs = DelphiMarkdown.toggleTask(fresh, tick.line, tick.checked, tick.text);
+          if (onTheirs == null) { take(fresh); host.notify("That line changed since it was shown, so nothing was ticked. Try again."); return; }
+          const stored = await onSave(onTheirs);
+          take(stored == null ? onTheirs : stored);
+          if (draftKey && window.DelphiRecovery) DelphiRecovery.clearDraft(draftKey[0], draftKey[1]);
+          return;
+        }
+      }
+      const next = DelphiMarkdown.toggleTask(area.value, tick.line, tick.checked, tick.text);
+      if (next == null) {
+        // The line moved or changed since the preview was drawn. Redrawn
+        // rather than guessed at.
+        paintPreview();
+        host.notify("That line changed since it was shown. Try again.");
+        return;
+      }
+      area.value = next;
+      text = next;
+      if (draftKey && window.DelphiRecovery) DelphiRecovery.saveDraft(draftKey[0], draftKey[1], next === saved ? "" : next);
+      await commit();
+      if (mode !== "write") paintPreview();
+    }
+
     // A click on the formatted text is a request to edit it, unless it was a
     // drag to select something to copy.
     prev.addEventListener("click", (e) => {
-      if (e.target.closest("a, button, input")) return;
+      if (e.target.closest("a, button, input, label")) return;
       const sel = window.getSelection();
       if (sel && !sel.isCollapsed) return;
       if (mode === "preview") { setTo("write"); area.focus(); }
     });
-    prev.addEventListener("keydown", (e) => { if (e.key === "Enter" && mode === "preview") { e.preventDefault(); setTo("write"); area.focus(); } });
+    prev.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || mode !== "preview" || e.target !== prev) return;
+      e.preventDefault();
+      setTo("write");
+      area.focus();
+    });
     function setTo(m) {
       mode = m;
       setMode(kind, m);
@@ -535,8 +675,10 @@ globalThis.DelphiDrawer = (() => {
     function paint() {
       for (const [m, b] of Object.entries(segButtons)) { b.classList.toggle("on", m === mode); b.setAttribute("aria-pressed", String(m === mode)); }
       bodyBox.className = `dw-ed-body ${mode}`;
+      bodyBox.style.gridTemplateColumns = "";
       bodyBox.textContent = "";
       if (mode !== "preview") bodyBox.append(area);
+      if (mode === "split") { bodyBox.append(handle); setRatio(ratio, { save: false }); }
       if (mode !== "write") { paintPreview(); bodyBox.append(prev); }
       requestAnimationFrame(grow);
     }
@@ -548,12 +690,76 @@ globalThis.DelphiDrawer = (() => {
       // kept until blur (taken if nothing was typed) or a save (reconciled).
       update(next) {
         const v = next == null ? "" : String(next);
-        if (v === saved) { pending = null; return; }
-        if (document.activeElement === area || area.value !== saved) { pending = v; return; }
+        if (v === saved) { remote = null; return; }
+        if (document.activeElement === area || area.value !== saved) { remote = v; return; }
         take(v);
       },
       setTo,
     };
+  }
+
+  /**
+   * A pad in the editor, for the drawer and the Pads tab alike.
+   *
+   * A tick in a pad is a task changing, so it takes the route the board's own
+   * tick takes when the line is a task this pad files: tasks.update, whose
+   * write-back (db.writeBackToPad) rewrites the line. That is the same rule an
+   * agent-held task or one In review meets on the board, and the same Finish
+   * prompt when a task with a Workbench is done. A line that is not filed yet,
+   * or a pad that files nothing, is plain text: the line is flipped in the
+   * pad as stored now and written through pads.write, whose derivation files
+   * it. Either way the stored pad is read first and the line checked against
+   * what was drawn, so a pad an agent appended to since it was opened is not
+   * written back over with the copy this window holds.
+   */
+  function padEditor(pad, { label = "Pad", kind = "pad", onSaved = null, onMode = null, value = null, draftKey = null } = {}) {
+    const ANCHOR = /<!--\s*d:(\d+)\s*-->/;
+    const after = (row) => { if (row && typeof row.body === "string") pad.body = row.body; if (onSaved) onSaved(pad); return pad.body; };
+    const ed = editor({
+      label, kind, value: value != null ? value : pad.body || "", draftKey: draftKey || ["padbody", pad.id], onMode,
+      placeholder: "The plan, as checkbox lines: - [ ] the thing to do",
+      // Every save is checked against the pad as stored (reconcile in the
+      // editor), so an agent's append or a status the board wrote back into
+      // a line is never written over with the copy this box holds.
+      current: async () => { const f = await window.delphi.pads.get(pad.id); return f ? f.body || "" : null; },
+      // What comes back is the pad with the anchors the derive wrote into new
+      // lines, and the box takes it, so the next save keeps them and a renamed
+      // line stays the same task.
+      onSave: async (body) => after(await window.delphi.pads.write(pad.id, { body, author: "you" })),
+      toggle: async (tick, api) => {
+        // Never through the editor's whole-body save, even with typing not
+        // saved yet: the tick is written to the pad as stored, and replace()
+        // keeps the typing here with the same box ticked in it.
+        const fresh = await window.delphi.pads.get(pad.id);
+        if (!fresh) { api.replace(pad.body, { ticked: false }); host.notify("The pad could not be read, so nothing was ticked."); return; }
+        const lines = String(fresh.body || "").split("\n");
+        if (lines[tick.line] == null || lines[tick.line].replace(/\r$/, "") !== String(tick.text).replace(/\r$/, "")) {
+          api.replace(after(fresh), { ticked: false });
+          host.notify("The pad changed since it was shown, so nothing was ticked. Try again.");
+          return;
+        }
+        const anchored = fresh.derives_tasks ? ANCHOR.exec(lines[tick.line]) : null;
+        let filed = null;
+        if (anchored) {
+          // Only a task this pad owns: an anchor copied in from another pad
+          // is stale text, as the derivation treats it, and must not tick
+          // somebody else's task.
+          const detail = await window.delphi.pads.tasks(pad.id);
+          const entry = ((detail && detail.lines) || []).find((l) => l.index === tick.line);
+          filed = entry && entry.task && entry.task.pad_id === pad.id && entry.task.id === Number(anchored[1]) ? entry.task : null;
+        }
+        if (filed) {
+          await window.delphi.tasks.update(filed.id, { status: tick.checked ? "done" : "todo" });
+          api.replace(after(await window.delphi.pads.get(pad.id)));
+        } else {
+          const next = DelphiMarkdown.toggleTask(fresh.body || "", tick.line, tick.checked, tick.text);
+          if (next == null) { api.replace(after(fresh), { ticked: false }); return; }
+          api.replace(after(await window.delphi.pads.write(pad.id, { body: next, author: "you" })));
+        }
+        host.refresh();
+      },
+    });
+    return ed;
   }
 
   /** A small inline editor that replaces a chip until it is done. */
@@ -2296,15 +2502,12 @@ globalThis.DelphiDrawer = (() => {
     paintToggle();
     nameBox = titleField(nameIn, "plain", { revert: () => nameKeep.base() });
     me.head.append(topRow(crumbs, [pin, share, del, moreB], flashHost, () => me.close()), nameBox.node, props, el("div", { className: "dw-note-line" }, toggle, toggleWords));
-    ed = editor({ label: "Pad", kind: "pad", value: pad.body || "", placeholder: "The plan, as checkbox lines: - [ ] the thing to do",
-      // The markers are how a line and its task stay the same thing. Kept in
-      // the source, left out of the formatted view.
-      preview: (s) => s.replace(/\s*<!--d:\d+-->/g, ""),
-      draftKey: ["padbody", pad.id],
-      current: async () => { const f = await window.delphi.pads.get(pad.id); return f ? f.body || "" : null; },
-      // What comes back is the pad with the anchors the derive wrote into new
-      // lines; the box takes it, so the next save keeps them.
-      onSave: async (body) => { const r = await window.delphi.pads.write(pad.id, { body, author: "you" }); pad.body = r && r.body != null ? r.body : body; host.refresh(); paintChecks(); return pad.body; },
+    // The <!--d:N--> markers are how a line and its task stay the same thing.
+    // Kept in the source, and left out of the formatted view by the renderer,
+    // which drops HTML comments, so the preview keeps the source line numbers
+    // a tick needs.
+    ed = padEditor(pad, {
+      onSaved: () => { host.refresh(); paintChecks(); },
       onMode: (m) => me.root.classList.toggle("wide", m === "split") });
     ed.area.addEventListener("input", paintChecks);
     paintChecks();
@@ -2345,6 +2548,8 @@ globalThis.DelphiDrawer = (() => {
   return {
     init: (h) => { host = h; },
     open, openNote, openPad,
+    // The one Write, Preview and Split editor, for the Pads tab (app.js).
+    editor, padEditor,
     close: () => (cur ? cur.close() : undefined),
     editTitle: () => { const b = document.querySelector(".dw .dw-title-btn"); if (b) b.click(); },
     isOpen: () => Boolean(cur),

@@ -1,0 +1,64 @@
+/* Markdown, as ui/markdown.js draws it ----------------------------------
+   The base .md rules (headings, paragraphs, tables) are in app.css. This is
+   what the one renderer added: code blocks with a language and a Copy button,
+   the highlighter's colours, task lists with live checkboxes, links and task
+   refs that carry no href, and the drawer editor's Split handle. Tokens only,
+   so both themes follow; tools/contrast_test.js checks the .hl-* colours. */
+
+.md h4, .md h5, .md h6 { margin: var(--s4) 0 var(--s2); font-size: 11.5px; font-weight: 650; color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+.md del { color: var(--ink-dim); }
+.md th.al-center, .md td.al-center { text-align: center; }
+.md th.al-right, .md td.al-right { text-align: right; }
+
+/* Links and #123 refs are <a> with no href, so the colour and the hand are
+   said here rather than inherited from :link. */
+.md a.md-link, .md a.md-ref { color: var(--accent-ink); text-decoration: underline; text-decoration-color: var(--accent-line); text-underline-offset: 2px; cursor: pointer; border-radius: var(--r-sm); }
+.md a.md-link:hover, .md a.md-ref:hover { text-decoration-color: currentColor; }
+.md a.md-ref { font-family: var(--mono); font-size: 0.92em; text-decoration-style: dotted; }
+
+/* A code block: a slim bar with the language and Copy, then the code. */
+.md .md-code { margin: 0 0 var(--s3); border: 1px solid var(--line-soft); border-radius: var(--r); background: var(--code-bg); overflow: hidden; }
+.md .md-code pre { margin: 0; border: 0; border-radius: 0; background: var(--code-bg); padding: var(--s2) var(--s4) var(--s3); overflow-x: auto; }
+.md .md-code pre code { background: none; padding: 0; color: var(--ink); font-size: 12px; line-height: 1.6; white-space: pre; }
+.md .md-code-bar { display: flex; align-items: center; gap: var(--s2); height: 28px; padding: 0 4px 0 var(--s3); border-bottom: 1px solid var(--line-soft); }
+.md .md-code-lang { flex: 1; min-width: 0; font: 500 11px/1 var(--mono); color: var(--ink-dim); letter-spacing: 0; text-transform: lowercase; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.md .md-copy { height: 22px; padding: 0 8px; border-radius: var(--r-sm); border: 1px solid transparent; background: transparent; color: var(--ink-dim); font-size: 11.5px; font-weight: 500; cursor: pointer; }
+.md .md-copy:hover { background: var(--surface); border-color: var(--line); color: var(--ink); }
+.md .md-copy[data-done] { color: var(--good-ink); }
+/* Read by a screen reader, never shown: the Copy button says it visibly. */
+.md .md-live { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+.hl-kw { color: var(--kw); }
+.hl-str { color: var(--str); }
+.hl-key { color: var(--key); }
+.hl-fn { color: var(--tag); }
+.hl-tag { color: var(--tag); }
+.hl-type { color: var(--tag); }
+.hl-num { color: var(--hl-num); }
+.hl-com { color: var(--hl-com); font-style: italic; }
+.hl-meta { color: var(--hl-meta); }
+.hl-add { color: var(--hl-add); }
+.hl-del { color: var(--hl-del); }
+
+/* Task lists: the box where the bullet was, and a done line quietened. */
+.md ul.md-tasks, .md ol.md-tasks { padding-left: var(--s4); }
+.md li.md-task { list-style: none; position: relative; }
+.md li.md-task > .md-check { position: absolute; left: -20px; top: 0.32em; width: 14px; height: 14px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.md li.md-task > .md-check:disabled { cursor: default; }
+.md li.md-task.done > .md-task-text { color: var(--ink-dim); text-decoration: line-through; text-decoration-color: var(--line); }
+.md ul.md-tasks > li.md-task { margin-left: 4px; }
+
+/* The handle between Split's two halves. */
+.dw-ed-body.split { grid-template-columns: minmax(0, 1fr) 7px minmax(0, 1fr); }
+.dw-ed-body.split .dw-raw { border-right: 0; }
+.dw-split { cursor: col-resize; background: var(--raised); border-left: 1px solid var(--line); border-right: 1px solid var(--line); touch-action: none; position: relative; }
+.dw-split::after { content: ""; position: absolute; left: 2px; top: 50%; width: 1px; height: 28px; margin-top: -14px; border-left: 1px solid var(--ink-faint); border-right: 1px solid var(--ink-faint); opacity: .6; }
+.dw-split:hover, .dw-split.drag, .dw-split:focus-visible { background: var(--accent-soft); }
+.dw-split:focus-visible { outline-offset: -2px; }
+.dw-ed-body.split .dw-prev { overflow-x: auto; }
+
+/* The Pads tab hosts the same editor in its pane. */
+.pad-pane .pad-ed { margin: var(--s3) var(--s4) var(--s2); }
+.pad-pane .pad-ed .dw-raw { min-height: 420px; }
+/* Outside the drawer the editor misses .dw's button reset, so it carries its own. */
+.pad-ed .dw-seg button { font: inherit; background: none; border: 0; cursor: pointer; }
