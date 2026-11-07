@@ -544,7 +544,7 @@ globalThis.DelphiTasks = (() => {
       // A control inside the row keeps its own Enter and Space: without this
       // the list's Enter (ui/keys.js) would open the task instead.
       if (e.target !== r) { if (["Enter", " ", "e", "E"].includes(e.key)) e.stopPropagation(); return; }
-      if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); app.openTask(t.id); }
+      if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); app.openTask(t.id, e.shiftKey ? "full" : "open"); }
       else if (e.key === " ") { e.preventDefault(); e.stopPropagation(); app.quickLook(t.id); }
       else if ((e.key === "e" || e.key === "E") && !e.metaKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); e.stopPropagation(); startEdit(t.id); }
     };
@@ -1103,7 +1103,7 @@ globalThis.DelphiTasks = (() => {
     c.oncontextmenu = (e) => { e.preventDefault(); app.taskMenu(t, e.clientX, e.clientY); };
     c.onkeydown = (e) => {
       if (e.target !== c) return;
-      if (e.key === "Enter") { e.preventDefault(); app.openTask(t.id); }
+      if (e.key === "Enter") { e.preventDefault(); app.openTask(t.id, e.shiftKey ? "full" : "open"); }
       else if (e.key === " ") { e.preventDefault(); app.quickLook(t.id); }
     };
     c.ondragstart = (e) => { e.dataTransfer.setData(DRAG_TYPE, String(t.id)); e.dataTransfer.effectAllowed = "move"; c.classList.add("dragging"); };

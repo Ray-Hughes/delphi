@@ -7656,8 +7656,11 @@ function wbDialog({ title, lead = null, body = [], actions, cancelValue = null, 
       // Workbench header is, after most verbs); its data-act finds the new one.
       let back = returnTo && returnTo.isConnected ? returnTo : null;
       if (!back && returnTo && returnTo.dataset && returnTo.dataset.act) {
-        back = document.querySelector(`.wb [data-act="${CSS.escape(returnTo.dataset.act)}"]`);
+        back = document.querySelector(`.wb [data-act="${CSS.escape(returnTo.dataset.act)}"], .dw [data-act="${CSS.escape(returnTo.dataset.act)}"]`);
       }
+      // Inside the drawer, never the page behind it: a button the dialog's
+      // verb removed falls back to the drawer itself.
+      if (!back && returnTo && returnTo.closest && returnTo.closest(".dw")) back = document.querySelector(".dw");
       if (back && typeof back.focus === "function") back.focus({ preventScroll: true });
       resolve(value);
     };
@@ -14648,7 +14651,7 @@ DelphiToday.init({
 });
 COMMANDS.push(...DelphiToday.commands());
 // The Tasks tab (ui/tasks.js): quick entry, inline edit, pills, List or Kanban.
-DelphiTasks.init({ ...shell, refresh: () => refresh(), repaint: () => render(), notify: (text) => notify(text), openTask: (id) => openTaskSheet(id), isAgent, isOverdue, taskMenu: (t, x, y) => taskMenu(t, x, y), quickLook: (id) => quickLook(id), projectById, projectName: (id) => (projectById(id) || {}).name || "", setProjectMode: (mode) => setTaskViewMode(mode), busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay") || window.DelphiPalette?.isOpen()) });
+DelphiTasks.init({ ...shell, refresh: () => refresh(), repaint: () => render(), notify: (text) => notify(text), openTask: (id, how) => openTaskAs(id, how), isAgent, isOverdue, taskMenu: (t, x, y) => taskMenu(t, x, y), quickLook: (id) => quickLook(id), projectById, projectName: (id) => (projectById(id) || {}).name || "", setProjectMode: (mode) => setTaskViewMode(mode), busy: () => Boolean(openSheet || openMenu || DelphiTopbar.isOpen() || document.querySelector("body > .overlay") || window.DelphiPalette?.isOpen()) });
 COMMANDS.push(...DelphiTasks.commands());
 // Memory (ui/memory.js): the tab, Log a fact, and the cards with reasons. The
 // open task is the sheet's until the drawer lends its own.
@@ -14689,18 +14692,19 @@ DelphiKeys.install({
   openSwitcher: () => DelphiTopbar.openSwitcher(),
   singleKey: (key, taskId) => DelphiFocus.key(key, taskId),
   openTask: async (id, how) => {
-    // Shift+Enter is the view the setting does not choose.
-    if (how === "full") {
-      if ((state.settings || {}).taskOpenMode === "centered" && window.DelphiDrawer) await DelphiDrawer.open(id);
-      else await openTaskFull(id);
-      return;
-    }
+    if (how === "full") { await openTaskAs(id, "full"); return; }
     if (how === "edit" && DelphiTasks.startEdit(id)) return;
     await openTaskSheet(id);
     if (how === "edit") { if (window.DelphiDrawer && DelphiDrawer.isOpen()) DelphiDrawer.editTitle(); else document.querySelector(".ts-title")?.focus(); }
   },
 });
 /** The centered view of a task, whatever taskOpenMode says: Shift+Enter and the drawer's Open full view. */
+/** Enter opens a task the way taskOpenMode says; Shift+Enter ("full") opens it the other way. */
+async function openTaskAs(id, how = "open") {
+  if (how !== "full") return openTaskSheet(id);
+  if ((state.settings || {}).taskOpenMode === "centered" && window.DelphiDrawer) return DelphiDrawer.open(id);
+  return openTaskFull(id);
+}
 async function openTaskFull(id) {
   // openTaskSheet reads the flag before its first await, so it is lowered
   // straight after the call: an open from anywhere else meanwhile keeps the setting.
@@ -14718,6 +14722,7 @@ DelphiDrawer.init({
   statusOf, isOverdue, isAgent, hasColour, colourLabel, gap,
   reminderChipSpec, alertsForTask, liveAlerts, paintTaskReminders,
   openFull: (id) => openTaskFull(id),
+  openTask: (id) => openTaskSheet(id),
   openNoteFull: (n) => { openNoteSheet.full = true; try { openNoteSheet(n); } finally { openNoteSheet.full = false; } },
   wb: { guard: wbGuard, starting: wbStarting, busy: wbBusyTasks, look: wbLook, chip: wbChip, update: wbUpdate, dialog: wbDialog,
     closingLong, finish: finishWorkbench, discard: discardWorkbench, pickRepo },
