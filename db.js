@@ -279,6 +279,23 @@ function record({ action, entity, entityId, summary, label, before, after }) {
 function atomic(fn) {
   return function atomically(...args) {
     const conn = open();
+    // isTransaction is node:sqlite's; without it (an older Node) the savepoint
+    // is the safe form, as before.
+    if (conn.isTransaction === false) {
+      // At the top, the write lock first (BEGIN IMMEDIATE). A deferred
+      // savepoint reads under a snapshot and asks for the lock at its first
+      // write; if the MCP server committed in between, that snapshot is stale
+      // and the write fails as "database is locked", which no wait cures.
+      try { conn.exec("BEGIN IMMEDIATE"); } catch (error) { throw busyAsConflict(error); }
+      try {
+        const result = fn.apply(this, args);
+        conn.exec("COMMIT");
+        return result;
+      } catch (error) {
+        try { conn.exec("ROLLBACK"); } catch {}
+        throw busyAsConflict(error);
+      }
+    }
     conn.exec("SAVEPOINT delphi_atomic");
     try {
       const result = fn.apply(this, args);
@@ -298,7 +315,11 @@ function busyAsConflict(error) {
   // SQLITE_BUSY) in errcode; the binary route only has the words.
   // 5 is SQLITE_BUSY and 517 SQLITE_BUSY_SNAPSHOT (a WAL reader whose
   // snapshot went stale before it could write).
-  const busy = error && (error.errcode === 5 || error.errcode === 517 || /SQLITE_BUSY|database is locked/i.test(String(error.message || error)));
+  // SQLITE_BUSY (5) and its extended codes: RECOVERY 261, SNAPSHOT 517 (a WAL
+  // reader whose snapshot went stale before it could write), TIMEOUT 773;
+  // and SQLITE_LOCKED (6). Each means: read again and retry.
+  const BUSY = [5, 6, 261, 517, 773];
+  const busy = error && (BUSY.includes(error.errcode) || /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i.test(String(error.message || error)));
   if (busy && error.code !== "CONFLICT") {
     const c = new Error("Something else was writing the database at the same moment, so nothing was written.");
     c.code = "CONFLICT";

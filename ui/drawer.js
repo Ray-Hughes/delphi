@@ -297,9 +297,13 @@ globalThis.DelphiDrawer = (() => {
    * (and under it the agent's version, when both reworded it). Words, indent
    * and box are each taken from the side that changed them.
    */
-  function mergeLine(b, t, m) {
-    if (t === b || t === m) return { lines: [m], clash: false };
-    if (m === b) return { lines: [t], clash: false };
+  function mergeLine(b, t, m, indentFrom = null) {
+    const reindent = (line, from) => `${indentOf(from)}${line.replace(/^\s*/, "")}`;
+    // A checkbox line that lost its anchor on one side (an agent rewriting
+    // the pad without them) keeps the base's, so its task stays one task.
+    const kept = (line) => (!anchorOf(line) && anchorOf(b) && tickOf(line) != null ? `${line}${anchorOf(b)}` : line);
+    if (t === b || t === m) return { lines: [kept(indentFrom === "t" ? reindent(m, t) : m)], clash: false };
+    if (m === b) return { lines: [kept(indentFrom === "m" ? reindent(t, m) : t)], clash: false };
     const kb = keyOf(b);
     const kt = keyOf(t);
     const km = keyOf(m);
@@ -308,7 +312,8 @@ globalThis.DelphiDrawer = (() => {
     const ib = indentOf(b);
     const it = indentOf(t);
     const im = indentOf(m);
-    let line = `${it !== ib && im === ib ? it : im}${words}`;
+    const indent = indentFrom === "m" ? im : indentFrom === "t" ? it : it !== ib && im === ib ? it : im;
+    let line = `${indent}${words}`;
     const tb = tickOf(b);
     const tt = tickOf(t);
     const tm = tickOf(m);
@@ -317,7 +322,7 @@ globalThis.DelphiDrawer = (() => {
       const on = tt === tb ? tm : tm === tb ? tt : Boolean(tt || tm);
       line = setTick(line, Boolean(on));
     }
-    const anchor = anchorOf(m) || anchorOf(t);
+    const anchor = anchorOf(m) || anchorOf(t) || anchorOf(b);
     if (anchor && tickOf(line) != null) line = `${line}${anchor}`;
     return both ? { lines: [line, agentVersion(t)], clash: true } : { lines: [line], clash: false };
   }
@@ -422,9 +427,12 @@ globalThis.DelphiDrawer = (() => {
       seen.add(id);
       of[j] = baseById.get(id);
     });
-    // Free base lines: those with no anchor. Free side lines: those with no
-    // anchor the base knows (a copy of a known anchor is a new line).
-    const bFree = B.map((_, i) => i).filter((i) => anchorId(B[i]) == null);
+    // Free base lines: those with no anchor, and those whose anchor appears
+    // nowhere on this side (an agent that rewrote the pad without anchors
+    // still wrote the same lines). Free side lines: those with no anchor the
+    // base knows (a copy of a known anchor is a new line).
+    const idsHere = new Set(X.map(anchorId).filter((id) => id != null));
+    const bFree = B.map((_, i) => i).filter((i) => anchorId(B[i]) == null || !idsHere.has(anchorId(B[i])));
     const xFree = X.map((_, j) => j).filter((j) => of[j] < 0 && !baseById.has(anchorId(X[j])));
     const used = new Set();
     for (const [p, q] of matchLines(bFree.map((i) => keyOf(B[i])), xFree.map((j) => keyOf(X[j])))) {
@@ -432,7 +440,7 @@ globalThis.DelphiDrawer = (() => {
       used.add(bFree[p]);
     }
     // Then by kind, within each gap, and only where neither has an anchor.
-    const leftB = bFree.filter((i) => !used.has(i));
+    const leftB = bFree.filter((i) => !used.has(i) && anchorId(B[i]) == null);
     if (leftB.length) {
       const placed = [];
       X.forEach((_, j) => { if (of[j] >= 0) placed.push(j); });
@@ -476,15 +484,44 @@ globalThis.DelphiDrawer = (() => {
     tOf.forEach((i, j) => { if (i >= 0) tByBase.set(i, j); });
     const mByBase = new Map();
     mOf.forEach((i, j) => { if (i >= 0) mByBase.set(i, j); });
-    // Who moved what: a base line outside the longest run kept in order.
-    const movedIn = (of) => {
-      const at = [];
-      of.forEach((i) => { if (i >= 0) at.push(i); });
-      const keep = increasing(at);
-      return new Set(at.filter((_, k) => !keep.has(k)));
+    // Who moved what. A line whose indent or parent changed was moved, by
+    // that side, whatever else moved. Of the rest, the longest run still in
+    // base order stayed, and the others moved. Parents first means a tie in
+    // the run (one side moved C under B, the other moved B) is settled by the
+    // line whose own place changed, not by which one the run happens to drop.
+    const parentsOf = (X, of) => {
+      const out = new Array(X.length).fill(-2);
+      const stack = [];
+      X.forEach((line, j) => {
+        if (!line.trim()) return;
+        const w = indentOf(line).replace(/\t/g, "  ").length;
+        while (stack.length && stack[stack.length - 1].w >= w) stack.pop();
+        // A parent the base has is its index; a new one is named by its
+        // words, so it is never mistaken for the top level (-1) and the same
+        // new parent typed on both sides is the same parent.
+        const pj = stack.length ? stack[stack.length - 1].j : -1;
+        out[j] = pj < 0 ? -1 : of[pj] >= 0 ? of[pj] : `new:${keyOf(X[pj])}`;
+        stack.push({ w, j });
+      });
+      return out;
     };
-    const agentMoved = movedIn(tOf);
-    const personMoved = movedIn(mOf);
+    const bIdent = B.map((_, i) => i);
+    const bParent = parentsOf(B, bIdent);
+    const movedIn = (X, of) => {
+      const parent = parentsOf(X, of);
+      const moved = new Set();
+      const at = [];
+      of.forEach((i, j) => {
+        if (i < 0) return;
+        if (indentOf(X[j]) !== indentOf(B[i]) || (parent[j] !== -2 && parent[j] !== bParent[i])) moved.add(i);
+        else at.push(i);
+      });
+      const keep = increasing(at);
+      at.forEach((i, k) => { if (!keep.has(k)) moved.add(i); });
+      return { moved, parent };
+    };
+    const { moved: agentMoved, parent: tParent } = movedIn(T, tOf);
+    const { moved: personMoved, parent: mParent } = movedIn(M, mOf);
     let conflicts = 0;
     const tasks = new Set();
     const out = [];          // [{ text, fromT }]
@@ -494,15 +531,19 @@ globalThis.DelphiDrawer = (() => {
     const twinOf = new Map();
     {
       const tNew = new Map();
-      T.forEach((t, j) => { if (tOf[j] < 0) { const k = keyOf(t); if (!tNew.has(k)) tNew.set(k, []); tNew.get(k).push(j); } });
+      // Never a blank line (two blank lines are not one thing both added),
+      // and only under the same parent: the same subtask under two tasks is two.
+      T.forEach((t, j) => { if (tOf[j] < 0 && keyOf(t)) { const k = `${tParent[j]}\u0000${keyOf(t)}`; if (!tNew.has(k)) tNew.set(k, []); tNew.get(k).push(j); } });
       M.forEach((m, j) => {
-        if (mOf[j] >= 0) return;
-        const list = tNew.get(keyOf(m));
+        if (mOf[j] >= 0 || !keyOf(m)) return;
+        const list = tNew.get(`${mParent[j]}\u0000${keyOf(m)}`);
         if (list && list.length && (tickOf(T[list[0]]) != null) === (tickOf(m) != null)) { const tj = list.shift(); twinOf.set(j, tj); placedT.add(tj); }
       });
     }
     const merged = (i, tj, mj) => {
-      const r = mergeLine(B[i], T[tj], M[mj]);
+      // A line's indent comes with its place, from the side that moved it.
+      const from = personMoved.has(i) ? "m" : agentMoved.has(i) ? "t" : null;
+      const r = mergeLine(B[i], T[tj], M[mj], from);
       if (r.clash) { conflicts++; const id = anchorId(T[tj]) || anchorId(M[mj]); if (id) tasks.add(id); }
       return r.lines;
     };
@@ -964,7 +1005,14 @@ globalThis.DelphiDrawer = (() => {
           // check it; a refusal because it moved again goes round once more.
           let stored;
           try { stored = await onSave(body, { expect: raw }); }
-          catch (error) { if (error && error.code === "CONFLICT") continue; throw error; }
+          catch (error) {
+            if (!error || error.code !== "CONFLICT") throw error;
+            if (attempt === 3) break;
+            // Another writer had it: wait a little longer each time (250 ms,
+            // 500, 1 s) rather than four tries in a row into the same lock.
+            await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
+            continue;
+          }
           const now = stored == null ? body : lf(stored);
           if (kept2) host.notify(`${kept2} ${kept2 === 1 ? "line was" : "lines were"} edited on both sides; both versions are kept, the agent's marked ${AGENT_MARK} under yours.`);
           if (area.value === next) take(now);
