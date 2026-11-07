@@ -694,7 +694,20 @@ function auditRebuildPlan(query) {
 function widenAudit(query, batch) {
   const plan = auditRebuildPlan(query);
   if (!plan.length) return { ran: false, statements: 0 };
-  batch(["PRAGMA legacy_alter_table = ON", ...plan]);
+  try {
+    batch(["PRAGMA legacy_alter_table = ON", ...plan]);
+  } catch (error) {
+    // The plan's own guard refused it: said as what happened, not as the
+    // scratch table's CHECK. Asked again to tell the two cases apart.
+    if (/CHECK constraint failed/i.test(String(error && error.message)) && /ok = 1|audit_rebuilt_check/i.test(String(error.message))) {
+      let done = false;
+      try { done = auditRebuildPlan(query).length === 0; } catch {}
+      throw new Error(done
+        ? "the History table was already widened by another process, so it was left alone"
+        : "the History table changed while it was being widened, so it was left as it was; the next start tries again");
+    }
+    throw error;
+  }
   return { ran: true, statements: plan.length };
 }
 
