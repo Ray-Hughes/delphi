@@ -142,6 +142,10 @@ function main() {
     for (const name of SCRUB) delete env[name];
     env.DELPHI_DATA_DIR = path.join(tmp, "data");
     env.DELPHI_DB = path.join(tmp, "data", "delphi.db");
+    // Every server a test starts runs in the checkout, which is no project in
+    // the test's database, so each would note it as a folder to ask about.
+    // Off unless a test turns it on, as tools/discovery_test.js does.
+    env.DELPHI_DISCOVERY = "0";
     fs.mkdirSync(env.DELPHI_DATA_DIR);
 
     const how = plan(file, env);

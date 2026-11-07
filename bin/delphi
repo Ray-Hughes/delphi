@@ -1273,6 +1273,14 @@ async function doctor(args) {
         : "not certain. " + w.app.reason);
     line("you are", w.actor + " (" + w.author_type + ")");
     line("route", w.sqlite_route);
+    // Not a problem, so not in the list below: a question waiting on a person.
+    const pf = w.pending_folders;
+    if (pf && pf.count) {
+      const home = os.homedir();
+      const shown = pf.folders.map((f) => (f === home || f.startsWith(home + path.sep) ? "~" + f.slice(home.length) : f));
+      line("new folders", pf.count + (pf.count === 1 ? " folder agents worked in is" : " folders agents worked in are") +
+        " not a project yet (" + shown.join(", ") + (pf.count > shown.length ? ", ..." : "") + "). Answer in Needs you.");
+    }
   }
   if (resolved.checkoutDbIgnored) line("ignored", resolved.checkoutDbIgnored);
   say("");

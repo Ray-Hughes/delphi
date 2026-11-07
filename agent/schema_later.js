@@ -90,6 +90,9 @@ const LATER_COLUMNS = [
   // What git said about a project's folder: see schema.sql.
   ["repos", "remote_url", "TEXT"],
   ["repos", "default_branch", "TEXT"],
+  // How many sessions have called from a discovered folder. A database from
+  // slice 4 has the table already, so the CREATE in LATER_TABLES never adds it.
+  ["discovered_folders", "seen_count", "INTEGER NOT NULL DEFAULT 1"],
   // A Finish or Discard in progress (state 'closing'). See schema.sql.
   ["workbenches", "closing_mode", "TEXT"],
   ["workbenches", "closing_ref", "TEXT"],
@@ -263,7 +266,8 @@ const LATER_TABLES = [
   state       TEXT NOT NULL DEFAULT 'new',
   project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
   detail      TEXT,
-  answered_at TEXT
+  answered_at TEXT,
+  seen_count  INTEGER NOT NULL DEFAULT 1
 )`],
 ];
 

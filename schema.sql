@@ -885,7 +885,10 @@ CREATE INDEX IF NOT EXISTS idx_restore_points_created ON restore_points(created_
 -- times it is seen it is one question for a person, never a project made
 -- behind their back. via says how it got here: 'migration' for a workspace no
 -- project was linked to, 'conflict' for a folder two projects had shared until
--- each folder became one project's (detail names both, and what each held). A
+-- each folder became one project's (detail names both, and what each held),
+-- 'session' for a folder an agent session called the server from that no
+-- project had (workbench/discover.js; detail holds the harness, remote and
+-- branch, seen_count how many sessions came from it). A
 -- person's answer goes in state, and an answered row never asks again. No CHECK
 -- on via or state, for the reason projects.task_view has none.
 -- agent/schema_later.js holds the same text.
@@ -899,7 +902,8 @@ CREATE TABLE IF NOT EXISTS discovered_folders (
   state       TEXT NOT NULL DEFAULT 'new',
   project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
   detail      TEXT,
-  answered_at TEXT
+  answered_at TEXT,
+  seen_count  INTEGER NOT NULL DEFAULT 1
 );
 -- The unique index on projects(path) is not here. This file runs before the
 -- folder migration (workbench/folders.js), and on a database where two projects

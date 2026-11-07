@@ -15,6 +15,7 @@ const schemaLater = require("./agent/schema_later");
 const identity = require("./agent/identity");
 const auditLib = require("./agent/audit");
 const folderRule = require("./workbench/folders");
+const discoverRule = require("./workbench/discover");
 
 // Decided by agent/locate.js, the same rule the MCP server and the command line
 // use, so the window and every agent are looking at one file. See paths.js.
@@ -3111,6 +3112,50 @@ function mergedFolderAnswer(id, auditIds = []) {
   answerConflict(id, "merged", auditIds);
 }
 
+// ---------------------------------------------------------------------------
+// "Add this folder?": folders agents worked in that are no project's. The
+// server writes the question (workbench/discover.js); these are the window's
+// answers, and there is no MCP tool for any of them.
+
+const folderDiscoveries = () => discoverRule.pending(sqlP);
+const foldersToAttach = () => discoverRule.attachable(sqlP);
+
+function discoveryRow(id) {
+  const row = one("SELECT * FROM discovered_folders WHERE id = :id AND via IN ('session', 'migration')", { id: Number(id) });
+  if (!row) throw new Error("That question is no longer there.");
+  // pending() is what the window was shown, and a row it leaves out (answered,
+  // or a folder some project has now) is not one a stale click may answer.
+  if (!discoverRule.pending(sqlP).some((d) => d.id === Number(row.id))) throw new Error("That question has been answered already.");
+  return row;
+}
+
+/**
+ * Settles the question about a folder once it is a project's: 'added' for a
+ * new project, 'attached' for one that had no folder. By path, because Add
+ * folder and the folder picker reach the same folder without the question's
+ * id. Not History: the project write beside it is, and undoing that write
+ * frees the folder, which pending() then asks about again.
+ */
+function settleDiscovery(folder, state, projectId) {
+  const want = discoverRule.key(folder);
+  if (!want) return 0;
+  let n = 0;
+  for (const d of all("SELECT id, path FROM discovered_folders WHERE via IN ('session', 'migration') AND state IN ('new', 'added', 'attached')")) {
+    if (discoverRule.key(d.path) !== want) continue;
+    run(`UPDATE discovered_folders SET state = :state, project_id = :pid, answered_at = datetime('now') WHERE id = :id`,
+      { id: Number(d.id), state, pid: Number(projectId) });
+    n += 1;
+  }
+  return n;
+}
+
+/** "Not a project": kept for good, so no later session asks again. */
+function ignoreDiscovery(id) {
+  const row = discoveryRow(id);
+  run("UPDATE discovered_folders SET state = 'ignored', answered_at = datetime('now') WHERE id = :id", { id: Number(row.id) });
+  return { ignored: true, path: row.path };
+}
+
 // Which database this is, as this connection sees it. The app's heartbeat is
 // deliberately not here: see agent/identity.js for why it is a file.
 const dbIdentity = () => identity.current((statement) => open().prepare(statement).all());
@@ -3164,6 +3209,7 @@ module.exports = {
   projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
   adoptProjectPaths,
   folderConflicts, keepFolderAnswer, giveFolder, mergedFolderAnswer, conflictRow,
+  folderDiscoveries, foldersToAttach, discoveryRow, settleDiscovery, ignoreDiscovery,
   folderAdoption: () => folderAdoption, holdFolderAdoption, newestAudit, auditSince,
   listSessions, getSession, createSession, updateSession, deleteSession, sessionChanges,
   listArchivedSessions,

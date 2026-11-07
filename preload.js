@@ -270,6 +270,9 @@ contextBridge.exposeInMainWorld("delphi", {
     keep: (id) => call("folders:keep", id),
     give: (id, toProjectId) => call("folders:give", id, toProjectId),
     merge: (id, fromProjectId) => call("folders:merge", id, fromProjectId),
+    discoveries: () => call("folders:discoveries"),
+    attach: (id, projectId) => call("folders:attach", id, projectId),
+    ignore: (id) => call("folders:ignore", id),
   },
   // Today: stuck tasks, the one banner and the brief, and "Mark as seen".
   today: { view: (opts) => call("today:view", opts || {}), seen: (upTo) => call("today:seen", upTo || null) },
