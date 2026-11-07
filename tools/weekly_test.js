@@ -238,18 +238,43 @@ check("and the Park's rows are only its own", q("SELECT COUNT(*) AS n FROM meta 
 lockedW.undo(probeParked);
 check("its Undo puts it back", statusOf(stale), "doing");
 
-section("a task written in a pad: Drop ticks its line, and Undo puts the task back");
-const pad = db.createScratchpad({ projectId: project.id, title: "wk pad", body: "- [ ] a pad task\n" });
-const padTask = q("SELECT id FROM tasks WHERE pad_id = :p1", [pad.id])[0].id;
+section("a task written in a pad: Drop ticks its line, and Undo unticks it");
+// Neighbours on both sides, one already ticked and one nested, so an Undo that
+// rewrote more than its own line, or dropped one, shows.
+const pad = db.createScratchpad({ projectId: project.id, title: "wk pad",
+  body: "# plan\n- [x] already done\n- [ ] a pad task\n  - [ ] its subtask\n- [ ] after it\nprose stays\n" });
+const padTask = q("SELECT id FROM tasks WHERE pad_id = :p1 AND title = 'a pad task'", [pad.id])[0].id;
 db.updateTask(padTask, { status: "doing" });
-const padLine = () => (q("SELECT body FROM scratchpads WHERE id = :p1", [pad.id])[0].body.match(/^- \[(.)\] a pad task/m) || [])[1];
+const padBody = () => q("SELECT body FROM scratchpads WHERE id = :p1", [pad.id])[0].body;
+const padLine = () => (padBody().match(/^- \[(.)\] a pad task/m) || [])[1];
+const othersOf = (body) => body.split("\n").filter((l) => !/a pad task/.test(l));
+const bodyBefore = padBody();
 const padDrop = w.drop(padTask, "covered elsewhere");
 check("dropped, its line is ticked", [statusOf(padTask), padLine()], ["done", "x"]);
 w.undo(padDrop);
-check("undone, the task is as it was", statusOf(padTask), "doing");
-// The line stays ticked: db.undo restores the task row and does not write the
-// board back to the pad, the same as an undo from History. That is db.js's to
-// change, for every undo at once, not this module's.
+check("undone, the task and its line are as they were", [statusOf(padTask), padLine()], ["doing", " "]);
+check("and every other line of the pad is untouched", othersOf(padBody()), othersOf(bodyBefore));
+check("the pad is back to its own words", padBody(), bodyBefore);
+db.derive(pad.id);
+check("so the next read of the pad leaves the task open", statusOf(padTask), "doing");
+
+section("the same, undone from History");
+w.drop(padTask, "again");
+// The Drop's status row by what it changed, not by being newest: its note is
+// a task row too.
+const taskRow = q(`SELECT id FROM audit WHERE entity = 'task' AND entity_id = :p1 AND undone = 0 AND action = 'update'
+                     AND json_extract(before_json, '$.status') = 'doing' AND json_extract(after_json, '$.status') = 'done'
+                   ORDER BY id DESC LIMIT 1`, [padTask])[0].id;
+check("dropped, its line is ticked", padLine(), "x");
+db.undo(taskRow);
+check("History's undo unticks the line with the status", [statusOf(padTask), padLine()], ["doing", " "]);
+check("and leaves every other line as it was", othersOf(padBody()), othersOf(bodyBefore));
+// Not only the status: a title put back by an undo goes to the line as well.
+db.updateTask(padTask, { title: "a pad task renamed" });
+const renameRow = q("SELECT id FROM audit WHERE entity = 'task' AND entity_id = :p1 AND json_extract(after_json, '$.title') = 'a pad task renamed'", [padTask])[0].id;
+check("renamed, the line says so", /^- \[ \] a pad task renamed/m.test(padBody()), true);
+db.undo(renameRow);
+check("undone, the pad is word for word as it started", padBody(), bodyBefore);
 
 section("a Drop that cannot finish leaves nothing behind");
 const failing = { ...db, updateTask: () => { throw new Error("refused for the test"); } };
