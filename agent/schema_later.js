@@ -134,6 +134,11 @@ const LATER_COLUMNS = [
   ["handoffs", "review_note", "TEXT"],
   ["handoffs", "queue_rank", "INTEGER"],
   ["handoffs", "premium_requests", "REAL"],
+  // The folder a task works in, when its project has several: one of the
+  // project's repos rows, or NULL for the project's Home. SET NULL, so taking
+  // the folder off the project sends the task back to Home rather than
+  // deleting it. Added by ALTER, never a rebuild of tasks. See schema.sql.
+  ["tasks", "repo_id", "INTEGER REFERENCES repos(id) ON DELETE SET NULL"],
   // A person's per project say over what agents may do there unasked.
   ["projects", "auto_approve", "INTEGER NOT NULL DEFAULT 0"],
   ["projects", "allow_unguarded", "INTEGER NOT NULL DEFAULT 0"],
@@ -269,6 +274,20 @@ const LATER_TABLES = [
   answered_at TEXT,
   seen_count  INTEGER NOT NULL DEFAULT 1
 )`],
+  // Where an item filed without a project was put, and why, when Delphi had
+  // to guess. See schema.sql and workbench/route.js.
+  ["filed_routes", `CREATE TABLE IF NOT EXISTS filed_routes (
+  entity      TEXT NOT NULL,
+  entity_id   INTEGER NOT NULL,
+  project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  folder      TEXT,
+  via         TEXT NOT NULL,
+  detail      TEXT,
+  actor       TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  settled_at  TEXT,
+  PRIMARY KEY (entity, entity_id)
+)`],
   // Edit this page: one row per screen and scope. See schema.sql and ui/layout.js.
   ["layouts", `CREATE TABLE IF NOT EXISTS layouts (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -301,6 +320,9 @@ const LATER_TABLES = [
   decided_at  TEXT
 )`],
 ];
+
+// Indexes dropped wherever they are found. See apply().
+const RETIRED_INDEXES = ["idx_projects_path"];
 
 // [name, table, columns the index needs, statement]. The columns are checked
 // because an index on a column that does not exist yet is an error, and a table
@@ -532,6 +554,14 @@ function apply(query) {
     new Map((query("SELECT name, sql FROM sqlite_master WHERE type = 'index'") || []).map((r) => [r.name, String(r.sql || "")])));
   if (!definitions) return result;
   const existing = new Set(definitions.keys());
+  // Indexes a later rule took back. Slice 4's unique index on projects(path)
+  // said a folder is one project's; a folder may be several projects' now, and
+  // a server must not meet the index on a file the app has not opened since.
+  for (const name of RETIRED_INDEXES) {
+    if (!existing.has(name)) continue;
+    const drop = `DROP INDEX IF EXISTS ${plainName(name)}`;
+    if (attempt(drop, () => { query(drop); return true; })) { existing.delete(name); result.dropped = [...(result.dropped || []), name]; }
+  }
   for (const [name, table, needs, statement, mustContain] of LATER_INDEXES) {
     const have = columns.get(table);
     if (!have || !needs.every((c) => have.includes(c))) continue;
@@ -765,6 +795,6 @@ function widenAuditLocked(query) {
 }
 
 module.exports = {
-  LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, apply, addLaterColumns, hasTable, columnsOf, allColumns,
+  LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, RETIRED_INDEXES, apply, addLaterColumns, hasTable, columnsOf, allColumns,
   AUDIT_ENTITIES, AUDIT_COLUMNS, auditEntitiesIn, auditRebuildPlan, widenAudit, widenAuditLocked,
 };

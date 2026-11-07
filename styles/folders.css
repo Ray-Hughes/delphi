@@ -76,3 +76,45 @@
 .fd .fc-head > span { color: var(--ink); }
 .fd .fc-confirm select.field { width: auto; max-width: 260px; flex: none; }
 .fd-none { font-size: 12px; color: var(--ink-dim); align-self: center; }
+
+/* A project's Folders list (ui/folderlist.js): Home first, each folder with
+   its remote and branch and who else works in it. */
+.fl-list { display: flex; flex-direction: column; }
+.fl-row { align-items: flex-start; }
+.fl-row .kind { flex: none; margin-top: 2px; }
+.fl-name { font-weight: 600; font-size: 13px; color: var(--ink); }
+.fl-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--ink-dim); margin-top: 2px; }
+.fl-also { color: var(--accent-ink); }
+.fl-empty p { margin: 0; padding: 12px 14px; font-size: 12.5px; color: var(--ink-dim); }
+.fl-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 14px; }
+.fl-msg:empty { display: none; }
+.setting .fl-list { border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); }
+
+/* "Filed under SSNR, from branch": an item an agent filed into a shared
+   folder, and Delphi chose the project. A click moves it or keeps it. */
+.route-chip {
+  display: inline-flex; align-items: center; gap: 5px; font: inherit; font-size: 11.5px; color: var(--accent-ink);
+  border: 1px dashed var(--accent-line); border-radius: 99px; padding: 1px 9px 1px 7px; background: var(--accent-soft);
+  cursor: pointer; white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis;
+}
+.route-chip:hover { border-style: solid; }
+.route-chip svg { flex: none; }
+.t-body .route-chip { margin-top: 4px; }
+.tk-row .route-chip { flex: 0 1 auto; min-width: 0; }
+.dw-crumb .route-chip { flex: 0 1 auto; min-width: 0; }
+
+/* The drawer's folder picker, over Start Workbench, for a project with several. */
+.wb-folder-slot:empty { display: none; }
+.wb-folder { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12.5px; color: var(--ink-dim); }
+.wb-folder select.field { width: auto; max-width: 280px; }
+.wb-folder-k { font-weight: 600; color: var(--ink); }
+.fd-picks { display: flex; flex-direction: column; gap: 4px; margin-left: 24px; max-height: 220px; overflow: auto; padding: 4px 0; }
+.fd-pick { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink); cursor: pointer; }
+.fd-pick.likely span:first-of-type { font-weight: 600; }
+.fd-why { font-size: 11.5px; color: var(--ink-dim); }
+.fl-row .kind { min-width: 58px; text-align: center; }
+.fl-foot .btn { gap: 6px; }
+.dw-route:empty { display: none; }
+.dw-route { padding: 2px 0 6px 34px; }
+.dw-route .route-chip { max-width: 100%; }
+.dw .dw-route .route-chip { border: 1px dashed var(--accent-line); background: var(--accent-soft); color: var(--accent-ink); padding: 1px 9px 1px 7px; border-radius: 99px; font-size: 11.5px; }

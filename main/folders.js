@@ -1,12 +1,12 @@
-// Folders, the window's half: Add folder as project, the fix for a folder that
-// moved, the shared-folder question and the "Add this folder?" question in
-// Needs you, and what git says about each folder.
+// Folders, the window's half: Add folder as project, a project's Folders list
+// (add, take off, make Home), the fix for a folder that moved, the "Add this
+// folder?" question in Needs you, and what git says about each folder.
 //
-// The rule for which folder is a project's lives in workbench/folders.js and
-// the writes in db.js, so the server and the app agree. This is the part only
-// the window does: the native picker, asking git about a folder before anyone
-// has decided anything, and the three answers to the shared-folder question,
-// which are a person's to give and so have no MCP tool.
+// The rule for a project's folders lives in workbench/folders.js and the
+// writes in db.js, so the server and the app agree. This is the part only
+// the window does: the native picker, and asking git about a folder before
+// anyone has decided anything. A folder may be several projects', so nothing
+// here refuses a folder because another project has it.
 //
 // Required by main.js, and by tools/folders_test.js under a plain Node with
 // node:sqlite, so it takes everything it touches as arguments.
@@ -15,6 +15,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const rule = require("../workbench/folders");
+const route = require("../workbench/route");
 
 /** owner/repo from a remote URL, for a line a person reads. The URL itself is kept. */
 function ownerRepo(remote) {
@@ -37,14 +38,13 @@ const tilde = (p) => {
  * @param db      the app's db.js
  * @param git     workbench/git.js
  * @param pick    async () => a folder path or null (the native picker)
- * @param items   () => the item store, for a merge
  */
-function createFolders({ db, git, pick = async () => null, items = () => db.items() }) {
+function createFolders({ db, git, pick = async () => null }) {
   /**
    * What a folder is, before anything is written: its repository root (a
    * subfolder offers the root, a Workbench or other worktree its main
-   * repository), the remote and default branch, and whether a project already
-   * has it or a project with no folder has its name. Writes nothing.
+   * repository), the remote and default branch, which projects already have
+   * it, and which projects with no folder have its name. Writes nothing.
    */
   async function inspect(raw) {
     const chosen = raw ? rule.normalise(raw) : await pick();
@@ -68,12 +68,12 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
     root = rule.normalise(root);
     const remote = top ? await git.remoteUrl(root) : null;
     const branch = top ? await git.defaultBranch(root) : null;
-    const owner = rule.ownerOf(db.sqlP, root);
+    const holders = rule.holders(db.sqlP, root).map((h) => ({ id: h.id, name: h.name, archived: h.status === "archived", home: h.home }));
     const name = suggestedName(root);
     const slug = db.slugKey(name);
     // A project with no folder whose name is this folder's is probably the
     // same work, filed before it had a folder. Offered, never assumed.
-    const matches = owner ? [] : db.listProjects().filter((p) => !p.path && (
+    const matches = db.listProjects().filter((p) => !p.path && !holders.some((h) => h.id === p.id) && (
       db.slugKey(p.key) === slug || db.slugKey(p.name) === slug)).map((p) => ({ id: p.id, key: p.key, name: p.name }));
     let key = slug || `p${Date.now()}`;
     for (let n = 2; db.projectByKey(key); n += 1) key = `${slug}-${n}`;
@@ -88,7 +88,7 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
       remote,
       ownerRepo: ownerRepo(remote),
       defaultBranch: branch,
-      existing: owner ? { id: Number(owner.id), name: owner.name, archived: owner.status === "archived" } : null,
+      holders,
       matches,
       suggestedName: name,
       suggestedKey: key,
@@ -102,11 +102,10 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
     return { remote: await git.remoteUrl(folder), branch: await git.defaultBranch(folder) };
   }
 
-  /** A new project for a folder: the project, its folder and its primary repos row, in one unit. */
+  /** A new project for a folder: the project, its Home and its primary repos row, in one unit. */
   async function create({ path: folder, name, key }) {
     const look = await inspect(folder);
     if (!look.ok) throw new Error(look.why || "That folder cannot be added.");
-    if (look.existing) throw new Error(rule.takenSentence({ name: look.existing.name, status: look.existing.archived ? "archived" : "active" }));
     const label = String(name || "").trim() || look.suggestedName;
     const colours = ["#6366F1", "#0f7a80", "#2f8757", "#8a6a00", "#c4572a", "#c04a41", "#7c4dbd", "#5d6b82"];
     const made = db.createProject({
@@ -115,50 +114,70 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
       remote: look.remote, branch: look.defaultBranch,
     });
     // However the sheet was reached (the question's button, the switcher, a
-    // drop), a folder that is a project now is not a question any more.
+    // drop), a folder that is a project's now is not a question any more.
     db.settleDiscovery(look.top, "added", made.id);
     return made;
   }
 
   /**
-   * A folder for a project that has none, or a new place for one whose folder
-   * moved: the same write, through updateProject, so History can undo it.
+   * A project's Home: a folder for a project that has none, or a new Home
+   * for one whose folder moved. The same write, through updateProject, so
+   * History can undo it. The old Home stays as a linked folder.
    */
   async function setFolder(projectId, folder) {
     const look = await inspect(folder);
     if (!look.ok) throw new Error(look.why || "That folder cannot be used.");
-    if (look.existing && look.existing.id !== Number(projectId)) throw new Error(rule.takenSentence({ name: look.existing.name, status: look.existing.archived ? "archived" : "active" }));
     const after = db.updateProject(Number(projectId), { path: look.top }, { remote: look.remote, branch: look.defaultBranch });
     db.settleDiscovery(look.top, "attached", Number(projectId));
     return after;
   }
 
+  /** Adds a folder to a project: its Home when it has none, linked otherwise. */
+  async function addFolder(projectId, folder) {
+    const look = await inspect(folder);
+    if (!look || look.cancelled) return { cancelled: true };
+    if (!look.ok) throw new Error(look.why || "That folder cannot be added.");
+    const done = db.linkFolder(Number(projectId), look.top, { remote: look.remote, branch: look.defaultBranch });
+    db.settleDiscovery(look.top, "attached", Number(projectId));
+    return { ...done, shown: look.shown };
+  }
+
+  /** Makes one of the project's folders its Home. */
+  async function makeHome(projectId, folder) {
+    const found = rule.isDir(folder) ? await detect(folder) : {};
+    return db.setHomeFolder(Number(projectId), folder, found.remote || found.branch ? found : {});
+  }
+
   /**
    * The "Add this folder?" questions, worded for Needs you: who worked there,
-   * what git says it is, and the projects it could be attached to, which are
-   * only those with no folder, since a folder is one project's.
+   * what git says it is, the projects it can be added to (every active one,
+   * since a folder may be several projects') and the one Delphi thinks it is.
    */
   function discoveries() {
     const list = db.folderDiscoveries();
     if (!list.length) return [];
     const attachable = db.foldersToAttach();
-    return list.map((d) => ({
-      ...d, shown: tilde(d.path), ownerRepo: ownerRepo(d.remote), attachable,
-    }));
+    return list.map((d) => {
+      const likely = route.suggest(db.sqlP, { folder: d.path, branch: d.branch });
+      return { ...d, shown: tilde(d.path), ownerRepo: ownerRepo(d.remote), attachable, suggested: likely ? likely.projectId : null, suggestedWhy: likely ? likely.why : null };
+    });
   }
 
   /**
-   * "Attach to an existing project": the folder becomes that project's, as
-   * if it had been chosen in its settings, so History can undo it. Refused
-   * for a project that has a folder already rather than swapping it, because
-   * swapping would quietly leave the old folder with no project.
+   * "Add to project": the folder becomes one of each chosen project's
+   * folders, as if added in its settings, so History can undo each one.
    */
-  async function attach(id, projectId) {
+  async function attach(id, projectIds) {
     const row = db.discoveryRow(id);
-    const project = db.getProject(Number(projectId));
-    if (!project || project.status === "archived") throw new Error("That project is not there any more.");
-    if (project.path) throw new Error(`${project.name} has a folder already (${tilde(project.path)}). A project has one folder, so pick one with none, or add this as a new project.`);
-    return setFolder(project.id, row.path);
+    const ids = [...new Set((Array.isArray(projectIds) ? projectIds : [projectIds]).map(Number).filter(Number.isFinite))];
+    if (!ids.length) throw new Error("Choose a project first.");
+    const out = [];
+    for (const pid of ids) {
+      const project = db.getProject(pid);
+      if (!project || project.status === "archived") throw new Error("One of those projects is not there any more.");
+      out.push(await addFolder(pid, row.path));
+    }
+    return out;
   }
 
   /** No folder, on purpose. The repos rows stay, for the folder's settings, and are not read. */
@@ -183,73 +202,6 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
   }
 
   /**
-   * The shared-folder questions, worded from what each project holds now,
-   * not when the migration ran: a project can have gained tasks since.
-   */
-  function conflicts() {
-    return db.folderConflicts().map((c) => {
-      const kept = c.detail && c.detail.kept ? db.getProject(c.detail.kept.id) : null;
-      const moved = (c.detail && c.detail.moved ? c.detail.moved : []).map((m) => db.getProject(m.id)).filter(Boolean);
-      const holds = (p) => {
-        const n = (q) => Number((db.sqlP(q, [p.id])[0] || {}).n || 0);
-        return {
-          tasks: n("SELECT COUNT(*) AS n FROM tasks WHERE project_id = :p1"),
-          open: n("SELECT COUNT(*) AS n FROM tasks WHERE project_id = :p1 AND status != 'done'"),
-          notes: n("SELECT COUNT(*) AS n FROM notes WHERE project_id = :p1"),
-          pads: n("SELECT COUNT(*) AS n FROM scratchpads WHERE project_id = :p1"),
-          sessions: n("SELECT COUNT(*) AS n FROM sessions WHERE project_id = :p1"),
-        };
-      };
-      const who = (p) => p && ({ id: p.id, name: p.name, status: p.status, path: p.path, ...holds(p) });
-      return { id: c.id, path: c.path, shown: tilde(c.path), kept: who(kept), moved: moved.map(who), at: c.first_seen };
-    }).filter((c) => c.kept || c.moved.length);
-  }
-
-  /**
-   * "Merge X into Y": everything X holds moves through the item store, as a
-   * person's moves that History can undo one by one, and X is archived, never
-   * deleted. A move the store refuses stops the merge before the archive, and
-   * the question stays open with the refusal as its sentence.
-   */
-  function merge(id, fromId) {
-    const row = db.conflictRow(id);
-    const detail = JSON.parse(row.detail || "{}");
-    const into = db.getProject(Number((detail.kept || {}).id));
-    const source = db.getProject(Number(fromId));
-    if (!into || !source) throw new Error("One of those projects is not there any more.");
-    if (Number(source.id) === Number(into.id)) throw new Error("A project cannot be merged into itself.");
-    // Only a project this question moved out. The id comes from the window,
-    // and any other one would be a project merged and archived by mistake.
-    if (!(detail.moved || []).some((m) => Number(m.id) === Number(source.id))) throw new Error(`${source.name} is not one of the projects that shared ${row.path}.`);
-    const store = items();
-    const from = db.newestAudit();
-    const ids = (q) => db.sqlP(q, [source.id]).map((r) => Number(r.id));
-    const queue = [
-      ["organizer", ids("SELECT id FROM organizers WHERE project_id = :p1 ORDER BY id")],
-      ["task", ids("SELECT id FROM tasks WHERE project_id = :p1 AND parent_id IS NULL ORDER BY id")],
-      ["note", ids("SELECT id FROM notes WHERE project_id = :p1 ORDER BY id")],
-      ["scratchpad", ids("SELECT id FROM scratchpads WHERE project_id = :p1 ORDER BY id")],
-      ["link", ids("SELECT id FROM links WHERE project_id = :p1 ORDER BY id")],
-      ["session", ids("SELECT id FROM sessions WHERE project_id = :p1 ORDER BY id")],
-    ];
-    const moved = [];
-    for (const [entity, list] of queue) {
-      for (const itemId of list) {
-        try {
-          store.move(entity, itemId, into.id);
-          moved.push({ entity, id: itemId });
-        } catch (error) {
-          const why = error && error.details && error.details.refusals ? error.details.refusals.join(" ") : String(error.message || error);
-          return { merged: false, moved, refused: { entity, id: itemId, why } };
-        }
-      }
-    }
-    db.updateProject(source.id, { status: "archived" });
-    db.mergedFolderAnswer(id, db.auditSince(from));
-    return { merged: true, moved, into: into.id, archived: source.id };
-  }
-
-  /**
    * Fills in the remote and default branch of every folder that has none
    * recorded yet. In the background after launch, because a folder may be on a
    * drive that is not mounted and git there can take a while to say so.
@@ -270,7 +222,7 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
     return changed;
   }
 
-  return { inspect, create, setFolder, clearFolder, listProjects, conflicts, merge, detectAll, detect, discoveries, attach };
+  return { inspect, create, setFolder, addFolder, makeHome, clearFolder, listProjects, detectAll, detect, discoveries, attach };
 }
 
 /** The IPC channels. Every one is the window's: there is no MCP tool for any of them. */
@@ -279,12 +231,14 @@ function register(handle, { folders, db }) {
   handle("folders:create", (payload = {}) => folders.create(payload));
   handle("folders:set", (projectId, folder) => folders.setFolder(projectId, folder));
   handle("folders:clear", (projectId) => folders.clearFolder(projectId));
-  handle("folders:conflicts", () => folders.conflicts());
-  handle("folders:keep", (id) => db.keepFolderAnswer(id));
-  handle("folders:give", (id, toProjectId) => db.giveFolder(id, toProjectId));
-  handle("folders:merge", (id, fromProjectId) => folders.merge(id, fromProjectId));
+  handle("folders:list", (projectId) => db.projectFolderList(projectId));
+  handle("folders:add", (projectId, folder) => folders.addFolder(projectId, folder || null));
+  handle("folders:remove", (projectId, folder) => db.unlinkFolder(projectId, folder));
+  handle("folders:home", (projectId, folder) => folders.makeHome(projectId, folder));
+  handle("folders:routes", () => db.filedRoutes());
+  handle("folders:settleRoute", (entity, id) => db.settleRoute(entity, id));
   handle("folders:discoveries", () => folders.discoveries());
-  handle("folders:attach", (id, projectId) => folders.attach(id, projectId));
+  handle("folders:attach", (id, projectIds) => folders.attach(id, projectIds));
   handle("folders:ignore", (id) => db.ignoreDiscovery(id));
 }
 

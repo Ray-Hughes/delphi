@@ -30,7 +30,12 @@
        is still paintTitleLive()'s, from the same list the Runs page reads. -->
   <header class="top" id="top">
     <div class="top-row">
-      <img class="top-mark" src="assets/mark-64.png" alt="Delphi" width="26" height="26" />
+      <!-- Home: Today across every project, from anywhere, always in the same
+           place. ui/topbar.js paints its state; G then H does the same. -->
+      <button class="home-btn" id="home-btn" type="button" aria-label="Home">
+        <img class="top-mark" src="assets/mark-64.png" alt="" width="26" height="26" />
+        <span class="home-label">Home</span>
+      </button>
       <div id="switcher"></div>
       <span class="grow"></span>
       <div id="bar"></div>
@@ -62,6 +67,12 @@
       <div class="head">
         <div class="head-top">
           <button class="back" id="back" title="Back (Command + [)" aria-label="Back" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 18l-6-6 6-6" />
+            </svg>
+          </button>
+          <button class="back fwd" id="fwd" title="Forward (Command + ])" aria-label="Forward" hidden>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M15 18l-6-6 6-6" />
@@ -99,6 +110,9 @@
        questions in Needs you. Before app.js, which lends them its callbacks. -->
   <script src="ui/addfolder.js"></script>
   <script src="ui/needs.js"></script>
+  <!-- A project's Folders list, the "Filed under" chip and the drawer's folder
+       picker (ui/folderlist.js). Before app.js, which lends it its callbacks. -->
+  <script src="ui/folderlist.js"></script>
   <!-- Settings: the one list of settings, then the floating panel built from it. -->
   <script src="settings/schema.js"></script>
   <script src="ui/settings.js"></script>

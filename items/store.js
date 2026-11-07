@@ -48,6 +48,8 @@ const ASSOCIABLE = ["task", "note", "scratchpad", "link"];
 const COPYABLE = ["task", "note", "scratchpad", "link"];
 const FLAGGABLE = ["task", "note", "scratchpad", "link", "organizer", "session"];
 const OPS = ["move", "copy", "associate", "dissociate"];
+// What workbench/route.js may file by a guess, and a move therefore settles.
+const ROUTED = ["task", "note", "scratchpad"];
 const FLAG_STATUSES = ["open", "evaluating", "proposed", "applied", "rejected", "withdrawn", "stale", "failed"];
 const LIVE = ["open", "evaluating", "proposed"];
 const SOURCES = ["person", "agent", "sweep"];
@@ -124,6 +126,11 @@ function makeItemStore({
     ? (statements) => { if (statements.length) batch(statements); }
     : (statements) => { for (const [q, p] of statements) sql(q, p); };
   const evaluator = makeEvaluator({ sql, settings });
+  // Asked once: a database the server met before its schema_later ran has no
+  // filed_routes, and a move must not fail over a table it only tidies.
+  // Only a yes is kept: a no is asked again, since schema_later may add it.
+  let routes = false;
+  const hasRoutes = () => routes || (routes = sql("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'filed_routes'", []).length > 0);
 
   // --- reading -------------------------------------------------------------------
 
@@ -463,11 +470,18 @@ function makeItemStore({
   const credit = (ctx) => (ctx && ctx.proposedBy ? `, proposed by ${ctx.proposedBy}` : "");
 
   /** A task subtree's move, as one statement. */
+  // A task's own folder (tasks.repo_id) is one of its project's repos rows.
+  // Moved, it keeps the folder when the project it lands in has the same one,
+  // and goes to that project's Home otherwise.
+  let repoCol = false;
+  const hasRepoCol = () => repoCol || (repoCol = sql("SELECT name FROM pragma_table_info('tasks') WHERE name = 'repo_id'", []).length > 0);
   const moveSubtree = (rootId, to, organizerId, detach) => [
     `WITH RECURSIVE sub(id) AS (SELECT :p1 UNION ALL SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id)
      UPDATE tasks SET project_id = :p2,
             organizer_id = CASE WHEN id = :p1 THEN :p3 ELSE NULL END,
-            parent_id = CASE WHEN id = :p1 AND :p4 = 1 THEN NULL ELSE parent_id END,
+            parent_id = CASE WHEN id = :p1 AND :p4 = 1 THEN NULL ELSE parent_id END,${hasRepoCol() ? `
+            repo_id = (SELECT r2.id FROM repos r1 JOIN repos r2 ON r2.path = r1.path AND r2.project_id = :p2
+                        WHERE r1.id = tasks.repo_id ORDER BY r2.is_primary DESC, r2.id LIMIT 1),` : ""}
             updated_at = datetime('now')
       WHERE id IN (SELECT id FROM sub)`,
     [rootId, to, organizerId ?? null, detach ? 1 : 0],
@@ -574,6 +588,14 @@ function makeItemStore({
     const what = auditEntity === "project" ? `${op.entity === "organizer" ? "epic" : "repository"} ${label} ${summary}` : summary;
     statements.push(auditStatement("update", auditEntity, auditId, what, label, before, { id: auditId, project_id: to }));
     statements.push(...(ctx.extra || []));
+    // An item Delphi filed by a guess (workbench/route.js) is settled by being
+    // moved: the chip goes, and the folder's next guess learns from where the
+    // person put it.
+    if (ROUTED.includes(op.entity) && hasRoutes()) {
+      statements.push([`UPDATE filed_routes SET project_id = :p1, settled_at = datetime('now'),
+                          detail = json_set(CASE WHEN json_valid(detail) THEN detail ELSE '{}' END, '$.moved_from', :p2)
+                        WHERE entity = :p3 AND entity_id = :p4`, [to, from, op.entity, op.id]]);
+    }
     // The pads were read before the batch, and on the sqlite3 route nothing
     // can hold them still in between. So the batch opens by checking each is
     // still the body it was cut from; json() of something that is not JSON is

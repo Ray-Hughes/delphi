@@ -539,6 +539,9 @@ globalThis.DelphiTasks = (() => {
     if (props.id) r.append(el("span", { className: "tk-id", textContent: `#${t.id}` }));
     if (props.status) r.append(statusMark(t));
     r.append(el("span", { className: "tk-title", textContent: t.title }));
+    // Filed into a shared folder by a guess: says so, with a Move (ui/folderlist.js).
+    const routed = globalThis.DelphiFolderList ? DelphiFolderList.chip("task", t) : null;
+    if (routed) r.append(routed);
     if (props.subtasks) { const p = pill(t, r); if (p) r.append(p); }
     if (props.project && opts.group !== "project" && t.project_name) {
       r.append(el("span", { className: "tk-proj" },

@@ -10,7 +10,7 @@
 // saw it and no History row), a known one, a subfolder of a known one, a
 // Workbench, a temporary folder, the data folder, the command line, two
 // sessions making one row, a root named by the client, "Not a project" kept
-// for good, and Attach offering and taking only a project with no folder.
+// for good, and Add to project offering every active project, several at once.
 
 const fs = require("fs");
 const os = require("os");
@@ -214,22 +214,24 @@ async function main() {
   await route("node:sqlite", {});
   await route("sqlite3 binary", { DELPHI_SQLITE_ROUTE: "binary" });
 
-  section("Attach: one folder per project");
+  section("Add to project: any project, several at once");
   const loose = repo("work", "attach", "bip-appeals-config");
   await session({ cwd: loose });
   const q = db.folderDiscoveries().find((d) => d.path === loose);
   const has = db.createProject({ key: "has-folder", name: "Has a folder", path: repo("work", "attach", "appeals-performance") });
   const none = db.createProject({ key: "no-folder", name: "Changeit truststore" });
   const offered = folders.discoveries().find((d) => d.id === q.id).attachable.map((p) => p.id);
-  check("only projects with no folder are offered", [offered.includes(none.id), offered.includes(has.id), offered.some((id) => db.getProject(id).path)], [true, false, false]);
-  await rejects("a project with a folder is refused, in a sentence", folders.attach(q.id, has.id), /has a folder already .*one folder/);
-  check("and nothing changed", [db.getProject(has.id).path !== loose, rowAt(loose).state], [true, "new"]);
-  await folders.attach(q.id, none.id);
-  check("the project with none takes it", [db.getProject(none.id).path, rowAt(loose).state, Number(rowAt(loose).project_id)], [loose, "attached", none.id]);
+  check("projects with a folder are offered as well as those with none", [offered.includes(none.id), offered.includes(has.id)], [true, true]);
+  await folders.attach(q.id, [none.id, has.id]);
+  check("each takes it: Home for the one with none, linked for the one with a Home",
+    [db.getProject(none.id).path, db.getProject(has.id).path !== loose, db.projectFolderList(has.id).some((f) => f.path === loose && !f.home), rowAt(loose).state],
+    [loose, true, true, "attached"]);
   check("the question is gone", db.folderDiscoveries().some((d) => d.id === q.id), false);
-  const last = db.sqlP("SELECT id FROM audit WHERE entity = 'project' AND entity_id = :p1 ORDER BY id DESC LIMIT 1", [none.id])[0];
-  db.undo(Number(last.id));
-  check("History puts it back, and the question is asked again", [db.getProject(none.id).path, db.folderDiscoveries().some((d) => d.id === q.id)], [null, true]);
+  for (const pid of [has.id, none.id]) {
+    const last = db.sqlP("SELECT id FROM audit WHERE entity = 'project' AND entity_id = :p1 ORDER BY id DESC LIMIT 1", [pid])[0];
+    db.undo(Number(last.id));
+  }
+  check("History puts both back, and the question is asked again", [db.getProject(none.id).path, db.projectFolderList(has.id).some((f) => f.path === loose), db.folderDiscoveries().some((d) => d.id === q.id)], [null, false, true]);
 
   section("Add as a new project");
   const made = await folders.create({ path: loose, name: "BIP appeals config" });

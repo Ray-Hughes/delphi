@@ -274,19 +274,24 @@ contextBridge.exposeInMainWorld("delphi", {
     forTask: (taskId) => call("ledger:forTask", taskId),
     rollup: (opts) => call("ledger:rollup", opts || {}),
   },
-  // A project is a folder. inspect() with no path shows the picker; with one
-  // (a drop) it looks at that folder. Neither writes anything.
+  // A project's folders. A folder may be several projects', and a project
+  // several folders, one of them its Home. inspect() with no path shows the
+  // picker; with one (a drop) it looks at that folder. Neither writes anything.
+  // add() with no folder shows the picker too. routes() are the items Delphi
+  // filed by a guess, for the "Filed under" chip.
   folders: {
     inspect: (folder) => call("folders:inspect", folder || null),
     create: (payload) => call("folders:create", payload),
     set: (projectId, folder) => call("folders:set", projectId, folder),
     clear: (projectId) => call("folders:clear", projectId),
-    conflicts: () => call("folders:conflicts"),
-    keep: (id) => call("folders:keep", id),
-    give: (id, toProjectId) => call("folders:give", id, toProjectId),
-    merge: (id, fromProjectId) => call("folders:merge", id, fromProjectId),
+    list: (projectId) => call("folders:list", projectId),
+    add: (projectId, folder) => call("folders:add", projectId, folder || null),
+    remove: (projectId, folder) => call("folders:remove", projectId, folder),
+    home: (projectId, folder) => call("folders:home", projectId, folder),
+    routes: () => call("folders:routes"),
+    settleRoute: (entity, id) => call("folders:settleRoute", entity, id),
     discoveries: () => call("folders:discoveries"),
-    attach: (id, projectId) => call("folders:attach", id, projectId),
+    attach: (id, projectIds) => call("folders:attach", id, projectIds),
     ignore: (id) => call("folders:ignore", id),
   },
   // Today: stuck tasks, the one banner and the brief, and "Mark as seen".

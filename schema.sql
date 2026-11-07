@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- projection go both ways. SET NULL rather than CASCADE for the reason the
   -- organizer above gives: deleting the document must never delete the work.
   pad_id       INTEGER REFERENCES scratchpads(id) ON DELETE SET NULL,
+  -- The folder this task works in, when its project has several: one of the
+  -- project's repos rows. NULL is the project's Home. SET NULL, so a folder
+  -- taken off the project sends its tasks back to Home. agent/schema_later.js
+  -- adds it to an older database.
+  repo_id      INTEGER REFERENCES repos(id) ON DELETE SET NULL,
   -- Free text until there is a people table. An agent name goes here too, which
   -- is what lets the queue show who is holding a piece of work.
   assignee     TEXT,
@@ -887,8 +892,9 @@ CREATE INDEX IF NOT EXISTS idx_restore_points_created ON restore_points(created_
 -- per folder (path is the git top level, worktrees resolved), so however many
 -- times it is seen it is one question for a person, never a project made
 -- behind their back. via says how it got here: 'migration' for a workspace no
--- project was linked to, 'conflict' for a folder two projects had shared until
--- each folder became one project's (detail names both, and what each held),
+-- project was linked to, 'conflict' for a folder slice 4 took from all but one
+-- of the projects sharing it (detail names them, and what each held; slice 4b
+-- puts the folder back and marks the row 'rejoined', with what it did),
 -- 'session' for a folder an agent session called the server from that no
 -- project had (workbench/discover.js; detail holds the harness, remote and
 -- branch, seen_count how many sessions came from it). A
@@ -908,9 +914,29 @@ CREATE TABLE IF NOT EXISTS discovered_folders (
   answered_at TEXT,
   seen_count  INTEGER NOT NULL DEFAULT 1
 );
--- The unique index on projects(path) is not here. This file runs before the
--- folder migration (workbench/folders.js), and on a database where two projects
--- still share a folder it would fail and stop the whole file.
+-- A folder may be several projects' (slice 4b): there is no unique index on
+-- projects(path), and agent/schema_later.js drops the one slice 4 made.
+
+-- Where an item an agent filed without naming a project was put, and why,
+-- when Delphi had to guess (workbench/route.js): via 'branch' or 'commit' for
+-- a ticket or key it read from git, 'recent' for the project most recently
+-- active in the folder, 'home' for the folder's Home project. The window draws
+-- "Filed under SSNR, from branch" from it, with a Move that goes through the
+-- item store; settled_at is set once a person moved it or said it was right,
+-- and a settled row is what makes the next guess in that folder a better one.
+-- agent/schema_later.js holds the same text.
+CREATE TABLE IF NOT EXISTS filed_routes (
+  entity      TEXT NOT NULL,
+  entity_id   INTEGER NOT NULL,
+  project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  folder      TEXT,
+  via         TEXT NOT NULL,
+  detail      TEXT,
+  actor       TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  settled_at  TEXT,
+  PRIMARY KEY (entity, entity_id)
+);
 
 -- Edit this page: how a person has arranged a screen's sections. One row per
 -- screen for everyone (project_id NULL) and at most one per screen per project,

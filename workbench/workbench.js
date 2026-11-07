@@ -565,9 +565,12 @@ function createWorkbench({
       if (!list.length) {
         throw refusal(`Task ${task.id}'s project has no git repository Delphi can find. Add one to the project, or point the project at the folder its code is in.`, "NO_REPO", { candidates: [] });
       }
+      // The task's own folder first, when it names one (tasks.repo_id), then
+      // the project's Home.
+      const own = task.repo_id != null ? list.find((c) => c.repo_id === Number(task.repo_id)) : null;
       const repoPrimary = list.filter((c) => c.source === "repo" && c.is_primary);
       const primaries = list.filter((c) => c.is_primary);
-      pick = list.length === 1 ? list[0] : repoPrimary.length === 1 ? repoPrimary[0] : primaries.length === 1 ? primaries[0] : null;
+      pick = own || (list.length === 1 ? list[0] : repoPrimary.length === 1 ? repoPrimary[0] : primaries.length === 1 ? primaries[0] : null);
       if (!pick) {
         throw refusal(`Task ${task.id}'s project has several repositories and none is marked primary: ${list.map((c) => `${c.name} (${c.path})`).join(", ")}. Say which one.`, "WHICH_REPO", { candidates: list });
       }

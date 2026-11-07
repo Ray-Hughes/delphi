@@ -211,3 +211,17 @@ body.panel .top-row { padding-left: 12px; }
 /* The session list was drawn indented under its project in the sidebar. In
    its own menu there is nothing to be indented under. */
 .sessions-pop .gkids { margin: 0 6px; padding-left: 0; border-left: 0; }
+
+/* Home: the mark and the word, top left, on every page. Lit on Home itself. */
+.home-btn {
+  display: flex; align-items: center; gap: 7px; height: 32px; padding: 0 10px 0 3px; flex: none;
+  border-radius: 8px; border: 1px solid transparent; background: none; color: var(--ink);
+  font: 600 13px/1 var(--font); cursor: pointer; transition: background .12s, border-color .12s;
+}
+.home-btn:hover { background: var(--raised); border-color: var(--line); }
+.home-btn.on { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-ink); }
+.home-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (max-width: 600px) { .home-btn .home-label { display: none; } .home-btn { padding: 0 3px; } .home-btn .top-mark { display: block; } }
+
+/* Forward, beside Back in the page head, when there is somewhere to go. */
+.head-top .back.fwd svg { transform: scaleX(-1); }

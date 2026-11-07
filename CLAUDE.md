@@ -151,17 +151,34 @@ repository (or under `DELPHI_WORKBENCH_DIR`). The verbs are Start, Open, Park,
 Finish and Discard, and git's own words stay in `workbench/git.js`, which turns
 its errors into sentences. It has nothing to do with the older `workspaces` and
 `project_workspaces` tables, which the folder migration read once and nothing
-reads now; a Workbench is attached to a task.
+reads now (rejoin() puts back the links slice 4 removed, for fidelity, but
+nothing reads them); a Workbench is attached to a task.
 
-**A project is a folder, and a folder is one project's.** `projects.path` is
-the folder, normalised (`workbench/folders.js normalise`) and unique where it is
-set, by an index the migration makes once no two projects share one; it is not
-in `schema.sql`, which runs first and would fail on a database that still has a
-shared folder. Every caller that needs a folder asks `folderFor` or
-`projectFolders` there: jobs, `$ ` runs, Workbench Start, `sheet_resolve` and
-sessions. A primary `repos` row counts only through the project's own folder, so
-a project in No folder resolves nowhere. The folder is written in one place,
-`db.js updateProject`, which moves the primary repos row with it.
+**A folder is several projects', and a project several folders'.** One
+repository holds several pieces of work and one piece of work spans several
+repositories. Each project has one Home, `projects.path`, normalised
+(`workbench/folders.js normalise`), with its primary `repos` row at the same
+path; its other folders are non-primary `repos` rows. There is no unique index
+on `projects.path` (slice 4 made one; `schema_later` drops it). Every caller
+that needs a folder asks `folderFor` or `projectFolders` there: jobs, `$ ` runs,
+Workbench Start (the task's own folder, `tasks.repo_id`, then Home),
+`sheet_resolve` and sessions. A primary `repos` row counts only through Home, so
+a project in No folder resolves nowhere. Home is written in one place, `db.js
+updateProject`, which moves the primary repos row with it and keeps the old Home
+as a linked folder; `linkFolder` and `unlinkFolder` record the repos row in
+`__folder` so History can undo them. Slice 4's split (shared folders taken from
+all but one project) is put back once by `rejoin()`, which leaves alone a
+project whose folders a person changed since and says so in the row.
+
+**Delphi works out the project; Today never asks.** When an agent files
+something without naming a project, `workbench/route.js` resolves it: what
+launched the agent (its job's task, its session, `DELPHI_PROJECT`), then a
+Workbench, then for a folder several projects share a ticket or key in the
+branch or the latest commit, the project most recently active in the folder,
+and the folder's Home. Shared by the server and the app, handed `sql` and the
+git facts, so it is the same answer on both routes. The last three are guesses:
+the filing is recorded in `filed_routes` and the window shows "Filed under SSNR,
+from branch" with a Move through the item store, which settles it.
 
 **The never-lose-work rules are why `workbench/` refuses more than it does.**
 Finish removes the folder only when nothing is unsaved and nothing is unpushed,

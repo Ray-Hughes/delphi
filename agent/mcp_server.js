@@ -954,6 +954,61 @@ function projectScope() {
   }
 }
 
+/**
+ * The project work done here belongs to, by workbench/route.js's precedence:
+ * what launched this session (its job's task, its session, DELPHI_PROJECT),
+ * a Workbench, then for a folder several projects share a ticket or key in
+ * the branch or the latest commit, the project most recently active in the
+ * folder, and the folder's Home. Null in a folder no project has.
+ *
+ * The folder is the one the server was started in, then the client's roots.
+ * What git says is read once a minute at most, and never for longer than git
+ * takes to answer quickly, so a tool call is not held up by it.
+ */
+const route = require("../workbench/route");
+const gitSeen = new Map();
+function gitHere(cwd) {
+  const was = gitSeen.get(cwd);
+  if (was && Date.now() - was.at < 60000) return was.facts;
+  const facts = route.readGit(cwd);
+  gitSeen.set(cwd, { at: Date.now(), facts });
+  return facts;
+}
+function routeHere() {
+  const scope = projectScope();
+  const base = { jobId: WHO.job_id, sessionId: WHO.session_id, scopeProject: scope && scope.id ? scope.id : null };
+  const places = [...new Set([process.cwd(), ...ROOTS])];
+  for (const cwd of places) {
+    try {
+      const r = route.resolve(sql, { ...base, cwd, ...gitHere(cwd) });
+      if (r) return r;
+    } catch (error) {
+      process.stderr.write(`delphi: could not work out the project for ${cwd}: ${(error && error.message) || error}\n`);
+    }
+  }
+  return null;
+}
+/**
+ * The statement that records a guessed filing, or none on a database with no
+ * filed_routes yet (schema_later could not add it): a missing chip is better
+ * than a write that fails whole. Only a yes is cached.
+ */
+let routesTable = false;
+function routeRecord(entity, idSql, routed) {
+  if (!routed || !routed.guessed) return [];
+  if (!routesTable) {
+    try { routesTable = sql("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'filed_routes'", []).length > 0; } catch { routesTable = false; }
+  }
+  return routesTable ? [route.recordStatement(entity, idSql, routed, ACTOR)] : [];
+}
+/** What a write tells the agent about where its item went, when Delphi chose. */
+function filedUnder(r) {
+  if (!r) return null;
+  const p = sql("SELECT key, name FROM projects WHERE id = :p1", [r.projectId])[0] || {};
+  return { project_id: r.projectId, project: p.key || null, name: p.name || null, via: r.via, guessed: Boolean(r.guessed),
+           ...(r.guessed ? { why: route.WHY[r.via] || null, move_with: "update_task project_id, within 24 hours of filing it" } : {}) };
+}
+
 const isDirectory = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
 const holds = (root, p) => {
   const a = (() => { try { return fs.realpathSync(root); } catch { return null; } })();
@@ -1053,6 +1108,8 @@ const TOOLS = {
         session_id: WHO.session_id,
         ...(WHO.job_id ? { job_id: WHO.job_id } : {}),
         project_scope: projectScope(),
+        // Where a write that names no project lands, and why.
+        working_in: (() => { try { return filedUnder(routeHere()); } catch { return null; } })(),
         app_running: app.running,
         app,
         checkout_db_ignored: RESOLVED.checkoutDbIgnored,
@@ -1150,13 +1207,13 @@ const TOOLS = {
 
   add_task: {
     description:
-      "Create a task for work that will not be finished now, without waiting to be asked.",
+      "Create a task for work that will not be finished now, without waiting to be asked. Without project_id it is filed where you are working: the task or job you were launched for, else your folder's project (filed_under says which, and why).",
     schema: {
       type: "object",
       required: ["title"],
       properties: {
         title: { type: "string" },
-        project_id: { type: "number" },
+        project_id: { type: "number", description: "Default: where you are working (see filed_under in the answer)" },
         detail: { type: "string", description: "Why it matters, how to verify" },
         priority: { type: "string", enum: ["high", "med", "low"] },
         due: { type: "string", description: "YYYY-MM-DD" },
@@ -1173,6 +1230,9 @@ const TOOLS = {
         if (!parent) throw new Error(`No task ${a.parent_id} to hang this from`);
         projectId = parent.project_id;
       }
+      // Not named: where this agent is working, by workbench/route.js.
+      const routed = projectId == null && !a.parent_id ? routeHere() : null;
+      if (routed) projectId = routed.projectId;
       // RETURNING, not "the newest row": with two agents filing at once the
       // newest row can be the other agent's.
       //
@@ -1184,8 +1244,10 @@ const TOOLS = {
         [`INSERT INTO tasks (project_id, title, detail, priority, due, ref, parent_id, source)
           VALUES (:p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8)`,
          [projectId, a.title, a.detail ?? null, a.priority || "med", a.due ?? null, a.ref ?? null, a.parent_id ?? null, ACTOR]],
-        [[`INSERT INTO status_events (task_id, status, actor) VALUES (${auditor.createdId("task", stepId)}, 'todo', :p1)`, [ACTOR]]]));
-      return sql("SELECT id, title FROM tasks WHERE id = :p1", [auditor.created("task", stepId)])[0];
+        [[`INSERT INTO status_events (task_id, status, actor) VALUES (${auditor.createdId("task", stepId)}, 'todo', :p1)`, [ACTOR]],
+         ...routeRecord("task", auditor.createdId("task", stepId), routed)]));
+      const made = sql("SELECT id, title, project_id FROM tasks WHERE id = :p1", [auditor.created("task", stepId)])[0];
+      return routed ? { ...made, filed_under: filedUnder(routed) } : made;
     },
   },
 
@@ -1892,20 +1954,26 @@ const TOOLS = {
       "Store knowledge against a project: a decision and why, a gotcha, a reference. Anything a future session would otherwise rediscover; prefer it to leaving knowledge in chat.",
     schema: {
       type: "object",
-      required: ["project_id", "title", "body"],
+      required: ["title", "body"],
       properties: {
-        project_id: { type: "number" },
+        project_id: { type: "number", description: "Default: where you are working (see filed_under in the answer)" },
         title: { type: "string" },
         body: { type: "string" },
         kind: { type: "string", enum: ["note", "decision", "gotcha", "reference", "contact"] },
       },
     },
     run: (a) => {
+      let projectId = a.project_id ?? null;
+      const routed = projectId == null ? routeHere() : null;
+      if (routed) projectId = routed.projectId;
+      if (projectId == null) throw new Error("Pass project_id: this folder is no project's, so there is nowhere to file the note. Call list_projects to see them.");
       const stepId = auditor.step();
       auditor.run(auditor.create("note", { summary: "created", label: a.title, stepId },
         [`INSERT INTO notes (project_id, title, body, kind) VALUES (:p1, :p2, :p3, :p4)`,
-         [a.project_id, a.title, a.body, a.kind || "note"]]));
-      return sql("SELECT id, title FROM notes WHERE id = :p1", [auditor.created("note", stepId)])[0];
+         [projectId, a.title, a.body, a.kind || "note"]],
+        routeRecord("note", auditor.createdId("note", stepId), routed)));
+      const made = sql("SELECT id, title, project_id FROM notes WHERE id = :p1", [auditor.created("note", stepId)])[0];
+      return routed ? { ...made, filed_under: filedUnder(routed) } : made;
     },
   },
 
@@ -1976,7 +2044,9 @@ const TOOLS = {
       },
     },
     run: (a) => {
-      const projectId = a.project_id ?? resolveProjectId(a);
+      let projectId = a.project_id ?? resolveProjectId(a);
+      const routed = projectId == null ? routeHere() : null;
+      if (routed) projectId = routed.projectId;
       const key = padKeyFor(projectId, a.key || a.title);
       const existing = sql("SELECT * FROM scratchpads WHERE project_id = :p1 AND key = :p2",
                            [projectId, key])[0];
@@ -1995,8 +2065,10 @@ const TOOLS = {
       auditor.run(auditor.create("scratchpad", { summary: "created", label: a.title, stepId },
         [`INSERT INTO scratchpads (project_id, key, title, body, author, derives_tasks)
           VALUES (:p1, :p2, :p3, :p4, :p5, :p6)`,
-         [projectId, key, a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : 1]]));
-      return derivePad(auditor.created("scratchpad", stepId));
+         [projectId, key, a.title, a.body, ACTOR, a.derives_tasks === false ? 0 : 1]],
+        routeRecord("scratchpad", auditor.createdId("scratchpad", stepId), routed)));
+      const pad = derivePad(auditor.created("scratchpad", stepId));
+      return routed ? { ...pad, filed_under: filedUnder(routed) } : pad;
     },
   },
 

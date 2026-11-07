@@ -674,6 +674,12 @@ globalThis.DelphiDrawer = (() => {
     // by the write the drawer made, and the new node is the one to go back to.
     const openerKey = opener ? (opener.closest && opener.closest("[data-task-id]") ? `[data-task-id="${opener.closest("[data-task-id]").dataset.taskId}"]`
       : opener.dataset && opener.dataset.act ? `[data-act="${CSS.escape(opener.dataset.act)}"]` : opener.id ? `#${CSS.escape(opener.id)}` : null) : null;
+    // Where the page was when the drawer opened: its scroll and the row the
+    // keyboard was on. Escape puts both back with the focus, so closing a
+    // drawer returns exactly to where you were (host.restoreView).
+    const page = document.getElementById("content");
+    const litRow = document.querySelector("#content [data-task-id].kbd-hi");
+    const was = { scroll: page ? page.scrollTop : 0, lit: litRow ? litRow.dataset.taskId : null };
     const root = el("aside", { className: "dw", tabIndex: -1 });
     root.setAttribute("role", "dialog");
     // Not aria-modal: the page beside it stays live to the pointer. Tab is
@@ -744,6 +750,9 @@ globalThis.DelphiDrawer = (() => {
         let back = opener && opener.isConnected ? opener : null;
         if (!back && openerKey) back = [...document.querySelectorAll(`#content ${openerKey}, ${openerKey}`)].find((n) => n.offsetParent !== null) || null;
         if (!busy && back && typeof back.focus === "function") back.focus({ preventScroll: true });
+        // The page under it has not moved while it was open, so it is put
+        // back as it was, whether this closed for good or for the next task.
+        if (host.restoreView) host.restoreView(was);
       }
     }
     const me = { root, head, body, foot, close, handle: null, focusFirst: () => (focusables()[0] || root).focus({ preventScroll: true }) };
@@ -1428,6 +1437,11 @@ globalThis.DelphiDrawer = (() => {
       crumbs.push(el("span", { className: "dw-crumb-now", textContent: `#${taskId}` }));
       const item = taskItem();
       if (item.associated) crumbs.push(host.fromChip(item));
+      // Filed by a guess into a shared folder: under the title, where it has
+      // room to say which project and why (ui/folderlist.js).
+      routeSlot.textContent = "";
+      const routed = host.routeChip ? host.routeChip("task", detail.task) : null;
+      if (routed) routeSlot.append(routed);
       const full = iconBtn("expand", "Open full view (Shift and Enter)", () => host.openFull(taskId), "full");
       full.setAttribute("aria-keyshortcuts", "Shift+Enter");
       const share = iconBtn("share", "Share via MCP: copy a brief an agent can act on", (e) => copyText(host.handoffText(detail), e.currentTarget, "Brief copied"), "share");
@@ -1558,6 +1572,7 @@ globalThis.DelphiDrawer = (() => {
     ring.onclick = () => write({ status: detail.task.status === "done" ? "todo" : "done" }, detail.task.status === "done" ? "reopened" : "marked done");
     const titleBox = titleField(title, "", { revert: () => { if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf); return detail.task.title; } });
     const titleRow = el("div", { className: "dw-title-row" }, ring, titleBox.node);
+    const routeSlot = el("div", { className: "dw-route" });
 
     // --- status and props ---
     const statusBox = el("div", { className: "dw-statusbar", role: "group" });
@@ -2206,7 +2221,10 @@ globalThis.DelphiDrawer = (() => {
       let opts = {};
       try {
         const list = await window.delphi.workbench.candidates(taskId);
-        if (list.length > 1) {
+        // The folder picker above Start answers this when it is shown: the
+        // task's own folder, else the project's Home. Asked only when the
+        // project has several repositories and no Home to fall back on.
+        if (list.length > 1 && detail.task.repo_id == null && !list.some((c) => c.is_primary)) {
           const pick = await host.wb.pickRepo(list);
           if (!pick) return;
           opts = pick.repo_id != null ? { repoId: pick.repo_id } : { path: pick.path };
@@ -2228,7 +2246,7 @@ globalThis.DelphiDrawer = (() => {
       const wb0 = detail.workbench;
       const st0 = (wb0 && wb0.status) || {};
       const sig = JSON.stringify([wb0 && { ...wb0, status: { ...st0, checkedAt: null } }, host.wb.starting.get(taskId) || null, busyNow(),
-        detail.project ? detail.project.id : null, detail.task.status, wbAdv, wbAdvOpen]);
+        detail.project ? detail.project.id : null, detail.task.status, detail.task.repo_id ?? null, wbAdv, wbAdvOpen]);
       paintCards();
       if (!sections.workbench.isOpen()) return;
       if (sig === wbSig && sections.workbench.body.contains(wbBox)) {
@@ -2278,6 +2296,14 @@ globalThis.DelphiDrawer = (() => {
           : `A Workbench is a folder and a branch for this task. ${detail.project.name} has no folder yet; Start asks which repository to use.`;
         const acts = can ? [wbButton("Start Workbench", "primary", wbStart, "A folder and a branch of its own for this task", "start")] : [];
         wbBox.append(emptyBlock("branch", "No Workbench yet", lead, acts));
+        // Which of the project's folders Start uses, when it has several.
+        // Filled in once the list is read; nothing at all for one folder.
+        if (can && host.folderPicker) {
+          const slot = el("div", { className: "wb-folder-slot" });
+          wbBox.append(slot);
+          host.folderPicker(detail, { onPicked: async () => { await reload(); host.refresh(); } })
+            .then((node) => { if (node && slot.isConnected) slot.append(node); }).catch(() => {});
+        }
         return;
       }
       const look = host.wb.look(wb);
@@ -2684,7 +2710,7 @@ globalThis.DelphiDrawer = (() => {
       return el("div", { className: "dw-empty" }, el("div", { className: "ill" }, icon(iconName, "")), el("h4", { textContent: h }), el("p", { textContent: p }), acts.length ? el("div", { className: "acts" }, ...acts) : null);
     }
 
-    me.head.append(top, titleRow, el("div", { className: "dw-props-wrap" }, statusBox, props), banners, cards);
+    me.head.append(top, titleRow, routeSlot, el("div", { className: "dw-props-wrap" }, statusBox, props), banners, cards);
     for (const key of order) me.body.append(sections[key].wrap);
     me.foot.append(composer);
     me.foot.classList.add("composer");
@@ -3084,6 +3110,8 @@ globalThis.DelphiDrawer = (() => {
     // The one Write, Preview and Split editor, for the Pads tab (app.js).
     editor, padEditor,
     close: () => (cur ? cur.close() : undefined),
+    /** The task open in the drawer, or null: a stop for Back and Forward (app.js). */
+    openTask: () => (cur && cur.root && cur.root.dataset.task ? Number(cur.root.dataset.task) : null),
     editTitle: () => { const b = document.querySelector(".dw .dw-title-btn"); if (b) b.click(); },
     isOpen: () => Boolean(cur),
     // The task open here, for Log a fact (ui/memory.js) and anything else that

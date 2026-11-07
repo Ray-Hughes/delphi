@@ -8,6 +8,7 @@
 
 const { DatabaseSync } = require("node:sqlite");
 const path = require("path");
+const os = require("os");
 const fs = require("fs");
 const paths = require("./paths");
 const pads = require("./pads");
@@ -16,6 +17,7 @@ const identity = require("./agent/identity");
 const auditLib = require("./agent/audit");
 const folderRule = require("./workbench/folders");
 const discoverRule = require("./workbench/discover");
+const routeRule = require("./workbench/route");
 
 // Decided by agent/locate.js, the same rule the MCP server and the command line
 // use, so the window and every agent are looking at one file. See paths.js.
@@ -61,8 +63,9 @@ function open() {
   // After the schema, because on a fresh database the table it rebuilds has just
   // been created with the right constraint and there is nothing to do.
   widenAuditEntities(db);
-  // One folder, one project (workbench/folders.js). After the schema, so the
-  // tables it writes exist, and before anything reads a project. main.js takes
+  // Every project's folders, and slice 4's split put back (workbench/folders.js).
+  // After the schema, so the tables it writes exist, and before anything reads
+  // a project. main.js takes
   // a snapshot first and may hold it back when the snapshot failed: a
   // migration with no copy from before it is the one thing not to do.
   // Guarded because a database that cannot adopt its folders still works, and
@@ -71,10 +74,11 @@ function open() {
   if (folderGate()) {
     try {
       folderAdoption = folderRule.adoptFolders({ sql: sqlP, batch: batchP });
-      if (!folderAdoption.index.ok) console.error(`folders: no unique index yet (${folderAdoption.index.why})`);
+      if (!folderAdoption.index.ok) console.error(`folders: could not drop slice 4's unique index (${folderAdoption.index.why})`);
+      for (const r of folderAdoption.rejoined || []) console.log(`folders: ${r.folder}: ${r.said}`);
     } catch (error) {
       folderAdoption = { ran: false, error: String(error.message || error) };
-      console.error("could not give each folder one project", error);
+      console.error("could not bring the folders up to date", error);
     }
   }
   return db;
@@ -683,17 +687,7 @@ function undo(auditId) {
     // A task's row before the reversal, so its pad line can follow it below.
     const taskWas = entry.entity === "task" && entry.action === "update"
       ? one("SELECT * FROM tasks WHERE id = :id", { id: entry.entity_id }) : null;
-    try {
-      applyUndo(entry);
-    } catch (error) {
-      // Putting a folder back that another project has since taken would give
-      // one folder two projects, which the unique index refuses by its own
-      // name. Said as what is in the way instead.
-      if (/UNIQUE constraint failed: projects\.path/.test(String(error.message))) {
-        throw new Error("That folder is another project's now, so this cannot be put back. Give that project a different folder first, then undo again.");
-      }
-      throw error;
-    }
+    applyUndo(entry);
     // Putting a pad body back leaves the board reading from text that is no
     // longer there, so the projection is taken again from the restored body.
     // Inside the same transaction as the restore, for the reason writeScratchpad
@@ -716,12 +710,6 @@ function undo(auditId) {
         for (const [q, p] of folderRule.primaryRepoStatements(sqlP, entry.entity_id, was.path)) sqlP(q, p);
       }
     }
-    // A folder question answered by this change is asked again once the
-    // answer is undone, rather than staying answered over a reversed answer.
-    run(`UPDATE discovered_folders SET state = 'new', answered_at = NULL
-          WHERE via = 'conflict' AND state IN ('given', 'merged')
-            AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(detail) THEN COALESCE(json_extract(detail, '$.answer_audit'), '[]') ELSE '[]' END) j
-                         WHERE j.value = :id)`, { id: Number(auditId) });
     run("UPDATE audit SET undone = 1, undone_at = datetime('now') WHERE id = :id", { id: auditId });
   })();
   return listAudit(100);
@@ -784,6 +772,12 @@ function applyUndo(entry) {
   // reverted every edit made to the item since it moved.
   // Flag bookkeeping (items/store.js flagAudit): a record that someone said
   // an item may be misfiled, which changed nothing about it to put back.
+  // A linked folder added or taken off (linkFolder, unlinkFolder): the repos
+  // row is the change, and it is carried whole in __folder.
+  if (before && before.__folder !== undefined) {
+    undoFolder(before.__folder);
+    return;
+  }
   if (before && before.__flag !== undefined) {
     throw new Error("That is a flag, which changed nothing. Withdraw or reject the flag instead.");
   }
@@ -1000,11 +994,9 @@ function getProject(id) {
 function createProject({ key, name, summary = null, colour = "#7c8698", path = null, icon = null, remote = undefined, branch = undefined }) {
   const slug = slugKey(key);
   if (!slug) throw new Error("A project key needs at least one letter or digit");
-  // One spelling of a folder, and one project per folder, said as a sentence
-  // before the unique index can say it as a constraint name.
+  // One spelling of a folder. Another project may have it too: a folder is
+  // as many projects' as are working in it.
   path = folderRule.normalise(path);
-  const owner = path ? folderRule.ownerOf(sqlP, path) : null;
-  if (owner) throw new Error(folderRule.takenSentence(owner));
 
   // Checked before the insert rather than left to the UNIQUE constraint, which
   // reaches the window as "UNIQUE constraint failed: projects.key" and says
@@ -1054,14 +1046,13 @@ function updateProject(id, fields, detected = {}) {
   if (fields.status !== undefined && !PROJECT_STATUSES.includes(fields.status)) {
     throw new Error(`status must be one of ${PROJECT_STATUSES.join(", ")}`);
   }
-  // The folder is written in one place, here: normalised, refused by name when
-  // another project has it, and its primary repos row moved with it in the
-  // same unit, because every resolver reads repos and a stale row would win.
+  // Home is written in one place, here: normalised, and its primary repos row
+  // moved with it in the same unit, because every resolver reads repos and a
+  // stale row would win. The old Home stays as a linked folder (its row is
+  // demoted, never moved), so changing Home never loses a folder.
   let folder;
   if (fields.path !== undefined) {
     folder = folderRule.normalise(fields.path);
-    const owner = folder ? folderRule.ownerOf(sqlP, folder, { except: id }) : null;
-    if (owner) throw new Error(folderRule.takenSentence(owner));
     fields = { ...fields, path: folder };
   }
   const sets = Object.keys(fields).filter((k) => allowed.includes(k));
@@ -1451,7 +1442,7 @@ function createTask({
 
 function updateTask(id, fields, { actor = null } = {}) {
   const allowed = ["project_id", "title", "detail", "status", "priority", "owner", "due", "ref",
-                   "assignee", "parent_id", "queue", "organizer_id", "colour"];
+                   "assignee", "parent_id", "queue", "organizer_id", "colour", "repo_id"];
   // Rejected here rather than stored and ignored: a colour outside the palette
   // has no hex behind it in either theme, so it would paint nothing and look
   // like the write silently failed.
@@ -1478,6 +1469,14 @@ function updateTask(id, fields, { actor = null } = {}) {
     return updateTask(id, rest, { actor });
   }
   const next = { ...fields };
+  // A task's own folder is one of its project's, or NULL for Home. Another
+  // project's row would start its Workbench with that project's settings.
+  if (next.repo_id !== undefined && next.repo_id !== null) {
+    const pid = next.project_id !== undefined ? next.project_id : before && before.project_id;
+    const own = one("SELECT id, is_primary FROM repos WHERE id = :id AND project_id IS :pid", { id: Number(next.repo_id), pid: pid == null ? null : Number(pid) });
+    if (!own) throw new Error("That folder is not one of this task's project's folders.");
+    next.repo_id = Number(own.id);
+  }
 
   if (before) {
     const projectId = next.project_id !== undefined ? next.project_id : before.project_id;
@@ -3319,70 +3318,163 @@ function adoptProjectPaths() {
 }
 
 // ---------------------------------------------------------------------------
-// Folders: one per project. The rule and the migration are in
-// workbench/folders.js; these are the window's writes.
+// A project's folders: Home and the linked ones. The rule is in
+// workbench/folders.js; these are the window's writes. Home is projects.path,
+// written by updateProject. A linked folder is a non-primary repos row, which
+// has no audit entity of its own, so it is recorded as an update of its
+// project carrying the row in __folder, and undone from that (undoFolder).
 
-/** The shared-folder questions the migration left for a person. */
-const folderConflicts = () => folderRule.conflicts(sqlP);
+const tildeOf = (p) => {
+  const home = os.homedir();
+  return p && (p === home || p.startsWith(home + path.sep)) ? `~${p.slice(home.length)}` : p;
+};
 
-function conflictRow(id) {
-  const row = one("SELECT * FROM discovered_folders WHERE id = :id AND via = 'conflict'", { id: Number(id) });
-  if (!row) throw new Error("That question is no longer there.");
-  // Answered once, from the window, and never asked again: a second click on a
-  // stale copy of the item must not undo the first answer.
-  if (row.state !== "new") throw new Error("That question has been answered already.");
-  return row;
+/** Every folder of a project, Home first, with who else has each. */
+function projectFolderList(projectId) {
+  const pid = Number(projectId);
+  return folderRule.projectFolders(sqlP, pid).map((f) => ({
+    ...f,
+    home: f.source === "project",
+    shown: tildeOf(f.path),
+    exists: folderRule.isDir(f.path),
+    also: folderRule.holders(sqlP, f.path).filter((h) => h.id !== pid && h.status !== "archived").map((h) => ({ id: h.id, name: h.name, home: h.home })),
+  }));
 }
 
-// The History rows an answer wrote are kept on the question, so undoing any
-// of them asks it again (see undo()).
-const answerConflict = (id, state, auditIds = []) =>
-  run(`UPDATE discovered_folders SET state = :state, answered_at = datetime('now'),
-         detail = json_set(COALESCE(detail, '{}'), '$.answer_audit', json(:ids)) WHERE id = :id`,
-      { id: Number(id), state, ids: JSON.stringify(auditIds.map(Number)) });
-const newestAudit = () => Number(one("SELECT COALESCE(MAX(id), 0) AS n FROM audit").n);
-// The window's own rows only: an agent writing to the same file in between is
-// not part of the answer, and undoing its row must not ask the question again.
-const auditSince = (from) => all("SELECT id FROM audit WHERE id > :from AND actor IS :actor ORDER BY id", { from, actor: WINDOW.actor }).map((r) => Number(r.id));
-
-/** "Keep it this way": the folder stays where the migration put it. */
-function keepFolderAnswer(id) {
-  conflictRow(id);
-  answerConflict(id, "kept");
-  return { kept: true };
+function recordFolder(projectId, summary, op) {
+  const p = getProject(projectId);
+  record({ action: "update", entity: "project", entityId: Number(projectId), summary, label: p ? p.name : null,
+           before: { __folder: op }, after: { __folder: op } });
 }
 
 /**
- * "Give the folder to ...": the project that kept it goes to No folder and the
- * other takes it. Two project updates in one step, each with its History row,
- * so History can put either back. Its repos row is left where it is: a
- * project with no folder reads no primary row, so it no longer resolves there,
- * and its Workbench settings are still there if the folder comes back.
+ * A folder for a project. Its Home when it has none, so a first folder is
+ * where its work runs; a linked folder otherwise. A folder it has already is
+ * left as it is. Another project having the folder too is fine.
  */
-function giveFolder(id, toProjectId) {
-  const row = conflictRow(id);
-  const to = getProject(Number(toProjectId));
-  if (!to) throw new Error("That project is not there any more.");
-  // Only to a project that gave this folder up: the id comes from the window,
-  // and any other would hand the folder to a project that never had it.
-  const detail = JSON.parse(row.detail || "{}");
-  if (!(detail.moved || []).some((m) => Number(m.id) === Number(to.id))) {
-    throw new Error(`${to.name} is not one of the projects that shared ${row.path}.`);
-  }
-  if (to.path && !folderRule.same(to.path, row.path)) throw new Error(`${to.name} has a folder of its own now (${to.path}).`);
-  const from = newestAudit();
-  const holder = folderRule.ownerOf(sqlP, row.path, { except: to.id });
-  if (holder) updateProject(Number(holder.id), { path: null });
-  updateProject(to.id, { path: row.path });
-  answerConflict(id, "given", auditSince(from));
-  return { from: holder ? Number(holder.id) : null, to: to.id, path: row.path };
+function linkFolder(projectId, raw, detected = {}) {
+  const pid = Number(projectId);
+  const p = getProject(pid);
+  if (!p) throw new Error("That project is not there any more.");
+  const folder = folderRule.normalise(raw);
+  if (!folder) throw new Error("Choose a folder first.");
+  if (folderRule.projectFolders(sqlP, pid).some((f) => folderRule.alike(f.path, folder))) return { project: p, folder, added: false };
+  if (!p.path) return { project: updateProject(pid, { path: folder }, detected), folder, added: true, home: true };
+  // A stale primary row at the folder (a Home changed away, then undone) is
+  // re-labelled rather than replaced, and its undo puts the label back rather
+  // than deleting a row whose Workbench settings were there before.
+  const stale = sqlP("SELECT * FROM repos WHERE project_id = :p1", [pid]).find((r) => folderRule.alike(r.path, folder)) || null;
+  for (const [q, params] of folderRule.linkStatements(sqlP, pid, folder, { remote: detected.remote, branch: detected.branch })) sqlP(q, params);
+  const row = stale
+    ? one("SELECT * FROM repos WHERE id = :id", { id: Number(stale.id) })
+    : sqlP("SELECT * FROM repos WHERE project_id = :p1 AND is_primary = 0 ORDER BY id DESC", [pid]).find((r) => folderRule.alike(r.path, folder));
+  if (!row) throw new Error(`Could not link ${tildeOf(folder)}.`);
+  recordFolder(pid, `linked ${tildeOf(folder)}`, { op: "link", repo: row, relabelled: stale ? Number(stale.is_primary) : null });
+  return { project: getProject(pid), folder, added: true, home: false };
 }
 
-/** Marks the question answered by a merge, once main/folders.js has moved everything. */
-function mergedFolderAnswer(id, auditIds = []) {
-  conflictRow(id);
-  answerConflict(id, "merged", auditIds);
+/**
+ * Takes a linked folder off a project. Home is not taken off this way: make
+ * another folder Home first, or choose No folder, because a project that
+ * quietly lost its Home would run its commands somewhere else. A folder a
+ * Workbench is working in stays until the Workbench is finished.
+ */
+function unlinkFolder(projectId, raw) {
+  const pid = Number(projectId);
+  const p = getProject(pid);
+  if (!p) throw new Error("That project is not there any more.");
+  const folder = folderRule.normalise(raw);
+  if (p.path && folderRule.alike(p.path, folder)) {
+    throw new Error(`${tildeOf(folder)} is ${p.name}'s Home. Make another folder Home first, then take this one off.`);
+  }
+  const tasksOn = (ids) => (ids.length ? sqlP(`SELECT id, repo_id FROM tasks WHERE repo_id IN (${ids.map(Number).join(", ")})`, []) : []);
+  const rows = sqlP("SELECT * FROM repos WHERE project_id = :p1", [pid]).filter((r) => folderRule.alike(r.path, folder));
+  const pointed = tasksOn(rows.map((r) => r.id));
+  const { statements, kept, held } = folderRule.releaseStatements(sqlP, pid, folder);
+  if (!held.length && !kept.length) throw new Error(`${tildeOf(folder)} is not one of ${p.name}'s folders.`);
+  if (held.length && !kept.length) throw new Error(`A Workbench is working in ${tildeOf(folder)}. Finish or Discard it first, then take the folder off.`);
+  for (const [q, params] of statements) sqlP(q, params);
+  for (const repo of kept) {
+    recordFolder(pid, `took ${tildeOf(folder)} off`, { op: "unlink", repo, tasks: pointed.filter((t) => Number(t.repo_id) === Number(repo.id)).map((t) => Number(t.id)) });
+  }
+  return { project: getProject(pid), folder, removed: kept.length };
 }
+
+/** Makes one of the project's folders its Home: an update History can undo. Its old Home stays, linked. */
+function setHomeFolder(projectId, raw, detected = {}) {
+  const pid = Number(projectId);
+  const folder = folderRule.normalise(raw);
+  if (!folderRule.projectFolders(sqlP, pid).some((f) => folderRule.alike(f.path, folder))) {
+    throw new Error(`${tildeOf(folder)} is not one of this project's folders. Add it first.`);
+  }
+  return updateProject(pid, { path: folder }, detected);
+}
+
+/** Reverses linkFolder or unlinkFolder from the row it carried. */
+function undoFolder(op) {
+  const repo = op && op.repo;
+  if (!repo || repo.id == null) throw new Error("That folder change carried no folder to put back.");
+  if (op.op === "link") {
+    const now = one("SELECT id, is_primary FROM repos WHERE id = :id", { id: Number(repo.id) });
+    if (!now) return;
+    // Made Home since: undoing the link would take the project's Home row.
+    if (Number(now.is_primary)) throw new Error(`${tildeOf(repo.path)} is this project's Home now. Make another folder Home first, then undo this.`);
+    if (op.relabelled !== null && op.relabelled !== undefined) {
+      run("UPDATE repos SET is_primary = :p WHERE id = :id", { p: Number(op.relabelled), id: Number(repo.id) });
+      return;
+    }
+    if (one("SELECT id FROM workbenches WHERE repo_id = :id LIMIT 1", { id: Number(repo.id) })) {
+      throw new Error(`A Workbench is working in ${tildeOf(repo.path)} now. Finish or Discard it first.`);
+    }
+    run("UPDATE tasks SET repo_id = NULL WHERE repo_id = :id", { id: Number(repo.id) });
+    run("DELETE FROM repos WHERE id = :id", { id: Number(repo.id) });
+    return;
+  }
+  if (op.op === "unlink") {
+    const taken = one("SELECT id, project_id, path FROM repos WHERE id = :id", { id: Number(repo.id) });
+    if (taken && Number(taken.project_id) === Number(repo.project_id) && folderRule.alike(taken.path, repo.path)) return;
+    if (taken) throw new Error(`Another folder has taken this one's place since, so ${tildeOf(repo.path)} cannot come back here. Add it again instead.`);
+    const cols = Object.keys(repo).filter((k) => /^[a-z_]+$/.test(k));
+    run(`INSERT INTO repos (${cols.join(", ")}) VALUES (${cols.map((k) => `:${k}`).join(", ")})`, Object.fromEntries(cols.map((k) => [k, repo[k] ?? null])));
+    for (const t of op.tasks || []) run("UPDATE tasks SET repo_id = :repo WHERE id = :id AND repo_id IS NULL", { repo: Number(repo.id), id: Number(t) });
+    return;
+  }
+  throw new Error("That folder change is not one Delphi knows how to put back.");
+}
+
+/**
+ * The items Delphi filed by a guess that nobody has moved or confirmed yet,
+ * for the "Filed under" chip. Only items still in the project they were filed
+ * under: one moved some other way is settled by that move.
+ */
+function filedRoutes() {
+  return all(`SELECT r.entity, r.entity_id, r.project_id, r.folder, r.via, r.detail, r.created_at, p.name AS project_name
+                FROM filed_routes r JOIN projects p ON p.id = r.project_id
+               WHERE r.settled_at IS NULL
+                 AND ((r.entity = 'task' AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = r.entity_id AND t.project_id = r.project_id))
+                   OR (r.entity = 'note' AND EXISTS (SELECT 1 FROM notes n WHERE n.id = r.entity_id AND n.project_id = r.project_id))
+                   OR (r.entity = 'scratchpad' AND EXISTS (SELECT 1 FROM scratchpads s WHERE s.id = r.entity_id AND s.project_id = r.project_id)))
+               ORDER BY r.created_at DESC LIMIT 500`).map((r) => {
+    let detail = {};
+    try { detail = JSON.parse(r.detail || "{}") || {}; } catch {}
+    return { ...r, detail, shown: tildeOf(r.folder), words: routeRule.chipWords(r, r.project_name),
+             others: (folderRule.holders(sqlP, r.folder) || []).filter((h) => h.id !== Number(r.project_id) && h.status !== "archived").map((h) => ({ id: h.id, name: h.name })) };
+  });
+}
+
+/** "That's right": the chip goes, and the folder's next guess counts it. */
+function settleRoute(entity, id) {
+  run("UPDATE filed_routes SET settled_at = datetime('now') WHERE entity = :entity AND entity_id = :id AND settled_at IS NULL", { entity: String(entity), id: Number(id) });
+  return { settled: true };
+}
+
+const newestAudit = () => Number(one("SELECT COALESCE(MAX(id), 0) AS n FROM audit").n);
+// The window's own rows only: an agent writing to the same file in between is
+// not part of what the window did.
+const auditSince = (from) => all("SELECT id FROM audit WHERE id > :from AND actor IS :actor ORDER BY id", { from, actor: WINDOW.actor }).map((r) => Number(r.id));
+
+/** What the resolver says for a folder, for the window (discovery's suggestion). */
+const routeFor = (facts) => routeRule.resolve(sqlP, facts);
 
 // ---------------------------------------------------------------------------
 // "Add this folder?": folders agents worked in that are no project's. The
@@ -3441,7 +3533,7 @@ const ATOMIC = [
   "setQueue", "claimNext", "releaseClaim", "completeClaim", "extendClaim", "reclaimExpired",
   "createNote", "updateNote", "deleteNote", "createScratchpad", "appendScratchpad", "patchScratchpad",
   "deleteScratchpad", "derive", "createLink", "deleteLink", "createAlert", "createHandoff", "updateHandoff",
-  "createExternalTask", "deleteSession", "keepFolderAnswer", "giveFolder", "mergedFolderAnswer",
+  "createExternalTask", "deleteSession", "linkFolder", "unlinkFolder", "setHomeFolder",
 ];
 
 module.exports = {
@@ -3481,7 +3573,7 @@ module.exports = {
   listWorkspaces, getWorkspace, workspaceByPath, createWorkspace, updateWorkspace, deleteWorkspace,
   projectsInWorkspace, workspacesForProject, linkProjectWorkspace, unlinkProjectWorkspace,
   adoptProjectPaths,
-  folderConflicts, keepFolderAnswer, giveFolder, mergedFolderAnswer, conflictRow,
+  projectFolderList, linkFolder, unlinkFolder, setHomeFolder, filedRoutes, settleRoute, routeFor,
   folderDiscoveries, foldersToAttach, discoveryRow, settleDiscovery, ignoreDiscovery,
   folderAdoption: () => folderAdoption, holdFolderAdoption, newestAudit, auditSince,
   listSessions, getSession, createSession, updateSession, deleteSession, sessionChanges,

@@ -1,13 +1,14 @@
 // Add folder as project, and the bar that offers to fix a folder that moved.
 //
-// A project is a folder. This is the way in: the switcher's "Add folder as
-// project...", the Cmd+K command, or a folder dropped anywhere on the window.
-// Each asks the main process what the folder is (main/folders.js inspect,
-// which writes nothing) and shows one sheet: the repository root, the remote
-// and default branch, a name and a key. Three answers skip the sheet or
-// change it, because they are the mistakes it exists to catch:
+// This is the way in for a new project with its Home folder: the switcher's
+// "Add folder as project...", the Cmd+K command, or a folder dropped anywhere
+// on the window. Each asks the main process what the folder is
+// (main/folders.js inspect, which writes nothing) and shows one sheet: the
+// repository root, the remote and default branch, a name and a key. Three
+// answers change it, because they are the mistakes it exists to catch:
 //
-//   - the folder is already a project: switch to it, and say so;
+//   - projects already work in the folder: named, each a click away, and a
+//     new one still allowed, since a folder can be several projects';
 //   - a project with no folder has the folder's name: offer to link the two,
 //     because it is probably the same work, filed before it had a folder;
 //   - it is a subfolder or a Workbench: the project is the repository, and
@@ -79,18 +80,13 @@ globalThis.DelphiAddFolder = (() => {
     try { look = await window.delphi.folders.inspect(folder); } catch (e) { say(plainError(e), true); return; }
     if (!look || look.cancelled) return;
     if (!look.ok) { say(look.why || "That folder cannot be added.", true); return; }
-    if (look.existing && !look.existing.archived) {
-      await app.go({ projectId: look.existing.id, view: "overview" });
-      say(`${look.shown} is already ${look.existing.name}. Switched to it.`);
-      return;
-    }
     showSheet(look);
   }
 
   function showSheet(look) {
     const name = look.suggestedName;
     openSheet((box, close) => {
-      const title = look.existing ? `${look.shown} is an archived project's folder` : `Add ${name} as a project`;
+      const title = `Add ${name} as a project`;
       box.append(el("h3", { textContent: title }));
 
       const facts = el("div", { className: "af-facts" });
@@ -107,16 +103,22 @@ globalThis.DelphiAddFolder = (() => {
 
       const msg = el("div", { className: "err-msg", role: "alert" });
       const actions = el("div", { className: "ask-actions" });
-      const cancel = el("button", { className: "btn", type: "button", textContent: look.existing ? "Close" : "Cancel" });
+      const cancel = el("button", { className: "btn", type: "button", textContent: "Cancel" });
       cancel.onclick = close;
 
-      if (look.existing) {
-        box.append(el("p", { textContent: `It belongs to ${look.existing.name}, which is archived. A folder belongs to one project, so bring that one back rather than adding another.` }));
-        const show = el("button", { className: "btn primary", type: "button", textContent: "Show archived projects" });
-        show.onclick = () => { close(); app.openSettings("archived"); };
-        actions.append(cancel, show);
-        box.append(actions);
-        return;
+      // Projects that work in this folder already. A folder can be several
+      // projects', so a new one is still allowed; each is a click away when it
+      // is the one that was meant.
+      const live = (look.holders || []).filter((h) => !h.archived);
+      if (live.length) {
+        const offer = el("div", { className: "af-match" });
+        offer.append(I("folder", "sm"), el("span", { className: "grow", textContent: `${look.shown} is ${live.map((h) => h.name).join(" and ")}'s already. Add another project for different work in it, or open the one you meant.` }));
+        for (const h of live.slice(0, 3)) {
+          const go = el("button", { className: "btn sm", type: "button", textContent: `Open ${h.name}` });
+          go.onclick = async () => { close(); await app.go({ projectId: h.id, view: "overview" }); };
+          offer.append(go);
+        }
+        box.append(offer);
       }
 
       // A project with no folder and this folder's name: offered first.
@@ -163,7 +165,7 @@ globalThis.DelphiAddFolder = (() => {
       for (const input of [nameIn, keyIn]) input.onkeydown = (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); submit(); } };
       actions.append(cancel, add);
       box.append(actions);
-    }, { label: look.existing ? "Folder already a project's" : `Add ${name} as a project` });
+    }, { label: `Add ${name} as a project` });
   }
 
   // --- dropping a folder on the window ---------------------------------------
