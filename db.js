@@ -2135,7 +2135,7 @@ function writeBackToPad(task, before) {
  */
 function toggleLine(entity, id, tick = {}) {
   const md = require("./ui/markdown.js");
-  const line = Number(tick.line);
+  const line = typeof tick.line === "number" ? tick.line : NaN;
   if (!Number.isInteger(line) || line < 0 || typeof tick.text !== "string" || typeof tick.checked !== "boolean") {
     throw new Error("A tick needs a line number, the line's text and checked.");
   }

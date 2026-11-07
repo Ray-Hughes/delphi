@@ -784,7 +784,7 @@ globalThis.DelphiDrawer = (() => {
               // Read again: Keep mine never lands on a copy nobody saw.
               const again = await read();
               if (again === undefined) return "kept";
-              if (again === undefined || lf(again) !== theirs) continue;
+              if (lf(again) !== theirs) continue;
               body = m ? m.mine : next;
             }
           }
