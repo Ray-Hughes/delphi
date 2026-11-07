@@ -1,6 +1,6 @@
 // Folders, the window's half: Add folder as project, the fix for a folder that
-// moved, the shared-folder question in Needs you, and what git says about each
-// folder.
+// moved, the shared-folder question and the "Add this folder?" question in
+// Needs you, and what git says about each folder.
 //
 // The rule for which folder is a project's lives in workbench/folders.js and
 // the writes in db.js, so the server and the app agree. This is the part only
@@ -109,11 +109,15 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
     if (look.existing) throw new Error(rule.takenSentence({ name: look.existing.name, status: look.existing.archived ? "archived" : "active" }));
     const label = String(name || "").trim() || look.suggestedName;
     const colours = ["#6366F1", "#0f7a80", "#2f8757", "#8a6a00", "#c4572a", "#c04a41", "#7c4dbd", "#5d6b82"];
-    return db.createProject({
+    const made = db.createProject({
       key: String(key || "").trim() || look.suggestedKey, name: label, path: look.top,
       colour: colours[db.listProjects().length % colours.length],
       remote: look.remote, branch: look.defaultBranch,
     });
+    // However the sheet was reached (the question's button, the switcher, a
+    // drop), a folder that is a project now is not a question any more.
+    db.settleDiscovery(look.top, "added", made.id);
+    return made;
   }
 
   /**
@@ -124,7 +128,37 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
     const look = await inspect(folder);
     if (!look.ok) throw new Error(look.why || "That folder cannot be used.");
     if (look.existing && look.existing.id !== Number(projectId)) throw new Error(rule.takenSentence({ name: look.existing.name, status: look.existing.archived ? "archived" : "active" }));
-    return db.updateProject(Number(projectId), { path: look.top }, { remote: look.remote, branch: look.defaultBranch });
+    const after = db.updateProject(Number(projectId), { path: look.top }, { remote: look.remote, branch: look.defaultBranch });
+    db.settleDiscovery(look.top, "attached", Number(projectId));
+    return after;
+  }
+
+  /**
+   * The "Add this folder?" questions, worded for Needs you: who worked there,
+   * what git says it is, and the projects it could be attached to, which are
+   * only those with no folder, since a folder is one project's.
+   */
+  function discoveries() {
+    const list = db.folderDiscoveries();
+    if (!list.length) return [];
+    const attachable = db.foldersToAttach();
+    return list.map((d) => ({
+      ...d, shown: tilde(d.path), ownerRepo: ownerRepo(d.remote), attachable,
+    }));
+  }
+
+  /**
+   * "Attach to an existing project": the folder becomes that project's, as
+   * if it had been chosen in its settings, so History can undo it. Refused
+   * for a project that has a folder already rather than swapping it, because
+   * swapping would quietly leave the old folder with no project.
+   */
+  async function attach(id, projectId) {
+    const row = db.discoveryRow(id);
+    const project = db.getProject(Number(projectId));
+    if (!project || project.status === "archived") throw new Error("That project is not there any more.");
+    if (project.path) throw new Error(`${project.name} has a folder already (${tilde(project.path)}). A project has one folder, so pick one with none, or add this as a new project.`);
+    return setFolder(project.id, row.path);
   }
 
   /** No folder, on purpose. The repos rows stay, for the folder's settings, and are not read. */
@@ -236,7 +270,7 @@ function createFolders({ db, git, pick = async () => null, items = () => db.item
     return changed;
   }
 
-  return { inspect, create, setFolder, clearFolder, listProjects, conflicts, merge, detectAll, detect };
+  return { inspect, create, setFolder, clearFolder, listProjects, conflicts, merge, detectAll, detect, discoveries, attach };
 }
 
 /** The IPC channels. Every one is the window's: there is no MCP tool for any of them. */
@@ -249,6 +283,9 @@ function register(handle, { folders, db }) {
   handle("folders:keep", (id) => db.keepFolderAnswer(id));
   handle("folders:give", (id, toProjectId) => db.giveFolder(id, toProjectId));
   handle("folders:merge", (id, fromProjectId) => folders.merge(id, fromProjectId));
+  handle("folders:discoveries", () => folders.discoveries());
+  handle("folders:attach", (id, projectId) => folders.attach(id, projectId));
+  handle("folders:ignore", (id) => db.ignoreDiscovery(id));
 }
 
 module.exports = { createFolders, register, ownerRepo, tilde };

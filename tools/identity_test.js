@@ -377,7 +377,9 @@ const PS_ONLY_SERVERS = JSON.stringify([
   identity.writeAlive(whoResolved, { version: "test" });
   check("a heartbeat is invisible to the database: data_version does not move", dataVersion(), v);
   check("it is a file in the data folder, not named like the database", path.basename(aliveAt), "app.alive.json");
-  rpc(cleanEnv({ DELPHI_DB: whoFile }), [["whoami"]]);
+  // Discovery off: the server runs in the checkout, which is no project in
+  // this file, and noting that folder is a write this check is not about.
+  rpc(cleanEnv({ DELPHI_DB: whoFile, DELPHI_DISCOVERY: "0" }), [["whoami"]]);
   check("and a server starting on a file that has its id writes nothing either", dataVersion(), v);
   const other = locate.resolve({ env: { DELPHI_DB: path.join(whoDir, "other.db") } });
   check("a second database in the same folder has a heartbeat file of its own", identity.aliveFile(other) !== aliveAt, true);

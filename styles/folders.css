@@ -69,3 +69,10 @@
 }
 .fc-msg:empty { display: none; }
 .fc-msg { margin-left: 24px; font-size: 12.5px; }
+
+/* "Add this folder?", in the same box. The head wraps, because the folder
+   name is a path and can be long. */
+.fd .fc-head { flex-wrap: wrap; row-gap: 2px; }
+.fd .fc-head > span { color: var(--ink); }
+.fd .fc-confirm select.field { width: auto; max-width: 260px; flex: none; }
+.fd-none { font-size: 12px; color: var(--ink-dim); align-self: center; }

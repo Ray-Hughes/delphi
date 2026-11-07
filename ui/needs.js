@@ -10,17 +10,26 @@
 //
 // The words are drawn from what each project holds now, not what it held when
 // the migration ran.
+//
+// Below those, "Add this folder?": a folder an agent session worked in that is
+// no project's (workbench/discover.js). The server only asks; the three
+// answers are here. Add as a new project opens Add folder on that folder, so
+// the sheet shows the remote and branch git reports now. Attach offers only
+// projects with no folder, because a folder is one project's. Not a project
+// is kept for good.
 
 globalThis.DelphiNeeds = (() => {
   const I = (name, size) => DelphiIcons.icon(name, size);
   let app = null;
   let items = [];
+  let found = [];
 
   async function load() {
     try { items = await window.delphi.folders.conflicts(); } catch { items = []; }
+    try { found = await window.delphi.folders.discoveries(); } catch { found = []; }
     return items;
   }
-  const count = () => items.length;
+  const count = () => items.length + found.length;
 
   /**
    * The short name a button can carry: "SSNR / MPI Person Update" is SSNR,
@@ -127,12 +136,100 @@ globalThis.DelphiNeeds = (() => {
     return node;
   }
 
+  /** "Today at 2:14 PM", "on 3 Nov": when an agent was last there, from SQLite's UTC text. */
+  function when(text) {
+    if (!text) return "";
+    const d = new Date(String(text).replace(" ", "T") + (/[zZ]|[+-]\d\d:?\d\d$/.test(text) ? "" : "Z"));
+    if (Number.isNaN(d.getTime())) return "";
+    const today = new Date();
+    if (d.toDateString() === today.toDateString()) return `today at ${d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+    return `on ${d.toLocaleDateString([], { day: "numeric", month: "short" })}`;
+  }
+
+  function foundNode(d) {
+    const node = el("div", { className: "fc fd" });
+    node.dataset.folderFound = String(d.id);
+    const msg = el("div", { className: "fc-msg", role: "status" });
+    const who = d.via === "migration" ? "A workspace from before folders became projects is" : `${d.harness || "An agent"} worked in`;
+    const lead = el("div", { className: "fc-head" }, I("folderplus", "sm"),
+      el("b", {}, "Add this folder? "),
+      el("span", {}, `${who} `, el("span", { className: "mono", textContent: d.shown }), d.via === "migration" ? ", and it isn't a project yet." : ", which isn't a project yet."));
+    const facts = [];
+    if (d.ownerRepo || d.remote) facts.push(`${d.ownerRepo || d.remote}${d.branch ? `, branch ${d.branch}` : ""}.`);
+    else if (d.via !== "migration") facts.push("Not a git repository.");
+    if (d.via !== "migration") {
+      const times = d.seen_count > 1 ? `${d.seen_count} sessions, the last ${when(d.last_seen)}` : `Seen ${when(d.last_seen)}`;
+      facts.push(`${times}.`);
+    }
+    facts.push("Nothing was made: it is yours to decide.");
+    node.append(lead, el("p", { className: "fc-words", textContent: facts.join(" ") }));
+
+    const acts = el("div", { className: "fc-acts" });
+    const all = [];
+    const button = (text, cls = "btn sm") => { const b = el("button", { className: cls, type: "button", textContent: text }); all.push(b); return b; };
+    const busy = (on) => all.forEach((b) => { b.disabled = on; });
+    const fail = (e) => { msg.className = "fc-msg err-msg"; msg.textContent = String(e && e.message ? e.message : e); busy(false); };
+    const finish = async (words) => { await load(); await app.refresh(); if (words) app.notify(words); };
+
+    const add = button("Add as a new project", "btn sm primary");
+    add.onclick = async () => {
+      // Add folder asks git again and writes nothing until its own Add, which
+      // settles this question in the main process and refreshes the window. A
+      // sheet cancelled leaves the question where it was.
+      await DelphiAddFolder.open(d.path);
+    };
+    acts.append(add);
+
+    const attach = button("Attach to a project");
+    const none = !d.attachable || !d.attachable.length;
+    if (none) {
+      attach.disabled = true;
+      attach.title = "Every project has a folder already, and a folder belongs to one project.";
+      all.pop();
+    }
+    attach.onclick = () => {
+      busy(true);
+      const pick = el("select", { className: "field" });
+      pick.setAttribute("aria-label", "Project to attach the folder to");
+      for (const p of d.attachable) pick.append(el("option", { value: String(p.id), textContent: p.name }));
+      const sure = el("div", { className: "fc-confirm" },
+        el("span", { className: "grow", textContent: "Only projects with no folder are listed: a project has one folder." }), pick);
+      const go = el("button", { className: "btn sm primary", type: "button", textContent: "Attach" });
+      const back = el("button", { className: "btn sm ghost", type: "button", textContent: "Cancel" });
+      back.onclick = () => { sure.remove(); busy(false); attach.focus(); };
+      go.onclick = async () => {
+        go.disabled = back.disabled = true;
+        const chosen = d.attachable.find((p) => String(p.id) === pick.value);
+        try {
+          await window.delphi.folders.attach(d.id, Number(pick.value));
+          await finish(`${chosen ? chosen.name : "That project"} has a folder now: ${d.shown}. History can put it back.`);
+        } catch (e) { sure.remove(); fail(e); }
+      };
+      sure.append(back, go);
+      node.append(sure);
+      pick.focus();
+    };
+    acts.append(attach);
+
+    const ignore = button("Not a project", "btn sm ghost");
+    ignore.title = `Delphi will not ask about ${d.shown} again.`;
+    ignore.onclick = async () => {
+      busy(true);
+      try { await window.delphi.folders.ignore(d.id); await finish(`Delphi won't ask about ${d.shown} again.`); } catch (e) { fail(e); }
+    };
+    acts.append(ignore);
+    if (none) acts.append(el("span", { className: "fd-none", textContent: "Every project has a folder, so there is none to attach it to." }));
+    node.append(acts, msg);
+    return node;
+  }
+
   /** Into the Needs you page, above everything else on it. */
   function mount(page) {
-    if (!items.length) return;
+    if (!items.length && !found.length) return;
     const box = el("div", { className: "box fc-box" });
-    box.append(el("div", { className: "sub-h" }, "Folders", el("span", { className: "r", textContent: "each folder is one project now" })));
+    box.append(el("div", { className: "sub-h" }, "Folders", el("span", { className: "r", textContent: "each folder is one project" })));
     for (const c of items) box.append(itemNode(c));
+    for (const d of found) box.append(foundNode(d));
     page.append(box);
   }
 

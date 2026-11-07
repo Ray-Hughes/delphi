@@ -13,7 +13,7 @@
  */
 
 const { execFileSync } = require("child_process");
-const { pathToFileURL } = require("url");
+const { pathToFileURL, fileURLToPath } = require("url");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -1011,6 +1011,10 @@ const TOOLS = {
         app,
         checkout_db_ignored: RESOLVED.checkoutDbIgnored,
         sqlite_route: DATABASE.kind,
+        // Folders agents worked in that wait on a person in Needs you. Said
+        // here so an agent that just worked in one knows it was noticed and
+        // does not make a project for it.
+        pending_folders: pendingFolders(),
       };
     },
   },
@@ -2783,6 +2787,106 @@ const READ_ONLY_TOOLS = new Set(secondOpinion.READ_ONLY_TOOLS);
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 
+// --- Folders a session works in that are no project's ----------------------
+//
+// The first time a session calls a tool, the folder it was started in (and
+// each root the client names, when it names any) is put to workbench/discover.js.
+// A folder no project has becomes one "Add this folder?" row for a person to
+// answer in the window; nothing here makes a project. On a tool call rather
+// than at initialize, because Claude Code starts every registered server in
+// every session it opens, and a folder an agent never used Delphi from is not
+// a question worth asking.
+//
+// No audit row. The CHECK on audit.entity has nothing a folder with no
+// project is (task, note, project, link, scratchpad, session, handoff), and
+// the next widening of it belongs to another slice. Who saw it is on the row
+// itself (seen_by, and the harness in detail), which is what the question
+// shows, and the person's answer writes History through the project it makes
+// or changes.
+const discover = require("../workbench/discover");
+const discoverGit = require("../workbench/git");
+const CLIENT = { name: null, roots: false };
+const discovered = new Set(); // folders this session has already counted
+let discovering = Promise.resolve();
+let discoveryWaiting = 0; // queued and not finished, so a tool call knows to wait
+let discoveryStarted = false;
+const DISCOVERY_WAIT_MS = 3000;
+// A discovery must never cost a tool call its answer, so every failure is
+// said on stderr and swallowed.
+const discoveryOff = () => READ_ONLY || CLI_CLIENT || CLIENT.name === "delphi-cli" || process.env.DELPHI_DISCOVERY === "0";
+
+async function discoverFolder(folder) {
+  const found = await discover.consider(sql, folder, { git: discoverGit, dataDir: RESOLVED.dataDir });
+  if (found.skip) return found;
+  // Counted once per session, so seen_count is sessions rather than calls.
+  if (discovered.has(found.path)) return found;
+  const [q, p] = discover.recordStatement(found, {
+    actor: process.env.DELPHI_ACTOR || null,
+    harness: discover.harnessName(process.env.DELPHI_ACTOR, CLIENT.name),
+    client: CLIENT.name, cwd: folder,
+  });
+  sql(q, p);
+  // After the write, so a folder whose write failed is not counted as done.
+  discovered.add(found.path);
+  return found;
+}
+
+function queueDiscovery(folders) {
+  if (discoveryOff()) return;
+  for (const folder of folders) {
+    discoveryWaiting += 1;
+    discovering = discovering.then(() => discoverFolder(folder)).catch((error) => {
+      // Looked at again on the next tool call: a locked file is usually a
+      // moment's contention, not a reason to forget the folder for the session.
+      discoveryStarted = false;
+      process.stderr.write(`delphi: could not note the folder ${folder}: ${(error && error.message) || error}\n`);
+    }).finally(() => { discoveryWaiting -= 1; });
+  }
+}
+
+// Requests this server sends the client (only roots/list), by id. Answers come
+// back on stdin as messages with no method, and are routed here rather than
+// to handle(), which would answer an answer with "Unknown method".
+const outgoing = new Map();
+let outgoingId = 0;
+function askClient(method, params = {}) {
+  const id = `delphi-${++outgoingId}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { outgoing.delete(id); reject(new Error(`${method} was not answered`)); }, 10000);
+    timer.unref();
+    outgoing.set(id, { resolve, reject, timer });
+    send({ jsonrpc: "2.0", id, method, params });
+  });
+}
+
+function pendingFolders() {
+  try {
+    const list = discover.pending(sql);
+    return { count: list.length, folders: list.slice(0, 5).map((f) => f.path), answer_in: "Needs you, in the Delphi window" };
+  } catch {
+    return null;
+  }
+}
+
+// The client's roots, once it has said them. Kept rather than acted on: they
+// count only once the session calls a tool, for the reason above.
+let ROOTS = [];
+function askRoots() {
+  if (!CLIENT.roots || discoveryOff()) return;
+  askClient("roots/list").then((result) => {
+    const folders = [];
+    for (const r of (result && result.roots) || []) {
+      try { if (String(r.uri).startsWith("file:")) folders.push(fileURLToPath(r.uri)); } catch {}
+    }
+    ROOTS = folders;
+    if (discoveryStarted) queueDiscovery(folders);
+  }).catch((error) => {
+    // A client that says it has roots and never names them costs only the
+    // roots; the folder the session started in is still looked at.
+    process.stderr.write(`delphi: the client did not list its roots: ${(error && error.message) || error}\n`);
+  });
+}
+
 /**
  * Answers one request.
  *
@@ -2796,6 +2900,8 @@ async function handle(req) {
   const { id, method, params } = req;
 
   if (method === "initialize") {
+    CLIENT.name = (params && params.clientInfo && params.clientInfo.name) || null;
+    CLIENT.roots = Boolean(params && params.capabilities && params.capabilities.roots);
     const scratchpad = READ_ONLY ? { on: false } : scratchpadState();
     const second = READ_ONLY ? { on: false } : secondOpinionState();
     // Both directives, when both are on, as separate sections of one text.
@@ -2836,8 +2942,17 @@ async function handle(req) {
     };
   }
 
+  if (method === "notifications/initialized") { askRoots(); return null; }
+  if (method === "notifications/roots/list_changed") { askRoots(); return null; }
+
   if (method === "tools/call") {
     refuseIfReplaced();
+    if (!discoveryStarted) { discoveryStarted = true; queueDiscovery([process.cwd(), ...ROOTS]); }
+    // Only when something is queued: an await on every call would let a
+    // second request's synchronous tool start before the first one's.
+    // Bounded: git on a drive that is not answering can take its full timeout,
+    // and a tool call should not. The discovery carries on behind it.
+    if (discoveryWaiting) await Promise.race([discovering, new Promise((r) => setTimeout(r, DISCOVERY_WAIT_MS).unref())]);
     const tool = TOOLS[params.name];
     if (!tool || (INTERNAL_TOOLS.has(params.name) && !CLI_CLIENT)) throw new Error(`Unknown tool ${params.name}`);
     if (READ_ONLY && !READ_ONLY_TOOLS.has(params.name)) {
@@ -2932,6 +3047,17 @@ process.stdin.on("data", (chunk) => {
     try {
       req = JSON.parse(line);
     } catch {
+      continue;
+    }
+
+    // An answer to something this server asked the client (roots/list).
+    if (req && req.method === undefined && req.id !== undefined) {
+      const waiter = outgoing.get(req.id);
+      if (waiter) {
+        outgoing.delete(req.id);
+        clearTimeout(waiter.timer);
+        if (req.error) waiter.reject(new Error(req.error.message || "error")); else waiter.resolve(req.result);
+      }
       continue;
     }
 
