@@ -364,7 +364,11 @@ const ago = (stamp) => TIME.ago(stamp);
 // ---------------------------------------------------------------------------
 
 async function refresh() {
+  // Alongside the first query rather than after the last: an undo from
+  // History lands here, and the page has to draw with the layout it put back.
+  const layouts = window.DelphiLayout ? DelphiLayout.load() : null;
   state.projects = await window.delphi.projects.list();
+  await layouts;
   state.workspaces = await window.delphi.workspaces.list();
   // One call per workspace rather than a new IPC, because there are a handful of
   // workspaces and the tree has to know which project sits under which.
@@ -1110,6 +1114,7 @@ function render() {
   if (window.DelphiRecovery) DelphiRecovery.remember({ projectId: state.projectId, view: state.view });
   if (window.DelphiTopbar) DelphiTopbar.paint();
   if (window.DelphiAddFolder) DelphiAddFolder.paintFix(state);
+  if (window.DelphiLayout) DelphiLayout.paint(state);
   if (window.DelphiToday) DelphiToday.paint(state);
   if (window.DelphiTasks) DelphiTasks.paint(state);
   if (window.DelphiMemory) DelphiMemory.paint(state);
@@ -6010,7 +6015,9 @@ async function renderHistory(root) {
     row.append(el("span", { className: "audit-when", textContent: ago(e.at) }));
     const who = auditWho(e);
     const what = el("div", { className: "audit-what" },
-      el("div", {}, el("span", { textContent: `${e.entity} ${who.summary}` }),
+      // A layout's summary is already a sentence ("Layout changed"), and
+      // "layout Layout changed" would say it twice.
+      el("div", {}, el("span", { textContent: e.entity === "layout" ? who.summary : `${e.entity} ${who.summary}` }),
                     ...(who.by ? [el("span", { className: "audit-by", textContent: who.by })] : [])));
     if (e.label) what.append(el("div", { className: "lbl", textContent: e.label.slice(0, 120) }));
     row.append(what);
@@ -10691,6 +10698,28 @@ function section(title, count, hint, ...nodes) {
 
 const isToday = (stamp) => TIME.dayOf(stamp) === today();
 
+// Edit this page (ui/layout.js): Runs' two columns are its regions, so a
+// section moves up and down its own column and never across. The ids are what
+// stored layouts name; never rename one.
+const RUNS_LAYOUT = window.DelphiLayout ? DelphiLayout.register({
+  id: "runs", label: "Runs", regionsClass: "runs-cols",
+  regions: [
+    { id: "work", label: "Runs", sections: [
+      { id: "running", label: "Running" },
+      { id: "queued", label: "Queued", empty: "Queued runs show here while they wait for a slot." },
+      { id: "finished", label: "Finished" },
+    ] },
+    { id: "side", label: "Side column", className: "waiting-col", sections: [
+      { id: "waiting", label: "Waiting on you" },
+      { id: "cost", label: "Cost and time", empty: "The cost and time card shows here." },
+    ] },
+  ],
+  presets: [
+    { id: "default", label: "Default", desc: "Every section, in Runs' own order.", layout: {} },
+    { id: "focus", label: "Focus", desc: "What is running and what waits on you, nothing else.", layout: { hidden: ["queued", "finished", "cost"] } },
+  ],
+}) : null;
+
 function renderRuns(root) {
   const page = el("div", { className: "home-page" });
   page.append(slotsBar());
@@ -10703,17 +10732,19 @@ function renderRuns(root) {
 
   const box = (rows, empty) => el("div", { className: "box" }, rows.length ? rows : el("div", { className: "empty-line", textContent: empty }));
 
-  const left = el("div");
-  left.append(section("Running", running.length, "each in its own Workbench",
-    box(running.map(runningRow), "Nothing is running. Hand a task to an agent from its panel, or approve one waiting on you.")));
+  // Each section built as it always was, then arranged by the layout.
+  const parts = {};
+  parts.running = section("Running", running.length, "each in its own Workbench",
+    box(running.map(runningRow), "Nothing is running. Hand a task to an agent from its panel, or approve one waiting on you."));
+  parts.queued = null;
   if (queued.length) {
     const hint = reorderOn() && queued.length > 1 ? "start in this order as slots free; drag to change it" : "start in this order as slots free";
-    left.append(section("Queued", queued.length, hint, box(queued.map((r, i) => queuedRow(r, i, queued)), "")));
+    parts.queued = section("Queued", queued.length, hint, box(queued.map((r, i) => queuedRow(r, i, queued)), ""));
   }
   const earlier = el("button", { className: "ts-linkbtn", type: "button", textContent: state.runsEarlier ? "Today only" : "Earlier" });
   earlier.onclick = () => { state.runsEarlier = !state.runsEarlier; render(); };
-  left.append(section(state.runsEarlier ? "Finished" : "Finished today", finished.length, earlier,
-    box(finished.map(finishedRow), state.runsEarlier ? "Nothing has finished yet." : "Nothing has finished today.")));
+  parts.finished = section(state.runsEarlier ? "Finished" : "Finished today", finished.length, earlier,
+    box(finished.map(finishedRow), state.runsEarlier ? "Nothing has finished yet." : "Nothing has finished today."));
 
   // Each agent's own unit, summed per agent and never across them.
   const totals = new Map();
@@ -10728,15 +10759,15 @@ function renderRuns(root) {
     const note = el("div", { className: "rule-note" }, "Today so far: ");
     spent.forEach((t, i) => note.append(i ? ", " : "", el("b", { textContent: `${t.label} ${t.usd ? `$${t.usd.toFixed(2)}` : `${compactNumber(t.tokens)} tokens`}` })));
     note.append(". Each agent reports its own unit, so they are not added together.");
-    left.lastChild.append(note);
+    parts.finished.append(note);
   }
 
-  const right = el("div", { className: "waiting-col" });
-  right.append(section("Waiting on you", waiting.length, "paused until you answer",
-    box(waiting.map(waitingRow), "Nothing is waiting on you.")));
-  if (window.DelphiLedger) right.append(DelphiLedger.runsCard());
+  parts.waiting = section("Waiting on you", waiting.length, "paused until you answer",
+    box(waiting.map(waitingRow), "Nothing is waiting on you."));
+  parts.cost = window.DelphiLedger ? DelphiLedger.runsCard() : null;
 
-  page.append(el("div", { className: "runs-cols" }, left, right));
+  page.append(RUNS_LAYOUT ? DelphiLayout.mount("runs", parts)
+    : el("div", { className: "runs-cols" }, el("div", {}, parts.running, parts.queued || "", parts.finished), el("div", { className: "waiting-col" }, parts.waiting, parts.cost || "")));
   root.append(page);
 }
 
@@ -14378,7 +14409,13 @@ function focusComposer() {
   };
 
   const field = place();
-  if (!field) return;
+  if (!field) {
+    // Hidden from the page with Edit this page, rather than not drawn yet.
+    if (state.view === "tasks" && window.DelphiLayout && !DelphiLayout.shown("tasks", "quick", state.projectId ?? null)) {
+      notify("Quick entry is hidden on this page. Edit this page to show it again.");
+    }
+    return;
+  }
 
   // A repaint that was still in flight replaces this field with a new one and the
   // cursor is left nowhere. Two menu items in quick succession is the case that
@@ -14579,6 +14616,13 @@ if (window.DelphiWeekly) {
 DelphiFocus.init({ ...shell, refresh: () => refresh(), notify: (text) => notify(text), openTask: (id) => openTaskSheet(id), isAgent,
   busy: () => Boolean(openSheet || openMenu || dialogStack.length || document.querySelector("body > .overlay") || window.DelphiPalette?.isOpen() || (window.DelphiSettingsPanel && DelphiSettingsPanel.isOpen())) });
 COMMANDS.push(...DelphiFocus.commands());
+// Edit this page (ui/layout.js): Today, Tasks and Runs, arranged within their
+// regions, each change in History.
+if (window.DelphiLayout) {
+  DelphiLayout.init({ state: () => state, repaint: () => render(), notify: (text, o) => notify(text, o),
+    projectName: (id) => (projectById(id) || {}).name || "" });
+  COMMANDS.push(...DelphiLayout.commands());
+}
 DelphiKeys.install({
   commands: () => COMMANDS,
   // A panel, a menu, a dialog or a popover owns the keyboard while it is open.
@@ -14738,6 +14782,9 @@ window.delphi.onFocusTask(({ projectId }) => {
  * are the behaviour the app had before these settings existed.
  */
 async function boot() {
+  // The stored page layouts, read before anything is drawn, so a page never
+  // appears in its default order and then rearranges itself.
+  const layouts = window.DelphiLayout ? DelphiLayout.load() : null;
   // Asked once, here. Probing spawns login shells, so it cannot be done per
   // render, and leaving it to the settings page meant the chat reported "not
   // connected" until someone happened to open settings.
@@ -14766,6 +14813,7 @@ async function boot() {
     applyMotion(true);
     state.pinned = readPins(null);
   }
+  await layouts;
   await reopen();
 }
 

@@ -269,6 +269,15 @@ const LATER_TABLES = [
   answered_at TEXT,
   seen_count  INTEGER NOT NULL DEFAULT 1
 )`],
+  // Edit this page: one row per screen and scope. See schema.sql and ui/layout.js.
+  ["layouts", `CREATE TABLE IF NOT EXISTS layouts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  screen      TEXT NOT NULL,
+  project_id  INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  layout      TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+)`],
 ];
 
 // [name, table, columns the index needs, statement]. The columns are checked
@@ -316,6 +325,10 @@ const LATER_INDEXES = [
    "CREATE INDEX IF NOT EXISTS idx_second_opinions_started ON second_opinions(started_at)"],
   ["idx_restore_points_created", "restore_points", ["created_at"],
    "CREATE INDEX IF NOT EXISTS idx_restore_points_created ON restore_points(created_at)"],
+  // One row per screen for everyone, and one per screen per project. NULL is
+  // global, and a UNIQUE index counts NULLs as distinct, hence the COALESCE.
+  ["idx_layouts_scope", "layouts", ["screen", "project_id"],
+   "CREATE UNIQUE INDEX IF NOT EXISTS idx_layouts_scope ON layouts(screen, COALESCE(project_id, 0))"],
 ];
 
 /**
@@ -526,4 +539,130 @@ function apply(query) {
   return result;
 }
 
-module.exports = { LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, apply, addLaterColumns, hasTable, columnsOf, allColumns };
+// ---------------------------------------------------------------------------
+// The audit table's entity list
+//
+// audit.entity carries a CHECK naming every kind of thing History records, and
+// a CHECK cannot be altered, so adding a kind means rebuilding the table the
+// way SQLite documents: make the new one, copy, drop the old, rename, put the
+// indexes back. It lives here rather than in db.js alone so the MCP server
+// runs it too (an agent may meet a database the app has not opened since an
+// upgrade), and so there is one copy of it rather than two.
+//
+// Columns are copied by name, from pragma_table_info, never from a list typed
+// here. The rebuild used to copy a fixed list, so a column a later slice added
+// to audit through LATER_COLUMNS would have been dropped by the next widening
+// without a word (slice 12 adds two). A column the old table has and
+// AUDIT_COLUMNS does not name is kept, with the type, NOT NULL and default the
+// old table gave it.
+
+/** Every entity History may name. schema.sql's CHECK lists the same, in this order. */
+const AUDIT_ENTITIES = ["task", "note", "project", "link", "scratchpad", "session", "handoff", "layout"];
+const quoteList = (list) => list.map((e) => `'${e}'`).join(", ");
+
+/** The audit table as schema.sql declares it, column by column. */
+const AUDIT_COLUMNS = [
+  ["id", "INTEGER PRIMARY KEY"],
+  ["at", "TEXT NOT NULL DEFAULT (datetime('now'))"],
+  ["action", "TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete'))"],
+  ["entity", `TEXT NOT NULL CHECK (entity IN (${quoteList(AUDIT_ENTITIES)}))`],
+  ["entity_id", "INTEGER"],
+  ["summary", "TEXT NOT NULL"],
+  ["label", "TEXT"],
+  ["before_json", "TEXT"],
+  ["after_json", "TEXT"],
+  ["undone", "INTEGER NOT NULL DEFAULT 0"],
+  ["undone_at", "TEXT"],
+  ["actor", "TEXT"],
+  ["actor_type", "TEXT"],
+  ["session_id", "INTEGER"],
+  ["job_id", "INTEGER"],
+  ["step", "TEXT"],
+];
+
+/**
+ * The entities a stored CREATE TABLE audit allows, or null when it has no
+ * CHECK on entity at all, which allows everything and so needs no widening.
+ */
+function auditEntitiesIn(createSql) {
+  // The column may be quoted ("entity", `entity`, [entity]): a table some tool
+  // rewrote. Read as no CHECK, it would never be widened, and every layout
+  // write would then fail on the CHECK it still has.
+  const m = /CHECK\s*\(\s*["`\[]?entity["`\]]?\s+IN\s*\(([^)]*)\)\s*\)/i.exec(String(createSql || ""));
+  if (!m) return null;
+  return [...m[1].matchAll(/'([^']*)'/g)].map((x) => x[1]);
+}
+
+const quoteName = (name) => `"${String(name).replace(/"/g, '""')}"`;
+
+/**
+ * The statements that rebuild audit with the full entity list, or [] when the
+ * table already allows every one, or does not exist. Only reads, so a test can
+ * look at what would run without running it.
+ */
+function auditRebuildPlan(query) {
+  const table = (query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit'") || [])[0];
+  if (!table || !table.sql) return [];
+  const allowed = auditEntitiesIn(table.sql);
+  if (!allowed || AUDIT_ENTITIES.every((e) => allowed.includes(e))) return [];
+
+  const old = query(`SELECT name, type, "notnull" AS nn, dflt_value AS dflt FROM pragma_table_info('audit') ORDER BY cid`) || [];
+  if (!old.length) return [];
+  const canonical = new Map(AUDIT_COLUMNS);
+  // Never narrower than it was: an entity a newer Delphi added stays allowed,
+  // or its rows would fail the copy and the widening would never land.
+  // Read from between quotes, so none holds one; any other spelling is kept.
+  const extra = allowed.filter((e) => e.length && !AUDIT_ENTITIES.includes(e));
+  if (extra.length) canonical.set("entity", `TEXT NOT NULL CHECK (entity IN (${quoteList([...AUDIT_ENTITIES, ...extra])}))`);
+  const oldNames = old.map((c) => c.name);
+  const definitions = old.map((c) => {
+    if (canonical.has(c.name)) return `${quoteName(c.name)} ${canonical.get(c.name)}`;
+    // Bracketed whatever it is: pragma_table_info gives an expression default
+    // without the brackets it was written with, and DEFAULT datetime('now')
+    // on its own is a syntax error.
+    return [quoteName(c.name), c.type, Number(c.nn) ? "NOT NULL" : "", c.dflt == null ? "" : `DEFAULT (${c.dflt})`].filter(Boolean).join(" ");
+  });
+  for (const [name, def] of AUDIT_COLUMNS) if (!oldNames.includes(name)) definitions.push(`${quoteName(name)} ${def}`);
+  const names = oldNames.map(quoteName).join(", ");
+
+  // Every index and trigger on audit as stored, so one a later slice added
+  // comes back too: dropping the table takes them with it.
+  const attached = (query("SELECT sql FROM sqlite_master WHERE tbl_name = 'audit' AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name") || [])
+    .map((r) => String(r.sql));
+  return [
+    "DROP TABLE IF EXISTS audit_rebuilt",
+    `CREATE TABLE audit_rebuilt (\n  ${definitions.join(",\n  ")}\n)`,
+    `INSERT INTO audit_rebuilt (${names}) SELECT ${names} FROM audit`,
+    // A copy that came out short stops here, inside the transaction, so the
+    // old table is never dropped. A CHECK on a scratch table is how a plain
+    // statement fails on a condition, the same way on both routes.
+    "CREATE TEMP TABLE IF NOT EXISTS audit_rebuilt_check (ok INTEGER NOT NULL CHECK (ok = 1))",
+    "INSERT INTO audit_rebuilt_check (ok) SELECT (SELECT COUNT(*) FROM audit_rebuilt) = (SELECT COUNT(*) FROM audit) " +
+      "AND (SELECT COALESCE(MAX(id), 0) FROM audit_rebuilt) = (SELECT COALESCE(MAX(id), 0) FROM audit)",
+    "DROP TABLE audit_rebuilt_check",
+    "DROP TABLE audit",
+    "ALTER TABLE audit_rebuilt RENAME TO audit",
+    ...attached,
+  ];
+}
+
+/**
+ * Widens audit.entity to AUDIT_ENTITIES when it is narrower, as one
+ * transaction. Idempotent without a migrations table: the guard is the stored
+ * CHECK itself, so once it names every entity there is nothing to do.
+ *
+ * @param query  one statement per call, as for apply()
+ * @param batch  statements as one transaction; db.js and the server each
+ *               have one, on every route
+ */
+function widenAudit(query, batch) {
+  const plan = auditRebuildPlan(query);
+  if (!plan.length) return { ran: false, statements: 0 };
+  batch(plan);
+  return { ran: true, statements: plan.length };
+}
+
+module.exports = {
+  LATER_COLUMNS, LATER_TABLES, LATER_INDEXES, LATER_TRIGGERS, apply, addLaterColumns, hasTable, columnsOf, allColumns,
+  AUDIT_ENTITIES, AUDIT_COLUMNS, auditEntitiesIn, auditRebuildPlan, widenAudit,
+};

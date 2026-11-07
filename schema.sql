@@ -202,11 +202,13 @@ CREATE TABLE IF NOT EXISTS audit (
   id          INTEGER PRIMARY KEY,
   at          TEXT NOT NULL DEFAULT (datetime('now')),
   action      TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete')),
-  -- Widened once, for scratchpads and the agent coordination rows. An existing
-  -- database cannot get this by ALTER TABLE, so db.js rebuilds the table when it
-  -- finds the narrower constraint. Adding a value here means adding it there too.
+  -- Widened for scratchpads and the agent coordination rows, then for layouts.
+  -- An existing database cannot get this by ALTER TABLE, so db.js
+  -- widenAuditEntities rebuilds the table when it finds a narrower constraint,
+  -- through agent/schema_later.js widenAudit. Adding a value here means adding
+  -- it to AUDIT_ENTITIES there too; tools/layout_test.js checks they agree.
   entity      TEXT NOT NULL CHECK (entity IN ('task', 'note', 'project', 'link',
-                                              'scratchpad', 'session', 'handoff')),
+                                              'scratchpad', 'session', 'handoff', 'layout')),
   entity_id   INTEGER,
   summary     TEXT NOT NULL,          -- human readable, e.g. "marked done"
   label       TEXT,                   -- what it was, so the list reads without a join
@@ -908,3 +910,25 @@ CREATE TABLE IF NOT EXISTS discovered_folders (
 -- The unique index on projects(path) is not here. This file runs before the
 -- folder migration (workbench/folders.js), and on a database where two projects
 -- still share a folder it would fail and stop the whole file.
+
+-- Edit this page: how a person has arranged a screen's sections. One row per
+-- screen for everyone (project_id NULL) and at most one per screen per project,
+-- which wins over it there. layout is versioned JSON (ui/layout.js reads it,
+-- settings/schema.js checks its shape); NULL means the screen's own defaults.
+-- A reset writes NULL rather than deleting the row: after the first save,
+-- every change is an update History can put back in place, and nothing ever
+-- has to be reinserted under an index something newer may hold. A project's
+-- own rows go with it on a delete, and the delete carries them, so undoing it
+-- brings them back.
+-- AUTOINCREMENT so an id is never handed out twice, which keeps an old
+-- History row from ever naming a newer layout. agent/schema_later.js holds the
+-- same text.
+CREATE TABLE IF NOT EXISTS layouts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  screen      TEXT NOT NULL,
+  project_id  INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  layout      TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_layouts_scope ON layouts(screen, COALESCE(project_id, 0));
