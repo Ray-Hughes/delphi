@@ -272,19 +272,30 @@ globalThis.DelphiDrawer = (() => {
   const tickOf = (line) => { const m = TICK_RE.exec(line); return m ? m[2].toLowerCase() === "x" : null; };
   const setTick = (line, on) => line.replace(TICK_RE, (_, a, _b, c) => `${a}${on ? "x" : " "}${c}`);
   const untick = (line) => line.replace(TICK_RE, (_, a, _b, c) => `${a} ${c}`);
-  /** A line's words: without its anchor or the state of its box. */
-  const keyOf = (line) => untick(unanchored(line)).replace(/\s+$/, "");
+  const indentOf = (line) => (/^\s*/.exec(line) || [""])[0];
+  /**
+   * A line's words: without its anchor, the state of its box or its indent.
+   * An indent is structure (which task a subtask sits under), and moves with
+   * the line's place, never counted as a rewording.
+   */
+  const keyOf = (line) => untick(unanchored(line)).trim();
   const AGENT_MARK = "(agent's version)";
   /** The agent's side of a clash, as prose: no box and no anchor, so it files nothing. */
   const agentVersion = (line) => {
-    const words = unanchored(line).replace(TICK_RE, "").replace(/^\s*[-*+]\s+/, "").trim();
-    const indent = (/^\s*/.exec(line) || [""])[0];
-    return `${indent}> ${AGENT_MARK} ${words}`;
+    let words = unanchored(line).replace(TICK_RE, "").replace(/^\s*[-*+]\s+/, "").trim();
+    // An agent's version reworded again is marked once, not twice.
+    for (;;) {
+      const bare = words.replace(/^>\s*/, "");
+      if (!bare.startsWith(AGENT_MARK)) break;
+      words = bare.slice(AGENT_MARK.length).trim();
+    }
+    return `${indentOf(line)}> ${AGENT_MARK} ${words}`;
   };
 
   /**
    * One line as both sides left it. Returns { lines, clash }: the merged line
-   * (and under it the agent's version, when both reworded it).
+   * (and under it the agent's version, when both reworded it). Words, indent
+   * and box are each taken from the side that changed them.
    */
   function mergeLine(b, t, m) {
     if (t === b || t === m) return { lines: [m], clash: false };
@@ -293,7 +304,11 @@ globalThis.DelphiDrawer = (() => {
     const kt = keyOf(t);
     const km = keyOf(m);
     const both = kt !== kb && km !== kb && kt !== km;
-    let line = unanchored(kt !== kb && km === kb ? t : m);
+    const words = unanchored(kt !== kb && km === kb ? t : m).replace(/^\s*/, "");
+    const ib = indentOf(b);
+    const it = indentOf(t);
+    const im = indentOf(m);
+    let line = `${it !== ib && im === ib ? it : im}${words}`;
     const tb = tickOf(b);
     const tt = tickOf(t);
     const tm = tickOf(m);
@@ -307,105 +322,146 @@ globalThis.DelphiDrawer = (() => {
     return both ? { lines: [line, agentVersion(t)], clash: true } : { lines: [line], clash: false };
   }
 
+  /** The longest increasing run of values, as the set of positions in it. */
+  function increasing(values) {
+    const tails = [];
+    const prev = new Array(values.length).fill(-1);
+    for (let k = 0; k < values.length; k++) {
+      let lo = 0;
+      let hi = tails.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (values[tails[mid]] < values[k]) lo = mid + 1; else hi = mid; }
+      if (lo > 0) prev[k] = tails[lo - 1];
+      tails[lo] = k;
+    }
+    const keep = new Set();
+    for (let k = tails.length ? tails[tails.length - 1] : -1; k >= 0; k = prev[k]) keep.add(k);
+    return keep;
+  }
+
   /**
-   * Pairs of indexes of equal keys, longest run first: a common prefix and
-   * suffix are taken for nothing, and only the middle is compared, by a map
-   * when it is large, so a 2,000 line pad with a few changes stays quick.
+   * Pairs of indexes of equal keys, in order. A common prefix and suffix
+   * cost nothing; a small middle is compared exactly; a large one is split at
+   * lines found exactly once on each side (patience), the longest increasing
+   * run of those kept, and each piece between them matched the same way. So
+   * a line moved from the top to the bottom of a 2,000 line pad is one move,
+   * not a run of edits.
    */
   function matchLines(a, b) {
-    const n = a.length;
-    const m = b.length;
-    let lo = 0;
-    while (lo < n && lo < m && a[lo] === b[lo]) lo++;
-    let hiA = n;
-    let hiB = m;
-    while (hiA > lo && hiB > lo && a[hiA - 1] === b[hiB - 1]) { hiA--; hiB--; }
     const pairs = [];
-    for (let i = 0; i < lo; i++) pairs.push([i, i]);
-    const rows = hiA - lo;
-    const cols = hiB - lo;
-    if (rows && cols && rows * cols <= 250000) {
-      const L = Array.from({ length: rows + 1 }, () => new Uint32Array(cols + 1));
-      for (let i = rows - 1; i >= 0; i--) {
-        for (let j = cols - 1; j >= 0; j--) {
-          L[i][j] = a[lo + i] === b[lo + j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    const solve = (a0, a1, b0, b1) => {
+      while (a0 < a1 && b0 < b1 && a[a0] === b[b0]) { pairs.push([a0, b0]); a0++; b0++; }
+      const tail = [];
+      while (a1 > a0 && b1 > b0 && a[a1 - 1] === b[b1 - 1]) { a1--; b1--; tail.push([a1, b1]); }
+      const rows = a1 - a0;
+      const cols = b1 - b0;
+      if (rows && cols && rows * cols <= 250000) {
+        const L = Array.from({ length: rows + 1 }, () => new Uint32Array(cols + 1));
+        for (let i = rows - 1; i >= 0; i--) {
+          for (let j = cols - 1; j >= 0; j--) {
+            L[i][j] = a[a0 + i] === b[b0 + j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+          }
+        }
+        let i = 0;
+        let j = 0;
+        while (i < rows && j < cols) {
+          if (a[a0 + i] === b[b0 + j]) { pairs.push([a0 + i, b0 + j]); i++; j++; }
+          else if (L[i + 1][j] >= L[i][j + 1]) i++;
+          else j++;
+        }
+      } else if (rows && cols) {
+        const count = (arr, s, e) => { const c = new Map(); for (let k = s; k < e; k++) c.set(arr[k], (c.get(arr[k]) || 0) + 1); return c; };
+        const ca = count(a, a0, a1);
+        const cb = count(b, b0, b1);
+        const at = new Map();
+        for (let j = b0; j < b1; j++) if (cb.get(b[j]) === 1) at.set(b[j], j);
+        const cand = [];
+        for (let i = a0; i < a1; i++) if (ca.get(a[i]) === 1 && at.has(a[i])) cand.push([i, at.get(a[i])]);
+        const keep = increasing(cand.map(([, j]) => j));
+        const anchors = cand.filter((_, k) => keep.has(k));
+        if (!anchors.length) {
+          // Nothing unique to split on: each line to the next equal one.
+          let last = b0 - 1;
+          const pos = new Map();
+          for (let j = b0; j < b1; j++) { if (!pos.has(b[j])) pos.set(b[j], []); pos.get(b[j]).push(j); }
+          for (let i = a0; i < a1; i++) {
+            const list = pos.get(a[i]);
+            if (!list) continue;
+            let k = 0;
+            while (k < list.length && list[k] <= last) k++;
+            if (k < list.length) { last = list[k]; pairs.push([i, last]); list.splice(0, k + 1); }
+          }
+        } else {
+          let pa = a0;
+          let pb = b0;
+          for (const [i, j] of anchors) { solve(pa, i, pb, j); pairs.push([i, j]); pa = i + 1; pb = j + 1; }
+          solve(pa, a1, pb, b1);
         }
       }
-      let i = 0;
-      let j = 0;
-      while (i < rows && j < cols) {
-        if (a[lo + i] === b[lo + j]) { pairs.push([lo + i, lo + j]); i++; j++; }
-        else if (L[i + 1][j] >= L[i][j + 1]) i++;
-        else j++;
-      }
-    } else if (rows && cols) {
-      // Large: each line to the next unused equal line after the last match.
-      const at = new Map();
-      for (let j = lo; j < hiB; j++) { const k = b[j]; if (!at.has(k)) at.set(k, []); at.get(k).push(j); }
-      let last = lo - 1;
-      for (let i = lo; i < hiA; i++) {
-        const list = at.get(a[i]);
-        if (!list) continue;
-        while (list.length && list[0] <= last) list.shift();
-        if (list.length) { last = list.shift(); pairs.push([i, last]); }
-      }
-    }
-    for (let k = 0; k < n - hiA; k++) pairs.push([hiA + k, hiB + k]);
-    return pairs;
+      for (let k = tail.length - 1; k >= 0; k--) pairs.push(tail[k]);
+    };
+    solve(0, a.length, 0, b.length);
+    return pairs.sort((x, y) => x[0] - y[0]);
   }
 
   /**
    * Which base line each line of a side is, by id: the anchor when the base
-   * has it, else the words, else the kind of line within the gap it sits in
-   * (a checkbox line pairs with a checkbox line). Returns an array of base
-   * indexes (or -1 for a line the base does not have) for the side's lines.
+   * has it; else, for a line with no anchor the base knows, its words, then
+   * its kind within the gap it sits in. An anchored base line is only ever
+   * the line with that anchor: a line that replaced it is a new line, never a
+   * rename of it, so one task is never retitled into another. Returns, for
+   * each line of the side, the base index it is, or -1.
    */
   function identify(B, X) {
     const baseById = new Map();
     B.forEach((line, i) => { const id = anchorId(line); if (id != null && !baseById.has(id)) baseById.set(id, i); });
     const of = new Array(X.length).fill(-1);
-    const used = new Set();
     const seen = new Set();
     X.forEach((line, j) => {
       const id = anchorId(line);
       if (id == null || !baseById.has(id) || seen.has(id)) return;
       seen.add(id);
       of[j] = baseById.get(id);
-      used.add(of[j]);
     });
-    // The rest by their words, in order.
-    const bRest = B.map((line, i) => i).filter((i) => !used.has(i) && !(anchorId(B[i]) != null && seen.has(anchorId(B[i]))));
-    const xRest = X.map((line, j) => j).filter((j) => of[j] < 0);
-    const pairs = matchLines(bRest.map((i) => keyOf(B[i])), xRest.map((j) => keyOf(X[j])));
-    for (const [p, q] of pairs) { of[xRest[q]] = bRest[p]; used.add(bRest[p]); }
-    // Then by kind, within each gap between lines already placed.
-    const placedAt = [];
-    X.forEach((_, j) => { if (of[j] >= 0) placedAt.push(j); });
-    let prevB = -1;
-    let from = 0;
-    const gaps = [...placedAt, X.length];
-    for (const stop of gaps) {
-      const nextB = stop < X.length ? of[stop] : B.length;
-      if (nextB > prevB) {
-        const bs = [];
-        for (let i = prevB + 1; i < nextB; i++) if (!used.has(i)) bs.push(i);
-        const xs = [];
-        for (let j = from; j < stop; j++) if (of[j] < 0) xs.push(j);
-        for (const i of bs) {
-          const box = tickOf(B[i]) != null;
-          const k = xs.findIndex((j) => (tickOf(X[j]) != null) === box && !(box && anchorId(X[j]) != null && anchorId(X[j]) !== anchorId(B[i]) && baseById.has(anchorId(X[j]))));
-          if (k >= 0) { of[xs[k]] = i; used.add(i); xs.splice(k, 1); }
+    // Free base lines: those with no anchor. Free side lines: those with no
+    // anchor the base knows (a copy of a known anchor is a new line).
+    const bFree = B.map((_, i) => i).filter((i) => anchorId(B[i]) == null);
+    const xFree = X.map((_, j) => j).filter((j) => of[j] < 0 && !baseById.has(anchorId(X[j])));
+    const used = new Set();
+    for (const [p, q] of matchLines(bFree.map((i) => keyOf(B[i])), xFree.map((j) => keyOf(X[j])))) {
+      of[xFree[q]] = bFree[p];
+      used.add(bFree[p]);
+    }
+    // Then by kind, within each gap, and only where neither has an anchor.
+    const leftB = bFree.filter((i) => !used.has(i));
+    if (leftB.length) {
+      const placed = [];
+      X.forEach((_, j) => { if (of[j] >= 0) placed.push(j); });
+      let from = 0;
+      let prevB = -1;
+      for (const stop of [...placed, X.length]) {
+        const nextB = stop < X.length ? of[stop] : B.length;
+        if (nextB > prevB) {
+          const xs = [];
+          for (let j = from; j < stop; j++) if (of[j] < 0 && anchorId(X[j]) == null) xs.push(j);
+          for (const i of leftB) {
+            if (i <= prevB || i >= nextB || used.has(i)) continue;
+            const box = tickOf(B[i]) != null;
+            const k = xs.findIndex((j) => (tickOf(X[j]) != null) === box);
+            if (k >= 0) { of[xs[k]] = i; used.add(i); xs.splice(k, 1); }
+          }
+          prevB = nextB;
         }
+        if (stop < X.length) from = stop + 1;
       }
-      if (stop < X.length) { prevB = Math.max(prevB, of[stop]); from = stop + 1; }
     }
     return of;
   }
 
   /**
    * A three-way merge of a pad. base is the copy the person began from,
-   * theirs the pad as stored now, mine the box. The result follows the
-   * person's order, with the agent's new lines placed after the line they
+   * theirs the pad as stored now, mine the box. A line goes where the person
+   * put it, unless only the agent moved it (or moved it under another task),
+   * then where the agent put it; the agent's new lines go after the line they
    * followed in the agent's copy. Returns { text, mine, conflicts, lines,
    * tasks }; mine is text (there is no other side to take), conflicts the
    * number of lines kept twice, tasks how many of them file a task.
@@ -420,27 +476,50 @@ globalThis.DelphiDrawer = (() => {
     tOf.forEach((i, j) => { if (i >= 0) tByBase.set(i, j); });
     const mByBase = new Map();
     mOf.forEach((i, j) => { if (i >= 0) mByBase.set(i, j); });
+    // Who moved what: a base line outside the longest run kept in order.
+    const movedIn = (of) => {
+      const at = [];
+      of.forEach((i) => { if (i >= 0) at.push(i); });
+      const keep = increasing(at);
+      return new Set(at.filter((_, k) => !keep.has(k)));
+    };
+    const agentMoved = movedIn(tOf);
+    const personMoved = movedIn(mOf);
     let conflicts = 0;
     const tasks = new Set();
-    // Each line of the result, keyed by where it came from, so the agent's
-    // lines can be placed after their neighbours.
-    const out = [];          // [{ text, fromT: index in T or -1 }]
+    const out = [];          // [{ text, fromT }]
     const placedT = new Set();
     // A new line both sides added with the same words is one line, kept where
-    // the person put it, with the agent's lines after it following it.
-    const twinOf = new Map();  // M index -> T index
+    // the person put it, with the agent's anchor (one task, not two).
+    const twinOf = new Map();
     {
       const tNew = new Map();
-      T.forEach((t, j) => { if (tOf[j] < 0) { if (!tNew.has(t)) tNew.set(t, []); tNew.get(t).push(j); } });
+      T.forEach((t, j) => { if (tOf[j] < 0) { const k = keyOf(t); if (!tNew.has(k)) tNew.set(k, []); tNew.get(k).push(j); } });
       M.forEach((m, j) => {
         if (mOf[j] >= 0) return;
-        const list = tNew.get(m);
-        if (list && list.length) { const tj = list.shift(); twinOf.set(j, tj); placedT.add(tj); }
+        const list = tNew.get(keyOf(m));
+        if (list && list.length && (tickOf(T[list[0]]) != null) === (tickOf(m) != null)) { const tj = list.shift(); twinOf.set(j, tj); placedT.add(tj); }
       });
     }
+    const merged = (i, tj, mj) => {
+      const r = mergeLine(B[i], T[tj], M[mj]);
+      if (r.clash) { conflicts++; const id = anchorId(T[tj]) || anchorId(M[mj]); if (id) tasks.add(id); }
+      return r.lines;
+    };
     M.forEach((m, j) => {
       const i = mOf[j];
-      if (i < 0) { out.push({ text: m, fromT: twinOf.has(j) ? twinOf.get(j) : -1 }); return; }
+      if (i < 0) {
+        if (!twinOf.has(j)) { out.push({ text: m, fromT: -1 }); return; }
+        const t = T[twinOf.get(j)];
+        let line = m;
+        if (tickOf(line) != null) {
+          line = setTick(unanchored(line), Boolean(tickOf(line) || tickOf(t)));
+          const anchor = anchorOf(t) || anchorOf(m);
+          if (anchor) line = `${line}${anchor}`;
+        }
+        out.push({ text: line, fromT: twinOf.get(j) });
+        return;
+      }
       const tj = tByBase.get(i);
       if (tj == null) {
         // The agent removed it. Gone, if the person left it as it was;
@@ -448,24 +527,30 @@ globalThis.DelphiDrawer = (() => {
         if (m !== B[i]) out.push({ text: m, fromT: -1 });
         return;
       }
+      // Only the agent moved it: it goes where the agent put it, below.
+      if (agentMoved.has(i) && !personMoved.has(i)) return;
       placedT.add(tj);
-      const r = mergeLine(B[i], T[tj], m);
-      if (r.clash) { conflicts++; const id = anchorId(T[tj]) || anchorId(m); if (id) tasks.add(id); }
+      const lines = merged(i, tj, j);
       // The agent's next lines go after the agent's version, not between.
-      r.lines.forEach((text, k) => out.push({ text, fromT: k === r.lines.length - 1 ? tj : -1 }));
+      lines.forEach((text, k) => out.push({ text, fromT: k === lines.length - 1 ? tj : -1 }));
     });
-    // The agent's lines the person's copy does not have: new ones, and base
-    // lines the person removed but the agent changed since (ticked, reworded).
-    // Each goes after the line it followed in the agent's copy.
-    const after = new Map();   // T index (or -1 for the top) -> T indexes placed after it
+    // The agent's lines not placed yet: new ones, lines only the agent moved,
+    // and base lines the person removed but the agent changed since. Each
+    // goes after the line it followed in the agent's copy.
+    const after = new Map();
     const inResult = new Set(placedT);
+    const textOf = new Map();
     T.forEach((t, j) => {
       if (placedT.has(j)) return;
       const i = tOf[j];
       if (i >= 0) {
-        const b = B[i];
-        const onlyFiled = keyOf(t) === keyOf(b) && tickOf(t) === tickOf(b);
-        if (t === b || onlyFiled) return;
+        if (mByBase.has(i)) {
+          textOf.set(j, merged(i, j, mByBase.get(i)));
+        } else {
+          const b = B[i];
+          const onlyFiled = keyOf(t) === keyOf(b) && tickOf(t) === tickOf(b) && indentOf(t) === indentOf(b);
+          if (t === b || onlyFiled) return;
+        }
       }
       let prev = j - 1;
       while (prev >= 0 && !inResult.has(prev)) prev--;
@@ -474,13 +559,12 @@ globalThis.DelphiDrawer = (() => {
       inResult.add(j);
     });
     const result = [];
-    // Without recursion, so a long run of the agent's new lines cannot run
-    // out of stack.
+    // Without recursion, so a long run of the agent's lines cannot run out of stack.
     const chain = (p) => {
       const stack = [...(after.get(p) || [])].reverse();
       while (stack.length) {
         const j = stack.pop();
-        result.push(T[j]);
+        result.push(...(textOf.get(j) || [T[j]]));
         const next = after.get(j);
         if (next) for (let k = next.length - 1; k >= 0; k--) stack.push(next[k]);
       }

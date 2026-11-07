@@ -79,7 +79,10 @@ function parse(body) {
   // same way as one indented with two.
   const stack = [];
 
-  lines.forEach((raw, index) => {
+  lines.forEach((line, index) => {
+    // A pad written with CRLF ends keeps them; the \r is not part of the line's
+    // words, and `.` would not match it, so the line would never be a task.
+    const raw = line.endsWith("\r") ? line.slice(0, -1) : line;
     const m = CHECKBOX.exec(raw);
     if (!m) return;
     const [, indent, marker, state, rest] = m;
@@ -137,7 +140,9 @@ function compose({ indent, marker, done, title, assignee, priority, taskId }) {
  */
 function writeLine(body, entry, fields = {}) {
   const lines = String(body == null ? "" : body).split("\n");
-  if (!lines[entry.index] || !CHECKBOX.test(lines[entry.index])) return body;
+  const cr = typeof lines[entry.index] === "string" && lines[entry.index].endsWith("\r") ? "\r" : "";
+  const plain = cr ? lines[entry.index].slice(0, -1) : lines[entry.index];
+  if (!plain || !CHECKBOX.test(plain)) return body;
   lines[entry.index] = compose({
     indent: entry.indent,
     marker: entry.marker,
@@ -146,7 +151,7 @@ function writeLine(body, entry, fields = {}) {
     assignee: fields.assignee !== undefined ? fields.assignee : entry.assignee,
     priority: fields.priority !== undefined ? fields.priority : entry.priority,
     taskId: fields.taskId !== undefined ? fields.taskId : entry.taskId,
-  });
+  }) + cr;
   return lines.join("\n");
 }
 
