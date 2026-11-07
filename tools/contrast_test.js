@@ -152,5 +152,19 @@ for (const [theme, vars] of [["light", light], ["dark", { ...light, ...darkPinne
   check(".fx-next and .fx-peek set no partial opacity", faded.length === 0, faded.join(", "));
 }
 
+// The drawer's labels a person acts on or has to read (the crumb, status and
+// editor modes, a folded section's summary, what the composer will do) use
+// --ink-dim, which the token checks above hold to AA. --ink-faint is ~3:1.
+{
+  const drawerCss = fs.readFileSync(path.join(__dirname, "..", "styles", "drawer.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  const MUST = [".dw-crumb", ".dw-statusbar button", ".dw-fold-h .sum", ".dw-seg button", ".dw-sense"];
+  console.log("\ndrawer: labels a person acts on are --ink-dim or stronger");
+  for (const sel of MUST) {
+    const rule = [...drawerCss.matchAll(/([^{}]*)\{([^}]*)\}/g)].find(([, s]) => s.trim() === sel);
+    const colour = rule && (rule[2].match(/(?:^|;)\s*color\s*:\s*([^;!]+)/) || [])[1];
+    check(`${sel} is not --ink-faint`, Boolean(colour) && !/--ink-faint/.test(colour), colour || "no colour rule");
+  }
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

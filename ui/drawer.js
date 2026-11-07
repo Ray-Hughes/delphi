@@ -30,6 +30,7 @@ globalThis.DelphiDrawer = (() => {
   // Each open takes a number; one that finds a newer number after its awaits
   // stands down, so two quick clicks cannot mount two drawers.
   let opening = 0;
+  let lastClose = null;
 
   // --- small things --------------------------------------------------------
 
@@ -208,6 +209,37 @@ globalThis.DelphiDrawer = (() => {
     return subtasks.slice().sort((a, b) => (at.has(a.id) ? at.get(a.id) : 1e9 + a.id) - (at.has(b.id) ? at.get(b.id) : 1e9 + b.id));
   }
 
+  /**
+   * What saving a box should do, from three texts: the stored text the box
+   * last took (base), the stored text now (theirs) and the box (mine). Agents
+   * write the same rows while a person types, so a save that ignored theirs
+   * would put the person's older copy over an agent's newer one.
+   *   "none"     nothing to write: mine is what was taken
+   *   "take"     nothing typed here, and it moved: show theirs
+   *   "same"     it moved to exactly what is typed here: nothing to write
+   *   "write"    only this box moved: write mine
+   *   "conflict" both moved: a person has to choose
+   */
+  function reconcile(base, theirs, mine) {
+    const b = String(base == null ? "" : base);
+    const t = theirs == null ? b : String(theirs);
+    const m = String(mine == null ? "" : mine);
+    if (m === b) return t === b ? "none" : "take";
+    if (t === b) return "write";
+    return t === m ? "same" : "conflict";
+  }
+
+  /** A person's choice when both copies moved: theirs, mine, or neither yet (null). */
+  async function chooseCopy(label) {
+    if (!host || !host.wb || !host.wb.dialog) return null;
+    return host.wb.dialog({
+      title: `${label} changed while you were writing`,
+      lead: "It was saved from somewhere else, often an agent, after you began. Keep yours over it, or take theirs. Until you choose, yours is kept as a draft and nothing is written.",
+      actions: [{ label: "Not now", value: null }, { label: "Take theirs", value: "theirs" }, { label: "Keep mine", value: "mine", kind: "primary" }],
+      cancelValue: null,
+    });
+  }
+
   /** What the composer will post, read from its mode and any prefix typed. */
   function composed(raw, mode, { openAsk = null, where = "" } = {}) {
     let v = String(raw || "");
@@ -249,6 +281,10 @@ globalThis.DelphiDrawer = (() => {
    */
   function frame({ label, onClose }) {
     const opener = document.activeElement && document.activeElement !== document.body ? document.activeElement : null;
+    // Named as well as held: the row that opened the drawer is often redrawn
+    // by the write the drawer made, and the new node is the one to go back to.
+    const openerKey = opener ? (opener.closest && opener.closest("[data-task-id]") ? `[data-task-id="${opener.closest("[data-task-id]").dataset.taskId}"]`
+      : opener.dataset && opener.dataset.act ? `[data-act="${CSS.escape(opener.dataset.act)}"]` : opener.id ? `#${CSS.escape(opener.id)}` : null) : null;
     const root = el("aside", { className: "dw", tabIndex: -1 });
     root.setAttribute("role", "dialog");
     // Not aria-modal: the page beside it stays live to the pointer. Tab is
@@ -276,6 +312,17 @@ globalThis.DelphiDrawer = (() => {
     // A click on the page beside the drawer closes it, except on a task row,
     // whose own click opens that task here instead; and never from inside a
     // menu, a dialog or a toast the drawer opened.
+    // A repaint can drop focus to the page; the next Tab comes back in here
+    // rather than wandering off behind the drawer.
+    const stray = (e) => {
+      if (e.key !== "Tab" || !root.isConnected) return;
+      const a = document.activeElement;
+      if (a && a !== document.body) return;
+      if (document.querySelector("body > .overlay, .ctx")) return;
+      e.preventDefault();
+      (focusables()[0] || root).focus({ preventScroll: true });
+    };
+    document.addEventListener("keydown", stray, true);
     const away = (e) => {
       const t = e.target;
       if (!t || !t.closest || root.contains(t)) return;
@@ -284,16 +331,30 @@ globalThis.DelphiDrawer = (() => {
     };
     let closed = false;
     const arm = setTimeout(() => { if (!closed) document.addEventListener("mousedown", away, true); }, 0);
-    async function close() {
-      if (closed) return;
+    let closing = null;
+    function close() {
+      if (closed) return closing;
       closed = true;
+      closing = shut();
+      // The next drawer waits for this one's saves (and any question they
+      // ask) before it reads anything, so it never opens on a stale row.
+      lastClose = closing;
+      return closing;
+    }
+    async function shut() {
       clearTimeout(arm);
       document.removeEventListener("mousedown", away, true);
+      document.removeEventListener("keydown", stray, true);
       if (host.sheet() === me.handle) host.setSheet(null);
       if (cur === me) cur = null;
       try { if (onClose) await onClose(); } finally {
         root.remove();
-        if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus({ preventScroll: true });
+        // Not over a field somebody has just clicked into.
+        const now = document.activeElement;
+        const busy = now && now !== document.body && !root.contains(now);
+        let back = opener && opener.isConnected ? opener : null;
+        if (!back && openerKey) back = [...document.querySelectorAll(`#content ${openerKey}, ${openerKey}`)].find((n) => n.offsetParent !== null) || null;
+        if (!busy && back && typeof back.focus === "function") back.focus({ preventScroll: true });
       }
     }
     const me = { root, head, body, foot, close, handle: null, focusFirst: () => (focusables()[0] || root).focus({ preventScroll: true }) };
@@ -375,10 +436,17 @@ globalThis.DelphiDrawer = (() => {
    * is saved straight away. A surface with its own route for a tick (a pad's
    * task goes through the board's update) passes toggle(tick, api).
    */
-  function editor({ label, kind, value, onSave, placeholder = "", draftKey = null, onMode = null, preview = (s) => s, toggle = null }) {
+  function editor({ label, kind, value, onSave, current = null, placeholder = "", draftKey = null, onMode = null, preview = (s) => s, toggle = null }) {
     let mode = modeOf(kind);
     let text = value || "";
+    // The stored text this box last took. A save compares the store against
+    // it (reconcile), and a write from elsewhere waits in pending while the
+    // box is being typed in, to be taken on blur when nothing was typed.
     let saved = text;
+    let remote = null;
+    // A draft restored from an earlier run was typed against an older copy,
+    // so it is only written once somebody types here again.
+    let restored = false;
     let ratio = splitOf(kind);
     const wrap = el("div", { className: "dw-ed" });
     wrap.dataset.kind = kind;
@@ -437,7 +505,7 @@ globalThis.DelphiDrawer = (() => {
 
     if (draftKey && window.DelphiRecovery) {
       const kept = DelphiRecovery.draft(draftKey[0], draftKey[1]);
-      if (kept != null && kept !== "" && kept !== text) { area.value = kept; text = kept; }
+      if (kept != null && kept !== "" && kept !== text) { area.value = kept; text = kept; restored = true; }
       area.addEventListener("input", () => DelphiRecovery.saveDraft(draftKey[0], draftKey[1], area.value === saved ? "" : area.value));
     }
     const grow = () => {
@@ -461,20 +529,65 @@ globalThis.DelphiDrawer = (() => {
       if (pending) clearTimeout(pending);
       pending = setTimeout(paintPreview, PREVIEW_WAIT);
     };
-    area.addEventListener("input", () => { text = area.value; if (mode === "split") paintSoon(); grow(); });
+    area.addEventListener("input", () => { restored = false; text = area.value; if (mode === "split") paintSoon(); grow(); });
+    const take = (v) => {
+      saved = v == null ? "" : String(v);
+      remote = null;
+      area.value = saved;
+      text = saved;
+      if (mode !== "write") paintPreview();
+      grow();
+    };
     let inflight = null;
     const commit = async () => {
       // Waits out a save already going, refused or not, so one text is never
       // sent twice and a refusal does not throw out of the next caller.
       while (inflight) { try { await inflight; } catch {} }
-      if (area.value === saved) return;
       const next = area.value;
-      // Marked saved only once it is, so a refused write is tried again on
-      // the next blur or close rather than taken as done.
-      inflight = Promise.resolve(onSave(next));
-      try { await inflight; } catch (error) { host.notifyError(error); return; } finally { inflight = null; }
-      saved = next;
-      if (draftKey && window.DelphiRecovery) DelphiRecovery.clearDraft(draftKey[0], draftKey[1]);
+      if (next === saved) {
+        if (remote != null && document.activeElement !== area) take(remote);
+        return;
+      }
+      if (restored) return;
+      const run = (async () => {
+        // The stored copy, read now. Unreadable means nothing is written: a
+        // save that cannot check is the one that loses an agent's work.
+        const read = async () => {
+          if (!current) return remote == null ? saved : remote;
+          try { const v = await current(); return v == null ? undefined : v; } catch { return undefined; }
+        };
+        let theirs = await read();
+        if (theirs === undefined) { host.notify(`${label} could not be checked against the stored copy, so it was not saved. It is kept here.`); return "kept"; }
+        let what = reconcile(saved, theirs, next);
+        // Asked again if it moved once more while the question was open, so
+        // "Keep mine" never lands on a copy nobody saw.
+        for (let round = 0; what === "conflict" && round < 3; round++) {
+          const pick = await chooseCopy(label);
+          // Theirs, chosen: the box shows it, even over words typed while the
+          // question was open, or the next blur would write them over it.
+          if (pick === "theirs") { take(theirs); return "done"; }
+          if (pick !== "mine") return "kept";
+          const again = await read();
+          if (again === undefined) return "kept";
+          if (again === theirs) { what = "write"; break; }
+          theirs = again;
+          what = reconcile(saved, theirs, next) === "same" ? "same" : "conflict";
+        }
+        if (what === "conflict") return "kept";
+        if (what === "same") { saved = next; remote = null; return "done"; }
+        // Marked saved only once it is, so a refused write is tried again on
+        // the next blur or close rather than taken as done. What the store
+        // kept (a pad with its <!--d:N--> anchors) becomes the box's text,
+        // unless more was typed meanwhile.
+        const stored = await onSave(next);
+        const now = stored == null ? next : String(stored);
+        if (area.value === next) take(now); else { saved = now; remote = null; }
+        return "done";
+      })();
+      inflight = run;
+      let outcome = null;
+      try { outcome = await run; } catch (error) { host.notifyError(error); return; } finally { inflight = null; }
+      if (outcome === "done" && draftKey && window.DelphiRecovery && area.value === saved) DelphiRecovery.clearDraft(draftKey[0], draftKey[1]);
     };
     area.addEventListener("blur", commit);
 
@@ -492,6 +605,7 @@ globalThis.DelphiDrawer = (() => {
         if (local != null) area.value = local;
       }
       saved = next;
+      remote = null;
       text = area.value;
       if (mode !== "write") paintPreview();
       grow();
@@ -509,6 +623,22 @@ globalThis.DelphiDrawer = (() => {
       return tickLocal(tick);
     }
     async function tickLocal(tick) {
+      // Nothing typed here and the stored text moved (an agent wrote it): the
+      // tick goes onto the stored text, never onto this older copy, and only
+      // if its line is still the line that was drawn.
+      if (current && area.value === saved) {
+        let fresh;
+        try { fresh = await current(); } catch { fresh = undefined; }
+        if (fresh === undefined || fresh === null) { host.notify(`${label} could not be read, so nothing was ticked.`); paintPreview(); return; }
+        if (fresh !== saved) {
+          const onTheirs = DelphiMarkdown.toggleTask(fresh, tick.line, tick.checked, tick.text);
+          if (onTheirs == null) { take(fresh); host.notify("That line changed since it was shown, so nothing was ticked. Try again."); return; }
+          const stored = await onSave(onTheirs);
+          take(stored == null ? onTheirs : stored);
+          if (draftKey && window.DelphiRecovery) DelphiRecovery.clearDraft(draftKey[0], draftKey[1]);
+          return;
+        }
+      }
       const next = DelphiMarkdown.toggleTask(area.value, tick.line, tick.checked, tick.text);
       if (next == null) {
         // The line moved or changed since the preview was drawn. Redrawn
@@ -558,14 +688,13 @@ globalThis.DelphiDrawer = (() => {
     paint();
     return {
       node: wrap, area, commit, mode: () => mode,
-      // A write from elsewhere, taken only when nobody is typing here.
+      // A write from elsewhere: taken now when nobody is typing here, else
+      // kept until blur (taken if nothing was typed) or a save (reconciled).
       update(next) {
-        if (document.activeElement === area || area.value !== saved) return;
-        saved = next || "";
-        area.value = saved;
-        text = saved;
-        if (mode !== "write") paintPreview();
-        grow();
+        const v = next == null ? "" : String(next);
+        if (v === saved) { remote = null; return; }
+        if (document.activeElement === area || area.value !== saved) { remote = v; return; }
+        take(v);
       },
       setTo,
     };
@@ -589,9 +718,21 @@ globalThis.DelphiDrawer = (() => {
     const ANCHOR = /<!--\s*d:(\d+)\s*-->/;
     const after = (row) => { if (row && typeof row.body === "string") pad.body = row.body; if (onSaved) onSaved(pad); return pad.body; };
     const ed = editor({
-      label, kind, value: value != null ? value : pad.body || "", draftKey, onMode,
+      label, kind, value: value != null ? value : pad.body || "", draftKey: draftKey || ["padbody", pad.id], onMode,
       placeholder: "The plan, as checkbox lines: - [ ] the thing to do",
-      onSave: async (body) => { await window.delphi.pads.write(pad.id, { body, author: "you" }); pad.body = body; if (onSaved) onSaved(pad); },
+      // Every save is checked against the pad as stored (reconcile in the
+      // editor), so an agent's append or a status the board wrote back into
+      // a line is never written over with the copy this box holds.
+      current: async () => { const f = await window.delphi.pads.get(pad.id); return f ? f.body || "" : null; },
+      // What comes back is the pad with the anchors the derive wrote into new
+      // lines, and the box takes it, so the next save keeps them and a renamed
+      // line stays the same task.
+      onSave: async (body) => {
+        const row = await window.delphi.pads.write(pad.id, { body, author: "you" });
+        // No body back means no anchors to take: keep what was sent.
+        if (!row || typeof row.body !== "string") { pad.body = body; if (onSaved) onSaved(pad); return body; }
+        return after(row);
+      },
       toggle: async (tick, api) => {
         // Never through the editor's whole-body save, even with typing not
         // saved yet: the tick is written to the pad as stored, and replace()
@@ -672,6 +813,8 @@ globalThis.DelphiDrawer = (() => {
     area.addEventListener("blur", () => setTimeout(() => { if (document.activeElement !== area) show(); }, 0));
     // Enter and Escape end an edit with focus back on the title, never on the page.
     area.addEventListener("keydown", (e) => {
+      // Enter while an input method is composing belongs to the composition.
+      if (e.isComposing) return;
       if (e.key === "Enter" || e.key === "Escape") {
         // Escape cancels: the task's saved title comes back, and the draft goes.
         if (e.key === "Escape") { e.stopPropagation(); if (revert) area.value = revert(); }
@@ -685,6 +828,50 @@ globalThis.DelphiDrawer = (() => {
     return { node: wrap, show, edit, view, button: btn };
   }
 
+  /**
+   * A note's or a pad's title, kept against the stored one the way the task
+   * title and every editor are: an untouched box takes a rename from
+   * elsewhere, and a typed one that meets a rename asks before writing.
+   */
+  function titleKeeper(area, { label, fetch, write, onTake }) {
+    let base = area.value;
+    let touched = false;
+    let busy = null;
+    area.addEventListener("input", () => { touched = true; });
+    const take = (v) => { base = v; area.value = v; touched = false; if (onTake) onTake(); };
+    async function save() {
+      // One at a time, and words typed while one ran get their own turn.
+      if (busy) { await busy; return save(); }
+      busy = (async () => {
+        await null;
+        try {
+          const next = area.value.trim();
+          if (!next || next === String(base).trim() || !touched) return;
+          let theirs;
+          try { theirs = await fetch(); } catch { return; }
+          if (theirs == null) return;
+          const what = reconcile(base, theirs, next);
+          if (what === "same") { base = next; touched = false; return; }
+          if (what === "conflict") {
+            const pick = await chooseCopy(label);
+            if (pick === "theirs") { take(theirs); return; }
+            if (pick !== "mine") return;
+          }
+          await write(next);
+          base = next;
+          touched = false;
+        } catch (error) { host.notifyError(error); }
+        finally { busy = null; }
+      })();
+      return busy;
+    }
+    return {
+      save,
+      base: () => base,
+      update(v) { if (v != null && v !== base && document.activeElement !== area && area.value === base) take(v); },
+    };
+  }
+
   // --- the task ------------------------------------------------------------
 
   async function open(taskId, { focus = null } = {}) {
@@ -692,6 +879,7 @@ globalThis.DelphiDrawer = (() => {
     const ticket = ++opening;
     const before = host.sheet();
     if (before) await before.close();
+    if (lastClose) await lastClose.catch(() => {});
     let detail = await window.delphi.tasks.detail(taskId);
     if (!detail || ticket !== opening) return;
     taskId = detail.task.id;
@@ -699,9 +887,13 @@ globalThis.DelphiDrawer = (() => {
     const S = host.state();
     // Drafts are kept under the task's id and its created_at, so a draft can
     // only come back into the task it was typed for (ui/recovery.js).
+    let gone = false;
     const draftOf = (window.DelphiRecovery && DelphiRecovery.taskDraftId && DelphiRecovery.taskDraftId(detail.task)) || taskId;
     const me = frame({ label: `Task ${taskId}: ${detail.task.title}`, onClose: async () => {
       if (window.DelphiRecovery) DelphiRecovery.taskClosed();
+      // Deleted elsewhere: there is nothing to save into, and typing stays as
+      // a recovery draft rather than an error.
+      if (gone) return;
       await saveTitle();
       // Closing takes the focused box away without a dependable blur, so the
       // description is saved here as well as on blur.
@@ -742,7 +934,7 @@ globalThis.DelphiDrawer = (() => {
     function paintTop() {
       const crumbs = [projectCrumb(detail.project, async () => { await me.close(); host.goTo({ projectId: detail.project.id, view: "tasks", query: "" }); })];
       if (detail.parent) {
-        const up = button("dw-crumb-up", `Open the parent task, #${detail.parent.id}`, () => open(detail.parent.id), { text: `#${detail.parent.id}` });
+        const up = button("dw-crumb-up", `Open the parent task, #${detail.parent.id}`, () => host.openTask(detail.parent.id), { text: `#${detail.parent.id}` });
         crumbs.push(up);
       }
       crumbs.push(el("span", { className: "dw-crumb-now", textContent: `#${taskId}` }));
@@ -797,10 +989,14 @@ globalThis.DelphiDrawer = (() => {
     // whose save is on its way is never put back to the old title.
     let titleFrom = detail.task.title;
     title.setAttribute("aria-label", "Task title");
+    // A restored draft was typed against an older title, so it is written
+    // only once somebody types here again.
+    let titleTouched = false;
+    title.addEventListener("input", () => { titleTouched = true; });
     if (window.DelphiRecovery) {
       const kept = DelphiRecovery.draft("title", draftOf);
       if (kept && kept !== detail.task.title) title.value = kept;
-      title.addEventListener("input", () => DelphiRecovery.saveDraft("title", draftOf, title.value === detail.task.title ? "" : title.value));
+      title.addEventListener("input", () => DelphiRecovery.saveDraft("title", draftOf, title.value === titleFrom ? "" : title.value));
     }
     const growTitle = () => { title.style.height = "auto"; title.style.height = `${title.scrollHeight}px`; };
     title.addEventListener("input", growTitle);
@@ -810,26 +1006,48 @@ globalThis.DelphiDrawer = (() => {
     // even when it wraps.
     let titleSaving = null;
     async function saveTitle() {
-      const next = title.value.trim();
-      // Untouched since the task last gave it its words: nothing to save, and
-      // saving would write an old title over a rename that arrived meanwhile.
-      if (!next || title.value === titleFrom || next === detail.task.title) {
-        // Typed back to what it was: nothing to keep for recovery either.
-        if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
-        return;
-      }
-      if (titleSaving) return titleSaving;
+      if (titleSaving) { await titleSaving; return saveTitle(); }
       titleSaving = (async () => {
+        // A turn first, so the finally below can never run before this
+        // promise is stored, and leave a settled one in place for good.
+        await null;
         try {
+          const next = title.value.trim();
+          const focused = document.activeElement === title;
+          // Untouched since the task last gave it its words: take whatever
+          // the task says now, which may be a rename that arrived meanwhile.
+          if (!next || next === String(titleFrom).trim()) {
+            if (!focused) { title.value = detail.task.title; titleFrom = detail.task.title; titleBox.show(); }
+            if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
+            return;
+          }
+          if (!titleTouched) return;
+          let theirs;
+          // Unreadable means not written: the draft stays.
+          try { const fresh = await window.delphi.tasks.detail(taskId); if (!fresh) return; theirs = fresh.task.title; } catch { return; }
+          const what = reconcile(titleFrom, theirs, next);
+          if (what === "same") { titleFrom = next; detail.task.title = next; return; }
+          if (what === "conflict") {
+            const pick = await chooseCopy("The title");
+            if (pick === "theirs") {
+              titleFrom = theirs; detail.task.title = theirs; titleTouched = false;
+              title.value = theirs;
+              if (document.activeElement !== title) titleBox.show();
+              if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
+              return;
+            }
+            if (pick !== "mine") return;
+          }
           await window.delphi.tasks.update(taskId, { title: next });
           detail.task.title = next;
           titleFrom = next;
-          if (document.activeElement !== title) title.value = next;
+          titleTouched = false;
+          if (document.activeElement !== title) { title.value = next; titleBox.show(); }
+          // Only a save that landed lets the draft go; a refused one keeps it.
+          if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
           host.refresh();
-        }
-        catch (error) { host.notifyError(error); }
-        if (window.DelphiRecovery) DelphiRecovery.clearDraft("title", draftOf);
-        titleSaving = null;
+        } catch (error) { host.notifyError(error); }
+        finally { titleSaving = null; }
       })();
       return titleSaving;
     }
@@ -950,6 +1168,7 @@ globalThis.DelphiDrawer = (() => {
         else paintProps();
       };
       i.onkeydown = (e) => {
+        if (e.isComposing) return;
         if (e.key === "Enter") { e.preventDefault(); end(true); }
         else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); end(false); props.querySelector("[data-act=assign]")?.focus(); }
       };
@@ -1029,11 +1248,17 @@ globalThis.DelphiDrawer = (() => {
 
     // Subtasks
     const orderKey = `delphi.drawer.order.${taskId}`;
+    let addText = "";
+    let composingAdd = false;
     function paintSubtasks({ force = false } = {}) {
       const box = sections.subtasks.body;
-      const holding = box.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+      const act = document.activeElement;
+      const inAdd = Boolean(act && act.classList && act.classList.contains("dw-addsub-in") && box.contains(act));
+      const holding = box.contains(act) && /^(INPUT|TEXTAREA)$/.test(act.tagName) && !inAdd;
       const subs = ordered(detail.subtasks, store.get(orderKey, []));
-      if (holding && !force) return;
+      // Never in the middle of an input method's composition: a rebuild would end it.
+      if ((holding || (inAdd && composingAdd)) && !force) return;
+      if (force) composingAdd = false;
       const focusedId = box.contains(document.activeElement) ? document.activeElement.closest("[data-sub]")?.dataset.sub : null;
       const focusedAct = focusedId ? document.activeElement.dataset.act : null;
       box.textContent = "";
@@ -1055,7 +1280,7 @@ globalThis.DelphiDrawer = (() => {
         cb.setAttribute("role", "checkbox");
         cb.setAttribute("aria-checked", String(done));
         cb.dataset.act = "tick";
-        const name = button("t", `Open subtask #${s.id}: ${s.title}`, () => open(s.id), { text: s.title });
+        const name = button("t", `Open subtask #${s.id}: ${s.title}`, () => host.openTask(s.id), { text: s.title });
         name.dataset.act = "open";
         name.title = s.title;
         row.append(grip, cb, name);
@@ -1120,14 +1345,20 @@ globalThis.DelphiDrawer = (() => {
       // Add inline. Enter adds and stays for the next; Tab nests the new one
       // under the subtask above it and Shift+Tab lifts it out to sit beside
       // this task, the way an outline works. With nothing typed, Tab is Tab.
-      const add = el("input", { className: "dw-addsub-in", placeholder: "Add subtask" });
+      // What is typed in the box outlives the box: a repaint (an agent's write,
+      // a tick, a reorder) rebuilds it, and the words go into the new one.
+      const add = el("input", { className: "dw-addsub-in", placeholder: "Add subtask", value: addText });
+      add.addEventListener("input", () => { addText = add.value; });
+      add.addEventListener("compositionstart", () => { composingAdd = true; });
+      add.addEventListener("compositionend", () => { composingAdd = false; });
       add.setAttribute("aria-label", "Add a subtask. Enter adds, Tab nests it under the one above, Shift and Tab lifts it out");
       const addRow = el("label", { className: "dw-addsub" }, icon("plus", "sm"), add,
         el("span", { className: "hint" }, el("kbd", { textContent: "Tab" }), "nest", el("kbd", { textContent: "⇧" }), el("kbd", { textContent: "Tab" }), "lift out"));
       let adding = false;
       add.onkeydown = async (e) => {
         const text = add.value.trim();
-        if (e.key === "Escape" && add.value) { e.preventDefault(); e.stopPropagation(); add.value = ""; return; }
+        if (e.isComposing) return;
+        if (e.key === "Escape" && add.value) { e.preventDefault(); e.stopPropagation(); add.value = ""; addText = ""; return; }
         if (!text || adding) return;
         let parentId = null;
         if (e.key === "Enter") parentId = taskId;
@@ -1136,9 +1367,14 @@ globalThis.DelphiDrawer = (() => {
         else return;
         e.preventDefault();
         adding = true;
+        const sent = add.value;
         try {
           const made = await window.delphi.tasks.create({ title: text, parentId, projectId: detail.task.project_id });
-          add.value = "";
+          // Cleared only if it still holds what was sent; more typed meanwhile stays.
+          const live = box.querySelector(".dw-addsub-in");
+          const nowText = live ? live.value : addText;
+          addText = nowText === sent ? "" : nowText;
+          if (live && live.value === sent) live.value = "";
           if (parentId !== taskId) flash(parentId ? `nested under #${parentId}` : `#${made && made.id ? made.id : ""} added beside this task`);
         } catch (error) { host.notifyError(error); }
         adding = false;
@@ -1151,6 +1387,7 @@ globalThis.DelphiDrawer = (() => {
       };
       box.append(addRow);
       if (!subs.length) box.append(el("p", { className: "dw-fine", textContent: "A subtask is a task, so each piece gets its own status, owner and Sheet." }));
+      if (inAdd) { add.focus({ preventScroll: true }); add.setSelectionRange(add.value.length, add.value.length); }
       if (focusedId) {
         const again = box.querySelector(`[data-sub="${focusedId}"] [data-act="${focusedAct || "open"}"]`);
         if (again) again.focus({ preventScroll: true });
@@ -1165,7 +1402,8 @@ globalThis.DelphiDrawer = (() => {
       desc = editor({
         label: "Markdown", kind: "task", value: detail.task.detail || "", placeholder: "What does finishing this actually involve",
         draftKey: ["desc", draftOf],
-        onSave: async (next) => { await window.delphi.tasks.update(taskId, { detail: next }); detail.task.detail = next; flash("description saved"); paintSectionMeta(); host.refresh(); },
+        current: async () => { const f = await window.delphi.tasks.detail(taskId); return f ? f.task.detail || "" : null; },
+        onSave: async (next) => { await window.delphi.tasks.update(taskId, { detail: next }); detail.task.detail = next; flash("description saved"); paintSectionMeta(); host.refresh(); return next; },
         onMode: () => widen(),
       });
       box.textContent = "";
@@ -1478,7 +1716,13 @@ globalThis.DelphiDrawer = (() => {
         detail.project ? detail.project.id : null, detail.task.status, wbAdv, wbAdvOpen]);
       paintCards();
       if (!sections.workbench.isOpen()) return;
-      if (sig === wbSig && sections.workbench.body.contains(wbBox)) return;
+      if (sig === wbSig && sections.workbench.body.contains(wbBox)) {
+        // Unchanged but for when it was checked: the chip's words in full stay
+        // true ("Checked 4s ago") without rebuilding what may hold focus.
+        const chip = wbBox.querySelector(".wb-chip");
+        if (chip && chip.wbTitle) chip.wbTitle(st0);
+        return;
+      }
       wbSig = sig;
       const hadFocus = wbBox.contains(document.activeElement) ? document.activeElement.dataset.act : null;
       buildWorkbench();
@@ -1540,7 +1784,22 @@ globalThis.DelphiDrawer = (() => {
       panel.append(kv);
       const f = el("div", { className: "dw-panel-f" });
       if (look.cls === "closing") {
-        f.append(el("span", { className: "dw-fine", textContent: host.wb.closingLong(look.closing) ? "The Sheet says where the folder is." : "Being put away. Nothing can be done to it until that ends." }));
+        f.append(el("span", { className: "dw-fine", textContent: host.wb.closingLong(look.closing) ? "Being put away for a while now, so it was probably interrupted. Housekeeping finishes or undoes it; the Sheet says where the folder is." : "Being put away. Nothing can be done to it until that ends." }));
+        // What the old panel showed without asking: who began it, when, where
+        // the folder went, and the ref that keeps a copy, with Copy on each.
+        const c = look.closing || {};
+        const grid = el("dl", { className: "dw-kv" });
+        for (const [k, v] of [["Doing", c.mode === "discard" ? "Discard" : c.mode === "finish" ? "Finish" : ""], ["Begun by", c.actor || ""],
+          ["At", c.at ? `${c.at} UTC` : ""], ["Folder now at", c.trash || ""], ["Copy", c.ref || ""]]) {
+          if (!v) continue;
+          const dd = el("dd", { className: "mono", title: v }, v);
+          if (k === "Copy" || k === "Folder now at") {
+            const b = iconBtn("copy", `Copy ${k === "Copy" ? "the ref" : "the folder"}`, (e) => copyText(v, e.currentTarget), k === "Copy" ? "copy-ref" : "copy-trash");
+            dd.append(" ", b);
+          }
+          grid.append(el("dt", { textContent: k }), dd);
+        }
+        if (grid.childNodes.length) panel.append(grid);
       } else if (look.unreadable) {
         f.append(wbButton("Open folder", "", () => wbOpen(wb, "folder"), null, "open-folder"));
       } else if (look.cls === "missing") {
@@ -1694,6 +1953,7 @@ globalThis.DelphiDrawer = (() => {
         log.replaceWith(i);
         i.focus();
         i.onkeydown = async (e) => {
+          if (e.isComposing) return;
           if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); paintMemory(); return; }
           if (e.key !== "Enter" || !i.value.trim()) return;
           e.preventDefault();
@@ -1835,6 +2095,8 @@ globalThis.DelphiDrawer = (() => {
         if (k === "decide" && !openAsk()) b.title = "Nothing to decide: no question is open";
         kindsBox.append(b);
       }
+      sense.classList.remove("err");
+      sense.removeAttribute("role");
       sense.textContent = box.value.trim() ? c.say : "";
       box.classList.toggle("mono", c.kind === "run");
       send.disabled = !c.ok || sending;
@@ -1843,6 +2105,7 @@ globalThis.DelphiDrawer = (() => {
       if (sending) return;
       const c = current();
       if (!c.ok) return;
+      const sentRaw = box.value;
       sending = true;
       send.disabled = true;
       try {
@@ -1859,12 +2122,14 @@ globalThis.DelphiDrawer = (() => {
         sending = false;
         paintKinds();
         sense.textContent = String(error.message || error);
+        sense.classList.add("err");
+        sense.setAttribute("role", "alert");
         return;
       }
       sending = false;
-      box.value = "";
-      kindMode = "say";
-      if (window.DelphiRecovery) DelphiRecovery.clearDraft("sheet", draftOf);
+      // Only what was sent goes; words typed while it was sending stay.
+      if (box.value === sentRaw) { box.value = ""; kindMode = "say"; }
+      if (window.DelphiRecovery && !box.value) DelphiRecovery.clearDraft("sheet", draftOf);
       detail = await window.delphi.tasks.detail(taskId) || detail;
       if (!sections.sheet.isOpen()) sections.sheet.set(true);
       paintAll();
@@ -1889,8 +2154,9 @@ globalThis.DelphiDrawer = (() => {
       for (const key of order) paintSection(key);
       paintKinds();
       if (document.activeElement !== title) {
-        if (title.value === titleFrom) title.value = detail.task.title;
-        titleFrom = detail.task.title;
+        // The base moves only with the box: an edit waiting to be saved keeps
+        // the title it was typed against, so a rename meanwhile is a conflict.
+        if (title.value === titleFrom) { title.value = detail.task.title; titleFrom = detail.task.title; }
         titleBox.show();
       }
       me.root.setAttribute("aria-label", `Task ${taskId}: ${detail.task.title}`);
@@ -1911,14 +2177,19 @@ globalThis.DelphiDrawer = (() => {
     // The keys: 1 to 4 set the status, P opens priority, A assigns. Never
     // while typing, so a digit in the composer is a digit.
     me.root.addEventListener("keydown", (e) => {
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
       const t = e.target;
       if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      // A key pressed on a subtask, a Sheet entry (an ask's options are a to d)
+      // or the composer belongs to that, never to the task above it.
+      if (t && t.closest && t.closest("[data-sub], [data-entry], .dw-foot, .ctx")) return;
       const k = e.key.toLowerCase();
       // Shift and Enter on a button is that button's; anywhere else it is the full view.
       if (e.key === "Enter" && e.shiftKey) { if (t.closest && t.closest("button, a, [role=button]")) return; e.preventDefault(); host.openFull(taskId); return; }
-      if (e.shiftKey) return;
-      const to = { 1: "todo", 2: "doing", 3: "blocked", 4: "done" }[e.key];
+      // Digits by the key, so a layout that needs Shift for them still works.
+      const digit = /^Digit[1-4]$/.test(e.code || "") ? e.code.slice(5) : e.key;
+      const to = { 1: "todo", 2: "doing", 3: "blocked", 4: "done" }[digit];
+      if (!to && e.shiftKey) return;
       if (to) { e.preventDefault(); if (statusOf() !== to) write({ status: to }, STATUS_LABEL[to].toLowerCase()); return; }
       if (k === "p") { e.preventDefault(); const b = props.querySelector("[data-act=priority]"); if (b) priorityMenu(b); return; }
       if (k === "a") { e.preventDefault(); const b = props.querySelector("[data-act=assign]"); if (b) editAssignee(b); }
@@ -1937,7 +2208,9 @@ globalThis.DelphiDrawer = (() => {
           do {
             liveAgain = false;
             const next = await window.delphi.tasks.detail(taskId);
-            if (host.sheet() !== handle || !next) return;
+            if (host.sheet() !== handle) return;
+            // Deleted elsewhere: nothing left to show, and nothing to save into.
+            if (!next) { gone = true; host.notify(`Task #${taskId} was deleted. Restore it from History.`); await me.close(); return; }
             if (JSON.stringify(next) === JSON.stringify(detail)) continue;
             detail = next;
             paintAll();
@@ -1986,6 +2259,7 @@ globalThis.DelphiDrawer = (() => {
     const ticket = ++opening;
     const before = host.sheet();
     if (before) await before.close();
+    if (lastClose) await lastClose.catch(() => {});
     if (ticket !== opening) return;
     const S = host.state();
     let n = { ...note };
@@ -1993,13 +2267,25 @@ globalThis.DelphiDrawer = (() => {
     let ed = null;
     const nameIn = el("textarea", { className: "dw-title plain", rows: 1, value: n.title, spellcheck: false });
     nameIn.setAttribute("aria-label", "Note title");
-    const saveAll = async () => {
-      const fields = {};
-      if (nameIn.value.trim() && nameIn.value.trim() !== n.title) fields.title = nameIn.value.trim();
-      if (ed && ed.area.value !== (n.body || "")) fields.body = ed.area.value;
-      if (!Object.keys(fields).length) return;
-      try { await window.delphi.notes.update(n.id, fields); Object.assign(n, fields); host.refresh(); } catch (error) { host.notifyError(error); }
+    // The note as the store has it now: a row from a list or a search can be
+    // stale or cut short, and every save is checked against this.
+    const fetchNote = async () => {
+      const list = await window.delphi.notes.list(n.project_id == null ? null : n.project_id);
+      return (list || []).find((x) => x.id === n.id) || null;
     };
+    try { const fresh = await fetchNote(); if (fresh) n = { ...n, ...fresh }; } catch {}
+    if (ticket !== opening) return;
+    nameIn.value = n.title;
+    let nameBox = null;
+    const nameKeep = titleKeeper(nameIn, {
+      label: "The note's title",
+      fetch: async () => { const f = await fetchNote(); return f ? f.title : null; },
+      write: async (title) => { await window.delphi.notes.update(n.id, { title }); n.title = title; host.refresh(); },
+      onTake: () => nameBox && nameBox.show(),
+    });
+    // The title and the body save apart, each on its own blur, so a title
+    // change never sends the body again.
+    const saveAll = async () => { await nameKeep.save(); if (ed) await ed.commit(); };
     const me = frame({ label: `Note ${n.id}: ${n.title}`, onClose: saveAll });
     cur = me;
     me.root.classList.add("dw-note");
@@ -2035,12 +2321,14 @@ globalThis.DelphiDrawer = (() => {
     if (n.associated && n.home_name) chips.append(host.fromChip(item()));
     const growName = () => { nameIn.style.height = "auto"; nameIn.style.height = `${nameIn.scrollHeight}px`; };
     nameIn.addEventListener("input", growName);
-    nameIn.addEventListener("blur", saveAll);
-    const nameBox = titleField(nameIn, "plain");
+    nameIn.addEventListener("blur", () => nameKeep.save());
+    nameBox = titleField(nameIn, "plain", { revert: () => nameKeep.base() });
     me.head.append(topRow(crumbs, [pin, share, del, moreB], flashHost, () => me.close()), chips, nameBox.node);
 
     ed = editor({ label: "Note", kind: "note", value: n.body || "", placeholder: "What is worth remembering here",
-      onSave: async (body) => { await window.delphi.notes.update(n.id, { body }); n.body = body; host.refresh(); paintLinked(); },
+      draftKey: ["notebody", n.id],
+      current: async () => { const f = await fetchNote(); return f ? f.body || "" : null; },
+      onSave: async (body) => { const r = await window.delphi.notes.update(n.id, { body }); n.body = r && r.body != null ? r.body : body; host.refresh(); paintLinked(); return n.body; },
       onMode: (m) => me.root.classList.toggle("wide", m === "split") });
     me.root.classList.toggle("wide", ed.mode() === "split");
     me.body.append(el("div", { className: "dw-sec" }, ed.node));
@@ -2058,6 +2346,7 @@ globalThis.DelphiDrawer = (() => {
         linkB.replaceWith(i);
         i.focus();
         i.onkeydown = async (e) => {
+          if (e.isComposing) return;
           if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); paintLinked(); return; }
           if (e.key !== "Enter") return;
           e.preventDefault();
@@ -2079,7 +2368,7 @@ globalThis.DelphiDrawer = (() => {
       for (const t of tasks) {
         const b = el("button", { className: "dw-mem row", type: "button", title: "Open this task here" }, statusMark(host.statusOf(t)), el("span", { className: "t plain", textContent: `#${t.id} ${t.title}` }));
         b.dataset.open = String(t.id);
-        b.onclick = () => open(t.id);
+        b.onclick = () => host.openTask(t.id);
         panel.append(b);
       }
       linked.append(panel);
@@ -2109,7 +2398,34 @@ globalThis.DelphiDrawer = (() => {
       else if (k === "m") { e.preventDefault(); const mv = pick("Move"); if (mv) mv.run(); }
       else if (k === "l") { e.preventDefault(); linked.querySelector("[data-act=link]")?.click(); }
     });
-    const handle = { drawer: true, note: n, root: me.root, close: () => me.close() };
+    let noteLive = false;
+    let noteAgain = false;
+    const handle = {
+      drawer: true, note: n, root: me.root, close: () => me.close(),
+      // An agent's write to the note while it is open here.
+      // One read at a time, the newest last, so an older read finishing late
+      // never puts an older body back in the box.
+      async live() {
+        if (noteLive) { noteAgain = true; return; }
+        noteLive = true;
+        try {
+          do {
+            noteAgain = false;
+            let f = null;
+            try { f = await fetchNote(); } catch { return; }
+            if (host.sheet() !== handle) return;
+            // Not in its project's list is not proof it is gone (it may live
+            // elsewhere now), so the drawer is left as it is.
+            if (!f) return;
+            nameKeep.update(f.title);
+            ed.update(f.body || "");
+            n = { ...n, ...f };
+            handle.note = n;
+            paintLinked();
+          } while (noteAgain);
+        } finally { noteLive = false; }
+      },
+    };
     me.handle = handle;
     host.setSheet(handle);
     requestAnimationFrame(growName);
@@ -2124,6 +2440,7 @@ globalThis.DelphiDrawer = (() => {
     const ticket = ++opening;
     const before = host.sheet();
     if (before) await before.close();
+    if (lastClose) await lastClose.catch(() => {});
     let pad = typeof padOrId === "object" ? padOrId : await window.delphi.pads.get(padOrId);
     if (pad && pad.body == null && pad.id) pad = await window.delphi.pads.get(pad.id);
     if (!pad || ticket !== opening) return;
@@ -2132,13 +2449,18 @@ globalThis.DelphiDrawer = (() => {
     let ed = null;
     const nameIn = el("textarea", { className: "dw-title plain", rows: 1, value: pad.title, spellcheck: false });
     nameIn.setAttribute("aria-label", "Pad title");
-    const save = async () => {
-      const fields = {};
-      if (nameIn.value.trim() && nameIn.value.trim() !== pad.title) fields.title = nameIn.value.trim();
-      if (ed && ed.area.value !== (pad.body || "")) { fields.body = ed.area.value; fields.author = "you"; }
-      if (!Object.keys(fields).length) return;
-      try { await window.delphi.pads.write(pad.id, fields); Object.assign(pad, fields); host.refresh(); } catch (error) { host.notifyError(error); }
-    };
+    let nameBox = null;
+    const nameKeep = titleKeeper(nameIn, {
+      label: "The pad's title",
+      fetch: async () => { const f = await window.delphi.pads.get(pad.id); return f ? f.title : null; },
+      write: async (title) => { await window.delphi.pads.write(pad.id, { title }); pad.title = title; host.refresh(); },
+      onTake: () => nameBox && nameBox.show(),
+    });
+    // Title and body save apart. The body is the whole pad, so its save is
+    // checked against the stored pad (reconcile) and never puts an older copy
+    // over an agent's append or a status the board wrote back into a line.
+    let padGone = false;
+    const save = async () => { if (padGone) return; await nameKeep.save(); if (ed) await ed.commit(); };
     const me = frame({ label: `Pad ${pad.key || pad.id}: ${pad.title}`, onClose: save });
     cur = me;
     me.root.classList.add("dw-pad");
@@ -2164,7 +2486,7 @@ globalThis.DelphiDrawer = (() => {
       el("span", { textContent: "Pads" }), el("span", { className: "dw-crumb-now mono", textContent: pad.key || `#${pad.id}` })];
     const growName = () => { nameIn.style.height = "auto"; nameIn.style.height = `${nameIn.scrollHeight}px`; };
     nameIn.addEventListener("input", growName);
-    nameIn.addEventListener("blur", save);
+    nameIn.addEventListener("blur", () => nameKeep.save());
     const checks = () => ((ed ? ed.area.value : pad.body || "").match(/^\s*[-*] \[[ xX]\]/gm) || []).length;
     const checksChip = el("span", { className: "dw-prop static" });
     const paintChecks = () => { checksChip.textContent = ""; checksChip.append(icon("tasks", "sm"), `${checks()} ${checks() === 1 ? "checkbox" : "checkboxes"}`); };
@@ -2190,7 +2512,7 @@ globalThis.DelphiDrawer = (() => {
       host.refresh();
     };
     paintToggle();
-    const nameBox = titleField(nameIn, "plain");
+    nameBox = titleField(nameIn, "plain", { revert: () => nameKeep.base() });
     me.head.append(topRow(crumbs, [pin, share, del, moreB], flashHost, () => me.close()), nameBox.node, props, el("div", { className: "dw-note-line" }, toggle, toggleWords));
     // The <!--d:N--> markers are how a line and its task stay the same thing.
     // Kept in the source, and left out of the formatted view by the renderer,
@@ -2205,7 +2527,29 @@ globalThis.DelphiDrawer = (() => {
     me.body.append(ed.node, el("p", { className: "dw-fine", textContent: "The <!--d:123--> markers are how a line and its task stay the same thing. Edit around them." }));
     me.foot.append(el("span", { textContent: "Agents write here with append_scratchpad" }), el("span", { className: "grow" }), el("span", {}, el("kbd", { textContent: "Esc" }), " close"));
     me.foot.classList.add("keys");
-    const handle = { drawer: true, pad, root: me.root, close: () => me.close() };
+    let padLive = false;
+    let padAgain = false;
+    const handle = {
+      drawer: true, pad, root: me.root, close: () => me.close(),
+      // An agent's append, or a status written back into a line by the board.
+      async live() {
+        if (padLive) { padAgain = true; return; }
+        padLive = true;
+        try {
+          do {
+            padAgain = false;
+            let f = null;
+            try { f = await window.delphi.pads.get(pad.id); } catch { return; }
+            if (host.sheet() !== handle) return;
+            if (!f) { padGone = true; host.notify("This pad was deleted. Restore it from History."); await me.close(); return; }
+            nameKeep.update(f.title);
+            ed.update(f.body || "");
+            Object.assign(pad, { derives_tasks: f.derives_tasks, pinned: f.pinned, updated_at: f.updated_at });
+            paintChecks();
+          } while (padAgain);
+        } finally { padLive = false; }
+      },
+    };
     me.handle = handle;
     host.setSheet(handle);
     requestAnimationFrame(growName);
@@ -2225,7 +2569,7 @@ globalThis.DelphiDrawer = (() => {
     // files against "the task on screen".
     taskId: () => { const h = host && host.sheet(); return h && h.drawer && h.taskId ? h.taskId : null; },
     // Pure, for tools/drawer_test.js.
-    stuck, related, ordered, composed,
+    stuck, related, ordered, composed, reconcile,
   };
 })();
 

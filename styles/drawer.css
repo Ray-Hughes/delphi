@@ -31,7 +31,7 @@
 .dw-head { padding: 12px 16px 12px; border-bottom: 1px solid var(--line); flex: none; }
 .dw-note .dw-head, .dw-pad .dw-head { border-bottom: 0; padding-bottom: 4px; }
 .dw-top { display: flex; align-items: center; gap: 6px; height: 28px; }
-.dw-crumb { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; color: var(--ink-faint); font-size: 12px; }
+.dw-crumb { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; color: var(--ink-dim); font-size: 12px; }
 .dw-crumb > * { flex: none; }
 .dw-crumb svg { color: var(--line); }
 .dw-crumb-p { display: inline-flex; align-items: center; gap: 6px; padding: 2px 4px; margin: -2px -4px; border-radius: var(--r-sm); }
@@ -84,7 +84,7 @@
 
 .dw-props-wrap { margin-left: 28px; }
 .dw-statusbar { display: flex; padding: 2px; margin-top: 10px; border-radius: 8px; background: var(--raised); border: 1px solid var(--line); }
-.dw-statusbar button { flex: 1; height: 26px; border-radius: 6px; font-size: 12px; color: var(--ink-faint) !important; display: flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; transition: background .12s, color .12s; }
+.dw-statusbar button { flex: 1; height: 26px; border-radius: 6px; font-size: 12px; color: var(--ink-dim) !important; display: flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; transition: background .12s, color .12s; }
 .dw-statusbar button.on { background: var(--surface) !important; color: var(--ink) !important; box-shadow: var(--shadow-1); font-weight: 600; }
 .dw-statusbar button:hover:not(.on) { color: var(--ink) !important; }
 .dw-statusbar .dw-st-more { flex: 0 0 auto; padding: 0 8px; }
@@ -146,7 +146,7 @@ button.dw-prop:hover { background: var(--raised) !important; }
 .dw-fold-h .chev { color: var(--ink-faint); display: grid; place-items: center; width: 14px; flex: none; transition: transform .14s var(--ease); }
 .dw-fold.open .dw-fold-h .chev { transform: rotate(90deg); }
 .dw-fold-h .ct { color: var(--ink-faint); font-size: 12px; font-variant-numeric: tabular-nums; flex: none; }
-.dw-fold-h .sum { color: var(--ink-faint); font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; flex: 1; min-width: 0; }
+.dw-fold-h .sum { color: var(--ink-dim); font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; flex: 1; min-width: 0; }
 .dw-fold-b { padding: 0 0 16px; }
 .dw-fold-b[hidden] { display: none; }
 .dw-progress { height: 4px; border-radius: 9px; background: var(--line); overflow: hidden; width: 64px; flex: none; }
@@ -211,7 +211,7 @@ button.dw-prop:hover { background: var(--raised) !important; }
 .dw-ed-bar .lbl { font-size: 12.5px; color: var(--ink-dim); font-weight: 600; }
 .dw-seg { display: inline-flex; padding: 2px; border-radius: 8px; background: var(--raised); border: 1px solid var(--line); flex: none; }
 .dw-ed-bar .dw-seg { background: var(--chrome); }
-.dw-seg button { height: 24px; padding: 0 9px; border-radius: 6px; color: var(--ink-faint) !important; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; transition: background .12s, color .12s; }
+.dw-seg button { height: 24px; padding: 0 9px; border-radius: 6px; color: var(--ink-dim) !important; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; transition: background .12s, color .12s; }
 .dw-seg button.on { background: var(--surface) !important; color: var(--ink) !important; box-shadow: var(--shadow-1); }
 .dw-seg button:hover:not(.on) { color: var(--ink) !important; }
 .dw-ed-body { display: grid; grid-template-columns: 1fr; }
@@ -356,7 +356,8 @@ button.dw-prop:hover { background: var(--raised) !important; }
 .dw-kinds button { height: 24px; padding: 0 8px; border-radius: 5px; font: 400 12px/24px var(--mono) !important; letter-spacing: 0; color: var(--ink-faint) !important; }
 .dw-kinds button.on { background: var(--accent-soft) !important; color: var(--accent-ink) !important; }
 .dw-kinds button:hover:not(.on) { background: var(--raised) !important; color: var(--ink) !important; }
-.dw-sense { font-size: 11.5px; color: var(--ink-faint); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
+.dw-sense.err { color: var(--crit-ink); white-space: normal; }
+.dw-sense { font-size: 11.5px; color: var(--ink-dim); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
 .dw-send { width: 28px; height: 28px; border-radius: 7px !important; display: grid; place-items: center; background: var(--btn-primary) !important; color: var(--btn-fg) !important; flex: none; }
 .dw-send:disabled { opacity: .45; cursor: default; }
 

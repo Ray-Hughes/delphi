@@ -385,7 +385,175 @@ async function main() {
   }
   await js("DelphiDrawer.close(); 1");
 
+  console.log("\nagents writing while a person reads or types");
+  const changed = () => win.webContents.send("db-changed");
+  const pick = async (label) => {
+    await until(`!!document.querySelector(".wb-dialog")`);
+    return js(`(() => { const b = [...document.querySelectorAll(".wb-dialog button")].find((n) => n.textContent === ${JSON.stringify(label)}); if (!b) return false; b.click(); return true; })()`);
+  };
+  const raw = (scope) => `document.querySelector('${scope} textarea.dw-raw')`;
+  const detailOf = (id) => q("SELECT detail FROM tasks WHERE id = :id", { id })[0].detail;
+  const typeInto = (sel, text) => js(`(() => { const a = ${sel}; a.focus(); a.value = a.value + ${JSON.stringify(text)}; a.dispatchEvent(new Event('input')); return 1; })()`);
+  // A hidden window that never has the focus fires no blur of its own, so
+  // the event a person's click elsewhere would send is sent by hand.
+  const blur = (sel) => js(`(() => { const a = ${sel}; a.blur(); a.dispatchEvent(new FocusEvent("blur")); return 1; })()`);
+  const dTask = db.createTask({ projectId: project.id, title: "Written by two", detail: "A" });
+  await js(`localStorage.setItem("delphi.drawer.mode.task", JSON.stringify("write")); localStorage.setItem("delphi.drawer.folds", JSON.stringify({ description: true })); 1`);
+  await openTask(dTask.id);
+  const D = raw(".dw [data-fold=description]");
+  db.updateTask(dTask.id, { detail: "B" }); changed();
+  check("not focused: the description shows the agent's write", await until(`${D}.value === "B"`), true);
+  await js(`${D}.focus(); 1`);
+  db.updateTask(dTask.id, { detail: "C" }); changed();
+  await wait(500);
+  check("focused: the box is left alone while it has the focus", await js(`${D}.value`), "B");
+  await blur(D);
+  check("and on blur, with nothing typed, it takes the agent's write", await until(`${D}.value === "C"`), true);
+  check("without writing anything back", detailOf(dTask.id), "C");
+  await typeInto(D, " mine");
+  db.updateTask(dTask.id, { detail: "D by an agent" }); changed();
+  await wait(300);
+  await blur(D);
+  check("typed and written both: it asks", await pick("Not now"), true);
+  await wait(300);
+  check("Not now writes nothing", detailOf(dTask.id), "D by an agent");
+  check("and keeps what was typed", await js(`${D}.value`), "C mine");
+  await js(`${D}.focus(); 1`); await blur(D);
+  check("asked again, Keep mine", await pick("Keep mine"), true);
+  await until(`!document.querySelector(".wb-dialog")`); await wait(300);
+  check("writes the person's text", detailOf(dTask.id), "C mine");
+  await typeInto(D, " again");
+  db.updateTask(dTask.id, { detail: "E by an agent" }); changed();
+  await wait(300);
+  await blur(D);
+  check("asked, Take theirs", await pick("Take theirs"), true);
+  await until(`${D}.value === "E by an agent"`);
+  check("keeps the agent's text and shows it", [detailOf(dTask.id), await js(`${D}.value`)], ["E by an agent", "E by an agent"]);
+  const T = "document.querySelector('.dw textarea.dw-title')";
+  const titleOf = (id) => q("SELECT title FROM tasks WHERE id = :id", { id })[0].title;
+  await js("document.querySelector('.dw .dw-title-btn').click(); 1");
+  await typeInto(T, " (mine)");
+  db.updateTask(dTask.id, { title: "Renamed by an agent" }); changed();
+  await wait(300);
+  await blur(T);
+  check("a title typed while an agent renamed it asks too", await pick("Take theirs"), true);
+  await wait(300);
+  check("Take theirs keeps the agent's title, in the store and the box", [titleOf(dTask.id), await js(`${T}.value`)], ["Renamed by an agent", "Renamed by an agent"]);
+  await js(`(() => { const a = ${T}; a.value = a.value + "  "; a.dispatchEvent(new Event('input')); return 1; })()`);
+  db.updateTask(dTask.id, { title: "Renamed again" }); changed();
+  await wait(300);
+  await blur(T);
+  await wait(400);
+  check("spaces typed after it are not a rename over the agent's", [titleOf(dTask.id), await js("!!document.querySelector('.wb-dialog')")], ["Renamed again", false]);
+  await js("DelphiDrawer.close(); 1"); await wait(300);
+
+  // A tick in the description while an agent has written it, unseen here.
+  const tTask = db.createTask({ projectId: project.id, title: "Ticks", detail: "- [ ] one\n- [ ] two" });
+  await js(`localStorage.setItem("delphi.drawer.mode.task", JSON.stringify("preview")); 1`);
+  await openTask(tTask.id);
+  await until(`!!document.querySelector('.dw [data-fold=description] input[data-line="1"]')`);
+  db.updateTask(tTask.id, { detail: "- [ ] one\n- [ ] two\nwritten by an agent" });
+  await js(`(() => { const b = document.querySelector('.dw [data-fold=description] input[data-line="1"]'); b.checked = true; b.dispatchEvent(new Event("change")); return 1; })()`);
+  await wait(800);
+  check("a tick lands on the agent's newer text, not over it", detailOf(tTask.id), "- [ ] one\n- [x] two\nwritten by an agent");
+  db.updateTask(tTask.id, { detail: "- [ ] zero\n- [ ] one\n- [x] two\nwritten by an agent" });
+  await js(`(() => { const b = document.querySelector('.dw [data-fold=description] input[data-line="0"]'); b.checked = true; b.dispatchEvent(new Event("change")); return 1; })()`);
+  await wait(800);
+  check("and a tick whose line moved meanwhile writes nothing", detailOf(tTask.id), "- [ ] zero\n- [ ] one\n- [x] two\nwritten by an agent");
+  await js("DelphiDrawer.close(); 1"); await wait(300);
+  await js(`localStorage.setItem("delphi.drawer.mode.task", JSON.stringify("write")); 1`);
+
+  if (pad) {
+    const padRow = () => q("SELECT body FROM scratchpads WHERE id = :id", { id: pad.id })[0].body;
+    db.writeScratchpad(pad.id, { derives_tasks: 1 });
+    await js(`localStorage.setItem("delphi.drawer.mode.pad", JSON.stringify("write")); 1`);
+    await js(`DelphiDrawer.openPad(${pad.id}).then(() => 1)`);
+    await until("!!document.querySelector('.dw.dw-pad')");
+    const P = raw(".dw-pad");
+    await typeInto(P, "\n- [ ] beta"); await blur(P);
+    check("a pad saved here gets its new line's anchor back in the box", await until(`/beta <!--d:\\d+-->/.test(${P}.value)`), true);
+    await js(`(() => { const a = ${P}; a.focus(); a.value = a.value.replace("beta", "beta two"); a.dispatchEvent(new Event('input')); return 1; })()`);
+    await blur(P);
+    await wait(800);
+    const st = db.scratchpadTasks(pad.id);
+    check("so renaming that line renames its task, not a second one", [st.lines.length, st.dropped.length, st.lines.some((l) => /beta two/.test(l.title || (l.task && l.task.title) || ""))], [2, 0, true]);
+    db.appendScratchpad(pad.id, "- [ ] agent line"); changed();
+    check("not focused: an agent's append shows", await until(`${P}.value.includes("agent line")`), true);
+    await typeInto(P, "\nmy prose");
+    db.appendScratchpad(pad.id, "- [ ] second agent line"); changed();
+    await wait(300);
+    await blur(P);
+    check("typed and appended both: it asks before writing the whole pad", await pick("Not now"), true);
+    await wait(300);
+    check("and Not now leaves the agent's line in the pad", padRow().includes("second agent line"), true);
+    await js("DelphiDrawer.close(); 1");
+    // Closing with the question still open asks it once more; Not now again
+    // keeps the typing as a draft and writes nothing.
+    check("closing asks once more", await pick("Not now"), true);
+    await until("!document.querySelector('.dw')");
+    check("and still writes nothing over the agent", padRow().includes("second agent line"), true);
+  }
+
+  const nNote = db.createNote({ projectId: project.id, title: "Shared note", body: "one" });
+  await js(`localStorage.setItem("delphi.drawer.mode.note", JSON.stringify("write")); 1`);
+  await js(`DelphiDrawer.openNote({ id: ${nNote.id}, project_id: ${project.id}, title: "stale", body: "" }).then(() => 1)`);
+  await until("!!document.querySelector('.dw.dw-note')");
+  const N = raw(".dw-note");
+  check("a note opened from a stale row shows the stored body", await js(`${N}.value`), "one");
+  db.updateNote(nNote.id, { body: "two by an agent" }); changed();
+  check("not focused: a note takes an agent's write", await until(`${N}.value === "two by an agent"`), true);
+  await typeInto(N, " and mine");
+  db.updateNote(nNote.id, { body: "three by an agent" }); changed();
+  await wait(300);
+  await blur(N);
+  check("typed and written both: it asks", await pick("Take theirs"), true);
+  await wait(300);
+  check("Take theirs keeps the agent's note", q("SELECT body FROM notes WHERE id = :id", { id: nNote.id })[0].body, "three by an agent");
+  await js("DelphiDrawer.close(); 1"); await wait(300);
+
+  console.log("\nkeys and clicks that do the thing");
+  await js(`navigate({ projectId: ${project.id}, view: "tasks", query: "" }).then(() => 1)`);
+  await until(`!!document.querySelector('#content .tk-row[data-task-id="${dTask.id}"]')`);
+  await wait(400);
+  await js(`document.querySelector('#content .tk-row[data-task-id="${dTask.id}"]').focus(); 1`);
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Return", modifiers: ["shift"] });
+  check("Shift and Enter on a focused row opens the centered view", await until("!!document.querySelector('.task-sheet')"), true);
+  await js("openSheet && openSheet.close(); 1"); await wait(300);
+  q("UPDATE tasks SET status = 'doing' WHERE id = :id", { id: task.id });
+  await openTask(task.id);
+  await unfold("subtasks");
+  await js("document.querySelector('.dw [data-sub] [data-act=open]').focus(); 1");
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "4" });
+  await wait(500);
+  check("4 pressed on a subtask does not touch the task above it", q("SELECT status FROM tasks WHERE id = :id", { id: task.id })[0].status, "doing");
+  await unfold("sheet");
+  const decidesBefore = q("SELECT COUNT(*) AS n FROM comments WHERE task_id = :t AND kind = 'decide'", { t: task.id })[0].n;
+  await js("document.querySelector('.dw [data-act=opt-a]:not([disabled])').click(); 1");
+  await wait(800);
+  check("clicking an ask's option answers it", q("SELECT COUNT(*) AS n FROM comments WHERE task_id = :t AND kind = 'decide'", { t: task.id })[0].n, decidesBefore + 1);
+  await unfold("runs");
+  await js("document.querySelector('.dw [data-fold=runs] [data-act=hand]').click(); 1");
+  check("clicking Run opens Hand to agent", await until("!!document.querySelector('.hand-dialog')"), true);
+  await js("(() => { const b = [...document.querySelectorAll('.hand-dialog button')].find((n) => /cancel/i.test(n.textContent)); if (b) b.click(); else document.querySelector('.hand-dialog').closest('.overlay').remove(); return 1; })()");
+  await wait(300);
+  const startTask = db.createTask({ projectId: project.id, title: "Start me" });
+  await openTask(startTask.id);
+  await unfold("workbench");
+  await until("!!document.querySelector('.dw [data-fold=workbench] [data-act=start]')");
+  await js("document.querySelector('.dw [data-fold=workbench] [data-act=start]').click(); 1");
+  // More than one place to start from asks which; the first is fine here.
+  await wait(600);
+  await js("(() => { const o = document.querySelector('.wb-dialog .repo-pick button, .wb-dialog [data-pick], .wb-dialog li button'); if (o) o.click(); return 1; })()");
+  check("clicking Start Workbench makes one", await until(`(window.__n = (window.__n || 0) + 1, !!document.querySelector('.dw [data-card=workbench] .v.mono'))`, 20000), true);
+  check("in the store too", q("SELECT COUNT(*) AS n FROM workbenches WHERE task_id = :t", { t: startTask.id })[0].n, 1);
+  await js("DelphiDrawer.close(); 1"); await wait(300);
+
   console.log("\nthe pure rules");
+  check("reconcile: untouched and unmoved writes nothing", await js(`DelphiDrawer.reconcile("a", "a", "a")`), "none");
+  check("reconcile: untouched and moved takes theirs", await js(`DelphiDrawer.reconcile("a", "b", "a")`), "take");
+  check("reconcile: typed and unmoved writes", await js(`DelphiDrawer.reconcile("a", "a", "c")`), "write");
+  check("reconcile: typed and moved asks", await js(`DelphiDrawer.reconcile("a", "b", "c")`), "conflict");
+  check("reconcile: moved to what was typed is done", await js(`DelphiDrawer.reconcile("a", "c", "c")`), "same");
   const day = 86400000;
   const at = (ms) => new Date(Date.now() - ms).toISOString().replace("T", " ").slice(0, 19);
   const S = (status, ms) => js(`DelphiDrawer.stuck({ task: { id: 1, status: ${JSON.stringify(status)}, updated_at: ${JSON.stringify(at(ms))} }, events: [], comments: [] })`);
